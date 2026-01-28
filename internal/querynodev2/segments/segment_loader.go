@@ -1956,8 +1956,16 @@ func estimateLoadingResourceUsageOfSegment(schema *schemapb.CollectionSchema, lo
 				needWarmup = paramtable.Get().QueryNodeCfg.TieredWarmupScalarIndex.GetValue() == "sync"
 			}
 
+			// Check if index is loaded via mmap
+			// mmap data is file-backed memory that can be reclaimed by kernel under memory pressure,
+			// so it should not be counted for OOM protection
+			indexMmapEnabled := isIndexMmapEnable(fieldSchema, fieldIndexInfo)
+
 			if !multiplyFactor.TieredEvictionEnabled || needWarmup {
-				indexMemorySize += estimateResult.MaxMemoryCost
+				if !indexMmapEnabled {
+					// Only count memory for non-mmap indexes
+					indexMemorySize += estimateResult.MaxMemoryCost
+				}
 				segDiskLoadingSize += estimateResult.MaxDiskCost
 			}
 
