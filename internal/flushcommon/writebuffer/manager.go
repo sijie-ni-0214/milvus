@@ -157,9 +157,10 @@ func (m *bufferManager) memoryCheck() {
 		}
 
 		if candidate != nil {
-			candidate.EvictBuffer(GetOldestBufferPolicy(paramtable.Get().DataNodeCfg.MemoryForceSyncSegmentNum.GetAsInt()))
+			candidate.EvictOldestBuffers(paramtable.Get().DataNodeCfg.MemoryForceSyncSegmentNum.GetAsInt())
 			mlog.Info(context.TODO(), "notify writebuffer to sync",
-				mlog.String("channel", candiChan), mlog.Float64("bufferSize(MB)", logutil.ToMB(float64(candiSize))))
+				mlog.String("channel", candiChan),
+				mlog.Float64("bufferSize(MB)", logutil.ToMB(float64(candiSize))))
 		}
 	}
 }

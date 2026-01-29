@@ -287,7 +287,7 @@ func (s *ManagerSuite) TestMemoryCheck() {
 		}
 		return int64(float64(memoryLimit) * 0.6)
 	})
-	wb.EXPECT().EvictBuffer(mock.Anything).Run(func(polices ...SyncPolicy) {
+	wb.EXPECT().EvictOldestBuffers(mock.Anything).Run(func(_ int) {
 		select {
 		case signal <- struct{}{}:
 		default:
@@ -333,7 +333,7 @@ func (s *ManagerSuite) TestStopDuringMemoryCheck() {
 		return int64(float64(memoryLimit) * 0.8)
 	}).Maybe()
 	//.Return(int64(float64(memoryLimit) * 0.6))
-	wb.EXPECT().EvictBuffer(mock.Anything).Maybe()
+	wb.EXPECT().EvictOldestBuffers(mock.Anything).Maybe()
 	manager.buffers.Insert(s.channelName, wb)
 	manager.Start()
 

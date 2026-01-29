@@ -24,10 +24,11 @@
 #include "common/Consts.h"
 #include "common/EasyAssert.h"
 #include "common/FieldMeta.h"
+#include "common/RequestTrace.h"
 #include "common/Schema.h"
-#include "common/Tracer.h"
 #include "common/Utils.h"
 #include "fmt/core.h"
+#include "fmt/ranges.h"
 #include "folly/ScopeGuard.h"
 #include "glog/logging.h"
 #include "index/Meta.h"
@@ -122,6 +123,7 @@ ReduceHelper::IsSearchResultRefineEnabled(SearchResult* search_result) const {
 
 void
 ReduceHelper::FilterInvalidSearchResult(SearchResult* search_result) {
+    // const auto t1 = std::chrono::high_resolution_clock::now();
     auto nq = search_result->total_nq_;
     auto topK = search_result->unity_topK_;
     AssertInfo(search_result->seg_offsets_.size() == nq * topK,
@@ -171,12 +173,24 @@ ReduceHelper::FilterInvalidSearchResult(SearchResult* search_result) {
     std::partial_sum(real_topks.begin(),
                      real_topks.end(),
                      search_result->topk_per_nq_prefix_sum_.begin() + 1);
+    // const auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
+    //                           std::chrono::high_resolution_clock::now() - t1)
+    //                           .count();
+    // LOG_INFO(
+    //     "[sss] filter invalid search result done, traceID: {}, "
+    //     "partition: {}, segment: {},  "
+    //     " duration: {} ms",
+    //     milvus::tracer::GetRequestTraceID(),
+    //     segment->get_partition_id(),
+    //     segment->get_segment_id(),
+    //     duration);
 }
 
 void
 ReduceHelper::FilterInvalidSearchResults() {
     tracer::AutoSpan span("ReduceHelper::FilterInvalidSearchResults",
                           tracer::GetRootSpan());
+    const auto t1 = std::chrono::high_resolution_clock::now();
     // First pass: filter invalid results and compact the array sequentially
     uint32_t valid_index = 0;
     for (auto& search_result : search_results_) {
@@ -198,12 +212,20 @@ ReduceHelper::FilterInvalidSearchResults() {
     }
     search_results_.resize(valid_index);
     num_segments_ = search_results_.size();
+    LOG_INFO(
+        "[sss] filter invalid search results done, traceID: {}, "
+        ", duration: {} ms",
+        milvus::tracer::GetRequestTraceID(),
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::high_resolution_clock::now() - t1)
+            .count());
 }
 
 void
 ReduceHelper::FillPrimaryKey() {
     tracer::AutoSpan span("ReduceHelper::FillPrimaryKey",
                           tracer::GetRootSpan());
+    const auto t1 = std::chrono::high_resolution_clock::now();
     // Bound inline PK work before reduction; strings can be costly even when resident.
     bool fanout = false;
     if (num_segments_ > 1) {
@@ -240,6 +262,7 @@ ReduceHelper::FillPrimaryKey() {
                 }
             }
         });
+        const auto submit_time = std::chrono::high_resolution_clock::now();
         for (auto& search_result : search_results_) {
             auto task = std::make_shared<std::packaged_task<void()>>(
                 [this, search_result] {

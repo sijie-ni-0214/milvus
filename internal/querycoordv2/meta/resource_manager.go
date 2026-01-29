@@ -641,9 +641,18 @@ func (rm *ResourceManager) HandleNodeUp(ctx context.Context, node int64) {
 	rm.handleNodeUp(ctx, node)
 }
 
+// excludedEmbeddedQueryNode reports whether a QueryNode embedded in a
+// StreamingNode must stay out of resource groups. Embedded QueryNodes join
+// resource groups only when queryCoord.enableSQNServeSegments lets them serve
+// sealed segments.
+func excludedEmbeddedQueryNode(info *session.NodeInfo) bool {
+	return info.IsEmbeddedQueryNodeInStreamingNode() &&
+		!paramtable.Get().QueryCoordCfg.EnableSQNServeSegments.GetAsBool()
+}
+
 func (rm *ResourceManager) handleNodeUp(ctx context.Context, node int64) {
 	nodeInfo := rm.nodeMgr.Get(node)
-	if nodeInfo == nil || nodeInfo.IsEmbeddedQueryNodeInStreamingNode() {
+	if nodeInfo == nil || excludedEmbeddedQueryNode(nodeInfo) {
 		return
 	}
 	if nodeInfo.IsStoppingState() {
@@ -1268,8 +1277,8 @@ func (rm *ResourceManager) CheckNodesInResourceGroup(ctx context.Context) {
 			} else if info.GetState() == session.NodeStateStopping {
 				mlog.Warn(context.TODO(), "node is stopping", mlog.Int64("node", node))
 				rm.handleNodeStopping(ctx, node)
-			} else if info.IsEmbeddedQueryNodeInStreamingNode() {
-				mlog.Warn(context.TODO(), "unreachable code, but just for dirty meta clean up", mlog.Int64("node", node))
+			} else if excludedEmbeddedQueryNode(info) {
+				mlog.Warn(ctx, "remove embedded query node from resource group, serving sealed segments is disabled", mlog.Int64("node", node))
 				rm.handleNodeStopping(ctx, node)
 			}
 		}
