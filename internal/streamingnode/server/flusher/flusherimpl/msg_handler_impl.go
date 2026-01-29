@@ -129,11 +129,22 @@ func (impl *msgHandlerImpl) HandleAlterCollection(ctx context.Context, putCollec
 
 func (impl *msgHandlerImpl) HandleTruncateCollection(flushMsg message.ImmutableTruncateCollectionMessageV2) error {
 	vchannel := flushMsg.VChannel()
-	if err := impl.wbMgr.SealSegments(context.Background(), vchannel, flushMsg.Header().SegmentIds); err != nil {
-		return errors.Wrap(err, "failed to seal segments")
-	}
-	if err := impl.wbMgr.FlushChannel(context.Background(), vchannel, flushMsg.TimeTick()); err != nil {
-		return errors.Wrap(err, "failed to flush channel")
+	header := flushMsg.Header()
+
+	if len(header.PartitionIds) > 0 {
+		// Truncate partition: directly flush only the specified segments
+		// This avoids flushing segments from other partitions
+		if err := impl.wbMgr.FlushSegments(context.Background(), vchannel, header.SegmentIds); err != nil {
+			return errors.Wrap(err, "failed to flush segments for truncate partition")
+		}
+	} else {
+		// Truncate collection: use original logic with flushTs
+		if err := impl.wbMgr.SealSegments(context.Background(), vchannel, header.SegmentIds); err != nil {
+			return errors.Wrap(err, "failed to seal segments")
+		}
+		if err := impl.wbMgr.FlushChannel(context.Background(), vchannel, flushMsg.TimeTick()); err != nil {
+			return errors.Wrap(err, "failed to flush channel")
+		}
 	}
 	return nil
 }

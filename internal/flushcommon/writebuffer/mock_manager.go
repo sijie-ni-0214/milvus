@@ -240,6 +240,54 @@ func (_c *MockBufferManager_FlushChannel_Call) RunAndReturn(run func(context.Con
 	return _c
 }
 
+// FlushSegments provides a mock function with given fields: ctx, channel, segmentIDs
+func (_m *MockBufferManager) FlushSegments(ctx context.Context, channel string, segmentIDs []int64) error {
+	ret := _m.Called(ctx, channel, segmentIDs)
+
+	if len(ret) == 0 {
+		panic("no return value specified for FlushSegments")
+	}
+
+	var r0 error
+	if rf, ok := ret.Get(0).(func(context.Context, string, []int64) error); ok {
+		r0 = rf(ctx, channel, segmentIDs)
+	} else {
+		r0 = ret.Error(0)
+	}
+
+	return r0
+}
+
+// MockBufferManager_FlushSegments_Call is a *mock.Call that shadows Run/Return methods with type explicit version for method 'FlushSegments'
+type MockBufferManager_FlushSegments_Call struct {
+	*mock.Call
+}
+
+// FlushSegments is a helper method to define mock.On call
+//   - ctx context.Context
+//   - channel string
+//   - segmentIDs []int64
+func (_e *MockBufferManager_Expecter) FlushSegments(ctx interface{}, channel interface{}, segmentIDs interface{}) *MockBufferManager_FlushSegments_Call {
+	return &MockBufferManager_FlushSegments_Call{Call: _e.mock.On("FlushSegments", ctx, channel, segmentIDs)}
+}
+
+func (_c *MockBufferManager_FlushSegments_Call) Run(run func(ctx context.Context, channel string, segmentIDs []int64)) *MockBufferManager_FlushSegments_Call {
+	_c.Call.Run(func(args mock.Arguments) {
+		run(args[0].(context.Context), args[1].(string), args[2].([]int64))
+	})
+	return _c
+}
+
+func (_c *MockBufferManager_FlushSegments_Call) Return(_a0 error) *MockBufferManager_FlushSegments_Call {
+	_c.Call.Return(_a0)
+	return _c
+}
+
+func (_c *MockBufferManager_FlushSegments_Call) RunAndReturn(run func(context.Context, string, []int64) error) *MockBufferManager_FlushSegments_Call {
+	_c.Call.Return(run)
+	return _c
+}
+
 // GetCheckpoint provides a mock function with given fields: channel
 func (_m *MockBufferManager) GetCheckpoint(channel string) (*msgpb.MsgPosition, bool, error) {
 	ret := _m.Called(channel)

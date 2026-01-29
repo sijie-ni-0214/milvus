@@ -1683,7 +1683,7 @@ func TestChannelCP(t *testing.T) {
 		channelName := mockVChannel
 
 		// Test case 1: No segments to drop
-		err = meta.TruncateChannelByTime(context.TODO(), channelName, flushTs)
+		err = meta.TruncateChannelByTime(context.TODO(), channelName, nil, flushTs)
 		assert.NoError(t, err)
 
 		// Test case 2: Add segments that should be dropped (timestamp <= flushTs)
@@ -1738,7 +1738,7 @@ func TestChannelCP(t *testing.T) {
 		assert.NoError(t, err)
 
 		// Test case 5: TruncateChannelByTime should drop seg1 but not seg2 or seg3
-		err = meta.TruncateChannelByTime(context.TODO(), channelName, flushTs)
+		err = meta.TruncateChannelByTime(context.TODO(), channelName, nil, flushTs)
 		assert.NoError(t, err)
 
 		// Verify seg1 is dropped
@@ -1757,7 +1757,7 @@ func TestChannelCP(t *testing.T) {
 		assert.Equal(t, commonpb.SegmentState_Dropped, seg3After.GetState())
 
 		// Test case 6: Call again with same flushTs, should return nil (no segments to drop)
-		err = meta.TruncateChannelByTime(context.TODO(), channelName, flushTs)
+		err = meta.TruncateChannelByTime(context.TODO(), channelName, nil, flushTs)
 		assert.NoError(t, err)
 	})
 }

@@ -221,6 +221,53 @@ func (_c *MockWriteBuffer_EvictBuffer_Call) RunAndReturn(run func(...SyncPolicy)
 	return _c
 }
 
+// FlushSegments provides a mock function with given fields: ctx, segmentIDs
+func (_m *MockWriteBuffer) FlushSegments(ctx context.Context, segmentIDs []int64) error {
+	ret := _m.Called(ctx, segmentIDs)
+
+	if len(ret) == 0 {
+		panic("no return value specified for FlushSegments")
+	}
+
+	var r0 error
+	if rf, ok := ret.Get(0).(func(context.Context, []int64) error); ok {
+		r0 = rf(ctx, segmentIDs)
+	} else {
+		r0 = ret.Error(0)
+	}
+
+	return r0
+}
+
+// MockWriteBuffer_FlushSegments_Call is a *mock.Call that shadows Run/Return methods with type explicit version for method 'FlushSegments'
+type MockWriteBuffer_FlushSegments_Call struct {
+	*mock.Call
+}
+
+// FlushSegments is a helper method to define mock.On call
+//   - ctx context.Context
+//   - segmentIDs []int64
+func (_e *MockWriteBuffer_Expecter) FlushSegments(ctx interface{}, segmentIDs interface{}) *MockWriteBuffer_FlushSegments_Call {
+	return &MockWriteBuffer_FlushSegments_Call{Call: _e.mock.On("FlushSegments", ctx, segmentIDs)}
+}
+
+func (_c *MockWriteBuffer_FlushSegments_Call) Run(run func(ctx context.Context, segmentIDs []int64)) *MockWriteBuffer_FlushSegments_Call {
+	_c.Call.Run(func(args mock.Arguments) {
+		run(args[0].(context.Context), args[1].([]int64))
+	})
+	return _c
+}
+
+func (_c *MockWriteBuffer_FlushSegments_Call) Return(_a0 error) *MockWriteBuffer_FlushSegments_Call {
+	_c.Call.Return(_a0)
+	return _c
+}
+
+func (_c *MockWriteBuffer_FlushSegments_Call) RunAndReturn(run func(context.Context, []int64) error) *MockWriteBuffer_FlushSegments_Call {
+	_c.Call.Return(run)
+	return _c
+}
+
 // GetCheckpoint provides a mock function with no fields
 func (_m *MockWriteBuffer) GetCheckpoint() *msgpb.MsgPosition {
 	ret := _m.Called()

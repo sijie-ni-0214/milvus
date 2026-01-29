@@ -980,7 +980,7 @@ func (s *mockMixCoord) TruncateCollection(ctx context.Context, req *milvuspb.Tru
 	panic("implement me")
 }
 
-func (s *mockMixCoord) DropSegmentsByTime(ctx context.Context, collectionID int64, flushTsList map[string]uint64) error {
+func (s *mockMixCoord) DropSegmentsByTime(ctx context.Context, collectionID int64, partitionIDs []int64, flushTsList map[string]uint64) error {
 	panic("implement me")
 }
 

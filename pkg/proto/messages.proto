@@ -731,6 +731,7 @@ message TruncateCollectionMessageHeader {
     int64 db_id = 1;
     int64 collection_id = 2;
     repeated int64 segment_ids = 3;
+    repeated int64 partition_ids = 4;  // Optional: if specified, only truncate these partitions
 }
 
 // TruncateCollectionMessageBody is the body of truncate collection message.

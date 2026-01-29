@@ -2996,17 +2996,17 @@ func (_c *MixCoord_DropRole_Call) RunAndReturn(run func(context.Context, *milvus
 	return _c
 }
 
-// DropSegmentsByTime provides a mock function with given fields: ctx, collectionID, flushTsList
-func (_m *MixCoord) DropSegmentsByTime(ctx context.Context, collectionID int64, flushTsList map[string]uint64) error {
-	ret := _m.Called(ctx, collectionID, flushTsList)
+// DropSegmentsByTime provides a mock function with given fields: ctx, collectionID, partitionIDs, flushTsList
+func (_m *MixCoord) DropSegmentsByTime(ctx context.Context, collectionID int64, partitionIDs []int64, flushTsList map[string]uint64) error {
+	ret := _m.Called(ctx, collectionID, partitionIDs, flushTsList)
 
 	if len(ret) == 0 {
 		panic("no return value specified for DropSegmentsByTime")
 	}
 
 	var r0 error
-	if rf, ok := ret.Get(0).(func(context.Context, int64, map[string]uint64) error); ok {
-		r0 = rf(ctx, collectionID, flushTsList)
+	if rf, ok := ret.Get(0).(func(context.Context, int64, []int64, map[string]uint64) error); ok {
+		r0 = rf(ctx, collectionID, partitionIDs, flushTsList)
 	} else {
 		r0 = ret.Error(0)
 	}
@@ -3022,14 +3022,15 @@ type MixCoord_DropSegmentsByTime_Call struct {
 // DropSegmentsByTime is a helper method to define mock.On call
 //   - ctx context.Context
 //   - collectionID int64
+//   - partitionIDs []int64
 //   - flushTsList map[string]uint64
-func (_e *MixCoord_Expecter) DropSegmentsByTime(ctx interface{}, collectionID interface{}, flushTsList interface{}) *MixCoord_DropSegmentsByTime_Call {
-	return &MixCoord_DropSegmentsByTime_Call{Call: _e.mock.On("DropSegmentsByTime", ctx, collectionID, flushTsList)}
+func (_e *MixCoord_Expecter) DropSegmentsByTime(ctx interface{}, collectionID interface{}, partitionIDs interface{}, flushTsList interface{}) *MixCoord_DropSegmentsByTime_Call {
+	return &MixCoord_DropSegmentsByTime_Call{Call: _e.mock.On("DropSegmentsByTime", ctx, collectionID, partitionIDs, flushTsList)}
 }
 
-func (_c *MixCoord_DropSegmentsByTime_Call) Run(run func(ctx context.Context, collectionID int64, flushTsList map[string]uint64)) *MixCoord_DropSegmentsByTime_Call {
+func (_c *MixCoord_DropSegmentsByTime_Call) Run(run func(ctx context.Context, collectionID int64, partitionIDs []int64, flushTsList map[string]uint64)) *MixCoord_DropSegmentsByTime_Call {
 	_c.Call.Run(func(args mock.Arguments) {
-		run(args[0].(context.Context), args[1].(int64), args[2].(map[string]uint64))
+		run(args[0].(context.Context), args[1].(int64), args[2].([]int64), args[3].(map[string]uint64))
 	})
 	return _c
 }
@@ -3039,7 +3040,7 @@ func (_c *MixCoord_DropSegmentsByTime_Call) Return(_a0 error) *MixCoord_DropSegm
 	return _c
 }
 
-func (_c *MixCoord_DropSegmentsByTime_Call) RunAndReturn(run func(context.Context, int64, map[string]uint64) error) *MixCoord_DropSegmentsByTime_Call {
+func (_c *MixCoord_DropSegmentsByTime_Call) RunAndReturn(run func(context.Context, int64, []int64, map[string]uint64) error) *MixCoord_DropSegmentsByTime_Call {
 	_c.Call.Return(run)
 	return _c
 }

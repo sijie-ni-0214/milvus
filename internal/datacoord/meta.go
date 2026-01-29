@@ -2518,7 +2518,8 @@ func (m *meta) GetFileResources(ctx context.Context, resourceIDs ...int64) ([]*i
 }
 
 // TruncateChannelByTime drops segments of a channel that were updated before the flush timestamp
-func (m *meta) TruncateChannelByTime(ctx context.Context, vChannel string, flushTs uint64) error {
+// If partitionIDs is specified, only drop segments of those partitions
+func (m *meta) TruncateChannelByTime(ctx context.Context, vChannel string, partitionIDs []int64, flushTs uint64) error {
 	m.segMu.Lock()
 	defer m.segMu.Unlock()
 
@@ -2528,7 +2529,15 @@ func (m *meta) TruncateChannelByTime(ctx context.Context, vChannel string, flush
 		stateChange: make(map[string]map[string]map[string]map[string]int),
 	}
 
+	// Build partition ID set for efficient lookup
+	partitionIDSet := typeutil.NewSet(partitionIDs...)
+	hasPartitionFilter := len(partitionIDs) > 0
+
 	for _, segment := range segments {
+		// Skip if partition filter is specified and segment's partition is not in the filter
+		if hasPartitionFilter && !partitionIDSet.Contain(segment.GetPartitionID()) {
+			continue
+		}
 		if segment.GetDmlPosition().GetTimestamp() <= flushTs && segment.GetState() != commonpb.SegmentState_Dropped {
 			cloned := segment.Clone()
 			updateSegStateAndPrepareMetrics(cloned, commonpb.SegmentState_Dropped, metricMutation)

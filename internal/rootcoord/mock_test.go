@@ -744,7 +744,7 @@ func withValidMixCoord() Opt {
 	)
 	mixc.EXPECT().NotifyDropPartition(mock.Anything, mock.Anything, mock.Anything).Return(nil)
 
-	mixc.EXPECT().DropSegmentsByTime(mock.Anything, mock.Anything, mock.Anything).Return(nil)
+	mixc.EXPECT().DropSegmentsByTime(mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(nil)
 
 	mixc.EXPECT().ShowLoadCollections(mock.Anything, mock.Anything).Return(
 		&querypb.ShowCollectionsResponse{

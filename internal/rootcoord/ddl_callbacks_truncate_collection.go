@@ -23,10 +23,12 @@ import (
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
 	"github.com/milvus-io/milvus/internal/distributed/streaming"
+	"github.com/milvus-io/milvus/internal/metastore/model"
 	"github.com/milvus-io/milvus/pkg/v2/log"
 	"github.com/milvus-io/milvus/pkg/v2/proto/messagespb"
 	"github.com/milvus-io/milvus/pkg/v2/streaming/util/message"
 	"github.com/milvus-io/milvus/pkg/v2/util/funcutil"
+	"github.com/milvus-io/milvus/pkg/v2/util/merr"
 	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
 
@@ -43,9 +45,19 @@ func (c *Core) broadcastTruncateCollection(ctx context.Context, req *milvuspb.Tr
 		return err
 	}
 
+	// resolve partition names to partition IDs
+	var partitionIDs []int64
+	if len(req.GetPartitionNames()) > 0 {
+		partitionIDs, err = c.resolvePartitionIDs(ctx, coll, req.GetPartitionNames())
+		if err != nil {
+			return err
+		}
+	}
+
 	header := &messagespb.TruncateCollectionMessageHeader{
 		DbId:         coll.DBID,
 		CollectionId: coll.CollectionID,
+		PartitionIds: partitionIDs,
 	}
 	body := &messagespb.TruncateCollectionMessageBody{}
 
@@ -78,7 +90,8 @@ func (c *DDLCallback) truncateCollectionV2AckCallback(ctx context.Context, resul
 	}
 
 	// Drop segments that were updated before the flush timestamp
-	if err := c.mixCoord.DropSegmentsByTime(ctx, header.CollectionId, flushTsList); err != nil {
+	// If partitionIds is specified, only drop segments of those partitions
+	if err := c.mixCoord.DropSegmentsByTime(ctx, header.CollectionId, header.PartitionIds, flushTsList); err != nil {
 		return errors.Wrap(err, "when dropping segments by time")
 	}
 
@@ -125,4 +138,27 @@ func (c *DDLCallback) truncateCollectionV2AckOnceCallback(ctx context.Context, r
 		return errors.Wrap(err, "when broadcasting altered collection")
 	}
 	return nil
+}
+
+// resolvePartitionIDs resolves partition names to partition IDs.
+// Returns an error if any partition name is not found.
+func (c *Core) resolvePartitionIDs(ctx context.Context, coll *model.Collection, partitionNames []string) ([]int64, error) {
+	// Build a map of partition name to partition ID for quick lookup
+	partitionMap := make(map[string]int64, len(coll.Partitions))
+	for _, partition := range coll.Partitions {
+		if partition.Available() {
+			partitionMap[partition.PartitionName] = partition.PartitionID
+		}
+	}
+
+	partitionIDs := make([]int64, 0, len(partitionNames))
+	for _, name := range partitionNames {
+		partitionID, ok := partitionMap[name]
+		if !ok {
+			return nil, merr.WrapErrPartitionNotFound(name)
+		}
+		partitionIDs = append(partitionIDs, partitionID)
+	}
+
+	return partitionIDs, nil
 }

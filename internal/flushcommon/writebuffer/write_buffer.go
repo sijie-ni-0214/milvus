@@ -55,6 +55,9 @@ type WriteBuffer interface {
 	SealSegments(ctx context.Context, segmentIDs []int64) error
 	// SealAllSegments seal all segments in the write buffer.
 	SealAllSegments(ctx context.Context)
+	// FlushSegments directly flushes specified segments without relying on flushTs.
+	// Used for truncate partition to avoid flushing segments from other partitions.
+	FlushSegments(ctx context.Context, segmentIDs []int64) error
 	// DropPartitions mark segments as Dropped of the partition
 	DropPartitions(partitionIDs []int64)
 	// GetCheckpoint returns current channel checkpoint.
@@ -201,6 +204,28 @@ func (wb *writeBufferBase) SealAllSegments(ctx context.Context) {
 	// mark all segments sealed if they were growing
 	wb.metaCache.UpdateSegments(metacache.UpdateState(commonpb.SegmentState_Sealed),
 		metacache.WithSegmentState(commonpb.SegmentState_Growing))
+}
+
+// FlushSegments directly flushes specified segments without relying on flushTs.
+// It seals the segments first, then triggers sync for them.
+func (wb *writeBufferBase) FlushSegments(ctx context.Context, segmentIDs []int64) error {
+	wb.mut.Lock()
+	defer wb.mut.Unlock()
+
+	if len(segmentIDs) == 0 {
+		return nil
+	}
+
+	// First seal the segments
+	if err := wb.sealSegments(ctx, segmentIDs); err != nil {
+		return err
+	}
+
+	// Then trigger sync for these segments
+	futures := wb.syncSegments(ctx, segmentIDs)
+	conc.AwaitAll(futures...)
+
+	return nil
 }
 
 func (wb *writeBufferBase) DropPartitions(partitionIDs []int64) {

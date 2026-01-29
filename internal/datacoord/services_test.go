@@ -2126,7 +2126,7 @@ func TestServer_DropSegmentsByTime(t *testing.T) {
 	t.Run("server not healthy", func(t *testing.T) {
 		s := &Server{}
 		s.stateCode.Store(commonpb.StateCode_Abnormal)
-		err := s.DropSegmentsByTime(ctx, collectionID, map[string]uint64{channelName: flushTs})
+		err := s.DropSegmentsByTime(ctx, collectionID, nil, map[string]uint64{channelName: flushTs})
 		assert.Error(t, err)
 	})
 
@@ -2142,7 +2142,7 @@ func TestServer_DropSegmentsByTime(t *testing.T) {
 		ctxWithTimeout, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
 		defer cancel()
 
-		err = s.DropSegmentsByTime(ctxWithTimeout, collectionID, map[string]uint64{channelName: flushTs})
+		err = s.DropSegmentsByTime(ctxWithTimeout, collectionID, nil, map[string]uint64{channelName: flushTs})
 		assert.Error(t, err)
 	})
 
@@ -2197,7 +2197,7 @@ func TestServer_DropSegmentsByTime(t *testing.T) {
 		meta.segments.SetSegment(seg1.ID, seg1)
 		meta.segments.SetSegment(seg2.ID, seg2)
 
-		err = s.DropSegmentsByTime(ctx, collectionID, map[string]uint64{channelName: flushTs})
+		err = s.DropSegmentsByTime(ctx, collectionID, nil, map[string]uint64{channelName: flushTs})
 		assert.NoError(t, err)
 
 		// Verify segment 1 is dropped

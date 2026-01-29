@@ -298,7 +298,7 @@ type MixCoord interface {
 	SyncQcFileResource(ctx context.Context, resources []*internalpb.FileResourceInfo, version uint64) error
 	SyncDcFileResource(ctx context.Context, resources []*internalpb.FileResourceInfo, version uint64) error
 
-	DropSegmentsByTime(ctx context.Context, collectionID int64, flushTsList map[string]uint64) error
+	DropSegmentsByTime(ctx context.Context, collectionID int64, partitionIDs []int64, flushTsList map[string]uint64) error
 
 	ManualUpdateCurrentTarget(ctx context.Context, collectionID int64) error
 }

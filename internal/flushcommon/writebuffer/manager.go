@@ -35,6 +35,9 @@ type BufferManager interface {
 	SealAllSegments(ctx context.Context, channel string) error
 	// FlushChannel set the flushTs of the provided write buffer.
 	FlushChannel(ctx context.Context, channel string, flushTs uint64) error
+	// FlushSegments directly flushes specified segments without relying on flushTs.
+	// Used for truncate partition to avoid flushing segments from other partitions.
+	FlushSegments(ctx context.Context, channel string, segmentIDs []int64) error
 	// RemoveChannel removes a write buffer from manager.
 	RemoveChannel(channel string)
 	// DropChannel remove write buffer and perform drop.
@@ -224,6 +227,19 @@ func (m *bufferManager) FlushChannel(ctx context.Context, channel string, flushT
 	}
 	buf.SetFlushTimestamp(flushTs)
 	return nil
+}
+
+// FlushSegments directly flushes specified segments without relying on flushTs.
+func (m *bufferManager) FlushSegments(ctx context.Context, channel string, segmentIDs []int64) error {
+	buf, loaded := m.buffers.Get(channel)
+	if !loaded {
+		log.Ctx(ctx).Warn("write buffer not found when flush segments",
+			zap.String("channel", channel),
+			zap.Int64s("segmentIDs", segmentIDs))
+		return merr.WrapErrChannelNotFound(channel)
+	}
+
+	return buf.FlushSegments(ctx, segmentIDs)
 }
 
 // BufferData put data into channel write buffer.

@@ -1246,8 +1246,9 @@ func (s *mixCoordImpl) TruncateCollection(ctx context.Context, req *milvuspb.Tru
 }
 
 // DropSegmentsByTime drop segments by time for TruncateCollection
-func (s *mixCoordImpl) DropSegmentsByTime(ctx context.Context, collectionID int64, flushTsList map[string]uint64) error {
-	return s.datacoordServer.DropSegmentsByTime(ctx, collectionID, flushTsList)
+// If partitionIDs is specified, only drop segments of those partitions
+func (s *mixCoordImpl) DropSegmentsByTime(ctx context.Context, collectionID int64, partitionIDs []int64, flushTsList map[string]uint64) error {
+	return s.datacoordServer.DropSegmentsByTime(ctx, collectionID, partitionIDs, flushTsList)
 }
 
 // ManualUpdateCurrentTarget manually update current target for TruncateCollection

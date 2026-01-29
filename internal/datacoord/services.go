@@ -2034,13 +2034,15 @@ func (s *Server) SyncFileResource(ctx context.Context, resources []*internalpb.F
 }
 
 // DropSegmentsByTime drop segments that were updated before the flush timestamp for TruncateCollection
-func (s *Server) DropSegmentsByTime(ctx context.Context, collectionID int64, flushTsList map[string]uint64) error {
+// If partitionIDs is specified, only drop segments of those partitions
+func (s *Server) DropSegmentsByTime(ctx context.Context, collectionID int64, partitionIDs []int64, flushTsList map[string]uint64) error {
 	if err := merr.CheckHealthy(s.GetStateCode()); err != nil {
 		return err
 	}
 
 	log.Ctx(ctx).Info("receive DropSegmentsByTime request",
-		zap.Int64("collectionID", collectionID))
+		zap.Int64("collectionID", collectionID),
+		zap.Int64s("partitionIDs", partitionIDs))
 
 	for channelName, flushTs := range flushTsList {
 		// wait until the checkpoint reaches or exceeds the flush timestamp
@@ -2050,7 +2052,8 @@ func (s *Server) DropSegmentsByTime(ctx context.Context, collectionID int64, flu
 			return err
 		}
 		// drop segments that were updated before the flush timestamp
-		err = s.meta.TruncateChannelByTime(ctx, channelName, flushTs)
+		// if partitionIDs is specified, only drop segments of those partitions
+		err = s.meta.TruncateChannelByTime(ctx, channelName, partitionIDs, flushTs)
 		if err != nil {
 			log.Warn("TruncateChannelByTime failed", zap.Error(err))
 			return err
