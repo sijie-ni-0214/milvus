@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/cockroachdb/errors"
@@ -166,7 +167,7 @@ func (m *segmentBuildInfo) GetTaskStats() []*metricsinfo.IndexTaskStats {
 }
 
 // NewMeta creates meta from provided `kv.TxnKV`
-func newIndexMeta(ctx context.Context, catalog metastore.DataCoordCatalog, collectionIDs []int64) (*indexMeta, error) {
+func newIndexMeta(ctx context.Context, catalog metastore.DataCoordCatalog, scanTargets []partitionScanTarget) (*indexMeta, error) {
 	mt := &indexMeta{
 		ctx:              ctx,
 		catalog:          catalog,
@@ -175,22 +176,24 @@ func newIndexMeta(ctx context.Context, catalog metastore.DataCoordCatalog, colle
 		segmentBuildInfo: newSegmentIndexBuildInfo(),
 		segmentIndexes:   typeutil.NewConcurrentMap[UniqueID, *typeutil.ConcurrentMap[UniqueID, *model.SegmentIndex]](),
 	}
-	err := mt.reloadFromKV(collectionIDs)
+	err := mt.reloadFromKV(scanTargets)
 	if err != nil {
 		return nil, err
 	}
 	return mt, nil
 }
 
+const segmentIndexScanProgressLogInterval = 10000
+
 // reloadFromKV loads meta from KV storage
-func (m *indexMeta) reloadFromKV(collectionIDs []int64) error {
+func (m *indexMeta) reloadFromKV(scanTargets []partitionScanTarget) error {
 	record := timerecord.NewTimeRecorder("indexMeta-reloadFromKV")
 
 	// Parallel load and process: ListIndexes and ListSegmentIndexes have no dependency,
 	// and they update completely separate data structures so memory updates can also run in parallel.
-	// collectionSegIdxes is hoisted to function scope so the gauge goroutine
+	// scanTargetSegIdxes is hoisted to function scope so the gauge goroutine
 	// (launched after g.Wait) can access it when both indexes and segment indexes are loaded.
-	collectionSegIdxes := make([][]*model.SegmentIndex, len(collectionIDs))
+	scanTargetSegIdxes := make([][]*model.SegmentIndex, len(scanTargets))
 	g, _ := errgroup.WithContext(m.ctx)
 	g.Go(func() error {
 		fieldIndexes, err := m.catalog.ListIndexes(m.ctx)
@@ -206,22 +209,56 @@ func (m *indexMeta) reloadFromKV(collectionIDs []int64) error {
 	g.Go(func() error {
 		pool := conc.NewPool[any](paramtable.Get().MetaStoreCfg.ReadConcurrency.GetAsInt())
 		defer pool.Release()
-		futures := make([]*conc.Future[any], 0, len(collectionIDs))
-		for i, collID := range collectionIDs {
-			i, collID := i, collID
+		futures := make([]*conc.Future[any], 0, len(scanTargets))
+		totalScanTargets := int64(len(scanTargets))
+		numPartitionTargets := lo.CountBy(scanTargets, func(target partitionScanTarget) bool {
+			return target.partitionScoped
+		})
+		var completedScanTargets atomic.Int64
+		var totalSegmentIndexes atomic.Int64
+		scanStart := time.Now()
+		mlog.Info(m.ctx, "indexMeta segment index scan targets prepared",
+			mlog.Int("numScanTargets", len(scanTargets)),
+			mlog.Int("numPartitionTargets", numPartitionTargets),
+			mlog.Int("readConcurrency", paramtable.Get().MetaStoreCfg.ReadConcurrency.GetAsInt()))
+		for i, target := range scanTargets {
+			i := i
+			target := target
 			futures = append(futures, pool.Submit(func() (any, error) {
-				segIdxes, err := m.catalog.ListSegmentIndexes(m.ctx, collID)
+				var (
+					segIdxes []*model.SegmentIndex
+					err      error
+				)
+				if target.partitionScoped {
+					segIdxes, err = m.catalog.ListPartitionSegmentIndexes(m.ctx, target.collectionID, target.partitionID)
+				} else {
+					segIdxes, err = m.catalog.ListSegmentIndexes(m.ctx, target.collectionID)
+				}
 				if err != nil {
+					mlog.Warn(m.ctx, "indexMeta segment index scan failed",
+						mlog.FieldCollectionID(target.collectionID),
+						mlog.FieldPartitionID(target.partitionID),
+						mlog.Bool("partitionScoped", target.partitionScoped),
+						mlog.Err(err))
 					return nil, err
 				}
-				collectionSegIdxes[i] = segIdxes
+				scanTargetSegIdxes[i] = segIdxes
+				totalSegmentIndexes.Add(int64(len(segIdxes)))
+				completed := completedScanTargets.Add(1)
+				if completed == totalScanTargets || completed%segmentIndexScanProgressLogInterval == 0 {
+					mlog.Info(m.ctx, "indexMeta segment index scan progress",
+						mlog.Int64("completedScanTargets", completed),
+						mlog.Int64("totalScanTargets", totalScanTargets),
+						mlog.Int64("numSegmentIndexes", totalSegmentIndexes.Load()),
+						mlog.Duration("duration", time.Since(scanStart)))
+				}
 				return nil, nil
 			}))
 		}
 		if err := conc.AwaitAll(futures...); err != nil {
 			return err
 		}
-		for _, segIdxes := range collectionSegIdxes {
+		for _, segIdxes := range scanTargetSegIdxes {
 			for _, segIdx := range segIdxes {
 				if segIdx.IndexMemSize == 0 {
 					segIdx.IndexMemSize = segIdx.IndexSerializedSize * paramtable.Get().DataCoordCfg.IndexMemSizeEstimateMultiplier.GetAsUint64()
@@ -246,11 +283,11 @@ func (m *indexMeta) reloadFromKV(collectionIDs []int64) error {
 	}
 
 	// Update Prometheus metrics asynchronously. Launched after g.Wait() so that
-	// both m.indexes (from goroutine 1) and collectionSegIdxes (from goroutine 2)
+	// both m.indexes (from goroutine 1) and scanTargetSegIdxes (from goroutine 2)
 	// are fully populated. Only count active indexes (index definition alive).
 	go func() {
 		storedSizeByCollection := make(map[int64]float64)
-		for _, segIdxes := range collectionSegIdxes {
+		for _, segIdxes := range scanTargetSegIdxes {
 			for _, segIdx := range segIdxes {
 				metrics.FlushedSegmentFileNum.WithLabelValues(metrics.IndexFileLabel).Observe(float64(len(segIdx.IndexFileKeys)))
 				if m.IsIndexExist(segIdx.CollectionID, segIdx.IndexID) {
@@ -1304,8 +1341,8 @@ func (m *indexMeta) RemoveSegmentIndex(ctx context.Context, buildID UniqueID) er
 // caller must hold keyLock for segIdx.BuildID. RemoveSegmentIndex, which owns
 // the catalog removal itself, uses this combined form; the manifest-commit
 // staging below uses the same two halves but runs the record removal under
-// segMu and defers the gauge until segMu is released, so the two paths cannot
-// drift.
+// the segment writer lock and defers the gauge until it is released, so the
+// two paths cannot drift.
 func (m *indexMeta) removeSegmentIndexInMemory(segIdx *model.SegmentIndex) {
 	m.subtractStoredIndexSizeOnRemoval(segIdx)
 	m.removeSegmentIndexRecordInMemory(segIdx)
@@ -1313,10 +1350,10 @@ func (m *indexMeta) removeSegmentIndexInMemory(segIdx *model.SegmentIndex) {
 
 // subtractStoredIndexSizeOnRemoval is the fieldIndexLock-guarded metric half of
 // removeSegmentIndexInMemory. It is split out because the manifest-commit
-// install defers it until segMu is released (see stagedSegmentIndexMutation):
-// every index DDL holds fieldIndexLock's write side across an etcd round trip,
-// so blocking on it inside segMu would stall every segment reader behind that
-// round trip.
+// install defers it until the segment writer lock is released (see
+// stagedSegmentIndexMutation): every index DDL holds fieldIndexLock's write side
+// across an etcd round trip, so blocking on it inside the writer lock would
+// stall every writer of the segment behind that round trip.
 func (m *indexMeta) subtractStoredIndexSizeOnRemoval(segIdx *model.SegmentIndex) {
 	// Reclaim size only when the index is still alive (segment-drop case);
 	// MarkIndexAsDeleted already subtracted otherwise. Keep resident removal in
@@ -1329,7 +1366,7 @@ func (m *indexMeta) subtractStoredIndexSizeOnRemoval(segIdx *model.SegmentIndex)
 
 // removeSegmentIndexRecordInMemory is the record half: it mutates only the
 // in-memory segment-index maps and the memory-only task counters. It never
-// acquires fieldIndexLock, so it is safe to run inside a segMu critical section.
+// acquires fieldIndexLock, so it is safe to run inside a segment writer lock critical section.
 func (m *indexMeta) removeSegmentIndexRecordInMemory(segIdx *model.SegmentIndex) {
 	segIndexes, ok := m.segmentIndexes.Get(segIdx.SegmentID)
 	if ok {
@@ -1357,13 +1394,14 @@ var errSegmentIndexRecordGone = errors.New("segment index record no longer exist
 // record is the locked task projection used to validate manifest contents.
 //
 // install performs in-memory changes only — it never acquires fieldIndexLock, so
-// the manifest commit may run it inside its segMu critical section. It returns
+// the manifest commit may run it inside its segment writer lock critical section. It returns
 // the observability update it deferred (never nil): the stored-index-size gauge
 // must serialize against MarkIndexAsDeleted via fieldIndexLock, whose write
 // side every index DDL (CreateIndex, AlterIndex, MarkIndexAsDeleted,
 // RemoveIndex) holds across an etcd round trip. The caller MUST run the
-// returned closure only after releasing segMu — acquiring fieldIndexLock inside
-// segMu would let one slow DDL stall every segment reader — and before
+// returned closure only after releasing the writer lock — acquiring
+// fieldIndexLock inside it would let one slow DDL stall every writer of the
+// segment — and before
 // releasing keyLock(BuildID), so the install-then-metric sequence stays ordered
 // against the next writer of the same build.
 type stagedSegmentIndexMutation struct {
@@ -1384,7 +1422,7 @@ type stagedSegmentIndexMutation struct {
 //
 // Precondition: the caller holds keyLock(mut.BuildID) across this projection,
 // the returned install, and the deferred metric closure install returns. It is
-// acquired by the caller rather than here so that it is ordered before segMu,
+// acquired by the caller rather than here so that it is ordered before the segment writer lock,
 // matching every other SegmentIndex writer; see CommitSegmentManifest's
 // lock-order note.
 func (m *indexMeta) stageSegmentIndexMutation(mut SegmentIndexMutation) (*stagedSegmentIndexMutation, error) {
@@ -1443,7 +1481,7 @@ func (m *indexMeta) stageSegmentIndexMutation(mut SegmentIndexMutation) (*staged
 	staged.install = func() func() {
 		m.updateSegmentIndex(finished)
 		// recordFinishedTask is observability only, but its stored-size gauge
-		// takes fieldIndexLock, so the whole step is deferred out of segMu.
+		// takes fieldIndexLock, so the whole step is deferred out of the writer lock.
 		return func() { m.recordFinishedTask(previous, finished, previousSize, mut.FinishedTask) }
 	}
 	return staged, nil

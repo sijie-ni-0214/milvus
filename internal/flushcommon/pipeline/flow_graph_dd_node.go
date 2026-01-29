@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"reflect"
 	"sync/atomic"
+	"time"
 
 	"go.opentelemetry.io/otel/trace"
 	"golang.org/x/time/rate"
@@ -69,6 +70,11 @@ type ddNode struct {
 	dropMode   atomic.Value
 	msgHandler util.MsgHandler
 
+	// HandleCreateSegment stats
+	createSegCount  int64
+	createSegDurSum time.Duration
+	createSegDurMax time.Duration
+
 	// for recovery
 	growingSegInfo    map[typeutil.UniqueID]*datapb.SegmentInfo // segmentID
 	sealedSegInfo     map[typeutil.UniqueID]*datapb.SegmentInfo // segmentID
@@ -99,6 +105,8 @@ func (ddn *ddNode) Operate(in []Msg) []Msg {
 		mlog.Warn(ddn.ctx, "type assertion failed for MsgStreamMsg", mlog.String("channel", ddn.vChannelName), mlog.String("name", reflect.TypeOf(in[0]).Name()))
 		return []Msg{}
 	}
+	msgCount := len(msMsg.TsMessages())
+	mlog.Info(ddn.ctx, "ddNode operate", mlog.String("channel", ddn.vChannelName), mlog.Int("msgCount", msgCount))
 
 	if msMsg.IsCloseMsg() {
 		fgMsg := FlowGraphMsg{
@@ -241,10 +249,24 @@ func (ddn *ddNode) Operate(in []Msg) []Msg {
 				mlog.Uint64("timetick", createSegment.CreateSegmentMessage.TimeTick()),
 			)
 			logger.Info(msgCtx, "receive create segment message")
+			t0 := time.Now()
 			if err := ddn.msgHandler.HandleCreateSegment(msgCtx, createSegment.CreateSegmentMessage); err != nil {
 				logger.Warn(msgCtx, "handle create segment message failed", mlog.Err(err))
 			} else {
 				logger.Info(msgCtx, "handle create segment message success")
+			}
+			dur := time.Since(t0)
+			ddn.createSegCount++
+			ddn.createSegDurSum += dur
+			if dur > ddn.createSegDurMax {
+				ddn.createSegDurMax = dur
+			}
+			if ddn.createSegCount%1000 == 0 {
+				logger.Info(ddn.ctx, "HandleCreateSegment stats",
+					mlog.Int64("count", ddn.createSegCount),
+					mlog.Duration("avg", ddn.createSegDurSum/time.Duration(ddn.createSegCount)),
+					mlog.Duration("max", ddn.createSegDurMax),
+					mlog.Duration("last", dur))
 			}
 		case commonpb.MsgType_FlushSegment:
 			flushMsg := msg.(*adaptor.FlushMessageBody)

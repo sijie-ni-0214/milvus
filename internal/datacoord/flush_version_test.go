@@ -31,9 +31,18 @@ func (s *ServerSuite) setupFlushVersionCatalog() (*datacoordkv.Catalog, dataview
 		CollectionID: 100, VChannels: []string{"ch1"},
 	})
 	require.NoError(s.T(), err)
-	s.testServer.meta.catalog = catalog
+	s.useFlushVersionCatalog(catalog)
 	s.testServer.dataViewManager = manager
 	return catalog, manager
+}
+
+// useFlushVersionCatalog makes catalog persist the test server's segments too,
+// so SegmentMeta and DataView share one store and catalog-level failure
+// injection reaches the flush publication.
+func (s *ServerSuite) useFlushVersionCatalog(catalog metastore.DataCoordCatalog) {
+	m := s.testServer.meta
+	m.catalog = catalog
+	m.segmentStore = newCatalogSegmentStore(func() metastore.DataCoordCatalog { return m.catalog })
 }
 
 func (s *ServerSuite) addFlushVersionSegment(id, rows int64) *datapb.SaveBinlogPathsRequest {
@@ -81,12 +90,11 @@ func (s *ServerSuite) TestFlushVersionSurvivesRetryRecoveryAndDataViewGC() {
 	// the first RPC response was lost and other segments advanced the view.
 	segments, err := catalog.ListSegments(ctx, 100)
 	require.NoError(s.T(), err)
-	// Background compaction still reads segment indexes during this simulated restart.
-	s.testServer.meta.segMu.Lock()
+	// Background compaction still reads segment indexes during this simulated
+	// restart; the segment cache is safe for concurrent use.
 	for _, segment := range segments {
 		s.testServer.meta.segments.SetSegment(segment.GetID(), NewSegmentInfo(segment))
 	}
-	s.testServer.meta.segMu.Unlock()
 	recovered, err := dataview.RecoverManager(ctx, catalog, func(context.Context, int64) (bool, error) {
 		return true, nil
 	}, nil, nil, nil)
@@ -318,7 +326,7 @@ func (s *ServerSuite) TestDualFrontierFlushTransactionAndCheckpointIsolation() {
 		}))
 	_, err := manager.OnCreateCollection(t.Context(), dataview.CreateCollectionDataViewEvent{CollectionID: 100, VChannels: []string{"ch1"}, TransformStarts: map[string]uint64{"ch1": 10}})
 	require.NoError(t, err)
-	s.testServer.meta.catalog = catalog
+	s.useFlushVersionCatalog(catalog)
 	s.testServer.dataViewManager = manager
 	req := s.addFlushVersionSegment(10, 10)
 	// Final Flush follows the durable first-pack publication.

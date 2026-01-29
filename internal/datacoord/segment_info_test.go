@@ -586,58 +586,6 @@ func newSegmentsInfoWithSegments(segs map[int64]*SegmentInfo) *SegmentsInfo {
 	return si
 }
 
-// TestRebuildFromStore covers the recovery path: segments loaded straight into
-// the shared store bypass SetSegment, so the compaction relations and the
-// per-segment transient state have to be seeded explicitly. Without it
-// SetIsCompacting silently does nothing and GetCompactionTo reports no
-// children, both of which only show up after a restart.
-func TestRebuildFromStore(t *testing.T) {
-	store := metacache.NewMetaStore(nil)
-	store.LoadSegments([]*datapb.SegmentInfo{
-		{ID: 1, CollectionID: 100, InsertChannel: "ch-0", State: commonpb.SegmentState_Dropped},
-		{ID: 2, CollectionID: 100, InsertChannel: "ch-0", State: commonpb.SegmentState_Flushed, CompactionFrom: []int64{1}},
-		{ID: 3, CollectionID: 100, InsertChannel: "ch-0", State: commonpb.SegmentState_Growing},
-	})
-	segments := NewSegmentsInfo(store)
-
-	// Before the rebuild the DC-side state is empty.
-	compactTos, ok := segments.GetCompactionTo(1)
-	assert.True(t, ok)
-	assert.Empty(t, compactTos)
-
-	segments.RebuildFromStore()
-
-	compactTos, ok = segments.GetCompactionTo(1)
-	assert.True(t, ok)
-	require.Len(t, compactTos, 1)
-	assert.EqualValues(t, 2, compactTos[0].GetID())
-
-	segments.SetIsCompacting(2, true)
-	assert.True(t, segments.GetSegment(2).isCompacting)
-
-	// A recovered growing segment starts out flushable and idle, matching
-	// NewSegmentInfo.
-	growing := segments.GetSegment(3)
-	assert.False(t, growing.lastFlushTime.IsZero())
-	assert.True(t, growing.lastWrittenTime.IsZero())
-}
-
-// TestSetIsCompactingWithoutRebuild asserts the setters themselves recover
-// from a missing entry, so a segment that reaches memory by some other path
-// than SetSegment still tracks its compaction state.
-func TestSetIsCompactingWithoutRebuild(t *testing.T) {
-	store := metacache.NewMetaStore(nil)
-	store.LoadSegments([]*datapb.SegmentInfo{{ID: 1, CollectionID: 100, State: commonpb.SegmentState_Flushed}})
-	segments := NewSegmentsInfo(store)
-
-	segments.SetIsCompacting(1, true)
-	assert.True(t, segments.GetSegment(1).isCompacting)
-
-	// An unknown segment is still a no-op rather than a panic.
-	segments.SetIsCompacting(42, true)
-	assert.Nil(t, segments.GetSegment(42))
-}
-
 // TestSetSegmentNormalizesRowCount pins the invariant that makes the shared
 // store trustworthy for row counts: the catalog reconciles a V1/V2 segment's
 // NumOfRows against its insert binlogs only on the copy it persists, so the

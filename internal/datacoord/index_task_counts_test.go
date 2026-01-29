@@ -122,7 +122,7 @@ func TestIndexTaskCountsRecovery(t *testing.T) {
 		&model.SegmentIndex{CollectionID: 1, IndexID: 10, BuildID: 100, IndexState: commonpb.IndexState_Finished, IsDeleted: true},
 		&model.SegmentIndex{CollectionID: 1, IndexID: 10, BuildID: 101, IndexState: commonpb.IndexState(100)},
 	)
-	m, err := newIndexMeta(context.Background(), catalog, []int64{1, 2, 3})
+	m, err := newIndexMeta(context.Background(), catalog, collectionScanTargets([]int64{1, 2, 3}))
 	require.NoError(t, err)
 	assertIndexTaskCounts(t, m)
 	require.Equal(t, indexTaskStateCounts{1, 1, 1, 1, 1, 1}, m.indexTaskCountsSnapshot())
@@ -146,7 +146,7 @@ func TestIndexTaskCountsRecovery(t *testing.T) {
 func TestIndexTaskCountsLifecycle(t *testing.T) {
 	ctx := context.Background()
 	catalog := &taskCountsCatalog{}
-	m, err := newIndexMeta(ctx, catalog, []int64{1, 2, 3})
+	m, err := newIndexMeta(ctx, catalog, collectionScanTargets([]int64{1, 2, 3}))
 	require.NoError(t, err)
 	require.NoError(t, m.CreateIndex(ctx, &model.Index{CollectionID: 1, IndexID: 10}))
 	task := &model.SegmentIndex{CollectionID: 1, IndexID: 10, SegmentID: 20, BuildID: 30}
@@ -206,7 +206,7 @@ func TestIndexTaskCountsRecoveryReplacement(t *testing.T) {
 			{CollectionID: 1, IndexID: 10, SegmentID: 20, BuildID: 30, IndexState: commonpb.IndexState_Finished},
 		},
 	}
-	m, err := newIndexMeta(context.Background(), catalog, []int64{1, 2, 3})
+	m, err := newIndexMeta(context.Background(), catalog, collectionScanTargets([]int64{1, 2, 3}))
 	require.NoError(t, err)
 	assertIndexTaskCounts(t, m)
 	require.Equal(t, indexTaskStateCounts{0, 0, 0, 1}, m.indexTaskCountsSnapshot())
@@ -239,7 +239,7 @@ func TestIndexTaskCountsPersistenceFailures(t *testing.T) {
 				indexes: []*model.Index{{CollectionID: 1, IndexID: 10, IsDeleted: name == "remove-indexes"}},
 				tasks:   []*model.SegmentIndex{{CollectionID: 1, IndexID: 10, SegmentID: 20, BuildID: 30, IndexState: commonpb.IndexState_Unissued}},
 			}
-			m, err := newIndexMeta(ctx, catalog, []int64{1, 2, 3})
+			m, err := newIndexMeta(ctx, catalog, collectionScanTargets([]int64{1, 2, 3}))
 			require.NoError(t, err)
 			before := m.indexTaskCountsSnapshot()
 			catalog.err = merr.ErrServiceUnavailable

@@ -56,6 +56,8 @@ type Catalog struct {
 	metaRootpath         string
 }
 
+const segmentIndexPaginationSize = 10000
+
 func NewCatalog(MetaKv kv.MetaKv, chunkManagerRootPath string, metaRootpath string) *Catalog {
 	return &Catalog{
 		MetaKv:               MetaKv,
@@ -777,7 +779,7 @@ func (kc *Catalog) CreateSegmentIndex(ctx context.Context, segIdx *model.Segment
 	return nil
 }
 
-func (kc *Catalog) ListSegmentIndexes(ctx context.Context, collectionID int64) ([]*model.SegmentIndex, error) {
+func (kc *Catalog) listSegmentIndexesWithPrefix(ctx context.Context, prefix string) ([]*model.SegmentIndex, error) {
 	segIndexes := make([]*model.SegmentIndex, 0)
 	applyFn := func(key []byte, value []byte) error {
 		segmentIndexInfo := &indexpb.SegmentIndex{}
@@ -791,13 +793,24 @@ func (kc *Catalog) ListSegmentIndexes(ctx context.Context, collectionID int64) (
 		return nil
 	}
 
-	prefix := buildSegmentIndexCollectionPrefix(collectionID)
-	err := kc.MetaKv.WalkWithPrefix(ctx, prefix, kc.paginationSize, applyFn)
+	paginationSize := kc.paginationSize
+	if paginationSize <= 0 || paginationSize > segmentIndexPaginationSize {
+		paginationSize = segmentIndexPaginationSize
+	}
+	err := kc.MetaKv.WalkWithPrefix(ctx, prefix, paginationSize, applyFn)
 	if err != nil {
 		return nil, err
 	}
 
 	return segIndexes, nil
+}
+
+func (kc *Catalog) ListSegmentIndexes(ctx context.Context, collectionID int64) ([]*model.SegmentIndex, error) {
+	return kc.listSegmentIndexesWithPrefix(ctx, buildSegmentIndexCollectionPrefix(collectionID))
+}
+
+func (kc *Catalog) ListPartitionSegmentIndexes(ctx context.Context, collectionID, partitionID int64) ([]*model.SegmentIndex, error) {
+	return kc.listSegmentIndexesWithPrefix(ctx, buildSegmentIndexPartitionPrefix(collectionID, partitionID))
 }
 
 func (kc *Catalog) AlterSegmentIndexes(ctx context.Context, segIdxes []*model.SegmentIndex) error {

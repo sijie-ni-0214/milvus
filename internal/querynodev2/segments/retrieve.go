@@ -19,6 +19,7 @@ package segments
 import (
 	"context"
 	"sync"
+	"time"
 
 	"github.com/apache/arrow/go/v17/arrow"
 
@@ -65,7 +66,8 @@ func ReleaseRecords(results []RetrieveSegmentResult) {
 func retrieveOnSegments(ctx context.Context, mgr *Manager, segments []Segment, segType SegmentType, plan *RetrievePlan, req *querypb.QueryRequest) ([]RetrieveSegmentResult, error) {
 	resultCh := make(chan RetrieveSegmentResult, len(segments))
 
-	plan.SetIgnoreNonPk(shouldEnableIgnoreNonPk(req, len(segments), plan.ShouldIgnoreNonPk()))
+	ignoreNonPk := shouldEnableIgnoreNonPk(req, len(segments), plan.ShouldIgnoreNonPk())
+	plan.SetIgnoreNonPk(ignoreNonPk)
 	// A local, not a field on the shared plan type: nothing outside this
 	// function reads it, and it is never passed to C.
 	useArrow := shouldUseArrowTransport(req, plan)
@@ -74,6 +76,15 @@ func retrieveOnSegments(ctx context.Context, mgr *Manager, segments []Segment, s
 	if segType == commonpb.SegmentState_Growing {
 		label = metrics.GrowingSegmentLabel
 	}
+
+	fanoutStart := time.Now()
+	logger := mlog.With(
+		mlog.String("segmentType", segType.String()),
+		mlog.Int("segmentNum", len(segments)),
+		mlog.String("queryLabel", contextutil.GetQueryLabel(ctx)),
+		mlog.Bool("ignoreNonPk", ignoreNonPk),
+		mlog.Int64("limit", req.GetReq().GetLimit()))
+	logger.Info(ctx, "retrieve segments fanout start")
 
 	retriever := func(ctx context.Context, s Segment) error {
 		tr := timerecord.NewTimeRecorder("retrieveOnSegments")
@@ -140,8 +151,14 @@ func retrieveOnSegments(ctx context.Context, mgr *Manager, segments []Segment, s
 		// payload of every surviving segment. A canceled context or a segment
 		// released mid-query is routine, so this accumulates.
 		ReleaseRecords(results)
+		logger.Warn(ctx, "retrieve segments fanout failed",
+			mlog.Duration("duration", time.Since(fanoutStart)),
+			mlog.Err(err))
 		return nil, err
 	}
+	logger.Info(ctx, "retrieve segments fanout done",
+		mlog.Duration("duration", time.Since(fanoutStart)),
+		mlog.Int("resultNum", len(results)))
 	return results, nil
 }
 
@@ -281,9 +298,17 @@ func Retrieve(ctx context.Context, manager *Manager, plan *RetrievePlan, req *qu
 
 	segIDs := req.GetSegmentIDs()
 	collID := req.Req.GetCollectionID()
+	logger := mlog.With(
+		mlog.Int64("collectionID", collID),
+		mlog.Int64s("partitionIDs", req.GetReq().GetPartitionIDs()),
+		mlog.Int64s("segmentIDs", segIDs),
+		mlog.String("scope", req.GetScope().String()),
+		mlog.String("queryLabel", contextutil.GetQueryLabel(ctx)))
+	logger.Debug(ctx, "retrieve on segments")
 
-	mlog.Debug(ctx, "retrieve on segments", mlog.Int64s("segmentIDs", segIDs), mlog.FieldCollectionID(collID))
-
+	totalStart := time.Now()
+	validateStart := time.Now()
+	logger.Info(ctx, "retrieve validate start")
 	if req.GetScope() == querypb.DataScope_Historical {
 		SegType = SegmentTypeSealed
 		retrieveSegments, err = validateOnHistorical(ctx, manager, collID, req.GetReq().GetPartitionIDs(), segIDs)
@@ -293,10 +318,30 @@ func Retrieve(ctx context.Context, manager *Manager, plan *RetrievePlan, req *qu
 	}
 
 	if err != nil {
+		logger.Warn(ctx, "retrieve validate failed",
+			mlog.Duration("duration", time.Since(validateStart)),
+			mlog.Err(err))
 		return nil, retrieveSegments, err
 	}
+	logger.Info(ctx, "retrieve validate done",
+		mlog.Duration("duration", time.Since(validateStart)),
+		mlog.Int("validatedSegmentNum", len(retrieveSegments)))
 
+	retrieveStart := time.Now()
 	result, err := retrieveOnSegments(ctx, manager, retrieveSegments, SegType, plan, req)
+	if err != nil {
+		logger.Warn(ctx, "retrieve failed",
+			mlog.Duration("retrieveDuration", time.Since(retrieveStart)),
+			mlog.Duration("totalDuration", time.Since(totalStart)),
+			mlog.Int("validatedSegmentNum", len(retrieveSegments)),
+			mlog.Err(err))
+		return result, retrieveSegments, err
+	}
+	logger.Info(ctx, "retrieve done",
+		mlog.Duration("retrieveDuration", time.Since(retrieveStart)),
+		mlog.Duration("totalDuration", time.Since(totalStart)),
+		mlog.Int("validatedSegmentNum", len(retrieveSegments)),
+		mlog.Int("resultNum", len(result)))
 	return result, retrieveSegments, err
 }
 

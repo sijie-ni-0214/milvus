@@ -32,7 +32,7 @@ import (
 // previous immutable snapshot is borrowed under the DataView collection lock;
 // it establishes admission, so later index DDL cannot roll a published segment
 // back to its ancestors. Neither this function nor its predicates reenter the
-// DataView manager. SegmentMeta is snapshotted under segMu before index reads.
+// DataView manager. SegmentMeta is snapshotted as a consistent cut before index reads.
 func (m *meta) loadableProjection(ctx context.Context, collectionID int64, previous *viewpb.DataViewOfCollection) ([]dataview.LoadableSegment, error) {
 	admitted := typeutil.NewUniqueSet()
 	for _, shard := range previous.GetShards() {
@@ -40,8 +40,10 @@ func (m *meta) loadableProjection(ctx context.Context, collectionID int64, previ
 			admitted.Insert(partition.GetSegmentIds()...)
 		}
 	}
-	m.segMu.RLock()
-	segments := m.segments.GetSegmentsBySelector(WithCollection(collectionID))
+	// One cut of the staged table and of the segments, with no half-installed
+	// multi-segment mutation. Lock order: DataView -> groupMu -> pubMu.
+	m.groupMu.RLock()
+	segments := m.selectSegmentsConsistent(ctx, WithCollection(collectionID))
 	valid := make(map[int64]*SegmentInfo, len(segments))
 	flushed, dropped := typeutil.NewUniqueSet(), typeutil.NewUniqueSet()
 	for _, segment := range segments {
@@ -72,7 +74,7 @@ func (m *meta) loadableProjection(ctx context.Context, collectionID int64, previ
 			flushed.Insert(segment.GetID())
 		}
 	}
-	m.segMu.RUnlock()
+	m.groupMu.RUnlock()
 
 	var indexes []*model.Index
 	if m.indexMeta != nil {

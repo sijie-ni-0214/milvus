@@ -459,6 +459,8 @@ func (ob *TargetObserver) updateNextTargetTimestamp(collectionID int64) {
 }
 
 func (ob *TargetObserver) shouldUpdateCurrentTarget(ctx context.Context, collectionID int64) bool {
+	checkStart := time.Now()
+	checkID := checkStart.UnixNano()
 	replicaNum := ob.meta.GetReplicaNumber(ctx, collectionID)
 	log := mlog.With(
 		mlog.FieldCollectionID(collectionID),
@@ -474,6 +476,12 @@ func (ob *TargetObserver) shouldUpdateCurrentTarget(ctx context.Context, collect
 	}
 
 	newVersion := ob.targetMgr.GetCollectionTargetVersion(ctx, collectionID, meta.NextTarget)
+	targetChannelNum := len(channelNames)
+	log.Info(ctx, "check current target readiness start",
+		mlog.Int64("checkID", checkID),
+		mlog.Int64("newTargetVersion", newVersion),
+		mlog.Int("targetChannelNum", targetChannelNum),
+	)
 
 	// checkDelegatorDataReady checks if a delegator is ready for the next target.
 	// A delegator is considered ready if:

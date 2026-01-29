@@ -164,7 +164,7 @@ func TestAllocSegment(t *testing.T) {
 		assert.EqualValues(t, 1, len(allocations1))
 		segments, ok := segmentManager.channel2Growing.Get(vchannel)
 		assert.True(t, ok)
-		assert.EqualValues(t, 1, segments.Len())
+		assert.EqualValues(t, 1, len(segments.Collect()))
 
 		err = meta.SetState(context.TODO(), allocations1[0].SegmentID, commonpb.SegmentState_Dropped)
 		assert.NoError(t, err)
@@ -175,7 +175,7 @@ func TestAllocSegment(t *testing.T) {
 		// clear old healthy and alloc new
 		segments, ok = segmentManager.channel2Growing.Get(vchannel)
 		assert.True(t, ok)
-		assert.EqualValues(t, 1, segments.Len())
+		assert.EqualValues(t, 1, len(segments.Collect()))
 		assert.NotEqual(t, allocations1[0].SegmentID, allocations2[0].SegmentID)
 	})
 }
@@ -378,10 +378,10 @@ func TestLoadSegmentsFromMeta(t *testing.T) {
 	assert.NoError(t, err)
 	growing, ok := segmentManager.channel2Growing.Get(vchannel)
 	assert.True(t, ok)
-	assert.EqualValues(t, 1, growing.Len())
+	assert.EqualValues(t, 1, len(growing.Collect()))
 	sealed, ok := segmentManager.channel2Sealed.Get(vchannel)
 	assert.True(t, ok)
-	assert.EqualValues(t, 1, sealed.Len())
+	assert.EqualValues(t, 1, len(sealed.Collect()))
 }
 
 func TestSaveSegmentsToMeta(t *testing.T) {
@@ -927,8 +927,8 @@ func TestSegmentManager_DropSegmentsOfChannel(t *testing.T) {
 			s := &SegmentManager{
 				meta:            tt.fields.meta,
 				channelLock:     lock.NewKeyLock[string](),
-				channel2Growing: typeutil.NewConcurrentMap[string, typeutil.UniqueSet](),
-				channel2Sealed:  typeutil.NewConcurrentMap[string, typeutil.UniqueSet](),
+				channel2Growing: typeutil.NewConcurrentMap[string, *typeutil.ConcurrentSet[int64]](),
+				channel2Sealed:  typeutil.NewConcurrentMap[string, *typeutil.ConcurrentSet[int64]](),
 			}
 			for _, segmentID := range tt.fields.segments {
 				segmentInfo := tt.fields.meta.GetSegment(context.Background(), segmentID)
@@ -937,20 +937,20 @@ func TestSegmentManager_DropSegmentsOfChannel(t *testing.T) {
 					channel = segmentInfo.GetInsertChannel()
 				}
 				if segmentInfo == nil || segmentInfo.GetState() == commonpb.SegmentState_Growing {
-					growing, _ := s.channel2Growing.GetOrInsert(channel, typeutil.NewUniqueSet())
+					growing, _ := s.channel2Growing.GetOrInsert(channel, typeutil.NewConcurrentSet[int64]())
 					growing.Insert(segmentID)
 				} else if segmentInfo.GetState() == commonpb.SegmentState_Sealed {
-					sealed, _ := s.channel2Sealed.GetOrInsert(channel, typeutil.NewUniqueSet())
+					sealed, _ := s.channel2Sealed.GetOrInsert(channel, typeutil.NewConcurrentSet[int64]())
 					sealed.Insert(segmentID)
 				}
 			}
 			s.DropSegmentsOfChannel(context.TODO(), tt.args.channel)
 			all := make([]int64, 0)
-			s.channel2Sealed.Range(func(_ string, segments typeutil.UniqueSet) bool {
+			s.channel2Sealed.Range(func(_ string, segments *typeutil.ConcurrentSet[int64]) bool {
 				all = append(all, segments.Collect()...)
 				return true
 			})
-			s.channel2Growing.Range(func(_ string, segments typeutil.UniqueSet) bool {
+			s.channel2Growing.Range(func(_ string, segments *typeutil.ConcurrentSet[int64]) bool {
 				all = append(all, segments.Collect()...)
 				return true
 			})
@@ -1060,8 +1060,8 @@ func TestSegmentManager_CleanZeroSealedSegmentsOfChannel(t *testing.T) {
 			s := &SegmentManager{
 				meta:            tt.fields.meta,
 				channelLock:     lock.NewKeyLock[string](),
-				channel2Growing: typeutil.NewConcurrentMap[string, typeutil.UniqueSet](),
-				channel2Sealed:  typeutil.NewConcurrentMap[string, typeutil.UniqueSet](),
+				channel2Growing: typeutil.NewConcurrentMap[string, *typeutil.ConcurrentSet[int64]](),
+				channel2Sealed:  typeutil.NewConcurrentMap[string, *typeutil.ConcurrentSet[int64]](),
 			}
 			for _, segmentID := range tt.fields.segments {
 				segmentInfo := tt.fields.meta.GetSegment(context.TODO(), segmentID)
@@ -1070,20 +1070,20 @@ func TestSegmentManager_CleanZeroSealedSegmentsOfChannel(t *testing.T) {
 					channel = segmentInfo.GetInsertChannel()
 				}
 				if segmentInfo == nil || segmentInfo.GetState() == commonpb.SegmentState_Growing {
-					growing, _ := s.channel2Growing.GetOrInsert(channel, typeutil.NewUniqueSet())
+					growing, _ := s.channel2Growing.GetOrInsert(channel, typeutil.NewConcurrentSet[int64]())
 					growing.Insert(segmentID)
 				} else if segmentInfo.GetState() == commonpb.SegmentState_Sealed {
-					sealed, _ := s.channel2Sealed.GetOrInsert(channel, typeutil.NewUniqueSet())
+					sealed, _ := s.channel2Sealed.GetOrInsert(channel, typeutil.NewConcurrentSet[int64]())
 					sealed.Insert(segmentID)
 				}
 			}
 			s.CleanZeroSealedSegmentsOfChannel(context.TODO(), tt.args.channel, tt.args.cpTs)
 			all := make([]int64, 0)
-			s.channel2Sealed.Range(func(_ string, segments typeutil.UniqueSet) bool {
+			s.channel2Sealed.Range(func(_ string, segments *typeutil.ConcurrentSet[int64]) bool {
 				all = append(all, segments.Collect()...)
 				return true
 			})
-			s.channel2Growing.Range(func(_ string, segments typeutil.UniqueSet) bool {
+			s.channel2Growing.Range(func(_ string, segments *typeutil.ConcurrentSet[int64]) bool {
 				all = append(all, segments.Collect()...)
 				return true
 			})
@@ -1170,7 +1170,5 @@ func TestAllocNewGrowingSegment_ManifestPath(t *testing.T) {
 // simulate a growing segment filling up still need the poke, so it lives here
 // rather than widening the production surface again.
 func setTestRowCount(m *meta, segmentID UniqueID, rowCount int64) {
-	m.segMu.Lock()
-	defer m.segMu.Unlock()
-	m.segments.modifyProto(segmentID, func(seg *datapb.SegmentInfo) { seg.NumOfRows = rowCount })
+	m.segments.SetRowCount(segmentID, rowCount)
 }

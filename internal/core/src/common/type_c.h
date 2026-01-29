@@ -155,6 +155,7 @@ typedef struct CTraceContext {
     const uint8_t* traceID;
     const uint8_t* spanID;
     uint8_t traceFlags;
+    const char* requestID;
 } CTraceContext;
 
 typedef struct CNewSegmentResult {

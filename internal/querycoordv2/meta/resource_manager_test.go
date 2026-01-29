@@ -275,6 +275,39 @@ func (suite *ResourceManagerSuite) TestManipulateResourceGroup() {
 	suite.Equal(1, suite.manager.GetResourceGroup(ctx, "rg11").NodeNum())
 }
 
+func (suite *ResourceManagerSuite) TestEmbeddedQueryNodeFollowsSQNServeSegments() {
+	ctx := suite.ctx
+	key := paramtable.Get().QueryCoordCfg.EnableSQNServeSegments.Key
+	defer paramtable.Get().Reset(key)
+	suite.manager.nodeMgr.Add(session.NewNodeInfo(session.ImmutableNodeInfo{
+		NodeID:   20,
+		Address:  "localhost",
+		Hostname: "localhost",
+		Labels: map[string]string{
+			sessionutil.LabelStreamingNodeEmbeddedQueryNode: "1",
+		},
+	}))
+	defer suite.manager.nodeMgr.Remove(20)
+
+	// Without SQN serving, an embedded QueryNode stays out of resource groups.
+	suite.Require().NoError(paramtable.Get().Save(key, "false"))
+	suite.manager.HandleNodeUp(ctx, 20)
+	suite.Empty(suite.manager.GetResourceGroupByNodeID(20))
+
+	// With SQN serving it joins a group and the periodic check keeps it there.
+	suite.Require().NoError(paramtable.Get().Save(key, "true"))
+	suite.manager.HandleNodeUp(ctx, 20)
+	rg := suite.manager.GetResourceGroupByNodeID(20)
+	suite.NotEmpty(rg)
+	suite.manager.CheckNodesInResourceGroup(ctx)
+	suite.Equal(rg, suite.manager.GetResourceGroupByNodeID(20))
+
+	// Disabling SQN serving again removes it on the next check.
+	suite.Require().NoError(paramtable.Get().Save(key, "false"))
+	suite.manager.CheckNodesInResourceGroup(ctx)
+	suite.Empty(suite.manager.GetResourceGroupByNodeID(20))
+}
+
 func (suite *ResourceManagerSuite) TestNodeUpAndDown() {
 	ctx := suite.ctx
 	suite.manager.nodeMgr.Add(session.NewNodeInfo(session.ImmutableNodeInfo{

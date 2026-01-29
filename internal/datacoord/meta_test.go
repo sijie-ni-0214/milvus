@@ -5557,25 +5557,19 @@ func Test_meta_GetSegmentsWithChannel(t *testing.T) {
 		},
 	))
 
+	ids := func(segments []*SegmentInfo) []int64 {
+		return lo.Map(segments, func(s *SegmentInfo, _ int) int64 { return s.ID })
+	}
 	m.segments.DropSegment(3)
-	// After dropping segment 3 (the only segment of collection 2), the
-	// per-collection and per-channel views are derived from the store.
-	got = m.GetSegmentsByChannel("h1")
-	assert.Equal(t, 1, len(got))
-	assert.Equal(t, int64(1), got[0].ID)
-	got = m.GetSegmentsByChannel("h2")
-	assert.Equal(t, 1, len(got))
-	assert.Equal(t, int64(2), got[0].ID)
-	assert.Equal(t, 2, len(m.GetSegmentsOfCollection(context.TODO(), 1)))
-	assert.Equal(t, 0, len(m.GetSegmentsOfCollection(context.TODO(), 2)))
+	assert.Empty(t, m.segments.GetSegmentsBySelector(WithCollection(2)))
+	assert.ElementsMatch(t, []int64{1, 2}, ids(m.segments.GetSegmentsBySelector(WithCollection(1))))
+	assert.ElementsMatch(t, []int64{1}, ids(m.segments.GetSegmentsByChannel("h1")))
+	assert.ElementsMatch(t, []int64{2}, ids(m.segments.GetSegmentsByChannel("h2")))
 
 	m.segments.DropSegment(2)
-	got = m.GetSegmentsByChannel("h1")
-	assert.Equal(t, 1, len(got))
-	assert.Equal(t, int64(1), got[0].ID)
-	got = m.GetSegmentsByChannel("h2")
-	assert.Equal(t, 0, len(got))
-	assert.Equal(t, 1, len(m.GetSegmentsOfCollection(context.TODO(), 1)))
+	assert.ElementsMatch(t, []int64{1}, ids(m.segments.GetSegmentsBySelector(WithCollection(1))))
+	assert.ElementsMatch(t, []int64{1}, ids(m.segments.GetSegmentsByChannel("h1")))
+	assert.Empty(t, m.segments.GetSegmentsByChannel("h2"))
 }
 
 func TestMeta_HasSegments(t *testing.T) {

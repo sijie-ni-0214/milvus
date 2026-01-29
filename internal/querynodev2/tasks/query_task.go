@@ -16,6 +16,7 @@ import (
 	"github.com/milvus-io/milvus/internal/util/queryutil"
 	"github.com/milvus-io/milvus/internal/util/searchutil/scheduler"
 	"github.com/milvus-io/milvus/pkg/v3/metrics"
+	"github.com/milvus-io/milvus/pkg/v3/mlog"
 	"github.com/milvus-io/milvus/pkg/v3/proto/internalpb"
 	"github.com/milvus-io/milvus/pkg/v3/proto/planpb"
 	"github.com/milvus-io/milvus/pkg/v3/proto/querypb"
@@ -98,10 +99,28 @@ func (t *QueryTask) PreExecute() error {
 	).
 		Observe(inQueueDurationMS)
 
+	logger := mlog.With(
+		mlog.Int64("collectionID", t.collection.ID()),
+		mlog.String("scope", t.req.GetScope().String()),
+		mlog.String("queryLabel", queryLabel),
+		mlog.Int("segmentNum", len(t.req.GetSegmentIDs())),
+		mlog.Int64s("segmentIDs", t.req.GetSegmentIDs()))
+	logger.Info(t.ctx, "[sss][www] qn scheduler task start",
+		mlog.Duration("queueDuration", inQueueDuration))
+	logger.Info(t.ctx, "[sss] query task pre execute",
+		mlog.Duration("queueDuration", inQueueDuration))
+
 	// Unmarshal the origin plan
+	stageStart := time.Now()
 	if err := proto.Unmarshal(t.req.Req.GetSerializedExprPlan(), t.plan); err != nil {
+		logger.Warn(t.ctx, "[sss] query task pre execute failed",
+			mlog.Duration("duration", time.Since(stageStart)),
+			mlog.Err(err))
 		return err
 	}
+	logger.Info(t.ctx, "[sss] query task pre execute done",
+		mlog.Duration("duration", time.Since(stageStart)),
+		mlog.Duration("queueDuration", inQueueDuration))
 
 	return nil
 }
@@ -126,6 +145,15 @@ func (t *QueryTask) ExecuteOnSegments(selected []segments.Segment) error {
 }
 
 func (t *QueryTask) execute(selected []segments.Segment) error {
+	logger := mlog.With(
+		mlog.Int64("collectionID", t.collection.ID()),
+		mlog.String("scope", t.req.GetScope().String()),
+		mlog.String("queryLabel", contextutil.GetQueryLabel(t.ctx)),
+		mlog.Int("segmentNum", len(t.req.GetSegmentIDs())),
+		mlog.Int64s("segmentIDs", t.req.GetSegmentIDs()))
+	executeStart := time.Now()
+	stageStart := executeStart
+	logger.Info(t.ctx, "[sss] query task execute start")
 	if t.scheduleSpan != nil {
 		t.scheduleSpan.End()
 	}
@@ -133,15 +161,25 @@ func (t *QueryTask) execute(selected []segments.Segment) error {
 
 	retrievePlan, err := t.collection.NewRetrievePlan(t.req)
 	if err != nil {
+		logger.Warn(t.ctx, "[sss] query task build retrieve plan failed",
+			mlog.Duration("duration", time.Since(stageStart)),
+			mlog.Err(err))
 		return err
 	}
+	logger.Info(t.ctx, "[sss] query task build retrieve plan done",
+		mlog.Duration("duration", time.Since(stageStart)),
+		mlog.Bool("planShouldIgnoreNonPk", retrievePlan.ShouldIgnoreNonPk()))
 	defer retrievePlan.Delete()
 	resultCount := retrieveTakeForOutputResultCount(t.req.GetReq(), t.plan)
 	takeAllowed := requestAllowsTakeForOutput(resultCount)
 	retrievePlan.SetTakeForOutputAllowed(takeAllowed)
 
-	var results []segments.RetrieveSegmentResult
-	var pinnedSegments []segments.Segment
+	stageStart = time.Now()
+	logger.Info(t.ctx, "[sss] query task retrieve start")
+	var (
+		results        []segments.RetrieveSegmentResult
+		pinnedSegments []segments.Segment
+	)
 	if selected != nil {
 		results, err = segments.RetrieveSelectedSegments(t.ctx, retrievePlan, t.req, selected)
 	} else {
@@ -156,10 +194,20 @@ func (t *QueryTask) execute(selected []segments.Segment) error {
 	defer segments.ReleaseRecords(results)
 
 	if err != nil {
+		logger.Warn(t.ctx, "[sss] query task retrieve failed",
+			mlog.Duration("duration", time.Since(stageStart)),
+			mlog.Int("pinnedSegmentNum", len(pinnedSegments)),
+			mlog.Err(err))
 		return err
 	}
+	logger.Info(t.ctx, "[sss] query task retrieve done",
+		mlog.Duration("duration", time.Since(stageStart)),
+		mlog.Int("resultNum", len(results)),
+		mlog.Int("pinnedSegmentNum", len(pinnedSegments)))
 
 	beforeReduce := time.Now()
+	logger.Info(t.ctx, "[sss] query task reduce start",
+		mlog.Int("resultNum", len(results)))
 
 	reduceResults := make([]*segcorepb.RetrieveResults, 0, len(results))
 	querySegments := make([]segments.Segment, 0, len(results))
@@ -192,8 +240,13 @@ func (t *QueryTask) execute(selected []segments.Segment) error {
 		metrics.BatchReduce,
 	).Observe(float64(time.Since(beforeReduce).Microseconds()) / 1000.0)
 	if err != nil {
+		logger.Warn(t.ctx, "[sss] query task reduce failed",
+			mlog.Duration("duration", time.Since(beforeReduce)),
+			mlog.Err(err))
 		return err
 	}
+	logger.Info(t.ctx, "[sss] query task reduce done",
+		mlog.Duration("duration", time.Since(beforeReduce)))
 
 	// Materialize the Arrow path's chosen rows into FieldsData. This is the
 	// response's own format, so it ends the Arrow representation here, at the
@@ -226,6 +279,9 @@ func (t *QueryTask) execute(selected []segments.Segment) error {
 		ElementIndices:     convertSegcoreElementIndicesToInternal(reducedResult.GetElementIndices()),
 		FeatureBits:        retrievePlan.FeatureBits() | segments.ColdReadFeatureBit(reducedResult.GetScannedRemoteBytes()),
 	}
+	logger.Info(t.ctx, "[sss] query task execute done",
+		mlog.Duration("duration", time.Since(executeStart)),
+		mlog.Int64("allRetrieveCount", reducedResult.GetAllRetrieveCount()))
 	return nil
 }
 

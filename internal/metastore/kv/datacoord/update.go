@@ -43,16 +43,34 @@ import (
 // or Type/Entry combinations it does not implement, are a caller programming
 // error and are rejected with a ServiceInternal error and no write.
 func (kc *Catalog) Update(ctx context.Context, actions ...metastore.UpdateAction) error {
+	b, err := kc.EncodeUpdate(ctx, actions...)
+	if err != nil {
+		return err
+	}
+	if containsSegmentIndexUpdate(actions) {
+		// A segment index removal and the segment manifest pointer that
+		// publishes or retracts its artifact must land together. Refuse a
+		// chunked fallback that could expose only half of the transition.
+		return txn.CommitWithoutFallback(ctx, kc.MetaKv, b)
+	}
+	return txn.Commit(ctx, kc.MetaKv, b)
+}
+
+// EncodeUpdate encodes actions into the ops Update would commit, without
+// committing them. DataCoord's optimistic segment store uses it to run the
+// non-segment actions of a composite write inside its own versioned
+// transaction; keys are relative to the MetaKv root path.
+func (kc *Catalog) EncodeUpdate(ctx context.Context, actions ...metastore.UpdateAction) (*txn.Builder, error) {
 	b := txn.New()
 	for _, action := range actions {
 		switch e := action.Entry.(type) {
 		case metastore.SegmentEntry:
 			if err := kc.applySegmentEntry(ctx, b, action.Type, e, publishesSegmentVersion(e.Segment, actions)); err != nil {
-				return err
+				return nil, err
 			}
 		case metastore.SegmentIndexEntry:
 			if e.SegmentIndex == nil {
-				return merr.WrapErrServiceInternalMsg("datacoord catalog: nil segment index in UpdateAction")
+				return nil, merr.WrapErrServiceInternalMsg("datacoord catalog: nil segment index in UpdateAction")
 			}
 			key := BuildSegmentIndexKey(
 				e.SegmentIndex.CollectionID,
@@ -68,11 +86,11 @@ func (kc *Catalog) Update(ctx context.Context, actions ...metastore.UpdateAction
 				// point to mark.
 				b.Remove(key)
 			default:
-				return unsupportedAction(action)
+				return nil, unsupportedAction(action)
 			}
 		case metastore.ChannelEntry:
 			if action.Type != metastore.ActionDelete {
-				return unsupportedAction(action)
+				return nil, unsupportedAction(action)
 			}
 			// CommitRemove keeps the flag delete last, so any earlier ops in
 			// this composite write land before it on the ordered fallback path.
@@ -82,17 +100,17 @@ func (kc *Catalog) Update(ctx context.Context, actions ...metastore.UpdateAction
 			case metastore.ActionAdd:
 				// Same encoding as catalog.SaveExternalCollectionRefreshTask.
 				if e.Task == nil {
-					return merr.WrapErrServiceInternalMsg("datacoord catalog: nil refresh task in UpdateAction")
+					return nil, merr.WrapErrServiceInternalMsg("datacoord catalog: nil refresh task in UpdateAction")
 				}
 				value, err := proto.Marshal(e.Task)
 				if err != nil {
-					return err
+					return nil, err
 				}
 				b.Save(buildExternalCollectionRefreshTaskKey(e.Task.GetTaskId()), string(value))
 			case metastore.ActionDelete:
 				b.Remove(buildExternalCollectionRefreshTaskKey(e.TaskID))
 			default:
-				return unsupportedAction(action)
+				return nil, unsupportedAction(action)
 			}
 		case metastore.RefreshJobEntry:
 			switch action.Type {
@@ -103,11 +121,11 @@ func (kc *Catalog) Update(ctx context.Context, actions ...metastore.UpdateAction
 				// RefreshTaskEntry save above must land before it on the
 				// ordered fallback path.
 				if e.Job == nil {
-					return merr.WrapErrServiceInternalMsg("datacoord catalog: nil refresh job in UpdateAction")
+					return nil, merr.WrapErrServiceInternalMsg("datacoord catalog: nil refresh job in UpdateAction")
 				}
 				value, err := proto.Marshal(e.Job)
 				if err != nil {
-					return err
+					return nil, err
 				}
 				b.CommitSave(buildExternalCollectionRefreshJobKey(e.Job.GetJobId()), string(value))
 			case metastore.ActionDelete:
@@ -117,19 +135,19 @@ func (kc *Catalog) Update(ctx context.Context, actions ...metastore.UpdateAction
 				// ordered fallback path.
 				b.CommitRemove(buildExternalCollectionRefreshJobKey(e.JobID))
 			default:
-				return unsupportedAction(action)
+				return nil, unsupportedAction(action)
 			}
 		case metastore.AnalyzeTaskEntry:
 			if action.Type != metastore.ActionDelete {
-				return unsupportedAction(action)
+				return nil, unsupportedAction(action)
 			}
 			b.Remove(buildAnalyzeTaskKey(e.TaskID))
 		case metastore.DataViewEntry:
 			if action.Type != metastore.ActionAdd {
-				return unsupportedAction(action)
+				return nil, unsupportedAction(action)
 			}
 			if e.DataView == nil || e.DataView.GetDataVersion() == nil {
-				return merr.WrapErrServiceInternalMsg("datacoord catalog: nil DataView or DataVersion in UpdateAction")
+				return nil, merr.WrapErrServiceInternalMsg("datacoord catalog: nil DataView or DataVersion in UpdateAction")
 			}
 			key := buildDataViewVersionKey(
 				e.DataView.GetCollectionId(),
@@ -138,7 +156,7 @@ func (kc *Catalog) Update(ctx context.Context, actions ...metastore.UpdateAction
 			)
 			value, err := proto.Marshal(e.DataView)
 			if err != nil {
-				return err
+				return nil, err
 			}
 			// The snapshot key is immutable per version; a new version always
 			// writes a fresh key, so the write is idempotent-safe. CommitSave
@@ -150,13 +168,13 @@ func (kc *Catalog) Update(ctx context.Context, actions ...metastore.UpdateAction
 			b.CommitSave(key, string(value))
 		case metastore.PartitionStatsVersionEntry:
 			if action.Type != metastore.ActionUpdate {
-				return unsupportedAction(action)
+				return nil, unsupportedAction(action)
 			}
 			b.Save(buildCurrentPartitionStatsVersionPath(e.CollectionID, e.PartitionID, e.VChannel),
 				strconv.FormatInt(e.Version, 10))
 		case metastore.PartitionStatsEntry:
 			if e.Info == nil {
-				return merr.WrapErrServiceInternalMsg("datacoord catalog: nil partition stats info in UpdateAction")
+				return nil, merr.WrapErrServiceInternalMsg("datacoord catalog: nil partition stats info in UpdateAction")
 			}
 			switch action.Type {
 			case metastore.ActionAdd:
@@ -169,7 +187,7 @@ func (kc *Catalog) Update(ctx context.Context, actions ...metastore.UpdateAction
 				cloned := proto.Clone(e.Info).(*datapb.PartitionStatsInfo)
 				k, v, err := buildPartitionStatsInfoKv(cloned)
 				if err != nil {
-					return err
+					return nil, err
 				}
 				b.Save(k, v)
 			case metastore.ActionDelete:
@@ -180,18 +198,18 @@ func (kc *Catalog) Update(ctx context.Context, actions ...metastore.UpdateAction
 				// on the ordered fallback path.
 				b.CommitRemove(buildPartitionStatsInfoPath(e.Info))
 			default:
-				return unsupportedAction(action)
+				return nil, unsupportedAction(action)
 			}
 		case metastore.SegmentChangeGroupEntry:
 			switch action.Type {
 			case metastore.ActionUpdate:
 				// Same encoding as catalog.SaveSegmentChangeGroup.
 				if e.Group == nil {
-					return merr.WrapErrServiceInternalMsg("datacoord catalog: nil segment change group in UpdateAction")
+					return nil, merr.WrapErrServiceInternalMsg("datacoord catalog: nil segment change group in UpdateAction")
 				}
 				value, err := model.MarshalSegmentChangeGroup(e.Group)
 				if err != nil {
-					return err
+					return nil, err
 				}
 				if e.Group.IsTerminal() {
 					// Terminal states (COMMITTED/FAILED/ABORTED) are the
@@ -215,19 +233,13 @@ func (kc *Catalog) Update(ctx context.Context, actions ...metastore.UpdateAction
 				// retirement are composed before it on the ordered fallback path.
 				b.CommitRemove(buildSegmentChangeGroupKey(e.CollectionID, e.GroupID))
 			default:
-				return unsupportedAction(action)
+				return nil, unsupportedAction(action)
 			}
 		default:
-			return merr.WrapErrServiceInternalMsg("datacoord catalog cannot apply entry %T", action.Entry)
+			return nil, merr.WrapErrServiceInternalMsg("datacoord catalog cannot apply entry %T", action.Entry)
 		}
 	}
-	if containsSegmentIndexUpdate(actions) {
-		// A segment index removal and the segment manifest pointer that
-		// publishes or retracts its artifact must land together. Refuse a
-		// chunked fallback that could expose only half of the transition.
-		return txn.CommitWithoutFallback(ctx, kc.MetaKv, b)
-	}
-	return txn.Commit(ctx, kc.MetaKv, b)
+	return b, nil
 }
 
 func containsSegmentIndexUpdate(actions []metastore.UpdateAction) bool {

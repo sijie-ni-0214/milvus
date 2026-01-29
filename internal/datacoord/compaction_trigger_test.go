@@ -159,6 +159,7 @@ func Test_compactionTrigger_force_without_index(t *testing.T) {
 		Schema: schema,
 	})
 	m := &meta{
+		catalog: catalog,
 		segments: newSegmentsInfoWithSegments(map[int64]*SegmentInfo{
 			1: {
 				SegmentInfo: segInfo,
@@ -528,6 +529,7 @@ func Test_compactionTrigger_force(t *testing.T) {
 			"test force compaction",
 			fields{
 				&meta{
+					catalog: catalog,
 					segments: newSegmentsInfoWithSegments(map[int64]*SegmentInfo{
 						1: seg1,
 						2: seg2,
@@ -584,6 +586,7 @@ func Test_compactionTrigger_force(t *testing.T) {
 		t.Run(tt.name+" with DiskANN index", func(t *testing.T) {
 			for _, segment := range tt.fields.meta.segments.GetSegments() {
 				// Collection 1000 means it has DiskANN index
+				tt.fields.meta.segments.DropSegment(segment.GetID())
 				segment.CollectionID = 1000
 				tt.fields.meta.segments.SetSegment(segment.GetID(), segment)
 			}
@@ -3062,6 +3065,7 @@ func Test_compactionTrigger_generatePlans(t *testing.T) {
 			name: "force trigger on large segments",
 			fields: fields{
 				meta: &meta{
+					catalog: catalog,
 					segments: newSegmentsInfoWithSegments(map[int64]*SegmentInfo{
 						1: seg1,
 						2: seg2,
@@ -3516,6 +3520,7 @@ func Test_compactionTrigger_generatePlansByTime(t *testing.T) {
 			name: "test time-based compaction",
 			fields: fields{
 				meta: &meta{
+					catalog: catalog,
 					segments: newSegmentsInfoWithSegments(map[int64]*SegmentInfo{
 						1: seg1,
 						2: seg2,

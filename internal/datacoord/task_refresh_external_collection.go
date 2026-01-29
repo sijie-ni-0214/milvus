@@ -684,11 +684,11 @@ func applyExternalRefreshPatch(oldSeg *SegmentInfo, incoming *datapb.SegmentInfo
 }
 
 // getExternalRefreshSegmentSnapshots returns clones in the same order as
-// segmentIDs while holding segMu across the full read, preventing one worker
-// request from observing segment metadata from different update generations.
+// segmentIDs under the publication lock, preventing one worker request from
+// observing segment metadata from different update generations.
 func getExternalRefreshSegmentSnapshots(mt *meta, segmentIDs []int64) []*SegmentInfo {
-	mt.segMu.RLock()
-	defer mt.segMu.RUnlock()
+	mt.pubMu.RLock()
+	defer mt.pubMu.RUnlock()
 
 	result := make([]*SegmentInfo, len(segmentIDs))
 	for i, segmentID := range segmentIDs {

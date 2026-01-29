@@ -26,6 +26,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"sync/atomic"
 
 	"google.golang.org/protobuf/proto"
 
@@ -84,6 +85,17 @@ type MetaView interface {
 	GetCollectionIDs() []int64
 }
 
+// SegmentSource serves segment reads in place of the store's own segment map.
+// Implementations must be safe for concurrent use and must not let callers
+// mutate the returned protos.
+type SegmentSource interface {
+	GetSegment(segmentID int64) (*datapb.SegmentInfo, bool)
+	GetSegmentsByIDs(segmentIDs []int64) map[int64]*datapb.SegmentInfo
+	GetAllSegments() map[int64]*datapb.SegmentInfo
+	GetSegments(collectionID int64) map[int64]*datapb.SegmentInfo
+	GetSegmentsByChannel(channel string) map[int64]*datapb.SegmentInfo
+}
+
 // MetaStore is the read-write metacache interface, used by components that
 // own metadata mutation (e.g. DataCoord). MetaStore owns the catalog and
 // provides all functionality directly — no catalog accessor is exposed.
@@ -94,6 +106,11 @@ type MetaStore interface {
 	PutSegment(segment *datapb.SegmentInfo)
 	RemoveSegment(segmentID int64)
 	LoadSegments(segments []*datapb.SegmentInfo)
+	// SetSegmentSource makes source serve every segment read of the store from
+	// then on. DataCoord installs its segment cache here once it is loaded, so
+	// DataCoord and QueryCoord read one copy of every segment; the store's own
+	// segment map then serves no reads.
+	SetSegmentSource(source SegmentSource)
 
 	// Collections — write
 	PutCollection(info *CollectionInfo)
@@ -107,6 +124,9 @@ type MetaStore interface {
 	GetChannelCheckpoint(vChannel string) *msgpb.MsgPosition
 	GetChannelCheckpoints() map[string]*msgpb.MsgPosition
 	LoadChannelCheckpoints(checkpoints map[string]*msgpb.MsgPosition)
+	// ReplaceChannelCheckpoints replaces every channel checkpoint and re-emits
+	// the checkpoint metrics, for a recovery that read the checkpoints itself.
+	ReplaceChannelCheckpoints(checkpoints map[string]*msgpb.MsgPosition)
 
 	// Channel lifecycle
 	MarkChannelAdded(ctx context.Context, channel string) error
@@ -123,6 +143,9 @@ type MetaStore interface {
 type metaStore struct {
 	mu      sync.RWMutex
 	catalog metastore.DataCoordCatalog
+
+	// source, once set, serves every segment read instead of segments.
+	source atomic.Pointer[sourceHolder]
 
 	// Segment storage + indexes
 	segments   map[int64]*datapb.SegmentInfo
@@ -149,6 +172,19 @@ func NewMetaStore(catalog metastore.DataCoordCatalog) MetaStore {
 	}
 }
 
+type sourceHolder struct{ SegmentSource }
+
+func (s *metaStore) SetSegmentSource(source SegmentSource) {
+	s.source.Store(&sourceHolder{source})
+}
+
+func (s *metaStore) segmentSource() SegmentSource {
+	if h := s.source.Load(); h != nil {
+		return h.SegmentSource
+	}
+	return nil
+}
+
 // InternalCatalog returns the catalog for sub-meta initialization.
 // This is NOT part of the MetaStore interface — only available on the
 // concrete type. Sub-metas (indexMeta, analyzeMeta, etc.) need direct
@@ -160,6 +196,9 @@ func (s *metaStore) InternalCatalog() metastore.DataCoordCatalog {
 // --- Segment read methods ---
 
 func (s *metaStore) GetSegment(segmentID int64) (*datapb.SegmentInfo, bool) {
+	if src := s.segmentSource(); src != nil {
+		return src.GetSegment(segmentID)
+	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	seg, ok := s.segments[segmentID]
@@ -167,6 +206,9 @@ func (s *metaStore) GetSegment(segmentID int64) (*datapb.SegmentInfo, bool) {
 }
 
 func (s *metaStore) GetSegmentsByIDs(segmentIDs []int64) map[int64]*datapb.SegmentInfo {
+	if src := s.segmentSource(); src != nil {
+		return src.GetSegmentsByIDs(segmentIDs)
+	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	result := make(map[int64]*datapb.SegmentInfo, len(segmentIDs))
@@ -179,6 +221,9 @@ func (s *metaStore) GetSegmentsByIDs(segmentIDs []int64) map[int64]*datapb.Segme
 }
 
 func (s *metaStore) GetAllSegments() map[int64]*datapb.SegmentInfo {
+	if src := s.segmentSource(); src != nil {
+		return src.GetAllSegments()
+	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	result := make(map[int64]*datapb.SegmentInfo, len(s.segments))
@@ -189,6 +234,9 @@ func (s *metaStore) GetAllSegments() map[int64]*datapb.SegmentInfo {
 }
 
 func (s *metaStore) GetSegments(collectionID int64) map[int64]*datapb.SegmentInfo {
+	if src := s.segmentSource(); src != nil {
+		return src.GetSegments(collectionID)
+	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	ids, ok := s.segCollIdx[collectionID]
@@ -203,6 +251,9 @@ func (s *metaStore) GetSegments(collectionID int64) map[int64]*datapb.SegmentInf
 }
 
 func (s *metaStore) GetSegmentsByChannel(channel string) map[int64]*datapb.SegmentInfo {
+	if src := s.segmentSource(); src != nil {
+		return src.GetSegmentsByChannel(channel)
+	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	ids, ok := s.segChanIdx[channel]
@@ -296,6 +347,27 @@ func (s *metaStore) removeSegmentIndexes(id int64, seg *datapb.SegmentInfo) {
 		delete(ids, id)
 		if len(ids) == 0 {
 			delete(s.segChanIdx, ch)
+		}
+	}
+}
+
+// SegmentMetricTransition updates DataCoordNumSegments for a segment replaced by
+// updated, for a segment storage that serves the store as its SegmentSource. A
+// nil old counts a new segment, a nil updated a removed one.
+func SegmentMetricTransition(old, updated *datapb.SegmentInfo) {
+	switch {
+	case old == nil && updated == nil:
+	case old == nil:
+		labels := segMetricLabels(updated)
+		metrics.DataCoordNumSegments.WithLabelValues(labels[:]...).Inc()
+	case updated == nil:
+		labels := segMetricLabels(old)
+		metrics.DataCoordNumSegments.WithLabelValues(labels[:]...).Dec()
+	default:
+		oldLabels, newLabels := segMetricLabels(old), segMetricLabels(updated)
+		if oldLabels != newLabels {
+			metrics.DataCoordNumSegments.WithLabelValues(oldLabels[:]...).Dec()
+			metrics.DataCoordNumSegments.WithLabelValues(newLabels[:]...).Inc()
 		}
 	}
 }
@@ -565,6 +637,18 @@ func (s *metaStore) GetChannelCheckpoints() map[string]*msgpb.MsgPosition {
 		result[ch] = proto.Clone(cp).(*msgpb.MsgPosition)
 	}
 	return result
+}
+
+func (s *metaStore) ReplaceChannelCheckpoints(checkpoints map[string]*msgpb.MsgPosition) {
+	s.mu.Lock()
+	s.checkpoints = make(map[string]*msgpb.MsgPosition, len(checkpoints))
+	for vChannel, pos := range checkpoints {
+		// for 2.2.2 issue https://github.com/milvus-io/milvus/issues/22181
+		pos.ChannelName = vChannel
+		s.checkpoints[vChannel] = pos
+	}
+	s.mu.Unlock()
+	s.emitCheckpointMetrics()
 }
 
 func (s *metaStore) LoadChannelCheckpoints(checkpoints map[string]*msgpb.MsgPosition) {
