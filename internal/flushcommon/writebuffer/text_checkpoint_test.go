@@ -73,6 +73,8 @@ func (s *L0WriteBufferSuite) TestTextCheckpointSyncLifecycle() {
 				return nil, nil, nil, nil, "persisted-manifest", 1, nil, nil
 			}).Build()
 			defer write.UnPatch()
+			// A streaming-created segment registers at DataCoord before its first save.
+			coord.EXPECT().AllocSegment(mock.Anything, mock.Anything).Return(nil).Maybe()
 			coord.EXPECT().SaveBinlogPaths(mock.Anything, mock.Anything).
 				RunAndReturn(func(_ context.Context, req *datapb.SaveBinlogPathsRequest) error {
 					metaCalls++

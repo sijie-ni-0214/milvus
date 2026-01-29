@@ -81,7 +81,7 @@
 #include "common/ScopedTimer.h"
 #include "common/Span.h"
 #include "common/SystemProperty.h"
-#include "common/Tracer.h"
+#include "common/RequestTrace.h"
 #include "common/TypeTraits.h"
 #include "common/Types.h"
 #include "common/Utils.h"
@@ -3273,6 +3273,7 @@ ChunkedSegmentSealedImpl::load_column_group_data_internal(
     milvus::OpContext* op_ctx,
     bool is_replace,
     StagedStateCommitter& committer) {
+    auto func_start = std::chrono::steady_clock::now();
     size_t num_rows = storage::GetNumRowsForLoadInfo(load_info);
     ArrowSchemaPtr arrow_schema = schema_snapshot->ConvertToArrowSchema();
     auto& mmap_config = storage::MmapManager::GetInstance().GetMmapConfig();
@@ -3339,13 +3340,31 @@ ChunkedSegmentSealedImpl::load_column_group_data_internal(
                                                    schema_snapshot,
                                                    info.warmup_policy);
 
+        auto t_prepare = std::chrono::steady_clock::now();
+        auto t_metadata_start = std::chrono::steady_clock::now();
         auto packing = PlanGroupChunkPacking(
             milvus_field_ids,
             field_metas,
             insert_files,
             fmt::format(
                 "seg_{}_cg_{}", get_segment_id(), column_group_id.get()));
+        auto t_metadata_done = std::chrono::steady_clock::now();
+        LOG_INFO(
+            "[xxx] segment {} column_group {} translator detail metadata done, "
+            "insert_file_count={}, row_group_meta_count={}, "
+            "skip_metrics_field_count={}, force_one_row_group_per_cell={}, "
+            "duration={}ms",
+            id_,
+            column_group_id.get(),
+            insert_files.size(),
+            packing.row_group_meta_list.size(),
+            packing.skip_metrics_by_field.size(),
+            packing.force_one_row_group_per_cell,
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                t_metadata_done - t_metadata_start)
+                .count());
 
+        auto t_translator_ctor_start = std::chrono::steady_clock::now();
         auto translator =
             std::make_unique<storagev2translator::GroupChunkTranslator>(
                 get_segment_id(),
@@ -3363,15 +3382,47 @@ ChunkedSegmentSealedImpl::load_column_group_data_internal(
                 writeback_mode,
                 packing.force_one_row_group_per_cell,
                 std::move(packing.skip_metrics_by_field));
+        auto t_translator_ctor_done = std::chrono::steady_clock::now();
+        LOG_INFO(
+            "[xxx] segment {} column_group {} translator detail ctor done, "
+            "enable_mmap={}, mmap_populate={}, warmup_policy='{}', "
+            "duration={}ms",
+            id_,
+            column_group_id.get(),
+            info.enable_mmap,
+            mmap_config.GetMmapPopulate(),
+            info.warmup_policy,
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                t_translator_ctor_done - t_translator_ctor_start)
+                .count());
+
+        auto t_chunked_group_start = std::chrono::steady_clock::now();
         auto chunked_column_group =
             std::make_shared<ChunkedColumnGroup>(std::move(translator));
+        auto t_chunked_group_done = std::chrono::steady_clock::now();
+        LOG_INFO(
+            "[xxx] segment {} column_group {} translator detail "
+            "chunked_column_group done, num_chunks={}, num_rows={}, "
+            "duration={}ms",
+            id_,
+            column_group_id.get(),
+            chunked_column_group->num_chunks(),
+            chunked_column_group->NumRows(),
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                t_chunked_group_done - t_chunked_group_start)
+                .count());
+        auto t_translator = std::chrono::steady_clock::now();
 
         for (const auto& field_id : milvus_field_ids) {
+            auto t_field_start = std::chrono::steady_clock::now();
             const auto& field_meta = field_metas.at(field_id);
+            auto t_proxy_start = std::chrono::steady_clock::now();
             auto column = std::make_shared<ProxyChunkColumn>(
                 chunked_column_group, field_id, field_meta);
+            auto t_proxy_done = std::chrono::steady_clock::now();
             auto data_type = field_meta.get_data_type();
 
+            auto t_load_common_start = std::chrono::steady_clock::now();
             load_field_data_common(field_id,
                                    column,
                                    num_rows,
@@ -3383,7 +3434,9 @@ ChunkedSegmentSealedImpl::load_column_group_data_internal(
                                    op_ctx,
                                    is_replace,
                                    committer);
+            auto t_load_common_done = std::chrono::steady_clock::now();
             if (field_id == TimestampFieldID) {
+                auto t_ts_index_start = std::chrono::steady_clock::now();
                 if (commit_ts_ != 0) {
                     std::vector<Timestamp> ts(num_rows, commit_ts_);
                     auto timestamp_index =
@@ -3436,12 +3489,77 @@ ChunkedSegmentSealedImpl::load_column_group_data_internal(
                         runtime.timestamp_index_slot = std::move(slot);
                     });
                 }
+                auto t_ts_index_done = std::chrono::steady_clock::now();
+                LOG_INFO(
+                    "[xxx] segment {} column_group {} translator detail "
+                    "timestamp index done, field={}, duration={}ms",
+                    id_,
+                    column_group_id.get(),
+                    field_id.get(),
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        t_ts_index_done - t_ts_index_start)
+                        .count());
             }
+            auto t_field_done = std::chrono::steady_clock::now();
+            LOG_INFO(
+                "[xxx] segment {} column_group {} translator detail field "
+                "done, field={}, proxy={}ms, load_common={}ms, total={}ms",
+                id_,
+                column_group_id.get(),
+                field_id.get(),
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    t_proxy_done - t_proxy_start)
+                    .count(),
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    t_load_common_done - t_load_common_start)
+                    .count(),
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    t_field_done - t_field_start)
+                    .count());
         }
 
         if (column_group_id.get() == DEFAULT_SHORT_COLUMN_GROUP_ID) {
+            auto t_memory_size_start = std::chrono::steady_clock::now();
             stats_.mem_size += chunked_column_group->memory_size();
+            auto t_memory_size_done = std::chrono::steady_clock::now();
+            LOG_INFO(
+                "[xxx] segment {} column_group {} translator detail "
+                "memory_size done, duration={}ms",
+                id_,
+                column_group_id.get(),
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    t_memory_size_done - t_memory_size_start)
+                    .count());
         }
+
+        auto t_load_done = std::chrono::steady_clock::now();
+        LOG_INFO(
+            "[xxx] segment {} column_group {} loaded, "
+            "prepare={}ms, translator={}ms, load_fields={}ms, total={}ms, "
+            "metadata={}ms, translator_ctor={}ms, chunked_column_group={}ms",
+            id_,
+            column_group_id.get(),
+            std::chrono::duration_cast<std::chrono::milliseconds>(t_prepare -
+                                                                  func_start)
+                .count(),
+            std::chrono::duration_cast<std::chrono::milliseconds>(t_translator -
+                                                                  t_prepare)
+                .count(),
+            std::chrono::duration_cast<std::chrono::milliseconds>(t_load_done -
+                                                                  t_translator)
+                .count(),
+            std::chrono::duration_cast<std::chrono::milliseconds>(t_load_done -
+                                                                  func_start)
+                .count(),
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                t_metadata_done - t_metadata_start)
+                .count(),
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                t_translator_ctor_done - t_translator_ctor_start)
+                .count(),
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                t_chunked_group_done - t_chunked_group_start)
+                .count());
     }
 }
 
@@ -9986,6 +10104,7 @@ ChunkedSegmentSealedImpl::LoadBatchFieldData(
     milvus::OpContext* op_ctx,
     bool is_replace,
     StagedStateCommitter& committer) {
+    auto batch_start = std::chrono::steady_clock::now();
     LOG_INFO("Loading field binlog for {} fields in segment {}",
              field_binlog_to_load.size(),
              id_);
@@ -10004,7 +10123,19 @@ ChunkedSegmentSealedImpl::LoadBatchFieldData(
             segment_load_info.GetStorageVersion();
         load_field_data_info.load_priority = segment_load_info.GetPriority();
         load_field_data_info.shard = segment_load_info.GetInsertChannel();
+        // when child fields specified, field id is group id, child field ids are actual id values here
+        bool has_child_fields = field_binlog.child_fields_size() > 0;
         auto fields_to_load = field_ids;
+        if (fields_to_load.empty()) {
+            if (has_child_fields) {
+                fields_to_load.reserve(field_binlog.child_fields_size());
+                for (auto field_id : field_binlog.child_fields()) {
+                    fields_to_load.emplace_back(field_id);
+                }
+            } else {
+                fields_to_load.emplace_back(field_binlog.fieldid());
+            }
+        }
         AssertInfo(!fields_to_load.empty(),
                    "load field data with empty field list");
         for (const auto& field_id : fields_to_load) {
@@ -10069,6 +10200,12 @@ ChunkedSegmentSealedImpl::LoadBatchFieldData(
         // Build FieldBinlogInfo
         FieldBinlogInfo field_binlog_info;
         field_binlog_info.field_id = group_id;
+        if (has_child_fields) {
+            field_binlog_info.child_field_ids.reserve(fields_to_load.size());
+            for (const auto& field_id : fields_to_load) {
+                field_binlog_info.child_field_ids.push_back(field_id.get());
+            }
+        }
 
         // Calculate total row count and collect binlog paths
         int64_t total_entries = 0;
@@ -10083,11 +10220,13 @@ ChunkedSegmentSealedImpl::LoadBatchFieldData(
             total_entries += binlog.entries_num();
         }
         field_binlog_info.row_count = total_entries;
-        field_binlog_info.child_field_ids.resize(field_ids.size());
-        std::transform(field_ids.begin(),
-                       field_ids.end(),
-                       field_binlog_info.child_field_ids.begin(),
-                       [](FieldId field_id) { return field_id.get(); });
+        if (!has_child_fields) {
+            field_binlog_info.child_field_ids.resize(field_ids.size());
+            std::transform(field_ids.begin(),
+                           field_ids.end(),
+                           field_binlog_info.child_field_ids.begin(),
+                           [](FieldId field_id) { return field_id.get(); });
+        }
 
         auto& mmap_config = storage::MmapManager::GetInstance().GetMmapConfig();
         auto global_use_mmap = is_vector
@@ -10106,6 +10245,16 @@ ChunkedSegmentSealedImpl::LoadBatchFieldData(
         field_data_to_load.emplace_back(group_id, load_field_data_info);
     }
 
+    auto prepare_done = std::chrono::steady_clock::now();
+    LOG_INFO(
+        "[xxx] segment {} prepare field metadata done, fields_to_load={}, "
+        "elapsed={}ms",
+        id_,
+        field_data_to_load.size(),
+        std::chrono::duration_cast<std::chrono::milliseconds>(prepare_done -
+                                                              batch_start)
+            .count());
+
     auto& pool = ThreadPools::GetThreadPool(milvus::ThreadPoolPriority::MIDDLE);
     std::vector<std::future<void>> load_field_futures;
     load_field_futures.reserve(field_data_to_load.size());
@@ -10114,6 +10263,10 @@ ChunkedSegmentSealedImpl::LoadBatchFieldData(
         // Create local copies to capture in lambda (C++17 compatible)
         const auto field_data = load_field_data_info;
         const auto captured_field_id = field_id;
+        LOG_INFO("[xxx] segment {} submit pool size {}, cap {}",
+                 id_,
+                 pool.GetThreadNum(),
+                 pool.GetMaxThreadNum());
         auto future = pool.Submit([this,
                                    field_data,
                                    captured_field_id,
@@ -10137,7 +10290,33 @@ ChunkedSegmentSealedImpl::LoadBatchFieldData(
         load_field_futures.push_back(std::move(future));
     }
 
+    auto submit_done = std::chrono::steady_clock::now();
+    LOG_INFO("[xxx] segment {} submitted {} load tasks, elapsed={}ms",
+             id_,
+             load_field_futures.size(),
+             std::chrono::duration_cast<std::chrono::milliseconds>(submit_done -
+                                                                   prepare_done)
+                 .count());
+
     storage::WaitAllFutures(load_field_futures);
+
+    auto wait_done = std::chrono::steady_clock::now();
+    LOG_INFO(
+        "[xxx] segment {} all field data loaded, "
+        "prepare={}ms, submit={}ms, wait={}ms, total={}ms",
+        id_,
+        std::chrono::duration_cast<std::chrono::milliseconds>(prepare_done -
+                                                              batch_start)
+            .count(),
+        std::chrono::duration_cast<std::chrono::milliseconds>(submit_done -
+                                                              prepare_done)
+            .count(),
+        std::chrono::duration_cast<std::chrono::milliseconds>(wait_done -
+                                                              submit_done)
+            .count(),
+        std::chrono::duration_cast<std::chrono::milliseconds>(wait_done -
+                                                              batch_start)
+            .count());
 }
 
 void
@@ -10149,7 +10328,7 @@ ChunkedSegmentSealedImpl::Load(milvus::tracer::TraceContext& trace_ctx,
 
     auto snapshot = CapturePublishedState();
     auto num_rows = snapshot->load_info->GetNumOfRows();
-    LOG_DEBUG("Loading segment {} with {} rows", id_, num_rows);
+    LOG_INFO("[xxx] Loading segment {} with {} rows", id_, num_rows);
 
     SegmentLoadInfo mutable_copy(snapshot->load_info->GetProto(),
                                  snapshot->fields);
@@ -10165,7 +10344,8 @@ ChunkedSegmentSealedImpl::Load(milvus::tracer::TraceContext& trace_ctx,
 
     ApplyLoadDiff(op_ctx, mutable_copy, diff);
 
-    LOG_DEBUG("Successfully loaded segment {} with {} rows", id_, num_rows);
+    LOG_INFO(
+        "[xxx] Successfully loaded segment {} with {} rows", id_, num_rows);
 }
 
 void

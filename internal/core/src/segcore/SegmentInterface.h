@@ -280,6 +280,9 @@ class SegmentInterface {
     virtual int64_t
     get_segment_id() const = 0;
 
+    virtual int64_t
+    get_partition_id() const = 0;
+
     virtual SegmentType
     type() const = 0;
 
@@ -612,6 +615,11 @@ class SegmentInternalInterface : public SegmentInterface {
 
     // Bring in base class Search overloads to avoid name hiding
     using SegmentInterface::Search;
+
+    int64_t
+    get_partition_id() const override {
+        return load_info_.partitionid();
+    }
 
     std::unique_ptr<SearchResult>
     Search(const query::Plan* Plan,

@@ -134,3 +134,15 @@ func (dc *dataCoordBroker) ImportV2(ctx context.Context, in *internalpb.ImportRe
 
 	return resp, nil
 }
+
+func (dc *dataCoordBroker) AllocSegment(ctx context.Context, req *datapb.AllocSegmentRequest) error {
+	resp, err := dc.client.AllocSegment(ctx, req)
+	if err := merr.CheckRPCCall(resp, err); err != nil {
+		mlog.Warn(ctx, "failed to AllocSegment",
+			mlog.FieldCollectionID(req.GetCollectionId()),
+			mlog.FieldSegmentID(req.GetSegmentId()),
+			mlog.Err(err))
+		return err
+	}
+	return nil
+}

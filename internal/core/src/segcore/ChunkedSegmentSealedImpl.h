@@ -208,6 +208,12 @@ class ChunkedSegmentSealedImpl : public SegmentSealed {
         return id_;
     }
 
+    int64_t
+    get_partition_id() const override {
+        auto load_info = CaptureLoadInfoSnapshot();
+        return load_info == nullptr ? -1 : load_info->GetPartitionID();
+    }
+
     std::shared_ptr<SegmentReadLease>
     AcquireReadLease(const folly::CancellationToken& cancel_token) const {
         return operation_gate_.AcquireRead(cancel_token, id_);

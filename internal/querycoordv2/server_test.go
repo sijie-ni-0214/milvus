@@ -1243,7 +1243,11 @@ func TestGetLeakedResourcesByCollectionPerRG(t *testing.T) {
 		s := newServer()
 		mocker := mockey.Mock((*meta.ReplicaManager).GetByCollection).Return([]*meta.Replica{replica}).Build()
 		defer mocker.UnPatch()
-		// Use the real ResourceManager: embedded QueryNodes never enter its RG map.
+		sqnServeSegments := paramtable.Get().QueryCoordCfg.EnableSQNServeSegments.Key
+		assert.NoError(t, paramtable.Get().Save(sqnServeSegments, "false"))
+		defer paramtable.Get().Reset(sqnServeSegments)
+		// Use the real ResourceManager: without SQN serving, embedded QueryNodes
+		// never enter its RG map.
 		// Role-specific QueryNode labels need not match the StreamingNode's RG.
 		s.nodeMgr.Add(session.NewNodeInfo(session.ImmutableNodeInfo{
 			NodeID: 98,

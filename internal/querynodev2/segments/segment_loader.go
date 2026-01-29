@@ -269,11 +269,15 @@ func (loader *segmentLoader) Load(ctx context.Context,
 	defer loader.unregister(infos...)
 
 	// continue to wait other task done
-	mlog.Info(context.TODO(), "start loading...", mlog.Int("segmentNum", len(segments)), mlog.Int("afterFilter", len(infos)))
+	mlog.Info(context.TODO(), "start loading...",
+		mlog.Int("segmentNum", len(segments)),
+		mlog.Int("afterFilter", len(infos)),
+		mlog.Int64s("segments", lo.Map(segments, func(info *querypb.SegmentLoadInfo, _ int) int64 { return info.GetSegmentID() })))
 
 	var err error
 	var requestResourceResult requestResourceResult
 
+	t1 := time.Now()
 	// Check memory & storage limit
 	// no need to check resource for lazy load here
 	requestResourceResult, err = loader.requestResource(ctx, infos...)
@@ -281,6 +285,7 @@ func (loader *segmentLoader) Load(ctx context.Context,
 		mlog.Warn(context.TODO(), "request resource failed", mlog.Err(err))
 		return nil, err
 	}
+	t2 := time.Now()
 	defer loader.freeRequestResource(requestResourceResult)
 
 	newSegments := typeutil.NewConcurrentMap[int64, Segment]()
@@ -323,6 +328,7 @@ func (loader *segmentLoader) Load(ctx context.Context,
 		newSegments.Insert(loadInfo.GetSegmentID(), segment)
 	}
 
+	t3 := time.Now()
 	loadSegmentFunc := func(idx int) (err error) {
 		loadInfo := infos[idx]
 		partitionID := loadInfo.PartitionID
@@ -343,22 +349,45 @@ func (loader *segmentLoader) Load(ctx context.Context,
 		tr := timerecord.NewTimeRecorder("loadDurationPerSegment")
 		logger.Info(ctx, "load segment...")
 
+		loadSegmentStart := time.Now()
+		var loadSegmentDataDuration time.Duration
+		var loadDeltalogsDuration time.Duration
+		var pkCandidateDuration time.Duration
+		var managerPutDuration time.Duration
+		var localMapDuration time.Duration
+		var notifyDuration time.Duration
+		externalCollection := typeutil.IsExternalCollection(collection.Schema())
+		bloomFilterEnabled := paramtable.Get().CommonCfg.BloomFilterEnabled.GetAsBool()
+		pkCandidateExisted := segment.PkCandidateExist()
+
 		// L0 segment has no index or data to be load.
 		if loadInfo.GetLevel() != datapb.SegmentLevel_L0 {
 			// lazy load segment do not load segment at first time.
+			loadSegmentDataStart := time.Now()
 			if err = loader.LoadSegment(ctx, segment, loadInfo); err != nil {
 				return merr.Wrap(err, "At LoadSegment")
 			}
+			loadSegmentDataDuration = time.Since(loadSegmentDataStart)
+			logger.Info(ctx, "load segment data done",
+				mlog.Duration("loadSegmentDataDuration", loadSegmentDataDuration),
+				mlog.Duration("elapsed", time.Since(loadSegmentStart)))
 		}
+
+		loadDeltalogsStart := time.Now()
 		if err = loader.loadDeltalogs(ctx, segment, loadInfo); err != nil {
 			return merr.Wrap(err, "At LoadDeltaLogs")
 		}
+		loadDeltalogsDuration = time.Since(loadDeltalogsStart)
+		logger.Info(ctx, "load deltalogs done",
+			mlog.Duration("loadDeltalogsDuration", loadDeltalogsDuration),
+			mlog.Duration("elapsed", time.Since(loadSegmentStart)))
 
 		schema := collection.Schema()
 		isExternalCollection := typeutil.IsExternalCollection(schema)
 		isMilvusTableRealPK := typeutil.NewStorageColumnResolver(schema).IsMilvusTable() &&
 			HasExternalPrimaryKey(schema)
-		if !segment.PkCandidateExist() {
+		if !pkCandidateExisted {
+			pkCandidateStart := time.Now()
 			mlog.Debug(context.TODO(), "loading PK candidate for segment", mlog.Int64("segmentID", segment.ID()))
 			if isExternalCollection {
 				var candidate pkoracle.Candidate
@@ -400,24 +429,46 @@ func (loader *segmentLoader) Load(ctx context.Context,
 							mlog.Int64("truncatedID", loadInfo.GetSegmentID()&0xFFFFFFFF))
 					}
 				}
-			} else if paramtable.Get().CommonCfg.BloomFilterEnabled.GetAsBool() {
+			} else if bloomFilterEnabled {
 				bfs, err := loader.loadSingleBloomFilterSet(ctx, loadInfo.GetCollectionID(), loadInfo, segment.Type())
 				if err != nil {
 					return merr.Wrap(err, "At LoadBloomFilter")
 				}
 				segment.SetPKCandidate(bfs)
-				// Charge bloom filter resource
-				bfs.Charge()
 			}
+			pkCandidateDuration = time.Since(pkCandidateStart)
+			logger.Info(ctx, "prepare pk candidate done",
+				mlog.Duration("pkCandidateDuration", pkCandidateDuration),
+				mlog.Bool("externalCollection", externalCollection),
+				mlog.Bool("bloomFilterEnabled", bloomFilterEnabled),
+				mlog.Duration("elapsed", time.Since(loadSegmentStart)))
 		}
 
 		if segment.Level() != datapb.SegmentLevel_L0 {
+			managerPutStart := time.Now()
 			loader.manager.Segment.Put(ctx, segmentType, segment)
+			managerPutDuration = time.Since(managerPutStart)
 		}
+		localMapStart := time.Now()
 		newSegments.GetAndRemove(segmentID)
 		loaded.Insert(segmentID, segment)
+		localMapDuration = time.Since(localMapStart)
+		notifyStart := time.Now()
 		loader.notifyLoadFinish(loadInfo)
+		notifyDuration = time.Since(notifyStart)
 		FinalizeLoad(segment)
+
+		logger.Info(ctx, "loadSegmentFunc breakdown",
+			mlog.Duration("loadSegmentDataDuration", loadSegmentDataDuration),
+			mlog.Duration("loadDeltalogsDuration", loadDeltalogsDuration),
+			mlog.Duration("pkCandidateDuration", pkCandidateDuration),
+			mlog.Duration("managerPutDuration", managerPutDuration),
+			mlog.Duration("localMapDuration", localMapDuration),
+			mlog.Duration("notifyDuration", notifyDuration),
+			mlog.Duration("totalDuration", time.Since(loadSegmentStart)),
+			mlog.Bool("externalCollection", isExternalCollection),
+			mlog.Bool("bloomFilterEnabled", bloomFilterEnabled),
+			mlog.Bool("pkCandidateExisted", pkCandidateExisted))
 
 		metrics.QueryNodeLoadSegmentLatency.WithLabelValues(paramtable.GetStringNodeID()).Observe(float64(tr.ElapseSpan().Milliseconds()))
 		return nil
@@ -427,7 +478,8 @@ func (loader *segmentLoader) Load(ctx context.Context,
 	// Make sure we can always benefit from concurrency, and not spawn too many idle goroutines
 	mlog.Info(context.TODO(), "start to load segments in parallel",
 		mlog.Int("segmentNum", len(infos)),
-		mlog.Int("concurrencyLevel", requestResourceResult.ConcurrencyLevel))
+		mlog.Int("concurrencyLevel", requestResourceResult.ConcurrencyLevel),
+		mlog.Int64s("segments", lo.Map(infos, func(info *querypb.SegmentLoadInfo, _ int) int64 { return info.GetSegmentID() })))
 
 	err = funcutil.ProcessFuncParallel(len(infos),
 		requestResourceResult.ConcurrencyLevel, loadSegmentFunc, "loadSegmentFunc")
@@ -436,14 +488,21 @@ func (loader *segmentLoader) Load(ctx context.Context,
 		return nil, err
 	}
 
+	t4 := time.Now()
 	// Wait for all segments loaded
 	segmentIDs := lo.Map(segments, func(info *querypb.SegmentLoadInfo, _ int) int64 { return info.GetSegmentID() })
 	if err := loader.waitSegmentLoadDone(ctx, segmentType, segmentIDs, version); err != nil {
 		mlog.Warn(context.TODO(), "failed to wait the filtered out segments load done", mlog.Err(err))
 		return nil, err
 	}
+	t5 := time.Now()
 
-	mlog.Info(context.TODO(), "all segment load done")
+	mlog.Info(context.TODO(), "all segment load done",
+		mlog.Duration("requestResourceTime", t2.Sub(t1)),
+		mlog.Duration("loadSegmentTime", t3.Sub(t2)),
+		mlog.Duration("loadSegmentFuncTime", t4.Sub(t3)),
+		mlog.Duration("waitSegmentLoadDoneTime", t5.Sub(t4)),
+		mlog.Int64s("segments", lo.Map(segments, func(info *querypb.SegmentLoadInfo, _ int) int64 { return info.GetSegmentID() })))
 	var result []Segment
 	loaded.Range(func(_ int64, s Segment) bool {
 		result = append(result, s)
@@ -664,6 +723,7 @@ func (loader *segmentLoader) GetChunkManager() storage.ChunkManager {
 
 // load single bloom filter
 func (loader *segmentLoader) loadSingleBloomFilterSet(ctx context.Context, collectionID int64, loadInfo *querypb.SegmentLoadInfo, segtype SegmentType) (*pkoracle.BloomFilterSet, error) {
+	startTs := time.Now()
 	partitionID := loadInfo.PartitionID
 	segmentID := loadInfo.SegmentID
 	bfs := pkoracle.NewBloomFilterSet(segmentID, partitionID, segtype)
@@ -691,25 +751,57 @@ func (loader *segmentLoader) loadSingleBloomFilterSet(ctx context.Context, colle
 	}
 
 	pkField := GetPkField(schema)
-	mlog.Debug(ctx, "loading bloom filter for remote...")
-	pkStatsBinlogs, err := packed.NewStatsResolverFromLoadInfo(loadInfo).BloomFilterPaths(pkField.GetFieldID())
-	if err != nil {
-		return nil, err
+	pkFieldID := pkField.GetFieldID()
+	downloader := loader.bloomFilterDownloaderWithSchema(loadInfo.GetCollectionID(), schema, isMilvusTableRealPK)
+	loadBloomFilter := func(ctx context.Context, bfs *pkoracle.BloomFilterSet) error {
+		mlog.Info(ctx, "loading bloom filter for remote...",
+			mlog.FieldCollectionID(collectionID),
+			mlog.FieldSegmentID(segmentID))
+		resolveStart := time.Now()
+		pkStatsBinlogs, err := packed.NewStatsResolverFromLoadInfo(loadInfo).BloomFilterPaths(pkFieldID)
+		if err != nil {
+			return err
+		}
+		resolveDuration := time.Since(resolveStart)
+
+		loadStart := time.Now()
+		err = loader.loadBloomFilter(ctx, segmentID, bfs, pkStatsBinlogs, downloader)
+		loadDuration := time.Since(loadStart)
+		if err != nil {
+			mlog.Warn(ctx, "load remote segment bloom filter failed",
+				mlog.Int64("partitionID", partitionID),
+				mlog.Int64("segmentID", segmentID),
+				mlog.Err(err),
+			)
+			return err
+		}
+		// Lazily loaded filters are charged once they are materialized.
+		bfs.Charge()
+		mlog.Info(ctx, "lazy load single bloom filter set done",
+			mlog.FieldCollectionID(collectionID),
+			mlog.FieldSegmentID(segmentID),
+			mlog.Int("pathNum", len(pkStatsBinlogs)),
+			mlog.Duration("resolvePathsDuration", resolveDuration),
+			mlog.Duration("loadBloomFilterDuration", loadDuration),
+			mlog.Duration("totalDuration", time.Since(startTs)))
+		return nil
 	}
-	err = loader.loadBloomFilter(ctx, segmentID, bfs, pkStatsBinlogs, loader.bloomFilterDownloaderWithSchema(loadInfo.GetCollectionID(), schema, isMilvusTableRealPK))
-	if err != nil {
-		mlog.Warn(context.TODO(), "load remote segment bloom filter failed",
-			mlog.Int64("partitionID", partitionID),
-			mlog.Int64("segmentID", segmentID),
-			mlog.Err(err),
-		)
-		return nil, err
-	}
-	if isMilvusTableRealPK && !bfs.PkCandidateExist() {
-		return nil, merr.WrapErrServiceInternalMsg("milvus-table real-PK segment missing bloom filter stats")
+	if isMilvusTableRealPK {
+		// A real-PK milvus table must fail the load when its bloom filter stats
+		// are missing, so it cannot defer loading to the first PK lookup.
+		if err := loadBloomFilter(ctx, bfs); err != nil {
+			return nil, err
+		}
+		if !bfs.PkCandidateExist() {
+			return nil, merr.WrapErrServiceInternalMsg("milvus-table real-PK segment missing bloom filter stats")
+		}
+		return bfs, nil
 	}
 
-	return bfs, nil
+	lazyCtx := context.WithoutCancel(ctx)
+	return pkoracle.NewLazyBloomFilterSet(segmentID, partitionID, segtype, func(bfs *pkoracle.BloomFilterSet) error {
+		return loadBloomFilter(lazyCtx, bfs)
+	}), nil
 }
 
 func (loader *segmentLoader) LoadBloomFilterSet(ctx context.Context, collectionID int64, infos ...*querypb.SegmentLoadInfo) ([]*pkoracle.BloomFilterSet, error) {
@@ -724,6 +816,7 @@ func (loader *segmentLoader) LoadBloomFilterSet(ctx context.Context, collectionI
 }
 
 func (loader *segmentLoader) LoadBloomFilterSetWithSchema(ctx context.Context, schema *schemapb.CollectionSchema, infos ...*querypb.SegmentLoadInfo) ([]*pkoracle.BloomFilterSet, error) {
+	startTs := time.Now()
 	segmentNum := len(infos)
 	if segmentNum == 0 {
 		mlog.Info(context.TODO(), "no segment to load")
@@ -759,6 +852,52 @@ func (loader *segmentLoader) LoadBloomFilterSetWithSchema(ctx context.Context, s
 
 	pkField := GetPkField(schema)
 	pkFieldID := pkField.GetFieldID()
+
+	if !isMilvusTableRealPK {
+		lazyCtx := context.WithoutCancel(ctx)
+		for i, info := range infos {
+			info := info
+			segmentID := info.GetSegmentID()
+			partitionID := info.GetPartitionID()
+			bfSets[i] = pkoracle.NewLazyBloomFilterSet(segmentID, partitionID, commonpb.SegmentState_Sealed, func(bfs *pkoracle.BloomFilterSet) error {
+				loadStart := time.Now()
+				resolveStart := time.Now()
+				pkStatsBinlogs, err := packed.NewStatsResolverFromLoadInfo(info).BloomFilterPaths(pkFieldID)
+				if err != nil {
+					return err
+				}
+				resolveDuration := time.Since(resolveStart)
+
+				readStart := time.Now()
+				err = loader.loadBloomFilter(lazyCtx, bfs.ID(), bfs, pkStatsBinlogs, loader.bloomFilterDownloaderWithSchema(info.GetCollectionID(), schema, false))
+				readDuration := time.Since(readStart)
+				if err != nil {
+					mlog.Warn(context.TODO(), "load remote segment bloom filter failed",
+						mlog.Int64("partitionID", bfs.Partition()),
+						mlog.Int64("segmentID", bfs.ID()),
+						mlog.Err(err),
+					)
+					return err
+				}
+				// Lazily loaded filters are charged once they are materialized.
+				bfs.Charge()
+				mlog.Info(context.TODO(), "lazy load bloom filter set segment done",
+					mlog.FieldCollectionID(info.GetCollectionID()),
+					mlog.FieldSegmentID(bfs.ID()),
+					mlog.Int("pathNum", len(pkStatsBinlogs)),
+					mlog.Duration("resolvePathsDuration", resolveDuration),
+					mlog.Duration("loadBloomFilterDuration", readDuration),
+					mlog.Duration("totalDuration", time.Since(loadStart)))
+				return nil
+			})
+		}
+
+		mlog.Info(context.TODO(), "create lazy bloom filter set done",
+			mlog.FieldCollectionID(infos[0].GetCollectionID()),
+			mlog.Int("segmentNum", segmentNum),
+			mlog.Duration("totalDuration", time.Since(startTs)))
+		return bfSets, nil
+	}
 
 	// Calculate total memory size needed for bloom filters (PK stats)
 	var totalMemorySize int64
@@ -1080,17 +1219,16 @@ func (loader *segmentLoader) loadSealedSegment(ctx context.Context, loadInfo *qu
 	}()
 
 	tr := timerecord.NewTimeRecorder("segmentLoader.loadSealedSegment")
-	if mlog.LevelEnabled(mlog.DebugLevel) {
-		collection := segment.GetCollection()
-		indexedFieldInfos, _, textIndexes, unindexedTextFields, jsonKeyStats, _, _ := separateLoadInfoV2(loadInfo, collection.Schema())
-
-		mlog.Debug(ctx, "Start loading fields...",
-			mlog.Int("indexedFields count", len(indexedFieldInfos)),
-			mlog.Int64s("indexed text fields", lo.Keys(textIndexes)),
-			mlog.Int64s("unindexed text fields", lo.Keys(unindexedTextFields)),
-			mlog.Int64s("indexed json key fields", lo.Keys(jsonKeyStats)),
-		)
-	}
+	collection := segment.GetCollection()
+	indexedFieldInfos, _, textIndexes, unindexedTextFields, jsonKeyStats, _, _ := separateLoadInfoV2(loadInfo, collection.Schema())
+	mlog.Info(ctx, "Start loading fields...",
+		mlog.Int("indexedFields count", len(indexedFieldInfos)),
+		mlog.Int64s("indexed text fields", lo.Keys(textIndexes)),
+		mlog.Int64s("unindexed text fields", lo.Keys(unindexedTextFields)),
+		mlog.Int64s("indexed json key fields", lo.Keys(jsonKeyStats)),
+		mlog.Int("running pool size", GetLoadPool().Running()),
+		mlog.Int("pool size", GetLoadPool().Cap()),
+	)
 	physicalLoadTiming := PhysicalLoadTimingFromContext(ctx)
 	loadSubmittedAt := time.Now()
 	_, err = GetLoadPool().Submit(func() (any, error) {
@@ -1146,7 +1284,11 @@ func (loader *segmentLoader) LoadSegment(ctx context.Context,
 	if !ok {
 		return merr.WrapErrParameterInvalid("LocalSegment", fmt.Sprintf("%T", seg))
 	}
-	mlog.Debug(ctx, "start loading segment files",
+	mlog.Info(ctx, "start loading segment files",
+		mlog.FieldCollectionID(segment.Collection()),
+		mlog.Int64("partitionID", segment.Partition()),
+		mlog.String("shard", segment.Shard().VirtualName()),
+		mlog.FieldSegmentID(segment.ID()),
 		mlog.Int64("rowNum", loadInfo.GetNumOfRows()),
 		mlog.String("segmentType", segment.Type().String()),
 		mlog.Int32("priority", int32(loadInfo.GetPriority())))
@@ -1159,6 +1301,7 @@ func (loader *segmentLoader) LoadSegment(ctx context.Context,
 	}
 	pkField := GetPkField(collection.Schema())
 
+	mlog.Info(context.TODO(), "start loading sealed segment", mlog.FieldSegmentID(segment.ID()))
 	if segment.Type() == SegmentTypeSealed {
 		if err := loader.loadSealedSegment(ctx, loadInfo, segment); err != nil {
 			return err
@@ -1348,11 +1491,13 @@ func (loader *segmentLoader) loadBloomFilterWithDownloader(
 // loadDeltalogs performs the internal actions of `LoadDeltaLogs`
 // this function does not perform resource check and is meant be used among other load APIs.
 func (loader *segmentLoader) loadDeltalogs(ctx context.Context, segment Segment, loadInfo *querypb.SegmentLoadInfo) error {
+	startTs := time.Now()
 	deltaLogs := loadInfo.GetDeltalogs()
 	ctx, sp := otel.Tracer(typeutil.QueryNodeRole).Start(ctx, fmt.Sprintf("LoadDeltalogs-%d", segment.ID()))
 	defer sp.End()
 	mlog.Debug(ctx, "loading delta...")
 
+	rowNumsStart := time.Now()
 	var rowNums int64
 	valid := func(binlog *datapb.Binlog, _ int) bool {
 		// the segment has applied the delta logs, skip it
@@ -1367,7 +1512,9 @@ func (loader *segmentLoader) loadDeltalogs(ctx context.Context, segment Segment,
 			return binlog.GetEntriesNum()
 		})
 	}
+	rowNumsDuration := time.Since(rowNumsStart)
 
+	setupStart := time.Now()
 	var metadata deltaStorageMetadata
 	if local, ok := segment.(*LocalSegment); ok && local.sealedMetadata != nil {
 		metadata = local.sealedMetadata.delta
@@ -1382,6 +1529,7 @@ func (loader *segmentLoader) loadDeltalogs(ctx context.Context, segment Segment,
 	if err != nil {
 		return err
 	}
+	setupDuration := time.Since(setupStart)
 
 	readDeltaRecords := func(reader storage.RecordReader) error {
 		defer reader.Close()
@@ -1418,15 +1566,24 @@ func (loader *segmentLoader) loadDeltalogs(ctx context.Context, segment Segment,
 	}
 	isMilvusTableRealPK := metadata.milvusTableRealPK
 	useExplicitDeltalogs := isMilvusTableRealPK && len(deltaLogs) > 0
+	collectPathsStart := time.Now()
+	pathNum := 0
+	var readDuration time.Duration
 	readPaths := func(paths []string, opts ...storage.RwOption) error {
 		if len(paths) == 0 {
 			return nil
 		}
+		pathNum += len(paths)
+		readStart := time.Now()
 		reader, err := storage.NewDeltalogReader(ctx, metadata.primaryKeyType, paths, opts...)
 		if err != nil {
 			return err
 		}
-		return readDeltaRecords(reader)
+		if err := readDeltaRecords(reader); err != nil {
+			return err
+		}
+		readDuration += time.Since(readStart)
+		return nil
 	}
 
 	// Manifest-backed delta loading is shared by the parent segment and by
@@ -1464,35 +1621,23 @@ func (loader *segmentLoader) loadDeltalogs(ctx context.Context, segment Segment,
 					}
 				}
 				if len(storageV3Paths) > 0 {
-					reader, err := storage.NewDeltalogReader(
-						ctx,
-						metadata.primaryKeyType,
+					if err := readPaths(
 						storageV3Paths,
 						storage.WithVersion(storage.StorageV3),
 						storage.WithStorageConfig(createStorageConfig()),
 						storage.WithExternalReaderContext(extfs),
-					)
-					if err != nil {
-						return err
-					}
-					if err := readDeltaRecords(reader); err != nil {
+					); err != nil {
 						return err
 					}
 				}
 				if len(legacyPaths) > 0 {
-					reader, err := storage.NewDeltalogReader(
-						ctx,
-						metadata.primaryKeyType,
+					if err := readPaths(
 						legacyPaths,
 						storage.WithVersion(storage.StorageV1),
 						storage.WithDownloader(func(ctx context.Context, paths []string) ([][]byte, error) {
 							return readExternalFiles(ctx, createStorageConfig(), extfs, paths)
 						}),
-					)
-					if err != nil {
-						return err
-					}
-					if err := readDeltaRecords(reader); err != nil {
+					); err != nil {
 						return err
 					}
 				}
@@ -1535,6 +1680,7 @@ func (loader *segmentLoader) loadDeltalogs(ctx context.Context, segment Segment,
 			return err
 		}
 	}
+	collectPathsDuration := time.Since(collectPathsStart)
 
 	// Child manifests are loaded after the parent delete source so all delete
 	// records are folded into the same DeltaData before segcore sees the segment.
@@ -1544,12 +1690,23 @@ func (loader *segmentLoader) loadDeltalogs(ctx context.Context, segment Segment,
 		}
 	}
 
+	loadDeltaDataStart := time.Now()
 	err = segment.LoadDeltaData(ctx, deltaData)
 	if err != nil {
 		return err
 	}
+	loadDeltaDataDuration := time.Since(loadDeltaDataStart)
 
-	mlog.Debug(ctx, "load delta logs done", mlog.Int64("deleteCount", deltaData.DeleteRowCount()))
+	mlog.Info(ctx, "load delta logs done",
+		mlog.Int64("deleteCount", deltaData.DeleteRowCount()),
+		mlog.Int64("rowNums", rowNums),
+		mlog.Int("pathNum", pathNum),
+		mlog.Duration("rowNumsDuration", rowNumsDuration),
+		mlog.Duration("setupDuration", setupDuration),
+		mlog.Duration("collectPathsDuration", collectPathsDuration),
+		mlog.Duration("readDuration", readDuration),
+		mlog.Duration("loadDeltaDataDuration", loadDeltaDataDuration),
+		mlog.Duration("totalDuration", time.Since(startTs)))
 	return nil
 }
 

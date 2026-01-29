@@ -651,7 +651,17 @@ func (s *Server) SaveBinlogPaths(ctx context.Context, req *datapb.SaveBinlogPath
 		channelName = req.GetChannel()
 	)
 
-	mlog.Info(context.TODO(), "receive SaveBinlogPaths request",
+	logger := mlog.With(
+		mlog.Int64("nodeID", nodeID),
+		mlog.String("channel", channelName),
+		mlog.FieldCollectionID(req.GetCollectionID()),
+		mlog.FieldSegmentID(req.GetSegmentID()),
+		mlog.String("level", req.GetSegLevel().String()),
+		mlog.Bool("withFullBinlogs", req.GetWithFullBinlogs()),
+	)
+
+	start := time.Now()
+	logger.Info(ctx, "receive SaveBinlogPaths request",
 		mlog.Bool("isFlush", req.GetFlushed()),
 		mlog.Bool("isDropped", req.GetDropped()),
 		mlog.Any("checkpoints", req.GetCheckPoints()))
@@ -676,7 +686,7 @@ func (s *Server) SaveBinlogPaths(ctx context.Context, req *datapb.SaveBinlogPath
 		}
 		if targetID != nodeID {
 			err := merr.WrapErrChannelMisrouted(channelName, fmt.Sprintf("WAL owner is node %d, publisher is node %d", targetID, nodeID))
-			mlog.Warn(ctx, "reject WAL publication from previous owner", mlog.Int64("nodeID", nodeID), mlog.Int64("channel nodeID", targetID), mlog.Err(err))
+			logger.Warn(ctx, "reject WAL publication from previous owner", mlog.Int64("channel nodeID", targetID), mlog.Err(err))
 			return merr.Status(err), nil
 		}
 	}
@@ -684,9 +694,10 @@ func (s *Server) SaveBinlogPaths(ctx context.Context, req *datapb.SaveBinlogPath
 	// try to parse path and fill logid
 	err := binlog.CompressSaveBinlogPaths(req)
 	if err != nil {
-		mlog.Warn(context.TODO(), "fail to CompressSaveBinlogPaths", mlog.String("channel", channelName), mlog.Err(err))
+		logger.Warn(ctx, "fail to CompressSaveBinlogPaths", mlog.Err(err))
 		return merr.Status(err), nil
 	}
+	validateDur := time.Since(start)
 
 	operators := []meta.UpdateOperator{}
 	var flushedVersion *viewpb.DataVersion
@@ -698,7 +709,7 @@ func (s *Server) SaveBinlogPaths(ctx context.Context, req *datapb.SaveBinlogPath
 		// validate level one segment
 		if seg == nil {
 			err := merr.WrapErrSegmentNotFound(req.GetSegmentID())
-			mlog.Warn(context.TODO(), "failed to get segment", mlog.Err(err))
+			logger.Warn(ctx, "failed to get segment", mlog.Err(err))
 			return merr.Status(err), nil
 		}
 
@@ -706,7 +717,7 @@ func (s *Server) SaveBinlogPaths(ctx context.Context, req *datapb.SaveBinlogPath
 			return dataview.FlushResultStatus(seg.GetSealedAtDataVersion()), nil
 		}
 		if seg.State == commonpb.SegmentState_Dropped {
-			mlog.Info(ctx, "save to dropped segment, ignore this request")
+			logger.Info(ctx, "save to dropped segment, ignore this request")
 			if req.GetFlushed() {
 				return dataview.FlushResultStatus(nil), nil
 			}
@@ -715,12 +726,12 @@ func (s *Server) SaveBinlogPaths(ctx context.Context, req *datapb.SaveBinlogPath
 
 		if !meta.IsSegmentHealthy(seg) {
 			err := merr.WrapErrSegmentNotFound(req.GetSegmentID())
-			mlog.Warn(context.TODO(), "failed to get segment, the segment not healthy", mlog.Err(err))
+			logger.Warn(ctx, "failed to get segment, the segment not healthy", mlog.Err(err))
 			return merr.Status(err), nil
 		}
 		incomingStorageVersion := req.GetStorageVersion()
 		if err := s.validateTextSegmentStorage(req, incomingStorageVersion); err != nil {
-			mlog.Warn(context.TODO(), "invalid TEXT segment storage format", mlog.Err(err))
+			logger.Warn(ctx, "invalid TEXT segment storage format", mlog.Err(err))
 			return merr.Status(err), nil
 		}
 
@@ -770,6 +781,8 @@ func (s *Server) SaveBinlogPaths(ctx context.Context, req *datapb.SaveBinlogPath
 		// the binlog arrays. See UpdateSegmentStats for the full contract.
 		meta.UpdateSegmentStats(req.GetSegmentID(), req.GetStats()),
 	)
+	buildOperatorsDur := time.Since(start) - validateDur
+	updateStart := time.Now()
 
 	// Update segment info in memory and meta. Stale updates (segment already
 	// flushed / outdated time tick) are swallowed inside UpdateSegmentsInfo as
@@ -913,8 +926,14 @@ func (s *Server) SaveBinlogPaths(ctx context.Context, req *datapb.SaveBinlogPath
 		}
 	}
 
+	updateSegmentsInfoDur := time.Since(updateStart)
+
 	s.meta.SetLastWrittenTime(req.GetSegmentID())
-	mlog.Info(context.TODO(), "SaveBinlogPaths sync segment with meta",
+	logger.Info(ctx, "SaveBinlogPaths done",
+		mlog.Duration("total", time.Since(start)),
+		mlog.Duration("validate", validateDur),
+		mlog.Duration("buildOperators", buildOperatorsDur),
+		mlog.Duration("updateSegmentsInfo", updateSegmentsInfoDur),
 		mlog.Any("checkpoints", req.GetCheckPoints()),
 		mlog.Strings("binlogs", meta.StringifyBinlogs(req.GetField2BinlogPaths())),
 		mlog.Strings("deltalogs", meta.StringifyBinlogs(req.GetDeltalogs())),
@@ -925,7 +944,7 @@ func (s *Server) SaveBinlogPaths(ctx context.Context, req *datapb.SaveBinlogPath
 	// Validate manifest segment after update
 	if seg := s.meta.GetSegment(ctx, req.GetSegmentID()); seg != nil {
 		if msg := meta.ValidateManifestSegment(seg); msg != "" {
-			mlog.Warn(context.TODO(), "manifest segment validation warning", mlog.String("detail", msg))
+			logger.Warn(ctx, "manifest segment validation warning", mlog.String("detail", msg))
 		}
 	}
 

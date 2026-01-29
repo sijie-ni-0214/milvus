@@ -7,6 +7,7 @@
 
 #include "common/Consts.h"
 #include "common/EasyAssert.h"
+#include "common/RequestTrace.h"
 #include "common/Utils.h"
 #include "common/common_type_c.h"
 #include "common/resource_c.h"
@@ -344,6 +345,7 @@ SealedIndexLoader::EstimatedResources() const {
 
 index::IndexPtr
 SealedIndexLoader::CreateIndex(milvus::OpContext* ctx) {
+    const auto t1 = std::chrono::high_resolution_clock::now();
     // Release preparation metadata after this attempt, including early failure.
     auto prepared_source = std::move(prepared_legacy_source_);
     int64_t segment_id = std::stoll(index_load_info_.segment_id);
@@ -434,6 +436,18 @@ SealedIndexLoader::CreateIndex(milvus::OpContext* ctx) {
     }
     AssertInfo(
         index != nullptr, "index loader for family {} returned null", Family());
+    const auto t2 = std::chrono::high_resolution_clock::now();
+    double cost =
+        std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1).count();
+    auto trace_id = milvus::tracer::GetRequestTraceID(ctx);
+    if (trace_id.empty()) {
+        trace_id = milvus::tracer::GetTraceIDAsHexStr(&ctx_);
+    }
+    LOG_INFO("[sss] load index. traceID: {}, segment: {}, key: {}, cost: {}",
+             trace_id,
+             index_load_info_.segment_id,
+             index_key_,
+             cost);
     return index;
 }
 
