@@ -124,6 +124,19 @@ ConfigureTieredStorage(
     const char* disk_path,
     const int64_t loading_timeout_ms);
 
+// Thread pool statistics structure
+typedef struct CThreadPoolStats {
+    size_t current;
+    size_t max;
+    size_t running;
+    size_t idle;
+    size_t queue_size;
+} CThreadPoolStats;
+
+// Get thread pool stats by priority (0=HIGH, 1=MIDDLE, 2=LOW)
+CThreadPoolStats
+GetSegcoreThreadPoolStats(int priority);
+
 #ifdef __cplusplus
 }
 #endif

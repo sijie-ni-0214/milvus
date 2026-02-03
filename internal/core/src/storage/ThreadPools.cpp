@@ -75,4 +75,19 @@ ThreadPools::ResizeThreadPool(milvus::ThreadPoolPriority priority,
     LOG_INFO("Resized threadPool priority:{}, size:{}", priority, size);
 }
 
+std::tuple<size_t, size_t, size_t, size_t, size_t>
+ThreadPools::GetThreadPoolStats(ThreadPoolPriority priority) {
+    std::shared_lock<std::shared_mutex> lock(mutex_);
+    auto iter = thread_pool_map.find(priority);
+    if (iter == thread_pool_map.end()) {
+        return {0, 0, 0, 0, 0};
+    }
+    auto& pool = iter->second;
+    return {pool->GetThreadNum(),
+            pool->GetMaxThreadNum(),
+            pool->GetRunningNum(),
+            pool->GetIdleNum(),
+            pool->GetQueueSize()};
+}
+
 }  // namespace milvus

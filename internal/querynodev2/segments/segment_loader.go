@@ -20,6 +20,7 @@ package segments
 #cgo pkg-config: milvus_core
 
 #include "segcore/load_index_c.h"
+#include "segcore/segcore_init_c.h"
 */
 import "C"
 
@@ -71,6 +72,48 @@ const (
 )
 
 var errRetryTimerNotified = errors.New("retry timer notified")
+
+// getSegcoreThreadPoolStats returns C++ segcore thread pool statistics
+// priority: 0=HIGH, 1=MIDDLE, 2=LOW
+func getSegcoreThreadPoolStats(priority int) (current, max, running, idle, queueSize int) {
+	stats := C.GetSegcoreThreadPoolStats(C.int(priority))
+	return int(stats.current), int(stats.max), int(stats.running), int(stats.idle), int(stats.queue_size)
+}
+
+// logThreadPoolStats logs both Go LoadPool and C++ segcore thread pool statistics
+func logThreadPoolStats(logger *log.MLogger) {
+	// Go LoadPool stats
+	loadPool := GetLoadPool()
+	logger.Info("LoadPool stats (Go)",
+		zap.Int("running", loadPool.Running()),
+		zap.Int("cap", loadPool.Cap()),
+		zap.Int("free", loadPool.Free()))
+
+	// C++ segcore thread pool stats for all priorities
+	// HIGH(0): DiskANN index, high priority load
+	// MIDDLE(1): some field loading
+	// LOW(2): most segment data loading (default priority)
+	priorities := []struct {
+		id   int
+		name string
+	}{
+		{0, "HIGH"},
+		{1, "MIDDLE"},
+		{2, "LOW"},
+	}
+	for _, p := range priorities {
+		current, max, running, idle, queueSize := getSegcoreThreadPoolStats(p.id)
+		if max > 0 { // pool exists
+			logger.Info("SegcoreThreadPool stats (C++)",
+				zap.String("priority", p.name),
+				zap.Int("current", current),
+				zap.Int("max", max),
+				zap.Int("running", running),
+				zap.Int("idle", idle),
+				zap.Int("queueSize", queueSize))
+		}
+	}
+}
 
 type Loader interface {
 	// Load loads binlogs, and spawn segments,
@@ -232,6 +275,9 @@ type segmentLoader struct {
 	// The channel will be closed as the segment loaded
 	loadingSegments *typeutil.ConcurrentMap[int64, *loadResult]
 
+	// loadingSegmentCount is the number of segment load operations currently in progress (for logging).
+	loadingSegmentCount atomic.Int64
+
 	mut                       sync.Mutex // guards committedResource
 	committedResource         LoadResource
 	committedLogicalResource  LoadResource
@@ -284,6 +330,9 @@ func (loader *segmentLoader) Load(ctx context.Context,
 
 	// continue to wait other task done
 	log.Info("start loading...", zap.Int("segmentNum", len(segments)), zap.Int("afterFilter", len(infos)))
+
+	// Log thread pool stats for debugging
+	logThreadPoolStats(log)
 
 	var err error
 	var requestResourceResult requestResourceResult
@@ -366,12 +415,15 @@ func (loader *segmentLoader) Load(ctx context.Context,
 			zap.Int64("segmentID", segmentID),
 			zap.String("segmentType", loadInfo.GetLevel().String()))
 		metrics.QueryNodeLoadSegmentConcurrency.WithLabelValues(fmt.Sprint(paramtable.GetNodeID()), "LoadSegment").Inc()
+		concurrentCount := loader.loadingSegmentCount.Inc()
+		logger.Info("load segment start, concurrent load segment count", zap.Int64("concurrentLoadSegmentCount", concurrentCount))
 		defer func() {
 			metrics.QueryNodeLoadSegmentConcurrency.WithLabelValues(fmt.Sprint(paramtable.GetNodeID()), "LoadSegment").Dec()
+			concurrentCountAfter := loader.loadingSegmentCount.Dec()
+			logger.Info("load segment done, concurrent load segment count", zap.Int64("concurrentLoadSegmentCount", concurrentCountAfter))
 			if err != nil {
 				logger.Warn("load segment failed when load data into memory", zap.Error(err))
 			}
-			logger.Info("load segment done")
 		}()
 		tr := timerecord.NewTimeRecorder("loadDurationPerSegment")
 		logger.Info("load segment...")

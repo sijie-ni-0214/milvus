@@ -18,6 +18,7 @@
 #include "segcore/segcore_init_c.h"
 #include "cachinglayer/Manager.h"
 #include "cachinglayer/Utils.h"
+#include "storage/ThreadPools.h"
 namespace milvus::segcore {
 
 std::once_flag close_glog_once;
@@ -237,6 +238,23 @@ ConfigureTieredStorage(const CacheWarmupPolicy scalarFieldCacheWarmupPolicy,
          disk_path_str,
          loading_resource_factor},
         std::chrono::milliseconds(loading_timeout_ms));
+}
+
+extern "C" CThreadPoolStats
+GetSegcoreThreadPoolStats(int priority) {
+    CThreadPoolStats stats = {0, 0, 0, 0, 0};
+    if (priority < 0 || priority > 2) {
+        return stats;
+    }
+    auto [current, max, running, idle, queue_size] =
+        milvus::ThreadPools::GetThreadPoolStats(
+            static_cast<milvus::ThreadPoolPriority>(priority));
+    stats.current = current;
+    stats.max = max;
+    stats.running = running;
+    stats.idle = idle;
+    stats.queue_size = queue_size;
+    return stats;
 }
 
 }  // namespace milvus::segcore
