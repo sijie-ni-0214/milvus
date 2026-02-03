@@ -113,6 +113,23 @@ class ThreadPool {
         return max_threads_size_.load();
     }
 
+    size_t
+    GetRunningNum() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return current_threads_size_ - idle_threads_size_;
+    }
+
+    size_t
+    GetIdleNum() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return idle_threads_size_;
+    }
+
+    size_t
+    GetQueueSize() {
+        return work_queue_.size();
+    }
+
     template <typename F, typename... Args>
     auto
     Submit(F&& f, Args&&... args) -> std::future<decltype(f(args...))> {

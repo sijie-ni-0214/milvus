@@ -115,7 +115,11 @@ func initDynamicPool() {
 func initLoadPool() {
 	loadOnce.Do(func() {
 		pt := paramtable.Get()
-		poolSize := hardware.GetCPUNum() * pt.CommonCfg.MiddlePriorityThreadCoreCoefficient.GetAsInt()
+		cpuNum := hardware.GetCPUNum()
+		coefficient := pt.CommonCfg.MiddlePriorityThreadCoreCoefficient.GetAsInt()
+		configKey := pt.CommonCfg.MiddlePriorityThreadCoreCoefficient.Key
+		configValue := pt.CommonCfg.MiddlePriorityThreadCoreCoefficient.GetValue()
+		poolSize := cpuNum * coefficient
 		pool := conc.NewPool[any](
 			poolSize,
 			conc.WithPreAlloc(false),
@@ -129,7 +133,12 @@ func initLoadPool() {
 		loadPool.Store(pool)
 
 		pt.Watch(pt.CommonCfg.MiddlePriorityThreadCoreCoefficient.Key, config.NewHandler("qn.loadpool.middlepriority", ResizeLoadPool))
-		log.Info("init loadPool done", zap.Int("size", poolSize))
+		log.Info("init loadPool done",
+			zap.Int("cpuNum", cpuNum),
+			zap.String("configKey", configKey),
+			zap.String("configValue", configValue),
+			zap.Int("middlePriorityThreadCoreCoefficient", coefficient),
+			zap.Int("size", poolSize))
 	})
 }
 
@@ -235,7 +244,13 @@ func ResizeSQPool(evt *config.Event) {
 func ResizeLoadPool(evt *config.Event) {
 	if evt.HasUpdated {
 		pt := paramtable.Get()
-		newSize := hardware.GetCPUNum() * pt.CommonCfg.MiddlePriorityThreadCoreCoefficient.GetAsInt()
+		cpuNum := hardware.GetCPUNum()
+		coefficient := pt.CommonCfg.MiddlePriorityThreadCoreCoefficient.GetAsInt()
+		newSize := cpuNum * coefficient
+		log.Info("ResizeLoadPool triggered",
+			zap.Int("cpuNum", cpuNum),
+			zap.Int("middlePriorityThreadCoreCoefficient", coefficient),
+			zap.Int("newSize", newSize))
 		resizePool(GetLoadPool(), newSize, "LoadPool")
 	}
 }

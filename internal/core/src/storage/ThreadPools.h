@@ -52,6 +52,11 @@ class ThreadPools {
     static void
     ResizeThreadPool(ThreadPoolPriority priority, float ratio);
 
+    // Get thread pool statistics for monitoring
+    // Returns: {current, max, running, idle, queue_size}
+    static std::tuple<size_t, size_t, size_t, size_t, size_t>
+    GetThreadPoolStats(ThreadPoolPriority priority);
+
     ~ThreadPools() {
         ShutDown();
     }
