@@ -116,9 +116,9 @@ func initLoadPool() {
 	loadOnce.Do(func() {
 		pt := paramtable.Get()
 		cpuNum := hardware.GetCPUNum()
-		coefficient := pt.CommonCfg.MiddlePriorityThreadCoreCoefficient.GetAsInt()
-		configKey := pt.CommonCfg.MiddlePriorityThreadCoreCoefficient.Key
-		configValue := pt.CommonCfg.MiddlePriorityThreadCoreCoefficient.GetValue()
+		coefficient := pt.CommonCfg.GoLoadPoolCoreCoefficient.GetAsInt()
+		configKey := pt.CommonCfg.GoLoadPoolCoreCoefficient.Key
+		configValue := pt.CommonCfg.GoLoadPoolCoreCoefficient.GetValue()
 		poolSize := cpuNum * coefficient
 		pool := conc.NewPool[any](
 			poolSize,
@@ -132,12 +132,12 @@ func initLoadPool() {
 
 		loadPool.Store(pool)
 
-		pt.Watch(pt.CommonCfg.MiddlePriorityThreadCoreCoefficient.Key, config.NewHandler("qn.loadpool.middlepriority", ResizeLoadPool))
+		pt.Watch(pt.CommonCfg.GoLoadPoolCoreCoefficient.Key, config.NewHandler("qn.loadpool.goloadpool", ResizeLoadPool))
 		log.Info("init loadPool done",
 			zap.Int("cpuNum", cpuNum),
 			zap.String("configKey", configKey),
 			zap.String("configValue", configValue),
-			zap.Int("middlePriorityThreadCoreCoefficient", coefficient),
+			zap.Int("goLoadPoolCoreCoefficient", coefficient),
 			zap.Int("size", poolSize))
 	})
 }
@@ -245,11 +245,11 @@ func ResizeLoadPool(evt *config.Event) {
 	if evt.HasUpdated {
 		pt := paramtable.Get()
 		cpuNum := hardware.GetCPUNum()
-		coefficient := pt.CommonCfg.MiddlePriorityThreadCoreCoefficient.GetAsInt()
+		coefficient := pt.CommonCfg.GoLoadPoolCoreCoefficient.GetAsInt()
 		newSize := cpuNum * coefficient
 		log.Info("ResizeLoadPool triggered",
 			zap.Int("cpuNum", cpuNum),
-			zap.Int("middlePriorityThreadCoreCoefficient", coefficient),
+			zap.Int("goLoadPoolCoreCoefficient", coefficient),
 			zap.Int("newSize", newSize))
 		resizePool(GetLoadPool(), newSize, "LoadPool")
 	}

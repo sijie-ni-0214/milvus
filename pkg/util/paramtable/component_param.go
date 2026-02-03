@@ -48,6 +48,7 @@ const (
 	DefaultMiddlePriorityThreadCoreCoefficient = 5
 	DefaultLowPriorityThreadCoreCoefficient    = 1
 	DefaultBM25LoadThreadCoreCoefficient       = 1
+	DefaultGoLoadPoolCoreCoefficient           = 5
 
 	DefaultSessionTTL        = 15 // s
 	DefaultSessionRetryTimes = 30
@@ -231,6 +232,7 @@ type commonConfig struct {
 	MiddlePriorityThreadCoreCoefficient ParamItem `refreshable:"true"`
 	LowPriorityThreadCoreCoefficient    ParamItem `refreshable:"true"`
 	BM25LoadThreadCoreCoefficient       ParamItem `refreshable:"true"`
+	GoLoadPoolCoreCoefficient           ParamItem `refreshable:"true"`
 	EnableMaterializedView              ParamItem `refreshable:"false"`
 	BuildIndexThreadPoolRatio           ParamItem `refreshable:"false"`
 	MaxDegree                           ParamItem `refreshable:"true"`
@@ -703,6 +705,16 @@ This configuration is only used by querynode and indexnode, it selects CPU instr
 		Export: true,
 	}
 	p.BM25LoadThreadCoreCoefficient.Init(base.mgr)
+
+	p.GoLoadPoolCoreCoefficient = ParamItem{
+		Key:          "common.threadCoreCoefficient.goLoadPool",
+		Version:      "2.6.11",
+		DefaultValue: strconv.Itoa(DefaultGoLoadPoolCoreCoefficient),
+		Doc: "This parameter specify how many times the number of threads " +
+			"is the number of cores in Go LoadPool for segment loading",
+		Export: true,
+	}
+	p.GoLoadPoolCoreCoefficient.Init(base.mgr)
 
 	p.DiskWriteMode = ParamItem{
 		Key:          "common.diskWriteMode",
