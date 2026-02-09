@@ -76,7 +76,7 @@ case "${unameOut}" in
       macos_sdk_path="$(xcrun --show-sdk-path)"
       export CFLAGS="-Wno-deprecated-declarations -I$(brew --prefix libomp)/include -isysroot ${macos_sdk_path}"
       export CXXFLAGS=${CFLAGS}
-      export LDFLAGS="-L$(brew --prefix libomp)/lib"
+      export LDFLAGS="-L$(brew --prefix libomp)/lib -L${macos_sdk_path}/usr/lib -F${macos_sdk_path}/System/Library/Frameworks"
       export CGO_CFLAGS="${CFLAGS}"
       export CGO_LDFLAGS="${LDFLAGS} -framework Security -framework CoreFoundation"
 
