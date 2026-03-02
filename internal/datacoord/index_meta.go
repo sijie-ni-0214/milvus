@@ -184,7 +184,7 @@ func (m *indexMeta) reloadFromKV() error {
 	if err := g.Wait(); err != nil {
 		return err
 	}
-	log.Info("indexMeta reloadFromKV done", zap.Duration("duration", record.ElapseSpan()))
+	log.Info("[Recovery] DataCoord indexMeta reloadFromKV done", zap.Duration("duration", record.ElapseSpan()))
 	return nil
 }
 

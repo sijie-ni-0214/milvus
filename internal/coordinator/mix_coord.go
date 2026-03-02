@@ -161,6 +161,7 @@ func (s *mixCoordImpl) activateFunc() error {
 
 func (s *mixCoordImpl) initInternal() error {
 	log := log.Ctx(s.ctx)
+	totalStart := time.Now()
 	s.rootcoordServer.SetMixCoord(s)
 	s.datacoordServer.SetMixCoord(s)
 	s.queryCoordServer.SetMixCoord(s)
@@ -169,11 +170,14 @@ func (s *mixCoordImpl) initInternal() error {
 	// Register WAL callbacks
 	RegisterWALCallbacks(s)
 
+	start := time.Now()
 	if err := s.streamingCoord.Start(s.ctx, s.fileResourceObserver); err != nil {
 		log.Error("streamCoord start failed", zap.Error(err))
 		return err
 	}
+	log.Info("[Recovery] streamingCoord started", zap.Duration("cost", time.Since(start)))
 
+	start = time.Now()
 	s.rootcoordServer.SetFileResourceObserver(s.fileResourceObserver)
 	if err := s.rootcoordServer.Init(); err != nil {
 		log.Error("rootCoord init failed", zap.Error(err))
@@ -184,9 +188,11 @@ func (s *mixCoordImpl) initInternal() error {
 		log.Error("rootCoord start failed", zap.Error(err))
 		return err
 	}
+	log.Info("[Recovery] rootCoord init and started", zap.Duration("cost", time.Since(start)))
 
 	// DataCoord and QueryCoord are independent of each other;
 	// both only depend on RootCoord being ready. Initialize and start them in parallel.
+	start = time.Now()
 	g, _ := errgroup.WithContext(s.ctx)
 	g.Go(func() error {
 		s.datacoordServer.SetFileResourceObserver(s.fileResourceObserver)
@@ -215,8 +221,10 @@ func (s *mixCoordImpl) initInternal() error {
 	if err := g.Wait(); err != nil {
 		return err
 	}
+	log.Info("[Recovery] dataCoord and queryCoord init and started in parallel", zap.Duration("cost", time.Since(start)))
 
 	s.fileResourceObserver.Start()
+	log.Info("[Recovery] MixCoord initInternal done", zap.Duration("total", time.Since(totalStart)))
 	return nil
 }
 

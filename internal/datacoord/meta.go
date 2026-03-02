@@ -186,6 +186,7 @@ type dbInfo struct {
 
 // NewMeta creates meta from provided `kv.TxnKV`
 func newMeta(ctx context.Context, catalog metastore.DataCoordCatalog, chunkManager storage.ChunkManager, broker broker.Broker) (*meta, error) {
+	start := time.Now()
 	var (
 		im  *indexMeta
 		am  *analyzeMeta
@@ -264,6 +265,7 @@ func newMeta(ctx context.Context, catalog metastore.DataCoordCatalog, chunkManag
 	mt.statsTaskMeta = stm
 	mt.snapshotMeta = spm
 
+	log.Ctx(ctx).Info("[Recovery] DataCoord newMeta done", zap.Duration("total", time.Since(start)))
 	return mt, nil
 }
 
@@ -286,7 +288,7 @@ func (m *meta) reloadFromKV(ctx context.Context, broker broker.Broker) error {
 	if retryErr != nil {
 		return retryErr
 	}
-	log.Ctx(ctx).Info("datacoord show collections done", zap.Duration("dur", record.RecordSpan()))
+	log.Ctx(ctx).Info("[Recovery] DataCoord show collections done", zap.Duration("dur", record.RecordSpan()))
 
 	collectionIDs := make([]int64, 0, 4096)
 	for _, collections := range resp.GetDbCollections() {
@@ -314,7 +316,7 @@ func (m *meta) reloadFromKV(ctx context.Context, broker broker.Broker) error {
 		return err
 	}
 
-	log.Ctx(ctx).Info("datacoord show segments done", zap.Duration("dur", record.RecordSpan()))
+	log.Ctx(ctx).Info("[Recovery] DataCoord list segments done", zap.Int("collections", len(collectionIDs)), zap.Duration("dur", record.RecordSpan()))
 
 	metrics.DataCoordNumCollections.WithLabelValues().Set(0)
 	metrics.DataCoordNumSegments.Reset()
@@ -350,6 +352,7 @@ func (m *meta) reloadFromKV(ctx context.Context, broker broker.Broker) error {
 		}
 	}
 
+	cpStart := time.Now()
 	channelCPs, err := m.catalog.ListChannelCheckpoint(m.ctx)
 	if err != nil {
 		return err
@@ -366,7 +369,11 @@ func (m *meta) reloadFromKV(ctx context.Context, broker broker.Broker) error {
 		}
 	}
 
-	log.Ctx(ctx).Info("DataCoord meta reloadFromKV done", zap.Int("numSegments", numSegments), zap.Duration("duration", record.ElapseSpan()))
+	log.Ctx(ctx).Info("[Recovery] DataCoord reloadFromKV done",
+		zap.Int("segments", numSegments),
+		zap.Int("channelCheckpoints", len(channelCPs)),
+		zap.Duration("listChannelCheckpoint", time.Since(cpStart)),
+		zap.Duration("total", record.ElapseSpan()))
 	return nil
 }
 

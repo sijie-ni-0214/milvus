@@ -109,7 +109,7 @@ func (csm *compactionTaskMeta) reloadFromKV() error {
 		}
 		csm.saveCompactionTaskMemory(task)
 	}
-	log.Info("DataCoord compactionTaskMeta reloadFromKV done", zap.Duration("duration", record.ElapseSpan()))
+	log.Info("[Recovery] DataCoord compactionTaskMeta reloadFromKV done", zap.Duration("duration", record.ElapseSpan()))
 	return nil
 }
 

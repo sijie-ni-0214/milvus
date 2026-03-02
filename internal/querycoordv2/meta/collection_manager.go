@@ -130,7 +130,7 @@ func (m *CollectionManager) Recover(ctx context.Context, broker Broker) error {
 	if err != nil {
 		return err
 	}
-	log.Ctx(ctx).Info("recover collections from kv store", zap.Duration("dur", time.Since(start)))
+	log.Ctx(ctx).Info("[Recovery] QueryCoord load collections from kv store", zap.Int("collections", len(collections)), zap.Duration("cost", time.Since(start)))
 
 	start = time.Now()
 	partitions, err := m.catalog.GetPartitions(ctx, lo.Map(collections, func(collection *querypb.CollectionLoadInfo, _ int) int64 {
@@ -142,7 +142,7 @@ func (m *CollectionManager) Recover(ctx context.Context, broker Broker) error {
 
 	ctx = log.WithTraceID(ctx, strconv.FormatInt(time.Now().UnixNano(), 10))
 	ctxLog := log.Ctx(ctx)
-	ctxLog.Info("recover partitions from kv store", zap.Duration("dur", time.Since(start)))
+	ctxLog.Info("[Recovery] QueryCoord load partitions from kv store", zap.Int("partitions", len(partitions)), zap.Duration("cost", time.Since(start)))
 
 	for _, collection := range collections {
 		if collection.GetReplicaNumber() <= 0 {

@@ -278,6 +278,7 @@ func (s *Server) Init() error {
 
 func (s *Server) initDataCoord() error {
 	log := log.Ctx(s.ctx)
+	totalStart := time.Now()
 
 	log.Info("DataCoord try to wait for MixCoord ready")
 	if err := s.initMixCoord(); err != nil {
@@ -289,15 +290,18 @@ func (s *Server) initDataCoord() error {
 	s.broker = broker.NewCoordinatorBroker(s.mixCoord)
 	s.allocator = allocator.NewRootCoordAllocator(s.mixCoord)
 
+	start := time.Now()
 	storageCli, err := s.newChunkManagerFactory()
 	if err != nil {
 		return err
 	}
-	log.Info("init chunk manager factory done")
+	log.Info("[Recovery] DataCoord init chunk manager factory done", zap.Duration("cost", time.Since(start)))
 
+	start = time.Now()
 	if err = s.initMeta(storageCli); err != nil {
 		return err
 	}
+	log.Info("[Recovery] DataCoord initMeta done", zap.Duration("cost", time.Since(start)))
 
 	// init id allocator after init meta
 	s.idAllocator = globalIDAllocator.NewGlobalIDAllocator("idTimestamp", s.kv)
@@ -312,15 +316,17 @@ func (s *Server) initDataCoord() error {
 	// check whether old node exist, if yes suspend auto balance until all old nodes down
 	s.updateBalanceConfigLoop(s.ctx)
 
+	start = time.Now()
 	if err = s.initCluster(); err != nil {
 		return err
 	}
-	log.Info("init datanode cluster done")
+	log.Info("[Recovery] DataCoord init cluster done", zap.Duration("cost", time.Since(start)))
 
+	start = time.Now()
 	if err = s.initServiceDiscovery(); err != nil {
 		return err
 	}
-	log.Info("init service discovery done")
+	log.Info("[Recovery] DataCoord init service discovery done", zap.Duration("cost", time.Since(start)))
 
 	s.globalScheduler = task.NewGlobalTaskScheduler(s.ctx, s.cluster2)
 
@@ -339,10 +345,6 @@ func (s *Server) initDataCoord() error {
 
 	s.initStatsInspector()
 	log.Info("init statsJobManager done")
-
-	// TODO: enable external collection inspector
-	// s.initExternalCollectionInspector()
-	// log.Info("init external collection inspector done")
 
 	if err = s.initSegmentManager(); err != nil {
 		return err
@@ -396,7 +398,7 @@ func (s *Server) initDataCoord() error {
 	s.serverLoopCtx, s.serverLoopCancel = context.WithCancel(s.ctx)
 
 	RegisterDDLCallbacks(s)
-	log.Info("init datacoord done", zap.Int64("nodeID", paramtable.GetNodeID()), zap.String("Address", s.address))
+	log.Info("[Recovery] DataCoord init done", zap.Int64("nodeID", paramtable.GetNodeID()), zap.String("Address", s.address), zap.Duration("total", time.Since(totalStart)))
 
 	s.initMessageCallback()
 	return nil

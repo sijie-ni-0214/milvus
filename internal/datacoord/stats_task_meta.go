@@ -90,7 +90,7 @@ func (stm *statsTaskMeta) reloadFromKV() error {
 		stm.segmentID2Tasks.Insert(secondaryKey, t)
 	}
 
-	log.Info("statsTaskMeta reloadFromKV done", zap.Duration("duration", record.ElapseSpan()))
+	log.Info("[Recovery] DataCoord statsTaskMeta reloadFromKV done", zap.Duration("duration", record.ElapseSpan()))
 	return nil
 }
 

@@ -919,6 +919,7 @@ func (kc *Catalog) GetCollectionByName(ctx context.Context, dbID int64, dbName s
 
 func (kc *Catalog) ListCollections(ctx context.Context, dbID int64, ts typeutil.Timestamp) ([]*model.Collection, error) {
 	prefix := getDatabasePrefix(dbID)
+	etcdStart := time.Now()
 	_, vals, err := kc.Snapshot.LoadWithPrefix(ctx, prefix, ts)
 	if err != nil {
 		log.Ctx(ctx).Error("get collections meta fail",
@@ -927,8 +928,9 @@ func (kc *Catalog) ListCollections(ctx context.Context, dbID int64, ts typeutil.
 			zap.Error(err))
 		return nil, err
 	}
+	etcdCost := time.Since(etcdStart)
 
-	start := time.Now()
+	concurrentStart := time.Now()
 	colls := make([]*model.Collection, len(vals))
 	futures := make([]*conc.Future[any], 0, len(vals))
 	for i, val := range vals {
@@ -954,7 +956,12 @@ func (kc *Catalog) ListCollections(ctx context.Context, dbID int64, ts typeutil.
 	if err != nil {
 		return nil, err
 	}
-	log.Ctx(ctx).Info("unmarshal all collection details cost", zap.Int64("db", dbID), zap.Duration("cost", time.Since(start)))
+	log.Ctx(ctx).Info("[Recovery] RootCoord ListCollections cost breakdown",
+		zap.Int64("db", dbID),
+		zap.Int("collections", len(vals)),
+		zap.Duration("etcd_load_collections", etcdCost),
+		zap.Duration("concurrent_append_details", time.Since(concurrentStart)),
+		zap.Duration("total", time.Since(etcdStart)))
 	return colls, nil
 }
 

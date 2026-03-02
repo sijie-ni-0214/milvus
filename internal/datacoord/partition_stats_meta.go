@@ -64,7 +64,7 @@ func (psm *partitionStatsMeta) reloadFromKV() error {
 		}
 		psm.partitionStatsInfos[info.GetVChannel()][info.GetPartitionID()].infos[info.GetVersion()] = info
 	}
-	log.Info("DataCoord partitionStatsMeta reloadFromKV done", zap.Duration("duration", record.ElapseSpan()))
+	log.Info("[Recovery] DataCoord partitionStatsMeta reloadFromKV done", zap.Duration("duration", record.ElapseSpan()))
 	return nil
 }
 

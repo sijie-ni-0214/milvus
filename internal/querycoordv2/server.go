@@ -62,7 +62,6 @@ import (
 	"github.com/milvus-io/milvus/pkg/v2/util/expr"
 	"github.com/milvus-io/milvus/pkg/v2/util/metricsinfo"
 	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
-	"github.com/milvus-io/milvus/pkg/v2/util/timerecord"
 	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
 
@@ -265,6 +264,7 @@ func (s *Server) initSession() error {
 
 func (s *Server) initQueryCoord() error {
 	log := log.Ctx(s.ctx)
+	totalStart := time.Now()
 	s.UpdateStateCode(commonpb.StateCode_Initializing)
 	log.Info("start init querycoord", zap.Any("State", commonpb.StateCode_Initializing))
 	// Init KV and ID allocator
@@ -369,13 +369,13 @@ func (s *Server) initQueryCoord() error {
 	meta.GlobalFailedLoadCache = meta.NewFailedLoadCache()
 
 	RegisterDDLCallbacks(s)
-	log.Info("init querycoord done", zap.Int64("nodeID", paramtable.GetNodeID()), zap.String("Address", s.address))
+	log.Info("[Recovery] QueryCoord init done", zap.Int64("nodeID", paramtable.GetNodeID()), zap.String("Address", s.address), zap.Duration("total", time.Since(totalStart)))
 	return err
 }
 
 func (s *Server) initMeta() error {
 	log := log.Ctx(s.ctx)
-	record := timerecord.NewTimeRecorder("querycoord")
+	totalStart := time.Now()
 
 	log.Info("init meta")
 	s.store = querycoord.NewCatalog(s.kv)
@@ -385,40 +385,48 @@ func (s *Server) initMeta() error {
 		s.mixCoord,
 	)
 
-	log.Info("recover meta...")
+	start := time.Now()
 	err := s.meta.CollectionManager.Recover(s.ctx, s.broker)
 	if err != nil {
 		log.Warn("failed to recover collections", zap.Error(err))
 		return err
 	}
 	collections := s.meta.GetAll(s.ctx)
-	log.Info("recovering collections...", zap.Int64s("collections", collections))
+	log.Info("[Recovery] QueryCoord recover collections done",
+		zap.Int("collections", len(collections)),
+		zap.Duration("cost", time.Since(start)))
 
 	// We really update the metric after observers think the collection loaded.
 	metrics.QueryCoordNumCollections.WithLabelValues().Set(0)
-
 	metrics.QueryCoordNumPartitions.WithLabelValues().Set(float64(len(s.meta.GetAllPartitions(s.ctx))))
 
+	start = time.Now()
 	err = s.meta.ReplicaManager.Recover(s.ctx, collections)
 	if err != nil {
 		log.Warn("failed to recover replicas", zap.Error(err))
 		return err
 	}
+	log.Info("[Recovery] QueryCoord recover replicas done", zap.Duration("cost", time.Since(start)))
 
+	start = time.Now()
 	err = s.meta.ResourceManager.Recover(s.ctx)
 	if err != nil {
 		log.Warn("failed to recover resource groups", zap.Error(err))
 		return err
 	}
+	log.Info("[Recovery] QueryCoord recover resource groups done", zap.Duration("cost", time.Since(start)))
 
 	s.dist = meta.NewDistributionManager(s.nodeMgr)
 	s.targetMgr = meta.NewTargetManager(s.broker, s.meta)
+
+	start = time.Now()
 	err = s.targetMgr.Recover(s.ctx, s.store)
 	if err != nil {
 		log.Warn("failed to recover collection targets", zap.Error(err))
 	}
+	log.Info("[Recovery] QueryCoord recover targets done", zap.Duration("cost", time.Since(start)))
 
-	log.Info("QueryCoord server initMeta done", zap.Duration("duration", record.ElapseSpan()))
+	log.Info("[Recovery] QueryCoord initMeta done", zap.Duration("total", time.Since(totalStart)))
 	return nil
 }
 
@@ -504,10 +512,15 @@ func (s *Server) startQueryCoord() error {
 
 func (s *Server) startServerLoop() {
 	log := log.Ctx(s.ctx)
+	totalStart := time.Now()
+
 	// leader cache observer shall be started before `SyncAll` call
 	s.leaderCacheObserver.Start(s.ctx)
+
 	// Recover dist, to avoid generate too much task when dist not ready after restart
+	start := time.Now()
 	s.distController.SyncAll(s.ctx)
+	log.Info("[Recovery] QueryCoord SyncAll dist done", zap.Duration("cost", time.Since(start)))
 
 	// start the components from inside to outside,
 	// to make the dependencies ready for every component
@@ -528,6 +541,8 @@ func (s *Server) startServerLoop() {
 
 	log.Info("start job scheduler...")
 	s.jobScheduler.Start()
+
+	log.Info("[Recovery] QueryCoord startServerLoop done", zap.Duration("total", time.Since(totalStart)))
 }
 
 func (s *Server) Stop() error {

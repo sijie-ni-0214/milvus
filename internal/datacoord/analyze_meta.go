@@ -68,7 +68,7 @@ func (m *analyzeMeta) reloadFromKV() error {
 	for _, analyzeTask := range analyzeTasks {
 		m.tasks[analyzeTask.TaskID] = analyzeTask
 	}
-	log.Info("analyzeMeta reloadFromKV done", zap.Duration("duration", record.ElapseSpan()))
+	log.Info("[Recovery] DataCoord analyzeMeta reloadFromKV done", zap.Duration("duration", record.ElapseSpan()))
 	return nil
 }
 
