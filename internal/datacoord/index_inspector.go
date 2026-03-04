@@ -228,7 +228,9 @@ func (i *indexInspector) createIndexForSegment(ctx context.Context, segment *Seg
 }
 
 func (i *indexInspector) reloadFromMeta() {
+	start := time.Now()
 	segments := i.meta.GetAllSegmentsUnsafe()
+	numEnqueued := 0
 	for _, segment := range segments {
 		for _, segIndex := range i.meta.indexMeta.GetSegmentIndexes(segment.GetCollectionID(), segment.ID) {
 			if segIndex.IsDeleted || (segIndex.IndexState != commonpb.IndexState_Unissued &&
@@ -252,6 +254,11 @@ func (i *indexInspector) reloadFromMeta() {
 				i.storageCli,
 				i.indexEngineVersionManager,
 			))
+			numEnqueued++
 		}
 	}
+	log.Info("[Recovery] DataCoord indexInspector reloadFromMeta done",
+		zap.Int("segments", len(segments)),
+		zap.Int("enqueued", numEnqueued),
+		zap.Duration("cost", time.Since(start)))
 }

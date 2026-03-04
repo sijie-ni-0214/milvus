@@ -153,8 +153,11 @@ func (m *indexMeta) reloadFromKV(collectionIDs []int64) error {
 
 	// Parallel load and process: ListIndexes and ListSegmentIndexes have no dependency,
 	// and they update completely separate data structures so memory updates can also run in parallel.
+	var numFieldIndexes int
+	var numSegmentIndexes int
 	g, _ := errgroup.WithContext(m.ctx)
 	g.Go(func() error {
+		start := time.Now()
 		fieldIndexes, err := m.catalog.ListIndexes(m.ctx)
 		if err != nil {
 			log.Error("indexMeta reloadFromKV load field indexes fail", zap.Error(err))
@@ -163,9 +166,14 @@ func (m *indexMeta) reloadFromKV(collectionIDs []int64) error {
 		for _, fieldIndex := range fieldIndexes {
 			m.updateCollectionIndex(fieldIndex)
 		}
+		numFieldIndexes = len(fieldIndexes)
+		log.Info("[Recovery] DataCoord indexMeta ListIndexes done",
+			zap.Int("fieldIndexes", numFieldIndexes),
+			zap.Duration("duration", time.Since(start)))
 		return nil
 	})
 	g.Go(func() error {
+		start := time.Now()
 		pool := conc.NewPool[any](paramtable.Get().MetaStoreCfg.ReadConcurrency.GetAsInt())
 		defer pool.Release()
 		futures := make([]*conc.Future[any], 0, len(collectionIDs))
@@ -184,6 +192,9 @@ func (m *indexMeta) reloadFromKV(collectionIDs []int64) error {
 		if err := conc.AwaitAll(futures...); err != nil {
 			return err
 		}
+		kvDuration := time.Since(start)
+		updateStart := time.Now()
+		total := 0
 		for _, segIdxes := range collectionSegIdxes {
 			for _, segIdx := range segIdxes {
 				if segIdx.IndexMemSize == 0 {
@@ -193,14 +204,24 @@ func (m *indexMeta) reloadFromKV(collectionIDs []int64) error {
 				metrics.FlushedSegmentFileNum.WithLabelValues(metrics.IndexFileLabel).Observe(float64(len(segIdx.IndexFileKeys)))
 				metrics.DataCoordStoredIndexFilesSize.WithLabelValues("", "",
 					fmt.Sprintf("%d", segIdx.CollectionID)).Add(float64(segIdx.IndexSerializedSize))
+				total++
 			}
 		}
+		numSegmentIndexes = total
+		log.Info("[Recovery] DataCoord indexMeta ListSegmentIndexes done",
+			zap.Int("collections", len(collectionIDs)),
+			zap.Int("segmentIndexes", total),
+			zap.Duration("kvLoad", kvDuration),
+			zap.Duration("memUpdate", time.Since(updateStart)))
 		return nil
 	})
 	if err := g.Wait(); err != nil {
 		return err
 	}
-	log.Info("[Recovery] DataCoord indexMeta reloadFromKV done", zap.Duration("duration", record.ElapseSpan()))
+	log.Info("[Recovery] DataCoord indexMeta reloadFromKV done",
+		zap.Int("fieldIndexes", numFieldIndexes),
+		zap.Int("segmentIndexes", numSegmentIndexes),
+		zap.Duration("duration", record.ElapseSpan()))
 	return nil
 }
 

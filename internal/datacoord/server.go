@@ -489,11 +489,21 @@ func (s *Server) Start() error {
 }
 
 func (s *Server) startDataCoord() {
+	log := log.Ctx(s.ctx)
+	totalStart := time.Now()
+
+	start := time.Now()
 	s.startTaskScheduler()
+	log.Info("[Recovery] DataCoord startTaskScheduler done", zap.Duration("cost", time.Since(start)))
+
+	start = time.Now()
 	s.startServerLoop()
+	log.Info("[Recovery] DataCoord startServerLoop done", zap.Duration("cost", time.Since(start)))
+
 	s.afterStart()
 	s.UpdateStateCode(commonpb.StateCode_Healthy)
 	sessionutil.SaveServerInfo(typeutil.MixCoordRole, s.session.GetServerID())
+	log.Info("[Recovery] DataCoord start done", zap.Duration("total", time.Since(totalStart)))
 }
 
 func (s *Server) GetServerID() int64 {

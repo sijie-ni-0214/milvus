@@ -98,7 +98,9 @@ func (si *statsInspector) Stop() {
 }
 
 func (si *statsInspector) reloadFromMeta() {
+	start := time.Now()
 	tasks := si.mt.statsTaskMeta.GetAllTasks()
+	numEnqueued := 0
 	for _, st := range tasks {
 		if st.GetState() != indexpb.JobState_JobStateInit &&
 			st.GetState() != indexpb.JobState_JobStateRetry &&
@@ -129,7 +131,12 @@ func (si *statsInspector) reloadFromMeta() {
 			si.allocator,
 			si.ievm,
 		))
+		numEnqueued++
 	}
+	log.Info("[Recovery] DataCoord statsInspector reloadFromMeta done",
+		zap.Int("tasks", len(tasks)),
+		zap.Int("enqueued", numEnqueued),
+		zap.Duration("cost", time.Since(start)))
 }
 
 func (si *statsInspector) triggerStatsTaskLoop() {
