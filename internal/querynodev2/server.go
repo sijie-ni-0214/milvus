@@ -34,6 +34,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	syncatomic "sync/atomic"
 	"time"
 
 	"github.com/cockroachdb/errors"
@@ -114,7 +115,8 @@ type QueryNode struct {
 	serverID              int64
 
 	// segment loader
-	loader segments.Loader
+	loader              segments.Loader
+	loadingSegmentCount syncatomic.Int32
 
 	// Search/Query
 	scheduler scheduler.Scheduler

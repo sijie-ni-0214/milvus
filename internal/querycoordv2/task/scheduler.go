@@ -323,6 +323,17 @@ type taskScheduler struct {
 	// nodeID -> collectionID -> taskDelta
 	segmentTaskDelta *ExecutingTaskDelta
 	channelTaskDelta *ExecutingTaskDelta
+
+	// per-schedule-round accumulators for cost breakdown
+	preProcessStepUpCost   time.Duration
+	preProcessCheckCost    time.Duration
+	checkStaleReplicaCost  time.Duration
+	checkStaleDistCost     time.Duration
+	checkStaleNodeLoopCost    time.Duration
+	isRelatedGetDistCost           time.Duration
+	isRelatedGetLeaderCost         time.Duration
+	isRelatedGetLeaderReplicaCost  time.Duration
+	isRelatedGetLeaderDistCost     time.Duration
 }
 
 func NewScheduler(ctx context.Context,
@@ -609,11 +620,16 @@ func (scheduler *taskScheduler) preAdd(task Task) error {
 }
 
 func (scheduler *taskScheduler) getReplicaShardLeader(channelName string, replicaID int64) *meta.DmChannel {
+	replicaStart := time.Now()
 	replica := scheduler.meta.ReplicaManager.Get(scheduler.ctx, replicaID)
+	scheduler.isRelatedGetLeaderReplicaCost += time.Since(replicaStart)
 	if replica == nil {
 		return nil
 	}
-	return scheduler.distMgr.ChannelDistManager.GetShardLeader(channelName, replica)
+	distStart := time.Now()
+	leader := scheduler.distMgr.ChannelDistManager.GetShardLeader(channelName, replica)
+	scheduler.isRelatedGetLeaderDistCost += time.Since(distStart)
+	return leader
 }
 
 func (scheduler *taskScheduler) tryPromoteAll() {
@@ -811,11 +827,34 @@ func (scheduler *taskScheduler) schedule(node int64) {
 		zap.Int("channelTaskNum", scheduler.channelTasks.Len()),
 	)
 
-	// Process tasks
+	// Process tasks — reset per-round accumulators
+	scheduler.preProcessStepUpCost = 0
+	scheduler.preProcessCheckCost = 0
+	scheduler.checkStaleReplicaCost = 0
+	scheduler.checkStaleDistCost = 0
+	scheduler.checkStaleNodeLoopCost = 0
+	scheduler.isRelatedGetDistCost = 0
+	scheduler.isRelatedGetLeaderCost = 0
+	scheduler.isRelatedGetLeaderReplicaCost = 0
+	scheduler.isRelatedGetLeaderDistCost = 0
 	toProcess := make([]Task, 0)
 	toRemove := make([]Task, 0)
+	processQueueLen := scheduler.processQueue.Len()
+	preProcessCost := time.Duration(0)
+	isRelatedCost := time.Duration(0)
 	scheduler.processQueue.Range(func(task Task) bool {
-		if scheduler.preProcess(task) && scheduler.isRelated(task, node) {
+		irStart := time.Now()
+		related := scheduler.isRelated(task, node)
+		isRelatedCost += time.Since(irStart)
+		if !related {
+			return true
+		}
+
+		ppStart := time.Now()
+		scheduler.preProcess(task)
+		preProcessCost += time.Since(ppStart)
+
+		if task.Status() == TaskStatusStarted {
 			toProcess = append(toProcess, task)
 		}
 		if task.Status() != TaskStatusStarted {
@@ -840,16 +879,32 @@ func (scheduler *taskScheduler) schedule(node int64) {
 	for _, task := range toRemove {
 		scheduler.remove(task)
 	}
+	removeDur := tr.RecordSpan()
 
 	scheduler.updateTaskMetrics()
+	metricsDur := tr.RecordSpan()
 
 	log.Info("processed tasks",
 		zap.Int("toProcessNum", len(toProcess)),
 		zap.Int32("committedNum", commmittedNum.Load()),
 		zap.Int("toRemoveNum", len(toRemove)),
 		zap.Duration("promoteDur", promoteDur),
-		zap.Duration("preprocessDUr", preprocessDur),
-		zap.Duration("processDUr", processDur),
+		zap.Duration("preprocessDur", preprocessDur),
+		zap.Int("processQueueLen", processQueueLen),
+		zap.Duration("preProcessCost", preProcessCost),
+		zap.Duration("stepUpCost", scheduler.preProcessStepUpCost),
+		zap.Duration("checkStaleCost", scheduler.preProcessCheckCost),
+		zap.Duration("checkStaleReplicaCost", scheduler.checkStaleReplicaCost),
+		zap.Duration("checkStaleDistCost", scheduler.checkStaleDistCost),
+		zap.Duration("checkStaleNodeLoopCost", scheduler.checkStaleNodeLoopCost),
+		zap.Duration("isRelatedCost", isRelatedCost),
+		zap.Duration("isRelatedGetDistCost", scheduler.isRelatedGetDistCost),
+		zap.Duration("isRelatedGetLeaderCost", scheduler.isRelatedGetLeaderCost),
+		zap.Duration("isRelatedGetLeaderReplicaCost", scheduler.isRelatedGetLeaderReplicaCost),
+		zap.Duration("isRelatedGetLeaderDistCost", scheduler.isRelatedGetLeaderDistCost),
+		zap.Duration("processDur", processDur),
+		zap.Duration("removeDur", removeDur),
+		zap.Duration("metricsDur", metricsDur),
 		zap.Duration("totalDur", tr.ElapseSpan()),
 	)
 
@@ -868,19 +923,23 @@ func (scheduler *taskScheduler) isRelated(task Task, node int64) bool {
 		}
 		if task, ok := task.(*SegmentTask); ok {
 			taskType := GetTaskType(task)
+			distStart := time.Now()
 			var segment *datapb.SegmentInfo
 			if taskType == TaskTypeMove || taskType == TaskTypeUpdate {
 				segment = scheduler.targetMgr.GetSealedSegment(task.ctx, task.CollectionID(), task.SegmentID(), meta.CurrentTarget)
 			} else {
 				segment = scheduler.targetMgr.GetSealedSegment(task.ctx, task.CollectionID(), task.SegmentID(), meta.NextTarget)
 			}
+			scheduler.isRelatedGetDistCost += time.Since(distStart)
 			if segment == nil {
 				continue
 			}
 			if task.replica == nil {
 				continue
 			}
+			leaderStart := time.Now()
 			leader := scheduler.getReplicaShardLeader(task.Shard(), task.ReplicaID())
+			scheduler.isRelatedGetLeaderCost += time.Since(leaderStart)
 			if leader == nil {
 				continue
 			}
@@ -901,6 +960,7 @@ func (scheduler *taskScheduler) preProcess(task Task) bool {
 		return false
 	}
 
+	stepUpStart := time.Now()
 	actions, step := task.Actions(), task.Step()
 	for step < len(actions) && actions[step].IsFinished(scheduler.distMgr) {
 		if GetTaskType(task) == TaskTypeMove && actions[step].Type() == ActionTypeGrow {
@@ -934,6 +994,9 @@ func (scheduler *taskScheduler) preProcess(task Task) bool {
 		step++
 	}
 
+	stepUpCost := time.Since(stepUpStart)
+
+	checkStart := time.Now()
 	if task.IsFinished(scheduler.distMgr) {
 		task.SetStatus(TaskStatusSucceeded)
 	} else {
@@ -941,6 +1004,10 @@ func (scheduler *taskScheduler) preProcess(task Task) bool {
 			task.Cancel(err)
 		}
 	}
+	checkCost := time.Since(checkStart)
+
+	scheduler.preProcessStepUpCost += stepUpCost
+	scheduler.preProcessCheckCost += checkCost
 
 	return task.Status() == TaskStatusStarted
 }
@@ -1134,6 +1201,7 @@ func (scheduler *taskScheduler) checkStale(task Task, checkDistExist bool) error
 
 	// Get replica, but only fail if we need it for RO node check
 	// NilReplica (ID=-1) is used for reduce-only tasks like unsubscribe channel
+	replicaStart := time.Now()
 	var replica *meta.Replica
 	if task.ReplicaID() != -1 {
 		replica = scheduler.meta.ReplicaManager.Get(scheduler.ctx, task.ReplicaID())
@@ -1142,6 +1210,7 @@ func (scheduler *taskScheduler) checkStale(task Task, checkDistExist bool) error
 			return merr.WrapErrReplicaNotFound(task.ReplicaID())
 		}
 	}
+	scheduler.checkStaleReplicaCost += time.Since(replicaStart)
 
 	// For segment grow tasks, check if segment is already loaded in dist.
 	// This prevents duplicate load RPCs when the checker creates tasks from a stale dist snapshot
@@ -1149,6 +1218,7 @@ func (scheduler *taskScheduler) checkStale(task Task, checkDistExist bool) error
 	// Only checked during promote (waitQueue → processQueue), not during preProcess,
 	// because during preProcess the segment may have been loaded by this task's own in-flight RPC,
 	// and canceling the task would kill that RPC with a misleading "context canceled" error.
+	distStart := time.Now()
 	if checkDistExist {
 		if segmentTask, ok := task.(*SegmentTask); ok && GetTaskType(task) == TaskTypeGrow && replica != nil {
 			existsInDist := scheduler.distMgr.SegmentDistManager.GetByFilter(
@@ -1163,7 +1233,9 @@ func (scheduler *taskScheduler) checkStale(task Task, checkDistExist bool) error
 			}
 		}
 	}
+	scheduler.checkStaleDistCost += time.Since(distStart)
 
+	nodeLoopStart := time.Now()
 	for _, action := range task.Actions() {
 		// Determine the target node for stale checking.
 		// For LeaderAction, we need to check the leader node (delegator) instead of the worker node.
@@ -1197,6 +1269,7 @@ func (scheduler *taskScheduler) checkStale(task Task, checkDistExist bool) error
 			}
 		}
 	}
+	scheduler.checkStaleNodeLoopCost += time.Since(nodeLoopStart)
 
 	return nil
 }
