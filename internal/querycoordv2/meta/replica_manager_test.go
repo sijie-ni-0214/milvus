@@ -373,7 +373,14 @@ func (suite *ReplicaManagerSuite) TestResourceGroup() {
 }
 
 func (suite *ReplicaManagerSuite) clearMemory() {
-	suite.mgr.replicas = make(map[int64]*Replica)
+	suite.mgr.coll2Replicas.Range(func(collID int64, _ *collectionReplicas) bool {
+		suite.mgr.coll2Replicas.Remove(collID)
+		return true
+	})
+	suite.mgr.replicaIndex.Range(func(replicaID int64, _ int64) bool {
+		suite.mgr.replicaIndex.Remove(replicaID)
+		return true
+	})
 }
 
 type ReplicaManagerV2Suite struct {
@@ -613,10 +620,10 @@ func TestGetReplicasJSON(t *testing.T) {
 		Nodes:         []int64{4, 5, 6},
 	})
 
-	err := replicaManager.put(ctx, replica1)
+	err := replicaManager.Put(ctx, replica1)
 	assert.NoError(t, err)
 
-	err = replicaManager.put(ctx, replica2)
+	err = replicaManager.Put(ctx, replica2)
 	assert.NoError(t, err)
 
 	meta := &Meta{
@@ -663,4 +670,137 @@ func TestGetReplicasJSON(t *testing.T) {
 	for _, replica := range replicas {
 		checkResult(replica)
 	}
+}
+
+func TestReplicaManagerConcurrent(t *testing.T) {
+	t.Run("RemoveCollection_vs_RecoverNodes", func(t *testing.T) {
+		catalog := mocks.NewQueryCoordCatalog(t)
+		catalog.EXPECT().SaveReplica(mock.Anything, mock.Anything, mock.Anything).Return(nil).Maybe()
+		catalog.EXPECT().SaveReplica(mock.Anything, mock.Anything).Return(nil).Maybe()
+		catalog.EXPECT().ReleaseReplicas(mock.Anything, mock.Anything).Return(nil).Maybe()
+		idAllocator := RandomIncrementIDAllocator()
+		mgr := NewReplicaManager(idAllocator, catalog)
+		ctx := context.Background()
+
+		collID := int64(1000)
+		// Spawn replicas
+		replicas, err := mgr.Spawn(ctx, collID, map[string]int{"rg1": 2}, nil, commonpb.LoadPriority_LOW)
+		assert.NoError(t, err)
+		assert.Len(t, replicas, 2)
+
+		// Recover nodes to assign nodes
+		rgs := map[string]*ResourceGroup{
+			"rg1": newTestResourceGroup("rg1", typeutil.NewUniqueSet(1, 2)),
+		}
+		err = mgr.RecoverNodesInCollection(ctx, collID, rgs)
+		assert.NoError(t, err)
+
+		// Concurrent: RemoveCollection and RecoverNodes
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			mgr.RemoveCollection(ctx, collID)
+		}()
+		// RecoverNodes may succeed or fail (collection removed), both are acceptable
+		mgr.RecoverNodesInCollection(ctx, collID, rgs)
+		<-done
+
+		// After both complete, collection should be removed
+		result := mgr.GetByCollection(ctx, collID)
+		assert.Empty(t, result)
+	})
+
+	t.Run("Spawn_vs_RemoveCollection", func(t *testing.T) {
+		catalog := mocks.NewQueryCoordCatalog(t)
+		catalog.EXPECT().SaveReplica(mock.Anything, mock.Anything, mock.Anything).Return(nil).Maybe()
+		catalog.EXPECT().SaveReplica(mock.Anything, mock.Anything).Return(nil).Maybe()
+		catalog.EXPECT().ReleaseReplicas(mock.Anything, mock.Anything).Return(nil).Maybe()
+		idAllocator := RandomIncrementIDAllocator()
+		mgr := NewReplicaManager(idAllocator, catalog)
+		ctx := context.Background()
+
+		collID := int64(2000)
+		// Spawn initial replicas
+		_, err := mgr.Spawn(ctx, collID, map[string]int{"rg1": 1}, nil, commonpb.LoadPriority_LOW)
+		assert.NoError(t, err)
+
+		// Concurrent: Spawn more and RemoveCollection
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			mgr.RemoveCollection(ctx, collID)
+		}()
+		mgr.Spawn(ctx, collID, map[string]int{"rg1": 1}, nil, commonpb.LoadPriority_LOW)
+		<-done
+
+		// No panic, no data corruption — the state is deterministic based on execution order
+	})
+
+	t.Run("MoveReplica_vs_RecoverNodes", func(t *testing.T) {
+		catalog := mocks.NewQueryCoordCatalog(t)
+		catalog.EXPECT().SaveReplica(mock.Anything, mock.Anything, mock.Anything).Return(nil).Maybe()
+		catalog.EXPECT().SaveReplica(mock.Anything, mock.Anything).Return(nil).Maybe()
+		idAllocator := RandomIncrementIDAllocator()
+		mgr := NewReplicaManager(idAllocator, catalog)
+		ctx := context.Background()
+
+		collID := int64(3000)
+		replicas, err := mgr.Spawn(ctx, collID, map[string]int{"rg1": 1, "rg2": 1}, nil, commonpb.LoadPriority_LOW)
+		assert.NoError(t, err)
+		assert.Len(t, replicas, 2)
+
+		rgs := map[string]*ResourceGroup{
+			"rg1": newTestResourceGroup("rg1", typeutil.NewUniqueSet(1)),
+			"rg2": newTestResourceGroup("rg2", typeutil.NewUniqueSet(2)),
+		}
+		err = mgr.RecoverNodesInCollection(ctx, collID, rgs)
+		assert.NoError(t, err)
+
+		// Concurrent: MoveReplica and RecoverNodes
+		rg1Replicas := lo.Filter(replicas, func(r *Replica, _ int) bool {
+			return r.GetResourceGroup() == "rg1"
+		})
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			mgr.MoveReplica(ctx, "rg2", rg1Replicas)
+		}()
+		mgr.RecoverNodesInCollection(ctx, collID, rgs)
+		<-done
+
+		// No panic, no data corruption
+		result := mgr.GetByCollection(ctx, collID)
+		assert.Len(t, result, 2)
+	})
+
+	t.Run("MoveReplica_MixedCollections", func(t *testing.T) {
+		catalog := mocks.NewQueryCoordCatalog(t)
+		catalog.EXPECT().SaveReplica(mock.Anything, mock.Anything, mock.Anything).Return(nil).Maybe()
+		catalog.EXPECT().SaveReplica(mock.Anything, mock.Anything).Return(nil).Maybe()
+		idAllocator := RandomIncrementIDAllocator()
+		mgr := NewReplicaManager(idAllocator, catalog)
+		ctx := context.Background()
+
+		// Spawn replicas for two different collections
+		coll1 := int64(4000)
+		coll2 := int64(5000)
+		replicas1, err := mgr.Spawn(ctx, coll1, map[string]int{"rg1": 1}, nil, commonpb.LoadPriority_LOW)
+		assert.NoError(t, err)
+		replicas2, err := mgr.Spawn(ctx, coll2, map[string]int{"rg1": 1}, nil, commonpb.LoadPriority_LOW)
+		assert.NoError(t, err)
+
+		// Move replicas from two different collections in one call
+		mixedReplicas := append(replicas1, replicas2...)
+		err = mgr.MoveReplica(ctx, "rg2", mixedReplicas)
+		assert.NoError(t, err)
+
+		// Verify each replica is in the correct collection and has the new RG
+		result1 := mgr.GetByCollection(ctx, coll1)
+		assert.Len(t, result1, 1)
+		assert.Equal(t, "rg2", result1[0].GetResourceGroup())
+
+		result2 := mgr.GetByCollection(ctx, coll2)
+		assert.Len(t, result2, 1)
+		assert.Equal(t, "rg2", result2[0].GetResourceGroup())
+	})
 }
