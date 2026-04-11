@@ -34,7 +34,6 @@ import (
 	"github.com/milvus-io/milvus/internal/querycoordv2/utils"
 	"github.com/milvus-io/milvus/pkg/v2/log"
 	"github.com/milvus-io/milvus/pkg/v2/metrics"
-	"github.com/milvus-io/milvus/pkg/v2/proto/datapb"
 	"github.com/milvus-io/milvus/pkg/v2/proto/querypb"
 	"github.com/milvus-io/milvus/pkg/v2/util/funcutil"
 	"github.com/milvus-io/milvus/pkg/v2/util/hardware"
@@ -811,14 +810,20 @@ func (scheduler *taskScheduler) schedule(node int64) {
 		zap.Int("channelTaskNum", scheduler.channelTasks.Len()),
 	)
 
-	// Process tasks
+	// Process tasks — check isRelated first to skip unrelated tasks early,
+	// avoiding unnecessary preProcess (checkStale lock overhead) for tasks
+	// that don't target this node.
 	toProcess := make([]Task, 0)
 	toRemove := make([]Task, 0)
 	scheduler.processQueue.Range(func(task Task) bool {
-		if scheduler.preProcess(task) && scheduler.isRelated(task, node) {
-			toProcess = append(toProcess, task)
+		if !scheduler.isRelated(task, node) {
+			return true
 		}
-		if task.Status() != TaskStatusStarted {
+
+		scheduler.preProcess(task)
+		if task.Status() == TaskStatusStarted {
+			toProcess = append(toProcess, task)
+		} else {
 			toRemove = append(toRemove, task)
 		}
 
@@ -865,28 +870,6 @@ func (scheduler *taskScheduler) isRelated(task Task, node int64) bool {
 	for _, action := range task.Actions() {
 		if action.Node() == node {
 			return true
-		}
-		if task, ok := task.(*SegmentTask); ok {
-			taskType := GetTaskType(task)
-			var segment *datapb.SegmentInfo
-			if taskType == TaskTypeMove || taskType == TaskTypeUpdate {
-				segment = scheduler.targetMgr.GetSealedSegment(task.ctx, task.CollectionID(), task.SegmentID(), meta.CurrentTarget)
-			} else {
-				segment = scheduler.targetMgr.GetSealedSegment(task.ctx, task.CollectionID(), task.SegmentID(), meta.NextTarget)
-			}
-			if segment == nil {
-				continue
-			}
-			if task.replica == nil {
-				continue
-			}
-			leader := scheduler.getReplicaShardLeader(task.Shard(), task.ReplicaID())
-			if leader == nil {
-				continue
-			}
-			if leader.Node == node {
-				return true
-			}
 		}
 	}
 	return false
