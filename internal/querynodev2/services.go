@@ -522,7 +522,10 @@ func (node *QueryNode) LoadSegments(ctx context.Context, req *querypb.LoadSegmen
 	}
 
 	// Actual load segment
-	log.Info("start to load segments...")
+	currentLoading := node.loadingSegmentCount.Add(1)
+	defer node.loadingSegmentCount.Add(-1)
+	log.Info("start to load segments...",
+		zap.Int32("currentLoadingCount", currentLoading))
 	loaded, err := node.loader.Load(ctx,
 		req.GetCollectionID(),
 		segments.SegmentTypeSealed,

@@ -121,14 +121,19 @@ func (ob *ReplicaObserver) waitNodeChangedOrTimeout(ctx context.Context, listene
 }
 
 func (ob *ReplicaObserver) checkStreamingQueryNodesInReplica(sqNodeIDs typeutil.UniqueSet) {
+	start := time.Now()
 	ctx := context.Background()
 	log := log.Ctx(ctx).WithRateGroup("qcv2.checkStreamingQueryNodesInReplica", 1, 60)
 	collections := ob.meta.GetAll(context.Background())
 
+	recoverStart := time.Now()
 	for _, collectionID := range collections {
 		ob.meta.RecoverSQNodesInCollection(context.Background(), collectionID, sqNodeIDs)
 	}
+	recoverElapsed := time.Since(recoverStart)
 
+	drainStart := time.Now()
+	removedNodeCount := 0
 	for _, collectionID := range collections {
 		replicas := ob.meta.ReplicaManager.GetByCollection(ctx, collectionID)
 		for _, replica := range replicas {
@@ -159,22 +164,40 @@ func (ob *ReplicaObserver) checkStreamingQueryNodesInReplica(sqNodeIDs typeutil.
 				logger.Warn("fail to remove streaming query node from replica", zap.Error(err))
 				continue
 			}
+			removedNodeCount += len(removeNodes)
 			logger.Info("all segment/channel has been removed from ro streaming query node, remove it from replica")
 		}
 	}
+	drainElapsed := time.Since(drainStart)
+
+	log.Info("checkStreamingQueryNodesInReplica done",
+		zap.Duration("total", time.Since(start)),
+		zap.Duration("recoverPhase", recoverElapsed),
+		zap.Duration("drainPhase", drainElapsed),
+		zap.Int("collections", len(collections)),
+		zap.Int("sqNodes", sqNodeIDs.Len()),
+		zap.Int("removedSQNodes", removedNodeCount),
+	)
 }
 
 func (ob *ReplicaObserver) checkNodesInReplica() {
+	start := time.Now()
 	ctx := context.Background()
 	log := log.Ctx(ctx).WithRateGroup("qcv2.checkNodesInReplica", 1, 60)
 	collections := ob.meta.GetAll(ctx)
+
+	recoverStart := time.Now()
 	for _, collectionID := range collections {
 		utils.RecoverReplicaOfCollection(ctx, ob.meta, collectionID)
 	}
+	recoverElapsed := time.Since(recoverStart)
 
 	balancePolicy := paramtable.Get().QueryCoordCfg.Balancer.GetValue()
 	enableChannelExclusiveMode := balancePolicy == meta.ChannelLevelScoreBalancerName
 
+	drainStart := time.Now()
+	removedNodeCount := 0
+	repeatRecoverCount := 0
 	// check all ro nodes, remove it from replica if all segment/channel has been moved
 	for _, collectionID := range collections {
 		replicas := ob.meta.ReplicaManager.GetByCollection(ctx, collectionID)
@@ -220,12 +243,24 @@ func (ob *ReplicaObserver) checkNodesInReplica() {
 				continue
 			}
 			hasNodeRemoved = true
+			removedNodeCount += len(removeNodes)
 			logger.Info("all segment/channel has been removed from ro node, remove it from replica",
 				zap.Int64s("removedNodes", removeNodes),
 			)
 		}
 		if hasNodeRemoved {
 			utils.RecoverReplicaOfCollection(ctx, ob.meta, collectionID)
+			repeatRecoverCount++
 		}
 	}
+	drainElapsed := time.Since(drainStart)
+
+	log.Info("checkNodesInReplica done",
+		zap.Duration("total", time.Since(start)),
+		zap.Duration("recoverPhase", recoverElapsed),
+		zap.Duration("drainPhase", drainElapsed),
+		zap.Int("collections", len(collections)),
+		zap.Int("removedNodes", removedNodeCount),
+		zap.Int("repeatRecover", repeatRecoverCount),
+	)
 }
