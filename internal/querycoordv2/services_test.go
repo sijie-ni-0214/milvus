@@ -1472,8 +1472,8 @@ func (suite *ServiceSuite) TestLoadBalanceWithEmptySegmentList() {
 	defer func() {
 		for _, collection := range suite.collections {
 			replicas := suite.meta.ReplicaManager.GetByCollection(ctx, collection)
-			suite.meta.ReplicaManager.RemoveNode(ctx, replicas[0].GetID(), srcNode)
-			suite.meta.ReplicaManager.RemoveNode(ctx, replicas[0].GetID(), dstNode)
+			suite.meta.ReplicaManager.RemoveNode(ctx, collection, replicas[0].GetID(), srcNode)
+			suite.meta.ReplicaManager.RemoveNode(ctx, collection, replicas[0].GetID(), dstNode)
 		}
 		suite.nodeMgr.Remove(1001)
 		suite.nodeMgr.Remove(1002)
@@ -1616,7 +1616,7 @@ func (suite *ServiceSuite) TestLoadBalanceFailed() {
 		suite.NoError(err)
 		suite.Equal(commonpb.ErrorCode_UnexpectedError, resp.ErrorCode)
 		suite.nodeMgr.Remove(10)
-		suite.meta.ReplicaManager.RemoveNode(ctx, replicas[0].GetID(), 10)
+		suite.meta.ReplicaManager.RemoveNode(ctx, collection, replicas[0].GetID(), 10)
 	}
 }
 
