@@ -160,7 +160,7 @@ func (ob *ReplicaObserver) checkStreamingQueryNodesInReplica(sqNodeIDs typeutil.
 				zap.Int64s("roNodes", roSQNodes),
 				zap.Int64s("rwNodes", rwSQNodes),
 			)
-			if err := ob.meta.ReplicaManager.RemoveSQNode(ctx, replica.GetID(), removeNodes...); err != nil {
+			if err := ob.meta.ReplicaManager.RemoveSQNode(ctx, collectionID, replica.GetID(), removeNodes...); err != nil {
 				logger.Warn("fail to remove streaming query node from replica", zap.Error(err))
 				continue
 			}
@@ -236,7 +236,7 @@ func (ob *ReplicaObserver) checkNodesInReplica() {
 			if len(removeNodes) == 0 {
 				continue
 			}
-			if err := ob.meta.ReplicaManager.RemoveNode(ctx, replica.GetID(), removeNodes...); err != nil {
+			if err := ob.meta.ReplicaManager.RemoveNode(ctx, collectionID, replica.GetID(), removeNodes...); err != nil {
 				logger.Warn("fail to remove node from replica",
 					zap.Int64s("removedNodes", removeNodes),
 					zap.Error(err))

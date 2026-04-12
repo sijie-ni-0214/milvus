@@ -63,8 +63,8 @@ type ReplicaManagerInterface interface {
 
 	// Node management
 	RecoverNodesInCollection(ctx context.Context, collectionID typeutil.UniqueID, rgs map[string]*ResourceGroup) error
-	RemoveNode(ctx context.Context, replicaID typeutil.UniqueID, nodes ...typeutil.UniqueID) error
-	RemoveSQNode(ctx context.Context, replicaID typeutil.UniqueID, nodes ...typeutil.UniqueID) error
+	RemoveNode(ctx context.Context, collectionID typeutil.UniqueID, replicaID typeutil.UniqueID, nodes ...typeutil.UniqueID) error
+	RemoveSQNode(ctx context.Context, collectionID typeutil.UniqueID, replicaID typeutil.UniqueID, nodes ...typeutil.UniqueID) error
 
 	// Metadata access
 	GetResourceGroupByCollection(ctx context.Context, collection typeutil.UniqueID) typeutil.Set[string]
@@ -77,9 +77,6 @@ var _ ReplicaManagerInterface = (*ReplicaManager)(nil)
 type ReplicaManager struct {
 	// per-collection read-write lock, auto-created/recycled by KeyLock
 	collLock *lock.KeyLock[int64]
-
-	// global index: replicaID → collectionID, only modified on replica creation/deletion
-	replicaIndex *typeutil.ConcurrentMap[int64, int64]
 
 	// flat index: replicaID → *Replica, lock-free read for Get()
 	flatReplicas *typeutil.ConcurrentMap[int64, *Replica]
@@ -122,7 +119,6 @@ func newCollectionReplicas() *collectionReplicas {
 func NewReplicaManager(idAllocator func() (int64, error), catalog metastore.QueryCoordCatalog) *ReplicaManager {
 	return &ReplicaManager{
 		collLock:      lock.NewKeyLock[int64](),
-		replicaIndex:  typeutil.NewConcurrentMap[int64, int64](),
 		flatReplicas:  typeutil.NewConcurrentMap[int64, *Replica](),
 		coll2Replicas: typeutil.NewConcurrentMap[int64, *collectionReplicas](),
 		idAllocator:   idAllocator,
@@ -173,7 +169,6 @@ func (m *ReplicaManager) removeReplicasLocked(ctx context.Context, collReplicas 
 			metrics.QueryCoordResourceGroupReplicaTotal.WithLabelValues(replica.GetResourceGroup()).Dec()
 			metrics.QueryCoordReplicaRONodeTotal.Add(-float64(replica.RONodesCount()))
 		}
-		m.replicaIndex.Remove(replicaID)
 		m.flatReplicas.Remove(replicaID)
 	}
 	if collReplicas.removeReplicas(replicaIDs...) {
@@ -249,7 +244,6 @@ func (m *ReplicaManager) Recover(ctx context.Context, collections []int64) error
 		if collectionSet.Contain(replica.GetCollectionID()) {
 			rep := NewReplicaWithPriority(replica, commonpb.LoadPriority_HIGH)
 			collID := rep.GetCollectionID()
-			m.replicaIndex.Insert(rep.GetID(), collID)
 			collReplicas, _ := m.coll2Replicas.GetOrInsert(collID, newCollectionReplicas())
 			collReplicas.putReplica(rep, m.flatReplicas)
 			metrics.QueryCoordResourceGroupReplicaTotal.WithLabelValues(rep.GetResourceGroup()).Inc()
@@ -536,16 +530,11 @@ func (m *ReplicaManager) RecoverSQNodesInCollection(ctx context.Context, collect
 }
 
 // RemoveNode removes the node from the given replica.
-func (m *ReplicaManager) RemoveNode(ctx context.Context, replicaID typeutil.UniqueID, nodes ...typeutil.UniqueID) error {
-	collID, ok := m.replicaIndex.Get(replicaID)
-	if !ok {
-		return merr.WrapErrReplicaNotFound(replicaID)
-	}
+func (m *ReplicaManager) RemoveNode(ctx context.Context, collectionID typeutil.UniqueID, replicaID typeutil.UniqueID, nodes ...typeutil.UniqueID) error {
+	m.collLock.Lock(collectionID)
+	defer m.collLock.Unlock(collectionID)
 
-	m.collLock.Lock(collID)
-	defer m.collLock.Unlock(collID)
-
-	collReplicas, ok := m.coll2Replicas.Get(collID)
+	collReplicas, ok := m.coll2Replicas.Get(collectionID)
 	if !ok {
 		return merr.WrapErrReplicaNotFound(replicaID)
 	}
@@ -566,16 +555,11 @@ func (m *ReplicaManager) RemoveNode(ctx context.Context, replicaID typeutil.Uniq
 }
 
 // RemoveSQNode removes the sq node from the given replica.
-func (m *ReplicaManager) RemoveSQNode(ctx context.Context, replicaID typeutil.UniqueID, nodes ...typeutil.UniqueID) error {
-	collID, ok := m.replicaIndex.Get(replicaID)
-	if !ok {
-		return merr.WrapErrReplicaNotFound(replicaID)
-	}
+func (m *ReplicaManager) RemoveSQNode(ctx context.Context, collectionID typeutil.UniqueID, replicaID typeutil.UniqueID, nodes ...typeutil.UniqueID) error {
+	m.collLock.Lock(collectionID)
+	defer m.collLock.Unlock(collectionID)
 
-	m.collLock.Lock(collID)
-	defer m.collLock.Unlock(collID)
-
-	collReplicas, ok := m.coll2Replicas.Get(collID)
+	collReplicas, ok := m.coll2Replicas.Get(collectionID)
 	if !ok {
 		return merr.WrapErrReplicaNotFound(replicaID)
 	}
@@ -754,7 +738,6 @@ func (m *ReplicaManager) Spawn(ctx context.Context, collection int64, replicaNum
 	}
 	collReplicas, _ := m.coll2Replicas.GetOrInsert(collection, newCollectionReplicas())
 	for _, r := range replicas {
-		m.replicaIndex.Insert(r.GetID(), collection)
 		collReplicas.putReplica(r, m.flatReplicas)
 		metrics.QueryCoordResourceGroupReplicaTotal.WithLabelValues(r.GetResourceGroup()).Inc()
 		metrics.QueryCoordReplicaRONodeTotal.Add(float64(r.RONodesCount()))
@@ -810,7 +793,6 @@ func (m *ReplicaManager) SpawnWithReplicaConfig(ctx context.Context, params Spaw
 	// Persist succeeded, now safe to insert into coll2Replicas.
 	collReplicas, _ := m.coll2Replicas.GetOrInsert(params.CollectionID, newCollectionReplicas())
 	for _, r := range replicas {
-		m.replicaIndex.Insert(r.GetID(), params.CollectionID)
 		if oldReplica, ok := collReplicas.id2replicas[r.GetID()]; ok {
 			metrics.QueryCoordResourceGroupReplicaTotal.WithLabelValues(oldReplica.GetResourceGroup()).Dec()
 			metrics.QueryCoordReplicaRONodeTotal.Add(-float64(oldReplica.RONodesCount()))
@@ -865,7 +847,6 @@ func (m *ReplicaManager) Put(ctx context.Context, replicas ...*Replica) error {
 		}
 		collReplicas, _ := m.coll2Replicas.GetOrInsert(collID, newCollectionReplicas())
 		for _, r := range groupedReplicas {
-			m.replicaIndex.Insert(r.GetID(), collID)
 			if old, ok := collReplicas.id2replicas[r.GetID()]; ok {
 				metrics.QueryCoordResourceGroupReplicaTotal.WithLabelValues(old.GetResourceGroup()).Dec()
 				metrics.QueryCoordReplicaRONodeTotal.Add(-float64(old.RONodesCount()))
@@ -898,7 +879,6 @@ func (m *ReplicaManager) RemoveCollection(ctx context.Context, collectionID type
 	for _, replica := range *collReplicas.replicas.Load() {
 		metrics.QueryCoordResourceGroupReplicaTotal.WithLabelValues(replica.GetResourceGroup()).Dec()
 		metrics.QueryCoordReplicaRONodeTotal.Add(-float64(replica.RONodesCount()))
-		m.replicaIndex.Remove(replica.GetID())
 		m.flatReplicas.Remove(replica.GetID())
 	}
 	m.coll2Replicas.Remove(collectionID)

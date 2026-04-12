@@ -377,8 +377,8 @@ func (suite *ReplicaManagerSuite) clearMemory() {
 		suite.mgr.coll2Replicas.Remove(collID)
 		return true
 	})
-	suite.mgr.replicaIndex.Range(func(replicaID int64, _ int64) bool {
-		suite.mgr.replicaIndex.Remove(replicaID)
+	suite.mgr.flatReplicas.Range(func(replicaID int64, _ *Replica) bool {
+		suite.mgr.flatReplicas.Remove(replicaID)
 		return true
 	})
 }
@@ -586,8 +586,8 @@ func (suite *ReplicaManagerV2Suite) recoverReplica(k int, clearOutbound bool) {
 				replicas := suite.mgr.GetByCollection(ctx, id)
 				for _, r := range replicas {
 					outboundNodes := r.GetRONodes()
-					suite.mgr.RemoveNode(ctx, r.GetID(), outboundNodes...)
-					suite.mgr.RemoveSQNode(ctx, r.GetID(), r.GetROSQNodes()...)
+					suite.mgr.RemoveNode(ctx, id, r.GetID(), outboundNodes...)
+					suite.mgr.RemoveSQNode(ctx, id, r.GetID(), r.GetROSQNodes()...)
 				}
 			}
 		}
