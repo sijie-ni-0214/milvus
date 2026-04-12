@@ -373,7 +373,7 @@ func (suite *ReplicaManagerSuite) TestResourceGroup() {
 }
 
 func (suite *ReplicaManagerSuite) clearMemory() {
-	suite.mgr.coll2Replicas.Range(func(collID int64, _ *collectionReplicas) bool {
+	suite.mgr.coll2Replicas.Range(func(collID int64, _ []*Replica) bool {
 		suite.mgr.coll2Replicas.Remove(collID)
 		return true
 	})
