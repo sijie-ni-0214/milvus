@@ -112,25 +112,43 @@ func (m *ReplicaManager) getCollReplica(collectionID, replicaID typeutil.UniqueI
 	return nil
 }
 
-// putCollReplica inserts or replaces a replica in the collection's replica list.
+// putCollReplica inserts or replaces one or more replicas in the collection's replica list.
+// The whole batch becomes visible to lock-free readers through a single slice replacement,
+// so multi-replica updates (RecoverNodesInCollection / TransferReplica / MoveReplica) look
+// atomic from the outside. flatReplicas is updated first so that the invariant
+// "visible via GetByCollection ⇒ visible via Get" always holds.
 // Caller must hold collLock for the collection.
-func (m *ReplicaManager) putCollReplica(collectionID typeutil.UniqueID, replica *Replica) {
+func (m *ReplicaManager) putCollReplica(collectionID typeutil.UniqueID, replicas ...*Replica) {
+	if len(replicas) == 0 {
+		return
+	}
 	old, _ := m.coll2Replicas.Get(collectionID)
-	newSlice := make([]*Replica, 0, len(old)+1)
-	replaced := false
+	updates := make(map[int64]*Replica, len(replicas))
+	for _, r := range replicas {
+		updates[r.GetID()] = r
+	}
+	newSlice := make([]*Replica, 0, len(old)+len(updates))
 	for _, r := range old {
-		if r.GetID() == replica.GetID() {
-			newSlice = append(newSlice, replica)
-			replaced = true
+		if nr, ok := updates[r.GetID()]; ok {
+			newSlice = append(newSlice, nr)
+			delete(updates, r.GetID())
 		} else {
 			newSlice = append(newSlice, r)
 		}
 	}
-	if !replaced {
-		newSlice = append(newSlice, replica)
+	// Append brand-new replicas (not present in the old slice), preserving input order.
+	for _, r := range replicas {
+		if _, ok := updates[r.GetID()]; ok {
+			newSlice = append(newSlice, r)
+			delete(updates, r.GetID())
+		}
 	}
+	// Step 1: publish to flat index first.
+	for _, r := range replicas {
+		m.flatReplicas.Insert(r.GetID(), r)
+	}
+	// Step 2: publish the new collection slice in one shot.
 	m.coll2Replicas.Insert(collectionID, newSlice)
-	m.flatReplicas.Insert(replica.GetID(), replica)
 }
 
 // removeCollReplicas removes replicas by ID from the collection's replica list.
@@ -173,20 +191,27 @@ func (m *ReplicaManager) persistReplicas(ctx context.Context, replicas ...*Repli
 }
 
 // updateReplicasInCollection updates replicas in the collection's in-memory data.
+// The slice replacement is batched through putCollReplica so lock-free readers never
+// observe a mid-batch mix of old and new replicas.
 // Caller must hold collLock.Lock for this collection.
 func (m *ReplicaManager) updateReplicasInCollection(collectionID typeutil.UniqueID, replicas ...*Replica) {
+	if len(replicas) == 0 {
+		return
+	}
 	for _, replica := range replicas {
 		if oldReplica := m.getCollReplica(collectionID, replica.GetID()); oldReplica != nil {
 			metrics.QueryCoordResourceGroupReplicaTotal.WithLabelValues(oldReplica.GetResourceGroup()).Dec()
 			metrics.QueryCoordReplicaRONodeTotal.Add(-float64(oldReplica.RONodesCount()))
 		}
-		m.putCollReplica(collectionID, replica)
 		metrics.QueryCoordResourceGroupReplicaTotal.WithLabelValues(replica.GetResourceGroup()).Inc()
 		metrics.QueryCoordReplicaRONodeTotal.Add(float64(replica.RONodesCount()))
 	}
+	m.putCollReplica(collectionID, replicas...)
 }
 
 // removeReplicasLocked removes specific replicas while holding collLock.Lock.
+// coll2Replicas is updated before flatReplicas so lock-free readers never observe
+// a replica that is visible via GetByCollection but missing from Get(id).
 func (m *ReplicaManager) removeReplicasLocked(ctx context.Context, collectionID int64, replicaIDs ...int64) error {
 	if len(replicaIDs) == 0 {
 		return nil
@@ -194,14 +219,14 @@ func (m *ReplicaManager) removeReplicasLocked(ctx context.Context, collectionID 
 	if err := m.catalog.ReleaseReplica(ctx, collectionID, replicaIDs...); err != nil {
 		return err
 	}
+	m.removeCollReplicas(collectionID, replicaIDs...)
 	for _, replicaID := range replicaIDs {
-		if replica := m.getCollReplica(collectionID, replicaID); replica != nil {
+		if replica, ok := m.flatReplicas.Get(replicaID); ok {
 			metrics.QueryCoordResourceGroupReplicaTotal.WithLabelValues(replica.GetResourceGroup()).Dec()
 			metrics.QueryCoordReplicaRONodeTotal.Add(-float64(replica.RONodesCount()))
 		}
 		m.flatReplicas.Remove(replicaID)
 	}
-	m.removeCollReplicas(collectionID, replicaIDs...)
 	return nil
 }
 
@@ -751,8 +776,8 @@ func (m *ReplicaManager) Spawn(ctx context.Context, collection int64, replicaNum
 	if err := m.persistReplicas(ctx, replicas...); err != nil {
 		return nil, err
 	}
+	m.putCollReplica(collection, replicas...)
 	for _, r := range replicas {
-		m.putCollReplica(collection, r)
 		metrics.QueryCoordResourceGroupReplicaTotal.WithLabelValues(r.GetResourceGroup()).Inc()
 		metrics.QueryCoordReplicaRONodeTotal.Add(float64(r.RONodesCount()))
 	}
@@ -866,12 +891,14 @@ func (m *ReplicaManager) RemoveCollection(ctx context.Context, collectionID type
 		return err
 	}
 
+	// coll2Replicas is updated before flatReplicas so the invariant
+	// "visible via GetByCollection ⇒ visible via Get" holds during deletion.
+	m.coll2Replicas.Remove(collectionID)
 	for _, replica := range replicas {
 		metrics.QueryCoordResourceGroupReplicaTotal.WithLabelValues(replica.GetResourceGroup()).Dec()
 		metrics.QueryCoordReplicaRONodeTotal.Add(-float64(replica.RONodesCount()))
 		m.flatReplicas.Remove(replica.GetID())
 	}
-	m.coll2Replicas.Remove(collectionID)
 	return nil
 }
 
