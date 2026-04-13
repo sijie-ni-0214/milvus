@@ -97,21 +97,6 @@ func NewReplicaManager(idAllocator func() (int64, error), catalog metastore.Quer
 	}
 }
 
-// getCollReplica returns the replica with the given ID from the collection's replica list.
-// Caller must hold collLock for the collection.
-func (m *ReplicaManager) getCollReplica(collectionID, replicaID typeutil.UniqueID) *Replica {
-	replicas, ok := m.coll2Replicas.Get(collectionID)
-	if !ok {
-		return nil
-	}
-	for _, r := range replicas {
-		if r.GetID() == replicaID {
-			return r
-		}
-	}
-	return nil
-}
-
 // putCollReplica inserts or replaces one or more replicas in the collection's replica list.
 // The whole batch becomes visible to lock-free readers through a single slice replacement,
 // so multi-replica updates (RecoverNodesInCollection / TransferReplica / MoveReplica) look
@@ -119,7 +104,28 @@ func (m *ReplicaManager) getCollReplica(collectionID, replicaID typeutil.UniqueI
 // "visible via GetByCollection ⇒ visible via Get" always holds.
 // Caller must hold collLock for the collection.
 func (m *ReplicaManager) putCollReplica(collectionID typeutil.UniqueID, replicas ...*Replica) {
-	if len(replicas) == 0 {
+	switch len(replicas) {
+	case 0:
+		return
+	case 1:
+		// Single-replica fast path: avoid map allocation, walk old slice once.
+		r := replicas[0]
+		old, _ := m.coll2Replicas.Get(collectionID)
+		newSlice := make([]*Replica, 0, len(old)+1)
+		replaced := false
+		for _, existing := range old {
+			if existing.GetID() == r.GetID() {
+				newSlice = append(newSlice, r)
+				replaced = true
+			} else {
+				newSlice = append(newSlice, existing)
+			}
+		}
+		if !replaced {
+			newSlice = append(newSlice, r)
+		}
+		m.flatReplicas.Insert(r.GetID(), r)
+		m.coll2Replicas.Insert(collectionID, newSlice)
 		return
 	}
 	old, _ := m.coll2Replicas.Get(collectionID)
@@ -198,8 +204,10 @@ func (m *ReplicaManager) updateReplicasInCollection(collectionID typeutil.Unique
 	if len(replicas) == 0 {
 		return
 	}
+	// flatReplicas still holds the pre-update snapshots (putCollReplica hasn't run yet),
+	// so O(1) lookup is enough for metric decrements.
 	for _, replica := range replicas {
-		if oldReplica := m.getCollReplica(collectionID, replica.GetID()); oldReplica != nil {
+		if oldReplica, ok := m.flatReplicas.Get(replica.GetID()); ok {
 			metrics.QueryCoordResourceGroupReplicaTotal.WithLabelValues(oldReplica.GetResourceGroup()).Dec()
 			metrics.QueryCoordReplicaRONodeTotal.Add(-float64(oldReplica.RONodesCount()))
 		}
@@ -283,7 +291,9 @@ func (m *ReplicaManager) getSrcReplicasAndCheckIfTransferable(collectionID typeu
 // Startup recovery
 // ============================================================
 
-// Recover recovers the replicas for given collections from meta store
+// Recover recovers the replicas for given collections from meta store.
+// Replicas are grouped by collection so each collection's slice is built in O(N)
+// instead of O(N^2) that would result from calling putCollReplica per replica.
 func (m *ReplicaManager) Recover(ctx context.Context, collections []int64) error {
 	replicas, err := m.catalog.GetReplicas(ctx)
 	if err != nil {
@@ -291,6 +301,7 @@ func (m *ReplicaManager) Recover(ctx context.Context, collections []int64) error
 	}
 
 	collectionSet := typeutil.NewUniqueSet(collections...)
+	grouped := make(map[int64][]*Replica)
 	for _, replica := range replicas {
 		if len(replica.GetResourceGroup()) == 0 {
 			replica.ResourceGroup = DefaultResourceGroupName
@@ -298,8 +309,7 @@ func (m *ReplicaManager) Recover(ctx context.Context, collections []int64) error
 
 		if collectionSet.Contain(replica.GetCollectionID()) {
 			rep := NewReplicaWithPriority(replica, commonpb.LoadPriority_HIGH)
-			collID := rep.GetCollectionID()
-			m.putCollReplica(collID, rep)
+			grouped[rep.GetCollectionID()] = append(grouped[rep.GetCollectionID()], rep)
 			metrics.QueryCoordResourceGroupReplicaTotal.WithLabelValues(rep.GetResourceGroup()).Inc()
 			metrics.QueryCoordReplicaRONodeTotal.Add(float64(rep.RONodesCount()))
 			log.Info("recover replica",
@@ -321,6 +331,9 @@ func (m *ReplicaManager) Recover(ctx context.Context, collections []int64) error
 				zap.Int64s("nodes", replica.GetNodes()),
 			)
 		}
+	}
+	for collID, reps := range grouped {
+		m.putCollReplica(collID, reps...)
 	}
 	return nil
 }
@@ -466,7 +479,7 @@ func (m *ReplicaManager) RecoverNodesInCollection(ctx context.Context, collectio
 	// recover node by resource group.
 	helper.RangeOverResourceGroup(func(replicaHelper *replicasInSameRGAssignmentHelper) {
 		replicaHelper.RangeOverReplicas(func(assignment *replicaAssignmentInfo) {
-			replica := m.getCollReplica(collectionID, assignment.GetReplicaID())
+			replica := assignment.GetReplica()
 			// For replicas with needWaitRGReady flag, skip assignment if the RG still has missing nodes.
 			if replica.NeedWaitRGReady() {
 				rgName := replica.GetResourceGroup()
@@ -550,7 +563,7 @@ func (m *ReplicaManager) RecoverSQNodesInCollection(ctx context.Context, collect
 			// nothing to do.
 			return
 		}
-		mutableReplica := m.getCollReplica(collectionID, assignment.GetReplicaID()).CopyForWrite()
+		mutableReplica := assignment.GetReplica().CopyForWrite()
 		mutableReplica.AddROSQNode(roNodes...)          // rw -> ro
 		mutableReplica.AddRWSQNode(recoverableNodes...) // ro -> rw
 		mutableReplica.AddRWSQNode(incomingNode...)     // unused -> rw
@@ -584,8 +597,8 @@ func (m *ReplicaManager) RemoveNode(ctx context.Context, collectionID typeutil.U
 	m.collLock.Lock(collectionID)
 	defer m.collLock.Unlock(collectionID)
 
-	replica := m.getCollReplica(collectionID, replicaID)
-	if replica == nil {
+	replica, ok := m.flatReplicas.Get(replicaID)
+	if !ok || replica.GetCollectionID() != collectionID {
 		return merr.WrapErrReplicaNotFound(replicaID)
 	}
 
@@ -605,8 +618,8 @@ func (m *ReplicaManager) RemoveSQNode(ctx context.Context, collectionID typeutil
 	m.collLock.Lock(collectionID)
 	defer m.collLock.Unlock(collectionID)
 
-	replica := m.getCollReplica(collectionID, replicaID)
-	if replica == nil {
+	replica, ok := m.flatReplicas.Get(replicaID)
+	if !ok || replica.GetCollectionID() != collectionID {
 		return merr.WrapErrReplicaNotFound(replicaID)
 	}
 
@@ -794,8 +807,8 @@ func (m *ReplicaManager) SpawnWithReplicaConfig(ctx context.Context, params Spaw
 
 	replicas := make([]*Replica, 0)
 	for _, config := range params.Configs {
-		existedReplica := m.getCollReplica(params.CollectionID, config.GetReplicaId())
-		if existedReplica != nil {
+		if existedReplica, ok := m.flatReplicas.Get(config.GetReplicaId()); ok &&
+			existedReplica.GetCollectionID() == params.CollectionID {
 			// if the replica already exists, just update the resource group
 			mutableReplica := existedReplica.CopyForWrite()
 			mutableReplica.SetResourceGroup(config.GetResourceGroupName())
