@@ -64,6 +64,7 @@ type ReplicaManagerInterface interface {
 	RecoverNodesInCollection(ctx context.Context, collectionID typeutil.UniqueID, rgs map[string]*ResourceGroup) error
 	RemoveNode(ctx context.Context, collectionID typeutil.UniqueID, replicaID typeutil.UniqueID, nodes ...typeutil.UniqueID) error
 	RemoveSQNode(ctx context.Context, collectionID typeutil.UniqueID, replicaID typeutil.UniqueID, nodes ...typeutil.UniqueID) error
+	EnableChannelExclusiveMode(ctx context.Context, collectionID typeutil.UniqueID, replicaID typeutil.UniqueID, channels []string) error
 
 	// Metadata access
 	GetResourceGroupByCollection(ctx context.Context, collection typeutil.UniqueID) typeutil.Set[string]
@@ -625,6 +626,32 @@ func (m *ReplicaManager) RemoveSQNode(ctx context.Context, collectionID typeutil
 
 	mutableReplica := replica.CopyForWrite()
 	mutableReplica.RemoveSQNode(nodes...) // ro -> unused
+	modified := mutableReplica.IntoReplica()
+
+	if err := m.persistReplicas(ctx, modified); err != nil {
+		return err
+	}
+	m.updateReplicasInCollection(collectionID, modified)
+	return nil
+}
+
+// EnableChannelExclusiveMode atomically enables channel exclusive mode on the given replica.
+// Reading the pre-update state and writing back happens under the same per-collection lock,
+// so concurrent writes can't be lost. No-op if the replica already has the mode enabled.
+func (m *ReplicaManager) EnableChannelExclusiveMode(ctx context.Context, collectionID typeutil.UniqueID, replicaID typeutil.UniqueID, channels []string) error {
+	m.collLock.Lock(collectionID)
+	defer m.collLock.Unlock(collectionID)
+
+	replica, ok := m.flatReplicas.Get(replicaID)
+	if !ok || replica.GetCollectionID() != collectionID {
+		return merr.WrapErrReplicaNotFound(replicaID)
+	}
+	if replica.IsChannelExclusiveModeEnabled() {
+		return nil
+	}
+
+	mutableReplica := replica.CopyForWrite()
+	mutableReplica.TryEnableChannelExclusiveMode(channels...)
 	modified := mutableReplica.IntoReplica()
 
 	if err := m.persistReplicas(ctx, modified); err != nil {

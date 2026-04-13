@@ -205,11 +205,13 @@ func (ob *ReplicaObserver) checkNodesInReplica() {
 		for _, replica := range replicas {
 			if enableChannelExclusiveMode && !replica.IsChannelExclusiveModeEnabled() {
 				// register channel for enable exclusive mode
-				mutableReplica := replica.CopyForWrite()
 				channels := ob.targetMgr.GetDmChannelsByCollection(ctx, collectionID, meta.CurrentTargetFirst)
-				mutableReplica.TryEnableChannelExclusiveMode(lo.Keys(channels)...)
-				replica = mutableReplica.IntoReplica()
-				ob.meta.ReplicaManager.Put(ctx, replica)
+				if err := ob.meta.ReplicaManager.EnableChannelExclusiveMode(ctx, collectionID, replica.GetID(), lo.Keys(channels)); err != nil {
+					log.Warn("failed to enable channel exclusive mode for replica",
+						zap.Int64("collectionID", collectionID),
+						zap.Int64("replicaID", replica.GetID()),
+						zap.Error(err))
+				}
 			}
 
 			roNodes := replica.GetRONodes()
