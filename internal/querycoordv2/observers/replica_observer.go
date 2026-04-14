@@ -144,7 +144,7 @@ func (ob *ReplicaObserver) checkStreamingQueryNodesInReplica(sqNodeIDs typeutil.
 			}
 			removeNodes := make([]int64, 0, len(roSQNodes))
 			for _, node := range roSQNodes {
-				channels := ob.distMgr.ChannelDistManager.GetByCollectionAndFilter(replica.GetCollectionID(), meta.WithNodeID2Channel(node))
+				channels := ob.distMgr.ChannelDistManager.GetByFilter(meta.WithCollectionID2Channel(collectionID), meta.WithNodeID2Channel(node))
 				segments := ob.distMgr.SegmentDistManager.GetByFilter(meta.WithCollectionID(collectionID), meta.WithNodeID(node))
 				if len(channels) == 0 && len(segments) == 0 {
 					removeNodes = append(removeNodes, node)
@@ -229,7 +229,7 @@ func (ob *ReplicaObserver) checkNodesInReplica() {
 			log.RatedInfo(10, "found ro nodes in replica")
 			removeNodes := make([]int64, 0, len(roNodes))
 			for _, node := range roNodes {
-				channels := ob.distMgr.ChannelDistManager.GetByCollectionAndFilter(replica.GetCollectionID(), meta.WithNodeID2Channel(node))
+				channels := ob.distMgr.ChannelDistManager.GetByFilter(meta.WithCollectionID2Channel(collectionID), meta.WithNodeID2Channel(node))
 				segments := ob.distMgr.SegmentDistManager.GetByFilter(meta.WithCollectionID(collectionID), meta.WithNodeID(node))
 				if len(channels) == 0 && len(segments) == 0 {
 					removeNodes = append(removeNodes, node)
