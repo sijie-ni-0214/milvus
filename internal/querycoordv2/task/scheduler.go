@@ -105,51 +105,98 @@ type replicaChannelIndex struct {
 
 type taskQueue struct {
 	mu sync.RWMutex
-	// TaskPriority -> TaskID -> Task
-	buckets []map[int64]Task
+	// NodeID -> TaskPriority -> TaskID -> Task
+	buckets map[int64][]map[int64]Task
 }
 
 func newTaskQueue() *taskQueue {
-	buckets := make([]map[int64]Task, len(TaskPriorities))
-	for i := range buckets {
-		buckets[i] = make(map[int64]Task)
-	}
 	return &taskQueue{
-		buckets: buckets,
+		buckets: make(map[int64][]map[int64]Task),
 	}
 }
 
+// Len returns the total number of unique tasks across all nodes.
+// A task appearing in multiple node buckets (e.g. Move task) is counted once.
 func (queue *taskQueue) Len() int {
 	queue.mu.RLock()
 	defer queue.mu.RUnlock()
-	taskNum := 0
-	for _, tasks := range queue.buckets {
-		taskNum += len(tasks)
+	seen := make(map[int64]struct{})
+	for _, nodeBuckets := range queue.buckets {
+		for _, bucket := range nodeBuckets {
+			for taskID := range bucket {
+				seen[taskID] = struct{}{}
+			}
+		}
 	}
+	return len(seen)
+}
 
-	return taskNum
+// LenByNode returns the number of tasks related to the specified node.
+func (queue *taskQueue) LenByNode(nodeID int64) int {
+	queue.mu.RLock()
+	defer queue.mu.RUnlock()
+	nodeBuckets, ok := queue.buckets[nodeID]
+	if !ok {
+		return 0
+	}
+	n := 0
+	for _, bucket := range nodeBuckets {
+		n += len(bucket)
+	}
+	return n
 }
 
 func (queue *taskQueue) Add(task Task) {
 	queue.mu.Lock()
 	defer queue.mu.Unlock()
-	bucket := queue.buckets[task.Priority()]
-	bucket[task.ID()] = task
+	for _, action := range task.Actions() {
+		queue.addToBucket(action.Node(), task)
+		if la, ok := action.(*LeaderAction); ok {
+			queue.addToBucket(la.GetLeaderID(), task)
+		}
+	}
 }
 
 func (queue *taskQueue) Remove(task Task) {
 	queue.mu.Lock()
 	defer queue.mu.Unlock()
-	bucket := queue.buckets[task.Priority()]
-	delete(bucket, task.ID())
+	for _, action := range task.Actions() {
+		queue.removeFromBucket(action.Node(), task)
+		if la, ok := action.(*LeaderAction); ok {
+			queue.removeFromBucket(la.GetLeaderID(), task)
+		}
+	}
 }
 
-// Range iterates all tasks in the queue ordered by priority from high to low
-func (queue *taskQueue) Range(fn func(task Task) bool) {
+func (queue *taskQueue) addToBucket(nodeID int64, task Task) {
+	nodeBuckets, ok := queue.buckets[nodeID]
+	if !ok {
+		nodeBuckets = make([]map[int64]Task, len(TaskPriorities))
+		for i := range nodeBuckets {
+			nodeBuckets[i] = make(map[int64]Task)
+		}
+		queue.buckets[nodeID] = nodeBuckets
+	}
+	nodeBuckets[task.Priority()][task.ID()] = task
+}
+
+func (queue *taskQueue) removeFromBucket(nodeID int64, task Task) {
+	if nodeBuckets, ok := queue.buckets[nodeID]; ok {
+		delete(nodeBuckets[task.Priority()], task.ID())
+	}
+}
+
+// RangeByNode iterates tasks related to the specified node,
+// ordered by priority from high to low.
+func (queue *taskQueue) RangeByNode(nodeID int64, fn func(task Task) bool) {
 	queue.mu.RLock()
 	defer queue.mu.RUnlock()
-	for priority := len(queue.buckets) - 1; priority >= 0; priority-- {
-		for _, task := range queue.buckets[priority] {
+	nodeBuckets, ok := queue.buckets[nodeID]
+	if !ok {
+		return
+	}
+	for priority := len(nodeBuckets) - 1; priority >= 0; priority-- {
+		for _, task := range nodeBuckets[priority] {
 			if !fn(task) {
 				return
 			}
@@ -622,11 +669,10 @@ func (scheduler *taskScheduler) getReplicaShardLeader(channelName string, replic
 	return scheduler.distMgr.ChannelDistManager.GetShardLeader(channelName, replica)
 }
 
-func (scheduler *taskScheduler) tryPromoteAll() {
-	// Promote waiting tasks
-	toPromote := make([]Task, 0, scheduler.waitQueue.Len())
+func (scheduler *taskScheduler) tryPromote(node int64) {
+	toPromote := make([]Task, 0)
 	toRemove := make([]Task, 0)
-	scheduler.waitQueue.Range(func(task Task) bool {
+	scheduler.waitQueue.RangeByNode(node, func(task Task) bool {
 		err := scheduler.promote(task)
 		if err != nil {
 			task.Cancel(err)
@@ -807,12 +853,12 @@ func (scheduler *taskScheduler) schedule(node int64) {
 		zap.Int64("nodeID", node),
 	)
 
-	scheduler.tryPromoteAll()
+	scheduler.tryPromote(node)
 	promoteDur := tr.RecordSpan()
 
 	log.Debug("process tasks related to node",
-		zap.Int("processingTaskNum", scheduler.processQueue.Len()),
-		zap.Int("waitingTaskNum", scheduler.waitQueue.Len()),
+		zap.Int("processingTaskNum", scheduler.processQueue.LenByNode(node)),
+		zap.Int("waitingTaskNum", scheduler.waitQueue.LenByNode(node)),
 		zap.Int("segmentTaskNum", scheduler.segmentTasks.Len()),
 		zap.Int("channelTaskNum", scheduler.channelTasks.Len()),
 	)
@@ -823,22 +869,10 @@ func (scheduler *taskScheduler) schedule(node int64) {
 	scheduler.checkStaleReplicaCost = 0
 	scheduler.checkStaleDistCost = 0
 	scheduler.checkStaleNodeLoopCost = 0
-	// Check isRelated first to skip unrelated tasks early,
-	// avoiding unnecessary preProcess (checkStale lock overhead) for tasks
-	// that don't target this node.
 	toProcess := make([]Task, 0)
 	toRemove := make([]Task, 0)
-	processQueueLen := scheduler.processQueue.Len()
 	preProcessCost := time.Duration(0)
-	isRelatedCost := time.Duration(0)
-	scheduler.processQueue.Range(func(task Task) bool {
-		irStart := time.Now()
-		related := scheduler.isRelated(task, node)
-		isRelatedCost += time.Since(irStart)
-		if !related {
-			return true
-		}
-
+	scheduler.processQueue.RangeByNode(node, func(task Task) bool {
 		ppStart := time.Now()
 		scheduler.preProcess(task)
 		preProcessCost += time.Since(ppStart)
@@ -878,14 +912,12 @@ func (scheduler *taskScheduler) schedule(node int64) {
 		zap.Int("toRemoveNum", len(toRemove)),
 		zap.Duration("promoteDur", promoteDur),
 		zap.Duration("preprocessDur", preprocessDur),
-		zap.Int("processQueueLen", processQueueLen),
 		zap.Duration("preProcessCost", preProcessCost),
 		zap.Duration("stepUpCost", scheduler.preProcessStepUpCost),
 		zap.Duration("checkStaleCost", scheduler.preProcessCheckCost),
 		zap.Duration("checkStaleReplicaCost", scheduler.checkStaleReplicaCost),
 		zap.Duration("checkStaleDistCost", scheduler.checkStaleDistCost),
 		zap.Duration("checkStaleNodeLoopCost", scheduler.checkStaleNodeLoopCost),
-		zap.Duration("isRelatedCost", isRelatedCost),
 		zap.Duration("processDur", processDur),
 		zap.Duration("removeDur", removeDur),
 		zap.Duration("metricsDur", metricsDur),
@@ -893,8 +925,8 @@ func (scheduler *taskScheduler) schedule(node int64) {
 	)
 
 	log.Info("process tasks related to node done",
-		zap.Int("processingTaskNum", scheduler.processQueue.Len()),
-		zap.Int("waitingTaskNum", scheduler.waitQueue.Len()),
+		zap.Int("processingTaskNum", scheduler.processQueue.LenByNode(node)),
+		zap.Int("waitingTaskNum", scheduler.waitQueue.LenByNode(node)),
 		zap.Int("segmentTaskNum", scheduler.segmentTasks.Len()),
 		zap.Int("channelTaskNum", scheduler.channelTasks.Len()),
 	)

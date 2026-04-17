@@ -940,8 +940,10 @@ func (suite *TaskSuite) TestMoveSegmentTask() {
 	segmentsNum := len(suite.moveSegments)
 	suite.AssertTaskNum(0, segmentsNum, 0, segmentsNum)
 
-	// Process tasks
-	suite.dispatchAndWait(leader)
+	// Process tasks — Move task actions target targetNode (Grow) and
+	// sourceNode (Reduce). Dispatch targetNode to promote and execute
+	// the first action.
+	suite.dispatchAndWait(targetNode)
 	suite.AssertTaskNum(segmentsNum, 0, 0, segmentsNum)
 
 	// Process tasks, target node contains the segment
@@ -954,10 +956,10 @@ func (suite *TaskSuite) TestMoveSegmentTask() {
 	})
 
 	suite.dist.SegmentDistManager.Update(targetNode, distSegments...)
-	// First action done, execute the second action
-	suite.dispatchAndWait(leader)
-	// Check second action
-	suite.dispatchAndWait(leader)
+	// First action done, step up and execute the second action on sourceNode
+	suite.dispatchAndWait(sourceNode)
+	// Check second action done
+	suite.dispatchAndWait(sourceNode)
 	suite.AssertTaskNum(0, 0, 0, 0)
 
 	for _, task := range tasks {
@@ -2461,4 +2463,240 @@ func (suite *TaskSuite) TestTaskStaleBySegmentInDist() {
 		suite.scheduler.remove(task)
 		suite.dist.SegmentDistManager.Update(targetNode)
 	})
+}
+
+func (suite *TaskSuite) TestTaskQueueNodeBucketing() {
+	queue := newTaskQueue()
+
+	// Create tasks targeting different nodes
+	task1, err := NewSegmentTask(
+		suite.ctx,
+		5*time.Second,
+		WrapIDSource(0),
+		suite.collection,
+		suite.replica,
+		commonpb.LoadPriority_LOW,
+		NewSegmentAction(1, ActionTypeGrow, "ch-0", 100),
+	)
+	suite.NoError(err)
+	task1.SetID(1)
+
+	task2, err := NewSegmentTask(
+		suite.ctx,
+		5*time.Second,
+		WrapIDSource(0),
+		suite.collection,
+		suite.replica,
+		commonpb.LoadPriority_LOW,
+		NewSegmentAction(2, ActionTypeGrow, "ch-0", 101),
+	)
+	suite.NoError(err)
+	task2.SetID(2)
+
+	task3, err := NewSegmentTask(
+		suite.ctx,
+		5*time.Second,
+		WrapIDSource(0),
+		suite.collection,
+		suite.replica,
+		commonpb.LoadPriority_LOW,
+		NewSegmentAction(1, ActionTypeGrow, "ch-0", 102),
+	)
+	suite.NoError(err)
+	task3.SetID(3)
+
+	// Add all tasks
+	queue.Add(task1)
+	queue.Add(task2)
+	queue.Add(task3)
+
+	// Verify total length
+	suite.Equal(3, queue.Len())
+
+	// Verify per-node counts
+	suite.Equal(2, queue.LenByNode(1))
+	suite.Equal(1, queue.LenByNode(2))
+	suite.Equal(0, queue.LenByNode(999)) // non-existent node
+
+	// Verify RangeByNode returns only tasks for the specified node
+	var node1Tasks []Task
+	queue.RangeByNode(1, func(task Task) bool {
+		node1Tasks = append(node1Tasks, task)
+		return true
+	})
+	suite.Equal(2, len(node1Tasks))
+
+	var node2Tasks []Task
+	queue.RangeByNode(2, func(task Task) bool {
+		node2Tasks = append(node2Tasks, task)
+		return true
+	})
+	suite.Equal(1, len(node2Tasks))
+	suite.Equal(int64(2), node2Tasks[0].ID())
+
+	// Remove task1 from node 1 and verify
+	queue.Remove(task1)
+	suite.Equal(2, queue.Len())
+	suite.Equal(1, queue.LenByNode(1))
+	suite.Equal(1, queue.LenByNode(2))
+}
+
+func (suite *TaskSuite) TestTaskQueueMoveTaskDualNode() {
+	queue := newTaskQueue()
+
+	destNode := int64(1)
+	srcNode := int64(2)
+	segmentID := int64(200)
+
+	// Create a Move task with Grow on destNode and Reduce on srcNode
+	task, err := NewSegmentTask(
+		suite.ctx,
+		5*time.Second,
+		WrapIDSource(0),
+		suite.collection,
+		suite.replica,
+		commonpb.LoadPriority_LOW,
+		NewSegmentAction(destNode, ActionTypeGrow, "ch-0", segmentID),
+		NewSegmentAction(srcNode, ActionTypeReduce, "ch-0", segmentID),
+	)
+	suite.NoError(err)
+	task.SetID(10)
+
+	queue.Add(task)
+
+	// Total count should be 1 (deduped across nodes)
+	suite.Equal(1, queue.Len())
+
+	// Task should appear in both node buckets
+	suite.Equal(1, queue.LenByNode(destNode))
+	suite.Equal(1, queue.LenByNode(srcNode))
+
+	// RangeByNode on either node should yield the same task
+	var destTasks []Task
+	queue.RangeByNode(destNode, func(t Task) bool {
+		destTasks = append(destTasks, t)
+		return true
+	})
+	suite.Equal(1, len(destTasks))
+	suite.Equal(int64(10), destTasks[0].ID())
+
+	var srcTasks []Task
+	queue.RangeByNode(srcNode, func(t Task) bool {
+		srcTasks = append(srcTasks, t)
+		return true
+	})
+	suite.Equal(1, len(srcTasks))
+	suite.Equal(int64(10), srcTasks[0].ID())
+
+	// Remove should clear from both nodes
+	queue.Remove(task)
+	suite.Equal(0, queue.Len())
+	suite.Equal(0, queue.LenByNode(destNode))
+	suite.Equal(0, queue.LenByNode(srcNode))
+}
+
+func (suite *TaskSuite) TestTaskQueueLeaderActionDualNode() {
+	queue := newTaskQueue()
+
+	leaderID := int64(1)
+	workerID := int64(2)
+	segmentID := int64(300)
+
+	// Create a LeaderSegmentTask: action.Node() = workerID, action.GetLeaderID() = leaderID
+	action := NewLeaderAction(leaderID, workerID, ActionTypeGrow, "ch-0", segmentID, 1)
+	task := NewLeaderSegmentTask(suite.ctx, WrapIDSource(0), suite.collection, suite.replica, leaderID, action)
+	task.SetID(20)
+
+	queue.Add(task)
+
+	// Total count should be 1
+	suite.Equal(1, queue.Len())
+
+	// Task should be indexed by both workerID and leaderID
+	suite.Equal(1, queue.LenByNode(workerID))
+	suite.Equal(1, queue.LenByNode(leaderID))
+
+	// RangeByNode on worker node
+	var workerTasks []Task
+	queue.RangeByNode(workerID, func(t Task) bool {
+		workerTasks = append(workerTasks, t)
+		return true
+	})
+	suite.Equal(1, len(workerTasks))
+	suite.Equal(int64(20), workerTasks[0].ID())
+
+	// RangeByNode on leader node
+	var leaderTasks []Task
+	queue.RangeByNode(leaderID, func(t Task) bool {
+		leaderTasks = append(leaderTasks, t)
+		return true
+	})
+	suite.Equal(1, len(leaderTasks))
+	suite.Equal(int64(20), leaderTasks[0].ID())
+
+	// Remove should clean both buckets
+	queue.Remove(task)
+	suite.Equal(0, queue.Len())
+	suite.Equal(0, queue.LenByNode(workerID))
+	suite.Equal(0, queue.LenByNode(leaderID))
+}
+
+func (suite *TaskSuite) TestTaskQueueRangeByNodePriority() {
+	queue := newTaskQueue()
+	nodeID := int64(1)
+
+	// Create 3 tasks with different priorities on the same node
+	taskLow, err := NewSegmentTask(
+		suite.ctx,
+		5*time.Second,
+		WrapIDSource(0),
+		suite.collection,
+		suite.replica,
+		commonpb.LoadPriority_LOW,
+		NewSegmentAction(nodeID, ActionTypeGrow, "ch-0", 400),
+	)
+	suite.NoError(err)
+	taskLow.SetID(31)
+	taskLow.SetPriority(TaskPriorityLow)
+
+	taskNormal, err := NewSegmentTask(
+		suite.ctx,
+		5*time.Second,
+		WrapIDSource(0),
+		suite.collection,
+		suite.replica,
+		commonpb.LoadPriority_LOW,
+		NewSegmentAction(nodeID, ActionTypeGrow, "ch-0", 401),
+	)
+	suite.NoError(err)
+	taskNormal.SetID(32)
+	taskNormal.SetPriority(TaskPriorityNormal)
+
+	taskHigh, err := NewSegmentTask(
+		suite.ctx,
+		5*time.Second,
+		WrapIDSource(0),
+		suite.collection,
+		suite.replica,
+		commonpb.LoadPriority_LOW,
+		NewSegmentAction(nodeID, ActionTypeGrow, "ch-0", 402),
+	)
+	suite.NoError(err)
+	taskHigh.SetID(33)
+	taskHigh.SetPriority(TaskPriorityHigh)
+
+	// Add in arbitrary order
+	queue.Add(taskLow)
+	queue.Add(taskHigh)
+	queue.Add(taskNormal)
+
+	suite.Equal(3, queue.LenByNode(nodeID))
+
+	// RangeByNode should iterate high -> normal -> low
+	var visited []Priority
+	queue.RangeByNode(nodeID, func(t Task) bool {
+		visited = append(visited, t.Priority())
+		return true
+	})
+	suite.Equal([]Priority{TaskPriorityHigh, TaskPriorityNormal, TaskPriorityLow}, visited)
 }
