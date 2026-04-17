@@ -17,6 +17,7 @@
 #include "segcore/storagev2translator/ManifestGroupTranslator.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <exception>
@@ -253,13 +254,21 @@ ManifestGroupTranslator::get_cells(
         completed_cells;
     completed_cells.reserve(cids.size());
 
+    auto t_consume_start = std::chrono::steady_clock::now();
+    size_t popped = 0;
+    std::ptrdiff_t max_channel_size_seen = 0;
     try {
         std::shared_ptr<milvus::segcore::CellLoadResult> cell_data;
         while (channel->pop(cell_data)) {
             CheckCancellation(
                 ctx, segment_id_, "ManifestGroupTranslator::get_cells()");
+            auto ch_sz = channel->size();
+            if (ch_sz > max_channel_size_seen) {
+                max_channel_size_seen = ch_sz;
+            }
             completed_cells[cell_data->cid] =
                 load_group_chunk(cell_data->tables, cell_data->cid);
+            ++popped;
         }
     } catch (...) {
         // Drain the channel to unblock producers that may be stuck on push()
@@ -276,6 +285,18 @@ ManifestGroupTranslator::get_cells(
     }
 
     storage::WaitAllFutures(load_futures);
+
+    auto consume_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                          std::chrono::steady_clock::now() - t_consume_start)
+                          .count();
+    LOG_INFO(
+        "[LOAD_PROFILE_DIAG] ManifestGroupTranslator {} consume done: "
+        "popped={} consume_ms={} max_channel_size_seen={}/{}",
+        key_,
+        popped,
+        consume_ms,
+        max_channel_size_seen,
+        channel->capacity());
 
     for (auto cid : cids) {
         auto it = completed_cells.find(cid);

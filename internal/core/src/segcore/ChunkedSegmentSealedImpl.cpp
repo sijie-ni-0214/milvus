@@ -2669,13 +2669,27 @@ ChunkedSegmentSealedImpl::ApplyLoadDiff(SegmentLoadInfo& segment_load_info,
                                         LoadDiff& diff,
                                         milvus::OpContext* op_ctx) {
     milvus::tracer::TraceContext trace_ctx;
+    auto phase_start = std::chrono::steady_clock::now();
+    auto log_phase = [this, &phase_start](const char* phase) {
+        auto now = std::chrono::steady_clock::now();
+        LOG_INFO("[LOAD_PROFILE] segment {} phase={} elapsed={}ms",
+                 id_,
+                 phase,
+                 std::chrono::duration_cast<std::chrono::milliseconds>(
+                     now - phase_start)
+                     .count());
+        phase_start = now;
+    };
+
     if (!diff.indexes_to_load.empty()) {
         LoadBatchIndexes(trace_ctx, diff.indexes_to_load, op_ctx);
+        log_phase("LoadBatchIndexes");
     }
 
     // reload fields
     if (!diff.fields_to_reload.empty()) {
         ReloadColumns(diff.fields_to_reload);
+        log_phase("ReloadColumns");
     }
 
     // drop index, must after reload binlog
@@ -2683,6 +2697,7 @@ ChunkedSegmentSealedImpl::ApplyLoadDiff(SegmentLoadInfo& segment_load_info,
         for (auto field_id : diff.indexes_to_drop) {
             DropIndex(field_id);
         }
+        log_phase("DropIndexes");
     }
 
     // load column groups
@@ -2695,21 +2710,25 @@ ChunkedSegmentSealedImpl::ApplyLoadDiff(SegmentLoadInfo& segment_load_info,
         auto arrow_schema = schema_->ConvertToArrowSchema();
         reader_ = milvus_storage::api::Reader::create(
             column_groups, arrow_schema, nullptr, *properties);
+        log_phase("CreateReader");
         if (!diff.column_groups_to_load.empty()) {
             LoadColumnGroups(
                 column_groups, properties, diff.column_groups_to_load, true);
+            log_phase("LoadColumnGroups_eager");
         }
         if (!diff.column_groups_to_lazyload.empty()) {
             LoadColumnGroups(column_groups,
                              properties,
                              diff.column_groups_to_lazyload,
                              false);
+            log_phase("LoadColumnGroups_lazy");
         }
     }
 
     // load field binlog
     if (!diff.binlogs_to_load.empty()) {
         LoadBatchFieldData(trace_ctx, diff.binlogs_to_load, op_ctx);
+        log_phase("LoadBatchFieldData");
     }
 
     // drop field
@@ -2717,11 +2736,14 @@ ChunkedSegmentSealedImpl::ApplyLoadDiff(SegmentLoadInfo& segment_load_info,
         for (auto field_id : diff.field_data_to_drop) {
             DropFieldData(field_id);
         }
+        log_phase("DropFields");
     }
 }
 
 void
 ChunkedSegmentSealedImpl::FinishLoad() {
+    auto fl_t0 = std::chrono::steady_clock::now();
+    int fill_count = 0;
     std::unique_lock lck(mutex_);
     for (const auto& [field_id, field_meta] : schema_->get_fields()) {
         if (field_id.get() < START_USER_FIELDID) {
@@ -2742,7 +2764,13 @@ ChunkedSegmentSealedImpl::FinishLoad() {
             continue;
         }
         fill_empty_field(field_meta);
+        fill_count++;
     }
+    auto fl_t1 = std::chrono::steady_clock::now();
+    LOG_INFO("[LOAD_PROFILE] segment {} phase=FinishLoad elapsed={}ms fill_count={}",
+             id_,
+             std::chrono::duration_cast<std::chrono::milliseconds>(fl_t1 - fl_t0).count(),
+             fill_count);
 }
 
 void
@@ -2968,6 +2996,7 @@ ChunkedSegmentSealedImpl::LoadColumnGroup(
                                      : mmap_config.GetScalarFieldEnableMmap();
     auto use_mmap = has_mmap_setting ? mmap_enabled : global_use_mmap;
 
+    auto cg_t0 = std::chrono::steady_clock::now();
     auto chunk_reader_result = reader_->get_chunk_reader(index);
     AssertInfo(chunk_reader_result.ok(),
                "get chunk reader failed, segment {}, column group index {}",
@@ -2975,6 +3004,7 @@ ChunkedSegmentSealedImpl::LoadColumnGroup(
                index);
 
     auto chunk_reader = std::move(chunk_reader_result).ValueOrDie();
+    auto cg_t1 = std::chrono::steady_clock::now();
 
     LOG_INFO("[StorageV2] segment {} loads manifest cg index {}",
              this->get_segment_id(),
@@ -2998,8 +3028,20 @@ ChunkedSegmentSealedImpl::LoadColumnGroup(
             segment_load_info_.GetPriority(),
             eager_load,
             warmup_policy);
+    auto cg_t2 = std::chrono::steady_clock::now();
     auto chunked_column_group =
         std::make_shared<ChunkedColumnGroup>(std::move(translator));
+    auto cg_t3 = std::chrono::steady_clock::now();
+
+    LOG_INFO("[LOAD_PROFILE] segment {} cg={} sub_phase=ChunkReader elapsed={}ms",
+             id_, index,
+             std::chrono::duration_cast<std::chrono::milliseconds>(cg_t1 - cg_t0).count());
+    LOG_INFO("[LOAD_PROFILE] segment {} cg={} sub_phase=CreateTranslator elapsed={}ms",
+             id_, index,
+             std::chrono::duration_cast<std::chrono::milliseconds>(cg_t2 - cg_t1).count());
+    LOG_INFO("[LOAD_PROFILE] segment {} cg={} sub_phase=CreateColumnGroup elapsed={}ms",
+             id_, index,
+             std::chrono::duration_cast<std::chrono::milliseconds>(cg_t3 - cg_t2).count());
 
     // Create ProxyChunkColumn for each field
     for (const auto& field_id : milvus_field_ids) {
@@ -3044,6 +3086,13 @@ ChunkedSegmentSealedImpl::LoadColumnGroup(
                        num_rows);
         }
     }
+    auto cg_t4 = std::chrono::steady_clock::now();
+    LOG_INFO("[LOAD_PROFILE] segment {} cg={} sub_phase=RegisterColumns elapsed={}ms",
+             id_, index,
+             std::chrono::duration_cast<std::chrono::milliseconds>(cg_t4 - cg_t3).count());
+    LOG_INFO("[LOAD_PROFILE] segment {} cg={} sub_phase=CgTotal elapsed={}ms",
+             id_, index,
+             std::chrono::duration_cast<std::chrono::milliseconds>(cg_t4 - cg_t0).count());
 }
 
 void
@@ -3254,9 +3303,20 @@ ChunkedSegmentSealedImpl::Load(milvus::tracer::TraceContext& trace_ctx,
     auto num_rows = segment_load_info_.GetNumOfRows();
     LOG_INFO("Loading segment {} with {} rows", id_, num_rows);
 
+    auto t0 = std::chrono::steady_clock::now();
     auto diff = segment_load_info_.GetLoadDiff();
+    auto t1 = std::chrono::steady_clock::now();
+    LOG_INFO("[LOAD_PROFILE] segment {} phase=GetLoadDiff elapsed={}ms",
+             id_,
+             std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0)
+                 .count());
     LOG_WARN("Load segment {} with diff {}", id_, diff.ToString());
     ApplyLoadDiff(segment_load_info_, diff, op_ctx);
+    auto t2 = std::chrono::steady_clock::now();
+    LOG_INFO("[LOAD_PROFILE] segment {} phase=Total elapsed={}ms",
+             id_,
+             std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t0)
+                 .count());
 
     LOG_INFO("Successfully loaded segment {} with {} rows", id_, num_rows);
 }

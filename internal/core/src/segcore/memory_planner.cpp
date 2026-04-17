@@ -332,6 +332,20 @@ LoadCellBatchAsync(milvus::OpContext* op_ctx,
     }
 
     auto& pool = ThreadPools::GetThreadPool(milvus::PriorityForLoad(priority));
+    auto& midd_pool =
+        ThreadPools::GetThreadPool(milvus::ThreadPoolPriority::MIDDLE);
+    LOG_INFO(
+        "[LOAD_PROFILE_DIAG] LoadCellBatchAsync submitting {} batches to pool "
+        "(queue_before={}, threads={}/{}) channel_cap={} "
+        "midd_pool(queue={}, threads={}/{})",
+        batches.size(),
+        pool.work_queue_.size(),
+        pool.GetThreadNum(),
+        pool.GetMaxThreadNum(),
+        channel->capacity(),
+        midd_pool.work_queue_.size(),
+        midd_pool.GetThreadNum(),
+        midd_pool.GetMaxThreadNum());
     auto remaining = std::make_shared<std::atomic<size_t>>(batches.size());
     auto reader_memory_limit =
         std::max<int64_t>(memory_limit / static_cast<int64_t>(batches.size()),
@@ -342,19 +356,35 @@ LoadCellBatchAsync(milvus::OpContext* op_ctx,
     std::vector<std::future<void>> futures;
     futures.reserve(batches.size());
 
+    size_t batch_idx = 0;
     for (auto& batch : batches) {
+        size_t this_batch_idx = batch_idx++;
         futures.emplace_back(pool.Submit([batch = std::move(batch),
                                           shared_factory,
                                           reader_memory_limit,
                                           channel,
                                           remaining,
-                                          op_ctx]() {
+                                          op_ctx,
+                                          this_batch_idx,
+                                          &pool]() {
             auto task_guard = folly::makeGuard([&channel, &remaining]() {
                 if (remaining->fetch_sub(1) == 1) {
                     channel->close();
                 }
             });
             CheckCancellation(op_ctx, -1, "LoadCellBatchAsync");
+
+            auto t_batch_start = std::chrono::steady_clock::now();
+            LOG_INFO(
+                "[LOAD_PROFILE_DIAG] batch {} start: file_idx={} rg_count={} "
+                "cells={} channel_size={}/{} pool_queue={}",
+                this_batch_idx,
+                batch.file_idx,
+                batch.rg_count,
+                batch.cells.size(),
+                channel->size(),
+                channel->capacity(),
+                pool.work_queue_.size());
 
             auto tables_result = (*shared_factory)(batch.file_idx,
                                                    batch.rg_offset,
@@ -370,6 +400,13 @@ LoadCellBatchAsync(milvus::OpContext* op_ctx,
                        batch.rg_count,
                        all_tables.size());
 
+            auto t_read_done = std::chrono::steady_clock::now();
+            auto read_ms =
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    t_read_done - t_batch_start)
+                    .count();
+
+            int64_t push_blocked_ms = 0;
             int64_t table_offset = 0;
             for (const auto& cell : batch.cells) {
                 auto cell_result = std::make_shared<CellLoadResult>();
@@ -380,8 +417,27 @@ LoadCellBatchAsync(milvus::OpContext* op_ctx,
                         std::move(all_tables[table_offset + i]));
                 }
                 table_offset += cell.rg_count;
+                auto t_push_start = std::chrono::steady_clock::now();
                 channel->push(std::move(cell_result));
+                push_blocked_ms +=
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - t_push_start)
+                        .count();
             }
+
+            auto batch_ms =
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - t_batch_start)
+                    .count();
+            LOG_INFO(
+                "[LOAD_PROFILE_DIAG] batch {} done: read_ms={} push_blocked_ms="
+                "{} total_ms={} channel_size_after={}/{}",
+                this_batch_idx,
+                read_ms,
+                push_blocked_ms,
+                batch_ms,
+                channel->size(),
+                channel->capacity());
         }));
     }
 
