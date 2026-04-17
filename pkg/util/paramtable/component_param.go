@@ -3429,6 +3429,10 @@ type queryNodeConfig struct {
 	// delete snapshot dump batch size
 	DeleteDumpBatchSize ParamItem `refreshable:"false"`
 
+	// StorageV2 load-cell-batch pipeline tuning
+	LoadCellChannelFactor ParamItem `refreshable:"true"`
+	LoadReaderParallelism ParamItem `refreshable:"true"`
+
 	// delete snapshot optimization
 	EnableLatestDeleteSnapshotOptimization ParamItem `refreshable:"true"`
 
@@ -4551,6 +4555,43 @@ user-task-polling:
 		Export:       true,
 	}
 	p.DeleteDumpBatchSize.Init(base.mgr)
+
+	p.LoadCellChannelFactor = ParamItem{
+		Key:          "queryNode.segcore.loadCellChannelFactor",
+		Version:      "2.6.12",
+		DefaultValue: "1.5",
+		Doc: "CellReaderChannel capacity multiplier for StorageV2 cell-batch loading. " +
+			"Capacity = pool.MaxThreadNum * factor. Higher values reduce IO back-pressure but increase peak memory. " +
+			"Must be > 0; invalid values fall back to the default.",
+		Formatter: func(v string) string {
+			factor, err := strconv.ParseFloat(v, 64)
+			if err != nil || factor <= 0 {
+				return "1.5"
+			}
+			return v
+		},
+		Export: true,
+	}
+	p.LoadCellChannelFactor.Init(base.mgr)
+
+	p.LoadReaderParallelism = ParamItem{
+		Key:          "queryNode.segcore.loadReaderParallelism",
+		Version:      "2.6.12",
+		DefaultValue: "1",
+		Doc: "Per-batch IO parallelism when reading row groups in StorageV2 cell-batch loading. " +
+			"Higher values increase concurrent S3 requests per batch but also increase peak memory proportionally " +
+			"(stacks on top of LoadCellBatchAsync's concurrent batches). Use with caution. " +
+			"Must be >= 1; invalid values fall back to the default.",
+		Formatter: func(v string) string {
+			parallelism, err := strconv.ParseInt(v, 10, 64)
+			if err != nil || parallelism < 1 {
+				return "1"
+			}
+			return v
+		},
+		Export: true,
+	}
+	p.LoadReaderParallelism.Init(base.mgr)
 
 	p.EnableLatestDeleteSnapshotOptimization = ParamItem{
 		Key:          "queryNode.segcore.enableLatestDeleteSnapshotOptimization",
