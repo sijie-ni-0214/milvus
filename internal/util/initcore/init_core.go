@@ -649,6 +649,24 @@ func SetupCoreConfigChangelCallback() {
 		paramtable.Get().QueryNodeCfg.TieredWarmupVectorField.RegisterCallback(updateTieredStorageConfigCallback)
 		paramtable.Get().QueryNodeCfg.TieredWarmupScalarIndex.RegisterCallback(updateTieredStorageConfigCallback)
 		paramtable.Get().QueryNodeCfg.TieredWarmupVectorIndex.RegisterCallback(updateTieredStorageConfigCallback)
+
+		paramtable.Get().QueryNodeCfg.LoadCellChannelFactor.RegisterCallback(func(ctx context.Context, key, oldValue, newValue string) error {
+			factor, err := strconv.ParseFloat(newValue, 64)
+			if err != nil {
+				return err
+			}
+			UpdateLoadCellChannelFactor(factor)
+			return nil
+		})
+
+		paramtable.Get().QueryNodeCfg.LoadReaderParallelism.RegisterCallback(func(ctx context.Context, key, oldValue, newValue string) error {
+			parallelism, err := strconv.ParseInt(newValue, 10, 64)
+			if err != nil {
+				return err
+			}
+			UpdateLoadReaderParallelism(parallelism)
+			return nil
+		})
 	})
 }
 

@@ -60,6 +60,12 @@ SetDefaultConfigParamTypeCheck(bool val);
 void
 SetEnableLatestDeleteSnapshotOptimization(bool val);
 
+void
+SetLoadCellChannelFactor(float val);
+
+void
+SetLoadReaderParallelism(int64_t val);
+
 // dynamic update segcore params
 void
 SetLogLevel(const char* level);

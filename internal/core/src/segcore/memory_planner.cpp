@@ -337,13 +337,14 @@ LoadCellBatchAsync(milvus::OpContext* op_ctx,
         ThreadPools::GetThreadPool(milvus::ThreadPoolPriority::MIDDLE);
     LOG_INFO(
         "[LOAD_PROFILE_DIAG] LoadCellBatchAsync submitting {} batches to pool "
-        "(queue_before={}, threads={}/{}) channel_cap={} "
+        "(queue_before={}, threads={}/{}) channel_cap={} parallelism={} "
         "midd_pool(queue={}, threads={}/{})",
         batches.size(),
         pool.work_queue_.size(),
         pool.GetThreadNum(),
         pool.GetMaxThreadNum(),
         channel->capacity(),
+        LOAD_READER_PARALLELISM.load(),
         midd_pool.work_queue_.size(),
         midd_pool.GetThreadNum(),
         midd_pool.GetMaxThreadNum());
@@ -491,7 +492,8 @@ MakeChunkReaderFactory(
         std::iota(rg_indices.begin(), rg_indices.end(), rg_offset);
         ARROW_ASSIGN_OR_RAISE(
             auto batches,
-            chunk_reader->get_chunks(rg_indices, /*parallelism=*/1));
+            chunk_reader->get_chunks(rg_indices,
+                                     milvus::LOAD_READER_PARALLELISM.load()));
         std::vector<std::shared_ptr<arrow::Table>> tables;
         tables.reserve(batches.size());
         for (auto& batch : batches) {

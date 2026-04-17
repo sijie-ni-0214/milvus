@@ -32,6 +32,8 @@ extern std::atomic<bool> ENABLE_LATEST_DELETE_SNAPSHOT_OPTIMIZATION;
 extern std::atomic<bool> OPTIMIZE_EXPR_ENABLED;
 extern std::atomic<bool> GROWING_JSON_KEY_STATS_ENABLED;
 extern std::atomic<bool> CONFIG_PARAM_TYPE_CHECK_ENABLED;
+extern std::atomic<float> LOAD_CELL_CHANNEL_FACTOR;
+extern std::atomic<int64_t> LOAD_READER_PARALLELISM;
 
 void
 SetIndexSliceSize(const int64_t size);
@@ -53,6 +55,12 @@ SetDefaultConfigParamTypeCheck(bool val);
 
 void
 SetEnableLatestDeleteSnapshotOptimization(bool val);
+
+void
+SetLoadCellChannelFactor(float val);
+
+void
+SetLoadReaderParallelism(int64_t val);
 
 void
 SetLogLevel(const char* level);

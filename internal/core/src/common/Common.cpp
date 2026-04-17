@@ -33,6 +33,8 @@ std::atomic<bool> GROWING_JSON_KEY_STATS_ENABLED(
     DEFAULT_GROWING_JSON_KEY_STATS_ENABLED);
 std::atomic<bool> CONFIG_PARAM_TYPE_CHECK_ENABLED(
     DEFAULT_CONFIG_PARAM_TYPE_CHECK_ENABLED);
+std::atomic<float> LOAD_CELL_CHANNEL_FACTOR(DEFAULT_LOAD_CELL_CHANNEL_FACTOR);
+std::atomic<int64_t> LOAD_READER_PARALLELISM(DEFAULT_LOAD_READER_PARALLELISM);
 
 void
 SetIndexSliceSize(const int64_t size) {
@@ -80,6 +82,32 @@ SetEnableLatestDeleteSnapshotOptimization(bool val) {
     ENABLE_LATEST_DELETE_SNAPSHOT_OPTIMIZATION.store(val);
     LOG_INFO("set default enable latest delete snapshot optimization: {}",
              ENABLE_LATEST_DELETE_SNAPSHOT_OPTIMIZATION.load());
+}
+
+void
+SetLoadCellChannelFactor(float val) {
+    if (val <= 0.0f) {
+        LOG_WARN(
+            "invalid load cell channel factor {}, fallback to default {}",
+            val,
+            DEFAULT_LOAD_CELL_CHANNEL_FACTOR);
+        val = DEFAULT_LOAD_CELL_CHANNEL_FACTOR;
+    }
+    LOAD_CELL_CHANNEL_FACTOR.store(val);
+    LOG_INFO("set load cell channel factor: {}",
+             LOAD_CELL_CHANNEL_FACTOR.load());
+}
+
+void
+SetLoadReaderParallelism(int64_t val) {
+    if (val <= 0) {
+        LOG_WARN("invalid load reader parallelism {}, fallback to default {}",
+                 val,
+                 DEFAULT_LOAD_READER_PARALLELISM);
+        val = DEFAULT_LOAD_READER_PARALLELISM;
+    }
+    LOAD_READER_PARALLELISM.store(val);
+    LOG_INFO("set load reader parallelism: {}", LOAD_READER_PARALLELISM.load());
 }
 
 void

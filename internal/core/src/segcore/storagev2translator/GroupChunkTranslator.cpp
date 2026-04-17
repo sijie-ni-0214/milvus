@@ -338,7 +338,8 @@ GroupChunkTranslator::get_cells(milvus::OpContext* ctx,
     auto& pool = milvus::ThreadPools::GetThreadPool(
         milvus::PriorityForLoad(load_priority_));
     auto channel = std::make_shared<milvus::segcore::CellReaderChannel>(
-        static_cast<size_t>(pool.GetMaxThreadNum() * 1.5));
+        static_cast<size_t>(pool.GetMaxThreadNum() *
+                            milvus::LOAD_CELL_CHANNEL_FACTOR.load()));
     auto fs = milvus_storage::ArrowFileSystemSingleton::GetInstance()
                   .GetArrowFileSystem();
 

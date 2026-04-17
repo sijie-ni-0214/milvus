@@ -468,6 +468,30 @@ func TestComponentParam(t *testing.T) {
 		assert.Equal(t, true, Params.KnowhereScoreConsistency.GetAsBool())
 		params.Save("queryNode.segcore.knowhereScoreConsistency", "false")
 
+		// StorageV2 load-cell-batch params: defaults + dynamic update + bounds check
+		assert.Equal(t, 1.5, Params.LoadCellChannelFactor.GetAsFloat())
+		assert.Equal(t, int64(1), Params.LoadReaderParallelism.GetAsInt64())
+
+		params.Save("queryNode.segcore.loadCellChannelFactor", "3.0")
+		assert.Equal(t, 3.0, Params.LoadCellChannelFactor.GetAsFloat())
+		params.Save("queryNode.segcore.loadCellChannelFactor", "0")
+		assert.Equal(t, 1.5, Params.LoadCellChannelFactor.GetAsFloat())
+		params.Save("queryNode.segcore.loadCellChannelFactor", "-2")
+		assert.Equal(t, 1.5, Params.LoadCellChannelFactor.GetAsFloat())
+		params.Save("queryNode.segcore.loadCellChannelFactor", "bad")
+		assert.Equal(t, 1.5, Params.LoadCellChannelFactor.GetAsFloat())
+		params.Remove("queryNode.segcore.loadCellChannelFactor")
+
+		params.Save("queryNode.segcore.loadReaderParallelism", "8")
+		assert.Equal(t, int64(8), Params.LoadReaderParallelism.GetAsInt64())
+		params.Save("queryNode.segcore.loadReaderParallelism", "0")
+		assert.Equal(t, int64(1), Params.LoadReaderParallelism.GetAsInt64())
+		params.Save("queryNode.segcore.loadReaderParallelism", "-3")
+		assert.Equal(t, int64(1), Params.LoadReaderParallelism.GetAsInt64())
+		params.Save("queryNode.segcore.loadReaderParallelism", "bad")
+		assert.Equal(t, int64(1), Params.LoadReaderParallelism.GetAsInt64())
+		params.Remove("queryNode.segcore.loadReaderParallelism")
+
 		nlist = Params.InterimIndexNlist.GetAsInt64()
 		assert.Equal(t, int64(128), nlist)
 

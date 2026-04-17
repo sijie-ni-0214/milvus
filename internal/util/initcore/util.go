@@ -91,3 +91,11 @@ func UpdateDefaultConfigParamTypeCheck(enable bool) {
 func UpdateEnableLatestDeleteSnapshotOptimization(enable bool) {
 	C.SetEnableLatestDeleteSnapshotOptimization(C.bool(enable))
 }
+
+func UpdateLoadCellChannelFactor(factor float64) {
+	C.SetLoadCellChannelFactor(C.float(factor))
+}
+
+func UpdateLoadReaderParallelism(parallelism int64) {
+	C.SetLoadReaderParallelism(C.int64_t(parallelism))
+}

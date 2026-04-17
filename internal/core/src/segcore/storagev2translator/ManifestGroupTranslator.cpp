@@ -34,6 +34,7 @@
 
 #include "cachinglayer/Utils.h"
 #include "common/ChunkWriter.h"
+#include "common/Common.h"
 #include "common/GroupChunk.h"
 #include "common/Types.h"
 #include "common/type_c.h"
@@ -231,7 +232,8 @@ ManifestGroupTranslator::get_cells(
     auto& pool = milvus::ThreadPools::GetThreadPool(
         milvus::PriorityForLoad(load_priority_));
     auto channel = std::make_shared<milvus::segcore::CellReaderChannel>(
-        static_cast<size_t>(pool.GetMaxThreadNum() * 1.5));
+        static_cast<size_t>(pool.GetMaxThreadNum() *
+                            milvus::LOAD_CELL_CHANNEL_FACTOR.load()));
 
     auto load_futures =
         milvus::segcore::LoadCellBatchAsync(ctx,

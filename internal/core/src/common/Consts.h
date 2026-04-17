@@ -107,6 +107,9 @@ const int64_t DEFAULT_JSON_INDEX_MEMORY_BUDGET = 16777216;  // bytes, 16MB
 const bool DEFAULT_GROWING_JSON_KEY_STATS_ENABLED = false;
 const bool DEFAULT_CONFIG_PARAM_TYPE_CHECK_ENABLED = true;
 
+const float DEFAULT_LOAD_CELL_CHANNEL_FACTOR = 1.5f;
+const int64_t DEFAULT_LOAD_READER_PARALLELISM = 1;
+
 // index config related
 const std::string SEGMENT_INSERT_FILES_KEY = "segment_insert_files";
 const std::string INSERT_FILES_KEY = "insert_files";

@@ -121,6 +121,10 @@ func doInitQueryNodeOnce(ctx context.Context) error {
 	cDeleteDumpBatchSize := C.int64_t(paramtable.Get().QueryNodeCfg.DeleteDumpBatchSize.GetAsInt64())
 	C.SetDefaultDeleteDumpBatchSize(cDeleteDumpBatchSize)
 
+	UpdateLoadCellChannelFactor(paramtable.Get().QueryNodeCfg.LoadCellChannelFactor.GetAsFloat())
+
+	UpdateLoadReaderParallelism(paramtable.Get().QueryNodeCfg.LoadReaderParallelism.GetAsInt64())
+
 	cEnableLatestDeleteSnapshotOptimization := C.bool(paramtable.Get().QueryNodeCfg.EnableLatestDeleteSnapshotOptimization.GetAsBool())
 	C.SetEnableLatestDeleteSnapshotOptimization(cEnableLatestDeleteSnapshotOptimization)
 

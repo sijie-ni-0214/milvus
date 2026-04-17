@@ -88,6 +88,16 @@ SetEnableLatestDeleteSnapshotOptimization(bool val) {
 }
 
 void
+SetLoadCellChannelFactor(float val) {
+    milvus::SetLoadCellChannelFactor(val);
+}
+
+void
+SetLoadReaderParallelism(int64_t val) {
+    milvus::SetLoadReaderParallelism(val);
+}
+
+void
 SetLogLevel(const char* level) {
     milvus::SetLogLevel(level);
 }
