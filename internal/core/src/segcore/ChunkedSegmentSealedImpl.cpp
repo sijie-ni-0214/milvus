@@ -2703,6 +2703,8 @@ ChunkedSegmentSealedImpl::Reopen(
 
 void
 ChunkedSegmentSealedImpl::FinishLoad() {
+    auto fl_t0 = std::chrono::steady_clock::now();
+    int fill_count = 0;
     std::unique_lock lck(mutex_);
     for (const auto& [field_id, field_meta] : schema_->get_fields()) {
         if (field_id.get() < START_USER_FIELDID) {
@@ -2723,7 +2725,13 @@ ChunkedSegmentSealedImpl::FinishLoad() {
             continue;
         }
         fill_empty_field(field_meta);
+        fill_count++;
     }
+    auto fl_t1 = std::chrono::steady_clock::now();
+    LOG_INFO("[LOAD_PROFILE] segment {} phase=FinishLoad elapsed={}ms fill_count={}",
+             id_,
+             std::chrono::duration_cast<std::chrono::milliseconds>(fl_t1 - fl_t0).count(),
+             fill_count);
 }
 
 void
@@ -2993,6 +3001,7 @@ ChunkedSegmentSealedImpl::LoadColumnGroup(
             .GetChunkManager()
             ->GetRootPath();
 
+    auto cg_t0 = std::chrono::steady_clock::now();
     auto chunk_reader_result = reader_->get_chunk_reader(index);
     AssertInfo(chunk_reader_result.ok(),
                "get chunk reader failed, segment {}, column group index {}",
@@ -3000,6 +3009,7 @@ ChunkedSegmentSealedImpl::LoadColumnGroup(
                index);
 
     auto chunk_reader = std::move(chunk_reader_result).ValueOrDie();
+    auto cg_t1 = std::chrono::steady_clock::now();
 
     LOG_INFO("[StorageV2] segment {} loads manifest cg index {}",
              this->get_segment_id(),
@@ -3018,8 +3028,20 @@ ChunkedSegmentSealedImpl::LoadColumnGroup(
             column_group->columns.size(),
             segment_load_info_.GetPriority(),
             warmup_policy);
+    auto cg_t2 = std::chrono::steady_clock::now();
     auto chunked_column_group =
         std::make_shared<ChunkedColumnGroup>(std::move(translator));
+    auto cg_t3 = std::chrono::steady_clock::now();
+
+    LOG_INFO("[LOAD_PROFILE] segment {} cg={} sub_phase=ChunkReader elapsed={}ms",
+             id_, index,
+             std::chrono::duration_cast<std::chrono::milliseconds>(cg_t1 - cg_t0).count());
+    LOG_INFO("[LOAD_PROFILE] segment {} cg={} sub_phase=CreateTranslator elapsed={}ms",
+             id_, index,
+             std::chrono::duration_cast<std::chrono::milliseconds>(cg_t2 - cg_t1).count());
+    LOG_INFO("[LOAD_PROFILE] segment {} cg={} sub_phase=CreateColumnGroup elapsed={}ms",
+             id_, index,
+             std::chrono::duration_cast<std::chrono::milliseconds>(cg_t3 - cg_t2).count());
 
     // Create ProxyChunkColumn for each field
     for (const auto& field_id : milvus_field_ids) {
@@ -3064,6 +3086,13 @@ ChunkedSegmentSealedImpl::LoadColumnGroup(
                        num_rows);
         }
     }
+    auto cg_t4 = std::chrono::steady_clock::now();
+    LOG_INFO("[LOAD_PROFILE] segment {} cg={} sub_phase=RegisterColumns elapsed={}ms",
+             id_, index,
+             std::chrono::duration_cast<std::chrono::milliseconds>(cg_t4 - cg_t3).count());
+    LOG_INFO("[LOAD_PROFILE] segment {} cg={} sub_phase=CgTotal elapsed={}ms",
+             id_, index,
+             std::chrono::duration_cast<std::chrono::milliseconds>(cg_t4 - cg_t0).count());
 }
 
 void
@@ -3295,6 +3324,19 @@ ChunkedSegmentSealedImpl::Load(milvus::tracer::TraceContext& trace_ctx,
     auto num_rows = segment_load_info_.GetNumOfRows();
     LOG_INFO("Loading segment {} with {} rows", id_, num_rows);
 
+    auto t0 = std::chrono::steady_clock::now();
+    auto phase_start = t0;
+    auto log_phase = [this, &phase_start](const char* phase) {
+        auto now = std::chrono::steady_clock::now();
+        LOG_INFO("[LOAD_PROFILE] segment {} phase={} elapsed={}ms",
+                 id_,
+                 phase,
+                 std::chrono::duration_cast<std::chrono::milliseconds>(
+                     now - phase_start)
+                     .count());
+        phase_start = now;
+    };
+
     // Step 1: Separate indexed and non-indexed fields
     std::map<FieldId, std::vector<const proto::segcore::FieldIndexInfo*>>
         field_id_to_index_info;
@@ -3312,6 +3354,7 @@ ChunkedSegmentSealedImpl::Load(milvus::tracer::TraceContext& trace_ctx,
 
     // Step 2: Load indexes in parallel using thread pool
     LoadBatchIndexes(trace_ctx, field_id_to_index_info, op_ctx);
+    log_phase("LoadBatchIndexes");
 
     LOG_INFO("Finished loading {} indexes for segment {}",
              field_id_to_index_info.size(),
@@ -3321,6 +3364,12 @@ ChunkedSegmentSealedImpl::Load(milvus::tracer::TraceContext& trace_ctx,
     auto manifest_path = segment_load_info_.GetManifestPath();
     if (manifest_path != "") {
         LoadManifest(manifest_path, op_ctx);
+        log_phase("LoadManifest_LoadColumnGroups");
+        LOG_INFO("[LOAD_PROFILE] segment {} phase=Total elapsed={}ms",
+                 id_,
+                 std::chrono::duration_cast<std::chrono::milliseconds>(
+                     std::chrono::steady_clock::now() - t0)
+                     .count());
         return;
     }
 
@@ -3350,8 +3399,14 @@ ChunkedSegmentSealedImpl::Load(milvus::tracer::TraceContext& trace_ctx,
 
     if (!field_binlog_to_load.empty()) {
         LoadBatchFieldData(trace_ctx, field_binlog_to_load, op_ctx);
+        log_phase("LoadBatchFieldData");
     }
 
+    LOG_INFO("[LOAD_PROFILE] segment {} phase=Total elapsed={}ms",
+             id_,
+             std::chrono::duration_cast<std::chrono::milliseconds>(
+                 std::chrono::steady_clock::now() - t0)
+                 .count());
     LOG_INFO("Successfully loaded segment {} with {} rows", id_, num_rows);
 }
 

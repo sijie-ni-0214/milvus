@@ -927,7 +927,13 @@ func (loader *segmentLoader) loadSealedSegment(ctx context.Context, loadInfo *qu
 		zap.Int64s("unindexed text fields", lo.Keys(unindexedTextFields)),
 		zap.Int64s("indexed json key fields", lo.Keys(jsonKeyStats)),
 	)
+	poolSubmitStart := time.Now()
 	_, err = GetLoadPool().Submit(func() (any, error) {
+		poolWait := time.Since(poolSubmitStart)
+		log.Info("[LOAD_PROFILE_GO] pool wait",
+			zap.Int64("segmentID", segment.ID()),
+			zap.Duration("elapsed", poolWait))
+
 		if err = segment.Load(ctx); err != nil {
 			return struct{}{}, errors.Wrap(err, "At Load")
 		}
@@ -937,6 +943,10 @@ func (loader *segmentLoader) loadSealedSegment(ctx context.Context, loadInfo *qu
 		}
 		return struct{}{}, nil
 	}).Await()
+	cppLoadFinishSpan := time.Since(poolSubmitStart)
+	log.Info("[LOAD_PROFILE_GO] Load+FinishLoad done",
+		zap.Int64("segmentID", segment.ID()),
+		zap.Duration("elapsed", cppLoadFinishSpan))
 	if err != nil {
 		return err
 	}
@@ -952,11 +962,21 @@ func (loader *segmentLoader) loadSealedSegment(ctx context.Context, loadInfo *qu
 	}
 
 	// load text indexes.
-	for _, info := range textIndexes {
+	textIndexStart := time.Now()
+	for i, info := range textIndexes {
+		txStart := time.Now()
 		if err := segment.LoadTextIndex(ctx, info, schemaHelper); err != nil {
 			return err
 		}
+		log.Info("[LOAD_PROFILE_GO] single text index",
+			zap.Int64("segmentID", segment.ID()),
+			zap.Int64("idx", i),
+			zap.Duration("elapsed", time.Since(txStart)))
 	}
+	log.Info("[LOAD_PROFILE_GO] all text indexes done",
+		zap.Int64("segmentID", segment.ID()),
+		zap.Int("count", len(textIndexes)),
+		zap.Duration("elapsed", time.Since(textIndexStart)))
 	loadTextIndexesSpan := tr.RecordSpan()
 
 	// create index for unindexed text fields.

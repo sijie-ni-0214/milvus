@@ -35,6 +35,18 @@ class Channel {
         inner_.set_capacity(capacity);
     }
 
+    // Returns the approximate number of items currently in the channel.
+    // May be negative when consumers are waiting (tbb semantics).
+    std::ptrdiff_t
+    size() const {
+        return inner_.size();
+    }
+
+    std::ptrdiff_t
+    capacity() const {
+        return inner_.capacity();
+    }
+
     void
     push(const T& value) {
         inner_.push(value);
