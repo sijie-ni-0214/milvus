@@ -458,25 +458,85 @@ MakeFileReaderFactory(std::vector<std::string> remote_files,
                        int64_t total_rg_count,
                        int64_t reader_memory_limit)
                -> arrow::Result<std::vector<std::shared_ptr<arrow::Table>>> {
-        ARROW_ASSIGN_OR_RAISE(auto reader,
-                              milvus_storage::FileRowGroupReader::Make(
-                                  fs,
-                                  (*files)[batch_key],
-                                  nullptr,
-                                  reader_memory_limit,
-                                  milvus::storage::GetReaderProperties()));
-        auto close_guard =
-            folly::makeGuard([&reader]() { (void)reader->Close(); });
-        ARROW_RETURN_NOT_OK(
-            reader->SetRowGroupOffsetAndCount(rg_offset, total_rg_count));
-        std::vector<std::shared_ptr<arrow::Table>> tables;
-        tables.reserve(total_rg_count);
-        for (int64_t i = 0; i < total_rg_count; ++i) {
-            std::shared_ptr<arrow::Table> table;
-            ARROW_RETURN_NOT_OK(reader->ReadNextRowGroup(&table));
-            tables.push_back(std::move(table));
+        // Read a contiguous sub-range of row groups from (*files)[batch_key]
+        // using an independent FileRowGroupReader. Used for both the sequential
+        // default path and each fan-out sub-task.
+        auto read_range = [files, fs, batch_key](
+                              int64_t off, int64_t cnt, int64_t per_mem)
+            -> arrow::Result<std::vector<std::shared_ptr<arrow::Table>>> {
+            ARROW_ASSIGN_OR_RAISE(auto reader,
+                                  milvus_storage::FileRowGroupReader::Make(
+                                      fs,
+                                      (*files)[batch_key],
+                                      nullptr,
+                                      per_mem,
+                                      milvus::storage::GetReaderProperties()));
+            auto close_guard =
+                folly::makeGuard([&reader]() { (void)reader->Close(); });
+            ARROW_RETURN_NOT_OK(reader->SetRowGroupOffsetAndCount(off, cnt));
+            std::vector<std::shared_ptr<arrow::Table>> sub_tables;
+            sub_tables.reserve(cnt);
+            for (int64_t i = 0; i < cnt; ++i) {
+                std::shared_ptr<arrow::Table> table;
+                ARROW_RETURN_NOT_OK(reader->ReadNextRowGroup(&table));
+                sub_tables.push_back(std::move(table));
+            }
+            return sub_tables;
+        };
+
+        int64_t parallelism = std::max<int64_t>(
+            1,
+            std::min<int64_t>(milvus::LOAD_READER_PARALLELISM.load(),
+                              total_rg_count));
+        if (parallelism <= 1) {
+            return read_range(rg_offset, total_rg_count, reader_memory_limit);
         }
-        return tables;
+
+        // Fan-out: split total_rg_count into P contiguous sub-ranges and read
+        // them concurrently via std::async. Each sub-task uses an independent
+        // FileRowGroupReader so there is no shared-cursor contention.
+        int64_t sub_size = (total_rg_count + parallelism - 1) / parallelism;
+        int64_t per_sub_mem = std::max<int64_t>(
+            reader_memory_limit / parallelism, FILE_SLICE_SIZE.load());
+
+        std::vector<std::future<
+            arrow::Result<std::vector<std::shared_ptr<arrow::Table>>>>>
+            futures;
+        futures.reserve(parallelism);
+        for (int64_t p = 0; p < parallelism; ++p) {
+            int64_t sub_off = rg_offset + p * sub_size;
+            int64_t sub_cnt =
+                std::min(sub_size, rg_offset + total_rg_count - sub_off);
+            if (sub_cnt <= 0) {
+                break;
+            }
+            futures.emplace_back(std::async(std::launch::async,
+                                            read_range,
+                                            sub_off,
+                                            sub_cnt,
+                                            per_sub_mem));
+        }
+
+        LOG_INFO(
+            "[LOAD_PROFILE_DIAG] MakeFileReaderFactory fan-out: file_idx={} "
+            "rg_offset={} total_rg_count={} parallelism={} sub_size={} "
+            "per_sub_mem_MB={}",
+            batch_key,
+            rg_offset,
+            total_rg_count,
+            parallelism,
+            sub_size,
+            per_sub_mem >> 20);
+
+        std::vector<std::shared_ptr<arrow::Table>> all_tables;
+        all_tables.reserve(total_rg_count);
+        for (auto& f : futures) {
+            ARROW_ASSIGN_OR_RAISE(auto sub, f.get());
+            for (auto& t : sub) {
+                all_tables.push_back(std::move(t));
+            }
+        }
+        return all_tables;
     };
 }
 
