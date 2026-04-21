@@ -432,7 +432,7 @@ MakeChunkReaderFactory(
         std::iota(rg_indices.begin(), rg_indices.end(), rg_offset);
         ARROW_ASSIGN_OR_RAISE(
             auto batches,
-            chunk_reader->get_chunks(rg_indices, /*parallelism=*/1));
+            chunk_reader->get_chunks(rg_indices, /*parallelism=*/8));
         std::vector<std::shared_ptr<arrow::Table>> tables;
         tables.reserve(batches.size());
         for (auto& batch : batches) {

@@ -1724,7 +1724,7 @@ SegmentGrowingImpl::LoadColumnGroup(
                 std::vector<int64_t> chunk_ids(part.count);
                 std::iota(chunk_ids.begin(), chunk_ids.end(), part.offset);
 
-                auto result = chunk_reader->get_chunks(chunk_ids, 1);
+                auto result = chunk_reader->get_chunks(chunk_ids, 8);
                 AssertInfo(result.ok(), "get chunks failed");
                 return result.ValueOrDie();
             }));
