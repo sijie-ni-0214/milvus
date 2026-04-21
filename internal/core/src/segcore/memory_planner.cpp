@@ -464,6 +464,7 @@ MakeFileReaderFactory(std::vector<std::string> remote_files,
         auto read_range = [files, fs, batch_key](
                               int64_t off, int64_t cnt, int64_t per_mem)
             -> arrow::Result<std::vector<std::shared_ptr<arrow::Table>>> {
+            auto t_make_start = std::chrono::steady_clock::now();
             ARROW_ASSIGN_OR_RAISE(auto reader,
                                   milvus_storage::FileRowGroupReader::Make(
                                       fs,
@@ -471,16 +472,48 @@ MakeFileReaderFactory(std::vector<std::string> remote_files,
                                       nullptr,
                                       per_mem,
                                       milvus::storage::GetReaderProperties()));
+            auto t_make_done = std::chrono::steady_clock::now();
+            auto make_ms =
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    t_make_done - t_make_start)
+                    .count();
             auto close_guard =
                 folly::makeGuard([&reader]() { (void)reader->Close(); });
             ARROW_RETURN_NOT_OK(reader->SetRowGroupOffsetAndCount(off, cnt));
             std::vector<std::shared_ptr<arrow::Table>> sub_tables;
             sub_tables.reserve(cnt);
+            std::vector<int64_t> per_rg_ms;
+            per_rg_ms.reserve(cnt);
             for (int64_t i = 0; i < cnt; ++i) {
+                auto t_rg_start = std::chrono::steady_clock::now();
                 std::shared_ptr<arrow::Table> table;
                 ARROW_RETURN_NOT_OK(reader->ReadNextRowGroup(&table));
+                auto t_rg_end = std::chrono::steady_clock::now();
+                per_rg_ms.push_back(
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        t_rg_end - t_rg_start)
+                        .count());
                 sub_tables.push_back(std::move(table));
             }
+            int64_t total_rg_ms = 0;
+            int64_t max_rg_ms = 0;
+            for (auto m : per_rg_ms) {
+                total_rg_ms += m;
+                if (m > max_rg_ms) max_rg_ms = m;
+            }
+            int64_t avg_rg_ms = cnt > 0 ? total_rg_ms / cnt : 0;
+            LOG_INFO(
+                "[LOAD_PROFILE_DIAG] read_range: file={} off={} cnt={} "
+                "per_mem_MB={} make_ms={} total_rg_read_ms={} avg_rg_ms={} "
+                "max_rg_ms={}",
+                (*files)[batch_key],
+                off,
+                cnt,
+                per_mem >> 20,
+                make_ms,
+                total_rg_ms,
+                avg_rg_ms,
+                max_rg_ms);
             return sub_tables;
         };
 
