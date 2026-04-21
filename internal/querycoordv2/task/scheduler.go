@@ -186,6 +186,28 @@ func (queue *taskQueue) removeFromBucket(nodeID int64, task Task) {
 	}
 }
 
+// Range iterates all unique tasks in the queue ordered by priority from high to low.
+// A task indexed under multiple node buckets (e.g. Move task, LeaderAction task)
+// is yielded exactly once.
+func (queue *taskQueue) Range(fn func(task Task) bool) {
+	queue.mu.RLock()
+	defer queue.mu.RUnlock()
+	seen := make(map[int64]struct{})
+	for priority := len(TaskPriorities) - 1; priority >= 0; priority-- {
+		for _, nodeBuckets := range queue.buckets {
+			for taskID, task := range nodeBuckets[priority] {
+				if _, ok := seen[taskID]; ok {
+					continue
+				}
+				seen[taskID] = struct{}{}
+				if !fn(task) {
+					return
+				}
+			}
+		}
+	}
+}
+
 // RangeByNode iterates tasks related to the specified node,
 // ordered by priority from high to low.
 func (queue *taskQueue) RangeByNode(nodeID int64, fn func(task Task) bool) {
@@ -669,10 +691,15 @@ func (scheduler *taskScheduler) getReplicaShardLeader(channelName string, replic
 	return scheduler.distMgr.ChannelDistManager.GetShardLeader(channelName, replica)
 }
 
-func (scheduler *taskScheduler) tryPromote(node int64) {
+// tryPromoteAll promotes eligible tasks from waitQueue globally. Promote must be
+// global (not per-node): a task targeting a now-offline node would otherwise sit
+// in waitQueue forever — the dispatching node never heartbeats, so per-node
+// RangeByNode never picks it up, leaving its segmentTasks index slot occupied
+// and blocking new tasks for the same segment via preAdd dedup.
+func (scheduler *taskScheduler) tryPromoteAll() {
 	toPromote := make([]Task, 0)
 	toRemove := make([]Task, 0)
-	scheduler.waitQueue.RangeByNode(node, func(task Task) bool {
+	scheduler.waitQueue.Range(func(task Task) bool {
 		err := scheduler.promote(task)
 		if err != nil {
 			task.Cancel(err)
@@ -853,7 +880,7 @@ func (scheduler *taskScheduler) schedule(node int64) {
 		zap.Int64("nodeID", node),
 	)
 
-	scheduler.tryPromote(node)
+	scheduler.tryPromoteAll()
 	promoteDur := tr.RecordSpan()
 
 	log.Debug("process tasks related to node",
