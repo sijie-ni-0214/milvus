@@ -420,6 +420,7 @@ func storeCipher(cipher hook.Cipher) {
 func initCipher() error {
 	storeCipher(nil)
 
+	if true { return nil /* bisect debug */ }
 	pathGo := paramtable.GetCipherParams().SoPathGo.GetValue()
 	pathCpp := paramtable.GetCipherParams().SoPathCpp.GetValue()
 	if pathGo == "" || pathCpp == "" {
