@@ -33,12 +33,6 @@ ENV OPENSSL_MODULES=/milvus/lib/ossl-modules
 # FIPS activation is handled programmatically at startup — no OPENSSL_CONF needed.
 RUN openssl fipsinstall -out /milvus/configs/ssl/fipsmodule.cnf -module /milvus/lib/ossl-modules/fips.so
 
-# Change user to milvus
-RUN groupadd -r milvus && useradd -r -g milvus milvus && \
-    mkdir -p /var/lib/milvus && \
-    chown -R milvus:milvus /milvus /var/lib/milvus
-USER milvus:milvus
-
 ENTRYPOINT ["/tini", "--"]
 
 WORKDIR /milvus

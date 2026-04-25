@@ -38,16 +38,6 @@ ENV OPENSSL_MODULES=/milvus/lib/ossl-modules
 # FIPS activation is handled programmatically at startup — no OPENSSL_CONF needed.
 RUN openssl fipsinstall -out /milvus/configs/ssl/fipsmodule.cnf -module /milvus/lib/ossl-modules/fips.so
 
-# Change user to milvus
-# protobuf 5.x RepeatedField adds container annotations that trigger ASAN
-# container-overflow false positives during static initialization, disable it.
-ENV ASAN_OPTIONS=detect_leaks=0:detect_container_overflow=0
-RUN groupadd -r milvus && useradd -r -g milvus milvus && \
-    mkdir -p /var/lib/milvus && \
-    chown -R milvus:milvus /milvus /var/lib/milvus
-ENV ASAN_OPTIONS=detect_leaks=1:detect_container_overflow=0
-USER milvus:milvus
-
 ENTRYPOINT ["/tini", "--"]
 
 WORKDIR /milvus
