@@ -208,6 +208,26 @@ func (suite *SegmentDistManagerSuite) TestGetBySegmentIDUsesIndex() {
 	suite.Equal(2, visited)
 }
 
+func (suite *SegmentDistManagerSuite) TestSegmentIDIndex() {
+	nodeDist := suite.dist.segments[suite.nodes[1]]
+	suite.Len(nodeDist.segmentIDSegment, 4)
+	suite.Same(nodeDist.segmentIDSegment[3], nodeDist.collSegments[suite.collection][2])
+
+	segments := suite.dist.GetByFilter(WithNodeID(suite.nodes[1]), WithSegmentID(3))
+	suite.Len(segments, 1)
+	suite.Equal(int64(3), segments[0].GetID())
+	suite.Equal(suite.nodes[1], segments[0].Node)
+
+	replica := newReplica(&querypb.Replica{
+		ID:           1,
+		CollectionID: suite.collection,
+		Nodes:        []int64{suite.nodes[0], suite.nodes[2]},
+	})
+	segments = suite.dist.GetByFilter(WithReplica(replica), WithSegmentID(3))
+	suite.Len(segments, 1)
+	suite.Equal(suite.nodes[2], segments[0].Node)
+}
+
 func (suite *SegmentDistManagerSuite) AssertIDs(segments []*Segment, ids ...int64) bool {
 	for _, segment := range segments {
 		hasSegment := false
