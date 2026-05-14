@@ -35,6 +35,7 @@ type segDistCriterion struct {
 	nodes          []int64
 	collectionID   int64
 	channel        string
+	segmentID      int64
 	hasOtherFilter bool
 }
 
@@ -86,10 +87,18 @@ func WithNodeID(nodeID int64) SegmentDistFilter {
 	return NodeSegDistFilter(nodeID)
 }
 
+type SegmentIDSegDistFilter int64
+
+func (f SegmentIDSegDistFilter) Match(s *Segment) bool {
+	return s.GetID() == int64(f)
+}
+
+func (f SegmentIDSegDistFilter) AddFilter(filter *segDistCriterion) {
+	filter.segmentID = int64(f)
+}
+
 func WithSegmentID(segmentID int64) SegmentDistFilter {
-	return SegmentDistFilterFunc(func(s *Segment) bool {
-		return s.GetID() == segmentID
-	})
+	return SegmentIDSegDistFilter(segmentID)
 }
 
 type CollectionSegDistFilter int64
@@ -191,14 +200,21 @@ func (m *SegmentDistManager) GetVersion() int64 {
 }
 
 type nodeSegments struct {
-	segments        []*Segment
-	collSegments    map[int64][]*Segment
-	channelSegments map[string][]*Segment
+	segments         []*Segment
+	collSegments     map[int64][]*Segment
+	channelSegments  map[string][]*Segment
+	segmentIDSegment map[int64]*Segment
 }
 
 func (s nodeSegments) Filter(criterion *segDistCriterion, filter func(*Segment) bool) []*Segment {
 	var segments []*Segment
 	switch {
+	case criterion.segmentID != 0:
+		segment, ok := s.segmentIDSegment[criterion.segmentID]
+		if !ok {
+			return nil
+		}
+		segments = []*Segment{segment}
 	case criterion.channel != "":
 		segments = s.channelSegments[criterion.channel]
 	case criterion.collectionID != 0:
@@ -216,9 +232,10 @@ func (s nodeSegments) Filter(criterion *segDistCriterion, filter func(*Segment) 
 
 func composeNodeSegments(segments []*Segment) nodeSegments {
 	return nodeSegments{
-		segments:        segments,
-		collSegments:    lo.GroupBy(segments, func(segment *Segment) int64 { return segment.GetCollectionID() }),
-		channelSegments: lo.GroupBy(segments, func(segment *Segment) string { return segment.GetInsertChannel() }),
+		segments:         segments,
+		collSegments:     lo.GroupBy(segments, func(segment *Segment) int64 { return segment.GetCollectionID() }),
+		channelSegments:  lo.GroupBy(segments, func(segment *Segment) string { return segment.GetInsertChannel() }),
+		segmentIDSegment: lo.SliceToMap(segments, func(segment *Segment) (int64, *Segment) { return segment.GetID(), segment }),
 	}
 }
 
