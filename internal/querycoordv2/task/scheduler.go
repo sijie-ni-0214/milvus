@@ -908,10 +908,10 @@ func (scheduler *taskScheduler) schedule(node int64) {
 	scanBudget := scheduler.getDispatchScanBudget(node)
 	scheduler.processQueue.RangeByNode(node, func(task Task) bool {
 		scannedTaskNum++
-		scheduler.preProcess(task)
-		if task.Status() == TaskStatusStarted {
+		shouldProcess := scheduler.preProcess(task)
+		if shouldProcess {
 			toProcess = append(toProcess, task)
-		} else {
+		} else if task.Status() != TaskStatusStarted {
 			toRemove = append(toRemove, task)
 		}
 
@@ -987,13 +987,21 @@ func actionExecutorNode(action Action) int64 {
 // and converts the task's status,
 // return true if the task should be executed,
 // false otherwise
-func (scheduler *taskScheduler) preProcess(task Task) bool {
+func (scheduler *taskScheduler) preProcess(task Task) (shouldProcess bool) {
 	if task.Status() != TaskStatusStarted {
 		return false
 	}
 
 	actions, step := task.Actions(), task.Step()
-	for step < len(actions) && actions[step].IsFinished(scheduler.distMgr) {
+	shouldProcess = true
+	for step < len(actions) {
+		finished, waitingDist := scheduler.checkActionFinish(actions[step])
+		if !finished {
+			if waitingDist {
+				shouldProcess = false
+			}
+			break
+		}
 		if GetTaskType(task) == TaskTypeMove && actions[step].Type() == ActionTypeGrow {
 			var newDelegatorReady bool
 			switch action := actions[step].(type) {
@@ -1033,7 +1041,19 @@ func (scheduler *taskScheduler) preProcess(task Task) bool {
 		}
 	}
 
-	return task.Status() == TaskStatusStarted
+	return shouldProcess && task.Status() == TaskStatusStarted
+}
+
+func (scheduler *taskScheduler) checkActionFinish(action Action) (finished bool, waitingDist bool) {
+	segmentAction, ok := action.(*SegmentAction)
+	if !ok {
+		return action.IsFinished(scheduler.distMgr), false
+	}
+	if !segmentAction.rpcReturned.Load() {
+		return false, false
+	}
+	distMatched := segmentAction.isDistMatched(scheduler.distMgr)
+	return distMatched, !distMatched
 }
 
 // process processes the given task,
