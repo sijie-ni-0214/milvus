@@ -906,7 +906,7 @@ func (sd *shardDelegator) LoadSegments(ctx context.Context, req *querypb.LoadSeg
 	// add common log fields
 	log = log.With(
 		zap.Int64("workID", targetNodeID),
-		zap.Int64s("segments", lo.Map(req.GetInfos(), func(info *querypb.SegmentLoadInfo, _ int) int64 { return info.GetSegmentID() })),
+		zap.Int("segmentCount", len(req.GetInfos())),
 	)
 
 	if req.GetInfos()[0].GetLevel() == datapb.SegmentLevel_L0 {
@@ -1004,7 +1004,7 @@ func (sd *shardDelegator) LoadSegments(ctx context.Context, req *querypb.LoadSeg
 		// Build a map from segmentID to BloomFilterSet
 		bfMap := make(map[int64]pkoracle.Candidate)
 		for _, candidate := range candidates {
-			log.Info("loaded bloom filter set for sealed segment",
+			log.Debug("loaded bloom filter set for sealed segment",
 				zap.Int64("segmentID", candidate.ID()),
 			)
 			bfMap[candidate.ID()] = candidate

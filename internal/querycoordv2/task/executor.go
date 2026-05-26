@@ -182,7 +182,7 @@ func (ex *Executor) Execute(task Task, step int) bool {
 	)
 
 	go func() {
-		log.Info("execute the action of task")
+		log.Debug("execute the action of task")
 		switch task.Actions()[step].(type) {
 		case *SegmentAction:
 			ex.executeSegmentAction(task.(*SegmentTask), step)
@@ -293,7 +293,7 @@ func (ex *Executor) loadSegment(task *SegmentTask, step int) error {
 	}
 
 	startTs := time.Now()
-	log.Info("load segments...")
+	log.Debug("load segments...")
 	status, err := ex.cluster.LoadSegments(task.Context(), view.Node, req)
 	err = merr.CheckRPCCall(status, err)
 	if err != nil {
@@ -302,7 +302,7 @@ func (ex *Executor) loadSegment(task *SegmentTask, step int) error {
 	}
 
 	elapsed := time.Since(startTs)
-	log.Info("load segments done", zap.Duration("elapsed", elapsed))
+	log.Debug("load segments done", zap.Duration("elapsed", elapsed))
 
 	return nil
 }

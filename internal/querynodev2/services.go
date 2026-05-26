@@ -711,7 +711,7 @@ func (node *QueryNode) LoadSegments(ctx context.Context, req *querypb.LoadSegmen
 		zap.Int64("dstNodeID", req.GetDstNodeID()),
 	)
 
-	log.Info("received load segments request",
+	log.Debug("received load segments request",
 		zap.Int64("version", req.GetVersion()),
 		zap.Bool("needTransfer", req.GetNeedTransfer()),
 		zap.String("loadScope", req.GetLoadScope().String()))
@@ -821,7 +821,7 @@ func (node *QueryNode) LoadSegments(ctx context.Context, req *querypb.LoadSegmen
 	}
 
 	// Actual load segment
-	log.Info("start to load segments...")
+	log.Debug("start to load segments...")
 	loaderStart := time.Now()
 	loaded, err := node.loader.Load(ctx,
 		req.GetCollectionID(),
@@ -838,8 +838,7 @@ func (node *QueryNode) LoadSegments(ctx context.Context, req *querypb.LoadSegmen
 	node.manager.Collection.Ref(req.GetCollectionID(), uint32(len(loaded)))
 	timing.collectionRefDur = time.Since(collectionRefStart)
 
-	log.Info("load segments done...",
-		zap.Int64s("segments", lo.Map(loaded, func(s segments.Segment, _ int) int64 { return s.ID() })))
+	log.Debug("load segments done...", zap.Int("segmentCount", len(loaded)))
 
 	// Publish filesystem metrics after load task completion
 	// Use default filesystem (empty path) for load tasks
