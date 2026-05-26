@@ -529,7 +529,7 @@ func (scheduler *taskScheduler) Add(task Task) error {
 
 	scheduler.taskStats.Add(task.ID(), task)
 	scheduler.updateTaskMetrics()
-	log.Ctx(task.Context()).Info("task added", zap.String("task", task.String()))
+	log.Ctx(task.Context()).Debug("task added", zap.String("task", task.String()))
 	task.RecordStartTs()
 	return nil
 }

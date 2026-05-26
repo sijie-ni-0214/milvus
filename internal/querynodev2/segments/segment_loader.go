@@ -343,10 +343,10 @@ func (loader *segmentLoader) Load(ctx context.Context,
 			if err != nil {
 				logger.Warn("load segment failed when load data into memory", zap.Error(err))
 			}
-			logger.Info("load segment done")
+			logger.Debug("load segment done")
 		}()
 		tr := timerecord.NewTimeRecorder("loadDurationPerSegment")
-		logger.Info("load segment...")
+		logger.Debug("load segment...")
 
 		// L0 segment has no index or data to be load.
 		if loadInfo.GetLevel() != datapb.SegmentLevel_L0 {
@@ -407,7 +407,7 @@ func (loader *segmentLoader) Load(ctx context.Context,
 
 	// Start to load,
 	// Make sure we can always benefit from concurrency, and not spawn too many idle goroutines
-	log.Info("start to load segments in parallel",
+	log.Debug("start to load segments in parallel",
 		zap.Int("segmentNum", len(infos)),
 		zap.Int("concurrencyLevel", requestResourceResult.ConcurrencyLevel))
 
@@ -539,7 +539,7 @@ func (loader *segmentLoader) requestResource(ctx context.Context, infos ...*quer
 
 	loader.committedResource.Add(result.Resource)
 	// loader.committedLogicalResource.Add(result.LogicalResource)
-	log.Info("request resource for loading segments (unit in MiB)",
+	log.Debug("request resource for loading segments (unit in MiB)",
 		zap.Float64("memory", logutil.ToMB(float64(result.Resource.MemorySize))),
 		zap.Float64("committedMemory", logutil.ToMB(float64(loader.committedResource.MemorySize))),
 		zap.Float64("disk", logutil.ToMB(float64(result.Resource.DiskSize))),
@@ -1728,7 +1728,7 @@ func (loader *segmentLoader) checkSegmentSize(ctx context.Context, segmentLoadIn
 		}
 	}
 
-	log.Info("predict memory and disk usage while loading (in MiB)",
+	log.Debug("predict memory and disk usage while loading (in MiB)",
 		zap.Float64("maxSegmentSize(MB)", logutil.ToMB(float64(maxSegmentSize))),
 		zap.Float64("committedMemSize(MB)", logutil.ToMB(float64(loader.committedResource.MemorySize))),
 		zap.Float64("memLimit(MB)", logutil.ToMB(float64(totalMem))),
