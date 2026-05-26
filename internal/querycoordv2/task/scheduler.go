@@ -53,6 +53,11 @@ const (
 	TaskTypeDropIndex
 )
 
+const (
+	minDispatchScanBudget    = 4096
+	dispatchScanBudgetFactor = 8
+)
+
 var TaskTypeName = map[Type]string{
 	TaskTypeGrow:        "Grow",
 	TaskTypeReduce:      "Reduce",
@@ -904,7 +909,10 @@ func (scheduler *taskScheduler) schedule(node int64) {
 	// Process tasks
 	toProcess := make([]Task, 0)
 	toRemove := make([]Task, 0)
+	scannedTaskNum := 0
+	scanBudget := scheduler.getDispatchScanBudget(node)
 	scheduler.processQueue.RangeByNode(node, func(task Task) bool {
+		scannedTaskNum++
 		scheduler.preProcess(task)
 		if task.Status() == TaskStatusStarted {
 			toProcess = append(toProcess, task)
@@ -912,7 +920,7 @@ func (scheduler *taskScheduler) schedule(node int64) {
 			toRemove = append(toRemove, task)
 		}
 
-		return true
+		return scannedTaskNum < scanBudget
 	})
 	preprocessDur := tr.RecordSpan()
 
@@ -934,6 +942,8 @@ func (scheduler *taskScheduler) schedule(node int64) {
 	scheduler.updateTaskMetrics()
 
 	log.Info("processed tasks",
+		zap.Int("scannedTaskNum", scannedTaskNum),
+		zap.Int("scanBudget", scanBudget),
 		zap.Int("toProcessNum", len(toProcess)),
 		zap.Int32("committedNum", commmittedNum.Load()),
 		zap.Int("toRemoveNum", len(toRemove)),
@@ -949,6 +959,19 @@ func (scheduler *taskScheduler) schedule(node int64) {
 		zap.Int("segmentTaskNum", scheduler.segmentTasks.Len()),
 		zap.Int("channelTaskNum", scheduler.channelTasks.Len()),
 	)
+}
+
+func (scheduler *taskScheduler) getDispatchScanBudget(node int64) int {
+	executor, ok := scheduler.executors.Get(node)
+	if !ok {
+		return minDispatchScanBudget
+	}
+
+	budget := int(executor.GetTotalTaskExecutionCap()) * dispatchScanBudgetFactor
+	if budget < minDispatchScanBudget {
+		return minDispatchScanBudget
+	}
+	return budget
 }
 
 func (scheduler *taskScheduler) isRelated(task Task, node int64) bool {
