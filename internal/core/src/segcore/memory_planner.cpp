@@ -176,9 +176,10 @@ LoadWithStrategy(const std::vector<std::string>& remote_files,
             // Use provided strategy to split row groups
             auto blocks = strategy->split(row_groups);
 
-            LOG_INFO("[StorageV2] split row groups into blocks: {} for file {}",
-                     blocks.size(),
-                     file);
+            LOG_DEBUG(
+                "[StorageV2] split row groups into blocks: {} for file {}",
+                blocks.size(),
+                file);
 
             // Create and submit tasks for each block
             std::vector<std::future<std::shared_ptr<milvus::ArrowDataWrapper>>>
