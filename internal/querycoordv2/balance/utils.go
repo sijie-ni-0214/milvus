@@ -43,6 +43,11 @@ const (
 // and reduce action (release segment) on the source node.
 func CreateSegmentTasksFromPlans(ctx context.Context, source task.Source, timeout time.Duration, plans []assign.SegmentAssignPlan) []task.Task {
 	ret := make([]task.Task, 0)
+	if len(plans) > 0 {
+		log.Info("create segment tasks from plans",
+			zap.String("source", source.String()),
+			zap.Int("planCount", len(plans)))
+	}
 	for _, p := range plans {
 		actions := make([]task.Action, 0)
 		if p.To != -1 {
@@ -75,7 +80,7 @@ func CreateSegmentTasksFromPlans(ctx context.Context, source task.Source, timeou
 			continue
 		}
 
-		log.Info("create segment task",
+		log.Debug("create segment task",
 			zap.Int64("collection", p.Segment.GetCollectionID()),
 			zap.Int64("segmentID", p.Segment.GetID()),
 			zap.Int64("replica", p.Replica.GetID()),

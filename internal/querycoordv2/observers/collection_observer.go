@@ -279,6 +279,19 @@ func (ob *CollectionObserver) observeLoadStatus(ctx context.Context) {
 		hasUpdate := false
 
 		channelTargetNum, subChannelCount := ob.observeChannelStatus(ctx, task.CollectionID)
+		currentTargetReady := false
+		useCollectionTargetCheck := collection.GetLoadType() == querypb.LoadType_LoadCollection
+		if useCollectionTargetCheck {
+			currentTargetReady = ob.targetMgr.IsCurrentTargetExist(ctx, task.CollectionID, common.AllPartitionsID)
+		}
+		if useCollectionTargetCheck && !currentTargetReady {
+			currentTargetReady = ob.targetObserver.Check(ctx, task.CollectionID, common.AllPartitionsID)
+			if !currentTargetReady {
+				log.Ctx(ctx).Warn("failed to manual check current target, skip partition load status update",
+					zap.Int64("collectionID", task.CollectionID),
+					zap.Int("partitionNum", len(partitions)))
+			}
+		}
 
 		for _, partition := range partitions {
 			if partition.LoadPercentage == 100 {
@@ -286,7 +299,7 @@ func (ob *CollectionObserver) observeLoadStatus(ctx context.Context) {
 			}
 			if ob.readyToObserve(ctx, partition.CollectionID) {
 				replicaNum := ob.meta.GetReplicaNumber(ctx, partition.GetCollectionID())
-				has := ob.observePartitionLoadStatus(ctx, partition, replicaNum, channelTargetNum, subChannelCount)
+				has := ob.observePartitionLoadStatus(ctx, partition, replicaNum, channelTargetNum, subChannelCount, useCollectionTargetCheck, currentTargetReady)
 				if has {
 					hasUpdate = true
 				}
@@ -344,7 +357,7 @@ func (ob *CollectionObserver) observeChannelStatus(ctx context.Context, collecti
 	return channelTargetNum, subChannelCount
 }
 
-func (ob *CollectionObserver) observePartitionLoadStatus(ctx context.Context, partition *meta.Partition, replicaNum int32, channelTargetNum, subChannelCount int) bool {
+func (ob *CollectionObserver) observePartitionLoadStatus(ctx context.Context, partition *meta.Partition, replicaNum int32, channelTargetNum, subChannelCount int, useCollectionTargetCheck bool, currentTargetReady bool) bool {
 	segmentTargets := ob.targetMgr.GetSealedSegmentsByPartition(ctx, partition.GetCollectionID(), partition.GetPartitionID(), meta.NextTarget)
 
 	targetNum := len(segmentTargets) + channelTargetNum
@@ -384,7 +397,10 @@ func (ob *CollectionObserver) observePartitionLoadStatus(ctx context.Context, pa
 
 	ob.partitionLoadedCount[partition.GetPartitionID()] = loadedCount
 	if loadPercentage == 100 {
-		if !ob.targetObserver.Check(ctx, partition.GetCollectionID(), partition.PartitionID) {
+		if useCollectionTargetCheck && !currentTargetReady {
+			return false
+		}
+		if !useCollectionTargetCheck && !ob.targetObserver.Check(ctx, partition.GetCollectionID(), partition.PartitionID) {
 			log.Ctx(ctx).Warn("failed to manual check current target, skip update load status",
 				zap.Int64("collectionID", partition.GetCollectionID()),
 				zap.Int64("partitionID", partition.GetPartitionID()))

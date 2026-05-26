@@ -117,6 +117,13 @@ func (c *SegmentChecker) Check(ctx context.Context) []task.Task {
 			}
 
 			replicas := c.meta.GetByCollection(ctx, cid)
+			if c.scheduler.GetSegmentTaskNum(
+				task.WithCollectionID2TaskFilter(cid),
+				task.WithTaskTypeFilter(task.TaskTypeGrow),
+			) > 0 {
+				continue
+			}
+
 			hasTask := false
 			for _, r := range replicas {
 				tasks := c.checkReplica(ctx, r)

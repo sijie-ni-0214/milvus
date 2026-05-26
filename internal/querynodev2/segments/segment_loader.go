@@ -259,9 +259,11 @@ func (loader *segmentLoader) Load(ctx context.Context,
 	var err error
 	var requestResourceResult requestResourceResult
 
-	// Check memory & storage limit
-	// no need to check resource for lazy load here
-	requestResourceResult, err = loader.requestResource(ctx, infos...)
+	// Check memory & storage limit.
+	// When many segment load RPCs arrive concurrently, resource may be
+	// temporarily reserved by in-flight loads. Wait in QueryNode instead of
+	// returning a retryable resource error to QueryCoord immediately.
+	requestResourceResult, err = loader.requestResourceWithRetry(ctx, infos...)
 	if err != nil {
 		log.Warn("request resource failed", zap.Error(err))
 		return nil, err
@@ -545,6 +547,32 @@ func (loader *segmentLoader) requestResource(ctx context.Context, infos ...*quer
 	)
 
 	return result, nil
+}
+
+func (loader *segmentLoader) requestResourceWithRetry(ctx context.Context, infos ...*querypb.SegmentLoadInfo) (requestResourceResult, error) {
+	result, err := loader.requestResource(ctx, infos...)
+	if !shouldWaitLoadingResource(result, err) {
+		return result, err
+	}
+
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return result, ctx.Err()
+		case <-ticker.C:
+			result, err = loader.requestResource(ctx, infos...)
+			if !shouldWaitLoadingResource(result, err) {
+				return result, err
+			}
+		}
+	}
+}
+
+func shouldWaitLoadingResource(result requestResourceResult, err error) bool {
+	return errors.Is(err, merr.ErrSegmentRequestResourceFailed) && !result.CommittedResource.IsZero()
 }
 
 // freeRequestResource returns request memory & storage usage request.

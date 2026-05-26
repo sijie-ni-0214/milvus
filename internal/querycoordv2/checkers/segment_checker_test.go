@@ -51,6 +51,8 @@ type SegmentCheckerTestSuite struct {
 	broker    *meta.MockBroker
 	nodeMgr   *session.NodeManager
 	scheduler *task.MockScheduler
+
+	segmentTaskNum int
 }
 
 func (suite *SegmentCheckerTestSuite) SetupSuite() {
@@ -83,9 +85,13 @@ func (suite *SegmentCheckerTestSuite) SetupTest() {
 	suite.broker = meta.NewMockBroker(suite.T())
 	targetManager := meta.NewTargetManager(suite.broker, suite.meta)
 
+	suite.segmentTaskNum = 0
 	suite.scheduler = task.NewMockScheduler(suite.T())
 	suite.scheduler.EXPECT().GetSegmentTaskDelta(mock.Anything, mock.Anything).Return(0).Maybe()
 	suite.scheduler.EXPECT().GetChannelTaskDelta(mock.Anything, mock.Anything).Return(0).Maybe()
+	suite.scheduler.EXPECT().GetSegmentTaskNum(mock.Anything, mock.Anything).RunAndReturn(func(...task.TaskFilter) int {
+		return suite.segmentTaskNum
+	}).Maybe()
 
 	// Initialize global assign policy factory before creating checker
 	assign.InitGlobalAssignPolicyFactory(suite.scheduler, suite.nodeMgr, distManager, suite.meta, targetManager)
@@ -183,6 +189,70 @@ func (suite *SegmentCheckerTestSuite) TestLoadSegments() {
 	tasks = checker.Check(context.TODO())
 	suite.Len(tasks, 0)
 	suite.Len(addedTasks, 1)
+}
+
+func (suite *SegmentCheckerTestSuite) TestSkipLoadSegmentsWithExistingGrowTask() {
+	ctx := context.Background()
+	checker := suite.checker
+	// set meta
+	checker.meta.PutCollection(ctx, utils.CreateTestCollection(1, 1))
+	checker.meta.PutPartition(ctx, utils.CreateTestPartition(1, 1))
+	checker.meta.Put(ctx, utils.CreateTestReplica(1, 1, []int64{1, 2}))
+	suite.nodeMgr.Add(session.NewNodeInfo(session.ImmutableNodeInfo{
+		NodeID:   1,
+		Address:  "localhost",
+		Hostname: "localhost",
+	}))
+	suite.nodeMgr.Add(session.NewNodeInfo(session.ImmutableNodeInfo{
+		NodeID:   2,
+		Address:  "localhost",
+		Hostname: "localhost",
+	}))
+	checker.meta.HandleNodeUp(ctx, 1)
+	checker.meta.HandleNodeUp(ctx, 2)
+
+	// set target
+	segments := []*datapb.SegmentInfo{
+		{
+			ID:            1,
+			PartitionID:   1,
+			InsertChannel: "test-insert-channel",
+		},
+	}
+
+	channels := []*datapb.VchannelInfo{
+		{
+			CollectionID: 1,
+			ChannelName:  "test-insert-channel",
+		},
+	}
+
+	suite.broker.EXPECT().GetRecoveryInfoV2(mock.Anything, int64(1)).Return(
+		channels, segments, nil)
+	checker.targetMgr.UpdateCollectionNextTarget(ctx, int64(1))
+
+	// set dist
+	checker.dist.ChannelDistManager.Update(2, &meta.DmChannel{
+		VchannelInfo: &datapb.VchannelInfo{
+			CollectionID: 1,
+			ChannelName:  "test-insert-channel",
+		},
+		Node:    2,
+		Version: 1,
+		View:    &meta.LeaderView{ID: 2, CollectionID: 1, Channel: "test-insert-channel", Version: 1, Status: &querypb.LeaderViewStatus{Serviceable: true}},
+	})
+
+	suite.segmentTaskNum = 1
+
+	var addedTasks []task.Task
+	suite.scheduler.EXPECT().Add(mock.Anything).RunAndReturn(func(t task.Task) error {
+		addedTasks = append(addedTasks, t)
+		return nil
+	}).Maybe()
+
+	tasks := checker.Check(context.TODO())
+	suite.Len(tasks, 0)
+	suite.Len(addedTasks, 0)
 }
 
 func (suite *SegmentCheckerTestSuite) TestSkipLoadSegments() {
