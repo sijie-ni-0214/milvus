@@ -1040,7 +1040,7 @@ JsonKeyStats::LoadColumnGroup(int64_t column_group_id,
     auto enable_mmap = !mmap_filepath_.empty();
     auto column_group_info =
         FieldDataInfo(column_group_id, field_id_, num_rows, mmap_filepath_);
-    LOG_INFO(
+    LOG_DEBUG(
         "loads column group {} with num_rows {} for segment "
         "{}",
         column_group_id,

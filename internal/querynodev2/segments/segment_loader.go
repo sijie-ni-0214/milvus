@@ -1119,7 +1119,7 @@ func (loader *segmentLoader) LoadSegment(ctx context.Context,
 		zap.Int64("segmentID", segment.ID()),
 	)
 
-	log.Info("start loading segment files",
+	log.Debug("start loading segment files",
 		zap.Int64("rowNum", loadInfo.GetNumOfRows()),
 		zap.String("segmentType", segment.Type().String()),
 		zap.Int32("priority", int32(loadInfo.GetPriority())))
@@ -1149,7 +1149,7 @@ func (loader *segmentLoader) LoadSegment(ctx context.Context,
 	// load statslog if it's growing segment
 	if segment.segmentType == SegmentTypeGrowing {
 		if bf, ok := segment.pkCandidate.(*pkoracle.BloomFilterSet); ok {
-			log.Info("loading statslog...")
+			log.Debug("loading statslog...")
 			resolver := packed.NewStatsResolverFromLoadInfo(loadInfo)
 			bfPaths, err := resolver.BloomFilterPaths(pkField.GetFieldID())
 			if err != nil {
@@ -1279,7 +1279,7 @@ func (loader *segmentLoader) loadBm25Stats(ctx context.Context, segmentID int64,
 			}
 		}
 		cnt += fieldOffset[i]
-		log.Info("Successfully load bm25 stats", zap.Duration("time", time.Since(startTs)), zap.Int64("numRow", newStats.NumRow()), zap.Int64("fieldID", fieldID))
+		log.Debug("Successfully load bm25 stats", zap.Duration("time", time.Since(startTs)), zap.Int64("numRow", newStats.NumRow()), zap.Int64("fieldID", fieldID))
 	}
 
 	return nil
@@ -1345,7 +1345,7 @@ func (loader *segmentLoader) loadBloomFilter(ctx context.Context, segmentID int6
 		size += stat.BF.Cap()
 		bfs.AddHistoricalStats(pkStat)
 	}
-	log.Info("Successfully load pk stats", zap.Duration("time", time.Since(startTs)), zap.Uint("size", size))
+	log.Debug("Successfully load pk stats", zap.Duration("time", time.Since(startTs)), zap.Uint("size", size))
 	return nil
 }
 
@@ -1359,7 +1359,7 @@ func (loader *segmentLoader) loadDeltalogs(ctx context.Context, segment Segment,
 		zap.Int64("segmentID", segment.ID()),
 		zap.Int("deltaNum", len(deltaLogs)),
 	)
-	log.Info("loading delta...")
+	log.Debug("loading delta...")
 
 	var rowNums int64
 	valid := func(binlog *datapb.Binlog, _ int) bool {
@@ -1458,7 +1458,7 @@ func (loader *segmentLoader) loadDeltalogs(ctx context.Context, segment Segment,
 		return err
 	}
 
-	log.Info("load delta logs done", zap.Int64("deleteCount", deltaData.DeleteRowCount()))
+	log.Debug("load delta logs done", zap.Int64("deleteCount", deltaData.DeleteRowCount()))
 	return nil
 }
 

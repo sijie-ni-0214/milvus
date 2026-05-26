@@ -169,10 +169,10 @@ ChunkTranslator::get_cells(
     }
 
     auto channel = std::make_shared<ArrowReaderChannel>();
-    LOG_INFO("segment {} submits load field {} chunks {} task to thread pool",
-             segment_id_,
-             field_id_,
-             fmt::format("{}", fmt::join(cids, " ")));
+    LOG_DEBUG("segment {} submits load field {} chunks {} task to thread pool",
+              segment_id_,
+              field_id_,
+              fmt::format("{}", fmt::join(cids, " ")));
     LoadArrowReaderFromRemote(remote_files, channel, load_priority_);
 
     for (auto cid : cids) {

@@ -1006,7 +1006,7 @@ ChunkedSegmentSealedImpl::load_column_group_data_internal(
                                                num_rows,
                                                mmap_dir_path,
                                                merged_in_load_list);
-        LOG_INFO(
+        LOG_DEBUG(
             "[StorageV2] segment {} loads column group {} with field ids "
             "{} "
             "with "
@@ -1121,11 +1121,11 @@ ChunkedSegmentSealedImpl::load_field_data_internal(
                           num_rows,
                           mmap_dir_path,
                           schema_->ShouldLoadField(field_id));
-        LOG_INFO("segment {} loads field {} with num_rows {}, sorted by pk {}",
-                 this->get_segment_id(),
-                 field_id.get(),
-                 num_rows,
-                 is_sorted_by_pk_);
+        LOG_DEBUG("segment {} loads field {} with num_rows {}, sorted by pk {}",
+                  this->get_segment_id(),
+                  field_id.get(),
+                  num_rows,
+                  is_sorted_by_pk_);
 
         if (SystemProperty::Instance().IsSystem(field_id)) {
             auto insert_files = info.insert_files;
@@ -1137,14 +1137,14 @@ ChunkedSegmentSealedImpl::load_field_data_internal(
                                       field_data_info.arrow_reader_channel,
                                       load_info.load_priority);
 
-            LOG_INFO("segment {} submits load field {} task to thread pool",
-                     this->get_segment_id(),
-                     field_id.get());
+            LOG_DEBUG("segment {} submits load field {} task to thread pool",
+                      this->get_segment_id(),
+                      field_id.get());
             load_system_field_internal(
                 field_id, field_data_info, load_info.load_priority);
-            LOG_INFO("segment {} loads system field {} mmap false done",
-                     this->get_segment_id(),
-                     field_id.get());
+            LOG_DEBUG("segment {} loads system field {} mmap false done",
+                      this->get_segment_id(),
+                      field_id.get());
         } else {
             std::vector<storagev1translator::ChunkTranslator::FileInfo>
                 file_infos;

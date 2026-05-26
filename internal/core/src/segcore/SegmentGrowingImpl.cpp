@@ -758,18 +758,18 @@ SegmentGrowingImpl::load_field_data_internal(const LoadFieldDataInfo& infos) {
             channel->push(field_data);
         }
 
-        LOG_INFO("segment {} loads field {} with num_rows {}",
-                 this->get_segment_id(),
-                 field_id.get(),
-                 num_rows);
+        LOG_DEBUG("segment {} loads field {} with num_rows {}",
+                  this->get_segment_id(),
+                  field_id.get(),
+                  num_rows);
         auto load_future = pool.Submit(LoadFieldDatasFromRemote,
                                        insert_files,
                                        channel,
                                        infos.load_priority);
 
-        LOG_INFO("segment {} submits load field {} task to thread pool",
-                 this->get_segment_id(),
-                 field_id.get());
+        LOG_DEBUG("segment {} submits load field {} task to thread pool",
+                  this->get_segment_id(),
+                  field_id.get());
         auto field_data = storage::CollectFieldDataChannel(channel);
         load_field_data_common(
             field_id, reserved_offset, field_data, primary_field_id, num_rows);
@@ -862,9 +862,9 @@ SegmentGrowingImpl::load_field_data_common(
     // update the mem size
     stats_.mem_size += storage::GetByteSizeOfFieldDatas(field_data);
 
-    LOG_INFO("segment {} loads field {} done",
-             this->get_segment_id(),
-             field_id.get());
+    LOG_DEBUG("segment {} loads field {} done",
+              this->get_segment_id(),
+              field_id.get());
 }
 
 void
@@ -889,7 +889,7 @@ SegmentGrowingImpl::load_column_group_data_internal(
             FieldDataInfo(column_group_id.get(), num_rows, "");
         column_group_info.arrow_reader_channel->set_capacity(parallel_degree);
 
-        LOG_INFO(
+        LOG_DEBUG(
             "[StorageV2] segment {} loads column group {} with num_rows {}",
             this->get_segment_id(),
             column_group_id.get(),
@@ -941,7 +941,7 @@ SegmentGrowingImpl::load_column_group_data_internal(
                                     infos.load_priority);
         });
 
-        LOG_INFO(
+        LOG_DEBUG(
             "[StorageV2] segment {} submits load column group {} task to "
             "thread pool",
             this->get_segment_id(),
