@@ -2659,6 +2659,8 @@ type queryCoordConfig struct {
 
 	TaskExecutionCap ParamItem `refreshable:"true"`
 
+	DispatchScanBudgetFactor ParamItem `refreshable:"true"`
+
 	// ---- Handoff ---
 	// Deprecated: Since 2.2.2
 	AutoHandoff ParamItem `refreshable:"true"`
@@ -2783,6 +2785,21 @@ func (p *queryCoordConfig) init(base *BaseTable) {
 		Export:       true,
 	}
 	p.TaskExecutionCap.Init(base.mgr)
+
+	p.DispatchScanBudgetFactor = ParamItem{
+		Key:          "queryCoord.dispatchScanBudgetFactor",
+		Version:      "2.6.0",
+		DefaultValue: "8",
+		Formatter: func(v string) string {
+			if getAsInt(v) < 1 {
+				return "1"
+			}
+			return v
+		},
+		Doc:    "The multiplier used to compute the per-node dispatch scan budget from queryCoord.taskExecutionCap.",
+		Export: true,
+	}
+	p.DispatchScanBudgetFactor.Init(base.mgr)
 
 	p.AutoHandoff = ParamItem{
 		Key:          "queryCoord.autoHandoff",

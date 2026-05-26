@@ -125,6 +125,27 @@ func TestExecutorCapacity(t *testing.T) {
 	})
 }
 
+func TestDispatchScanBudgetFactor(t *testing.T) {
+	paramtable.Init()
+
+	paramtable.Get().Save("queryCoord.taskExecutionCap", "5")
+	paramtable.Get().Save("queryCoord.dispatchScanBudgetFactor", "3")
+	defer paramtable.Get().Reset("queryCoord.taskExecutionCap")
+	defer paramtable.Get().Reset("queryCoord.dispatchScanBudgetFactor")
+
+	scheduler := NewScheduler(context.Background(), nil, nil, nil, nil, nil, session.NewNodeManager())
+	assert.Equal(t, 3, scheduler.getDispatchScanBudget(1))
+
+	scheduler.executors.Insert(1, newTestExecutor(1))
+	assert.Equal(t, 15, scheduler.getDispatchScanBudget(1))
+
+	paramtable.Get().Save("queryCoord.dispatchScanBudgetFactor", "4")
+	assert.Equal(t, 20, scheduler.getDispatchScanBudget(1))
+
+	paramtable.Get().Save("queryCoord.dispatchScanBudgetFactor", "0")
+	assert.Equal(t, 5, scheduler.getDispatchScanBudget(1))
+}
+
 func TestExecutorChannelPoolCapacity(t *testing.T) {
 	paramtable.Init()
 

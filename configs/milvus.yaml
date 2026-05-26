@@ -402,6 +402,7 @@ proxy:
 queryCoord:
   taskMergeCap: 1
   taskExecutionCap: 360
+  dispatchScanBudgetFactor: 8 # The multiplier used to compute the per-node dispatch scan budget from queryCoord.taskExecutionCap.
   # Switch value to control if to automatically replace a growing segment with the corresponding indexed sealed segment when the growing segment reaches the sealing threshold.
   # If this parameter is set false, Milvus simply searches the growing segments with brute force.
   autoHandoff: true

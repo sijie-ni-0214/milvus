@@ -904,7 +904,10 @@ func (scheduler *taskScheduler) schedule(node int64) {
 	// Process tasks
 	toProcess := make([]Task, 0)
 	toRemove := make([]Task, 0)
+	scannedTaskNum := 0
+	scanBudget := scheduler.getDispatchScanBudget(node)
 	scheduler.processQueue.RangeByNode(node, func(task Task) bool {
+		scannedTaskNum++
 		scheduler.preProcess(task)
 		if task.Status() == TaskStatusStarted {
 			toProcess = append(toProcess, task)
@@ -912,7 +915,7 @@ func (scheduler *taskScheduler) schedule(node int64) {
 			toRemove = append(toRemove, task)
 		}
 
-		return true
+		return scannedTaskNum < scanBudget
 	})
 	preprocessDur := tr.RecordSpan()
 
@@ -934,6 +937,8 @@ func (scheduler *taskScheduler) schedule(node int64) {
 	scheduler.updateTaskMetrics()
 
 	log.Info("processed tasks",
+		zap.Int("scannedTaskNum", scannedTaskNum),
+		zap.Int("scanBudget", scanBudget),
 		zap.Int("toProcessNum", len(toProcess)),
 		zap.Int32("committedNum", commmittedNum.Load()),
 		zap.Int("toRemoveNum", len(toRemove)),
@@ -949,6 +954,16 @@ func (scheduler *taskScheduler) schedule(node int64) {
 		zap.Int("segmentTaskNum", scheduler.segmentTasks.Len()),
 		zap.Int("channelTaskNum", scheduler.channelTasks.Len()),
 	)
+}
+
+func (scheduler *taskScheduler) getDispatchScanBudget(node int64) int {
+	factor := paramtable.Get().QueryCoordCfg.DispatchScanBudgetFactor.GetAsInt()
+	executor, ok := scheduler.executors.Get(node)
+	if !ok {
+		return factor
+	}
+
+	return int(executor.GetTotalTaskExecutionCap()) * factor
 }
 
 func (scheduler *taskScheduler) isRelated(task Task, node int64) bool {
