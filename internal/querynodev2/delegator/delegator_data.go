@@ -930,6 +930,23 @@ func (sd *shardDelegator) loadStreamDelete(ctx context.Context,
 		return candidate.ID(), candidate
 	})
 
+	// Fast path for bulk recovery: when the delegator has no buffered deletes
+	// or L0 deletes, making the loaded segment visible is enough.
+	sd.deleteMut.RLock()
+	deleteEntryNum, _ := sd.deleteBuffer.Size()
+	l0Segments := sd.deleteBuffer.ListL0()
+	if deleteEntryNum == 0 && len(l0Segments) == 0 {
+		err := sd.addDistributionIfVersionOK(schemaVersion, entries...)
+		sd.deleteMut.RUnlock()
+		if err != nil {
+			return err
+		}
+		log.Debug("load stream delete skipped for empty delete buffer",
+			zap.Int("segmentCount", len(infos)))
+		return nil
+	}
+	sd.deleteMut.RUnlock()
+
 	// Phase 0: Forward L0 deletions (no lock needed, unchanged)
 	for _, info := range infos {
 		candidate := idCandidates[info.GetSegmentID()]
@@ -984,14 +1001,19 @@ func (sd *shardDelegator) loadStreamDelete(ctx context.Context,
 		if err != nil {
 			return err
 		}
-		log.Info("forward delete to worker (phase 2: snapshot)...",
+		fields := []zap.Field{
 			zap.String("channel", info.InsertChannel),
 			zap.Int64("segmentID", info.GetSegmentID()),
 			zap.Time("startPosition", tsoutil.PhysicalTime(info.GetStartPosition().GetTimestamp())),
 			zap.Int64("tsHitDeleteRowNum", tsHit),
 			zap.Int64("bfHitDeleteRowNum", bfHit),
 			zap.Int64("bfCost", time.Since(start).Milliseconds()),
-		)
+		}
+		if tsHit > 0 || bfHit > 0 {
+			log.Info("forward delete to worker (phase 2: snapshot)...", fields...)
+		} else {
+			log.Debug("forward delete to worker (phase 2: snapshot)...", fields...)
+		}
 	}
 
 	// === Phase 3: Catch-up new entries + flush + add distribution under RLock (fast — milliseconds) ===
@@ -1038,7 +1060,7 @@ func (sd *shardDelegator) loadStreamDelete(ctx context.Context,
 	if err := sd.addDistributionIfVersionOK(schemaVersion, entries...); err != nil {
 		return err
 	}
-	log.Info("load stream delete done")
+	log.Debug("load stream delete done", zap.Int("segmentCount", len(infos)))
 	return nil
 }
 
