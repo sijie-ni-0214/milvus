@@ -107,16 +107,21 @@ func (dh *distHandler) pullDist(ctx context.Context, failures *int, dispatchTask
 		if node != nil {
 			fields = append(fields, zap.Time("lastHeartbeat", node.LastHeartbeat()))
 		}
-		fields = append(fields, zap.Error(err))
-		log.Ctx(ctx).WithRateGroup("distHandler.pullDist", 1, 60).
-			RatedWarn(30.0, "failed to get data distribution", fields...)
+		fields = append(fields, zap.Int64("nodeID", dh.nodeID), zap.Error(err))
+		log.Ctx(ctx).Warn("failed to get data distribution", fields...)
 	} else {
 		*failures = 0
 		dh.handleDistResp(ctx, resp, dispatchTask)
 	}
-	log.Ctx(ctx).WithRateGroup("distHandler.pullDist", 1, 120).
-		RatedInfo(120.0, "pull and handle distribution done",
-			zap.Int("respSize", proto.Size(resp)), zap.Duration("pullDur", d1), zap.Duration("handleDur", tr.RecordSpan()))
+	log.Ctx(ctx).Info("pull and handle distribution done",
+		zap.Int64("nodeID", dh.nodeID),
+		zap.Int64("respNodeID", resp.GetNodeID()),
+		zap.Int("respSize", proto.Size(resp)),
+		zap.Int("segmentCnt", len(resp.GetSegments())),
+		zap.Int("channelCnt", len(resp.GetChannels())),
+		zap.Int("leaderViewCnt", len(resp.GetLeaderViews())),
+		zap.Duration("pullDur", d1),
+		zap.Duration("handleDur", tr.RecordSpan()))
 }
 
 func (dh *distHandler) handleDistResp(ctx context.Context, resp *querypb.GetDataDistributionResponse, dispatchTask bool) {
@@ -133,9 +138,20 @@ func (dh *distHandler) handleDistResp(ctx context.Context, resp *querypb.GetData
 	node.SetLastHeartbeat(now)
 	metrics.QueryCoordLastHeartbeatTimeStamp.WithLabelValues(fmt.Sprint(resp.GetNodeID())).Set(float64(now.UnixNano()))
 
+	tr := timerecord.NewTimeRecorder("")
+	var (
+		updateNodeStatsDur time.Duration
+		updateSegmentsDur  time.Duration
+		updateChannelsDur  time.Duration
+		dispatchDur        time.Duration
+	)
 	// skip  update dist if no distribution change happens in query node
 	if resp.GetLastModifyTs() != 0 && resp.GetLastModifyTs() <= dh.lastUpdateTs {
-		log.RatedInfo(30, "skip update dist due to no distribution change", zap.Int64("lastModifyTs", resp.GetLastModifyTs()), zap.Int64("lastUpdateTs", dh.lastUpdateTs))
+		log.Info("skip update dist due to no distribution change",
+			zap.Int64("nodeID", resp.GetNodeID()),
+			zap.Int("segmentCnt", len(resp.GetSegments())),
+			zap.Int64("lastModifyTs", resp.GetLastModifyTs()),
+			zap.Int64("lastUpdateTs", dh.lastUpdateTs))
 	} else {
 		dh.lastUpdateTs = resp.GetLastModifyTs()
 
@@ -145,13 +161,24 @@ func (dh *distHandler) handleDistResp(ctx context.Context, resp *querypb.GetData
 			session.WithMemCapacity(resp.GetMemCapacityInMB()),
 			session.WithCPUNum(resp.GetCpuNum()),
 		)
+		updateNodeStatsDur = tr.RecordSpan()
 		dh.updateSegmentsDistribution(ctx, resp)
+		updateSegmentsDur = tr.RecordSpan()
 		dh.updateChannelsDistribution(ctx, resp)
+		updateChannelsDur = tr.RecordSpan()
 	}
 
 	if dispatchTask {
 		dh.scheduler.Dispatch(dh.nodeID)
+		dispatchDur = tr.RecordSpan()
 	}
+	log.Info("handleDistResp done",
+		zap.Int64("nodeID", dh.nodeID),
+		zap.Duration("updateNodeStatsDur", updateNodeStatsDur),
+		zap.Duration("updateSegmentsDur", updateSegmentsDur),
+		zap.Duration("updateChannelsDur", updateChannelsDur),
+		zap.Duration("dispatchDur", dispatchDur),
+		zap.Duration("totalDur", tr.ElapseSpan()))
 }
 
 func (dh *distHandler) SetNotifyFunc(notifyFunc NotifyDelegatorChanges) {

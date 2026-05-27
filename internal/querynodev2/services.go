@@ -1460,6 +1460,7 @@ func (node *QueryNode) GetMetrics(ctx context.Context, req *milvuspb.GetMetricsR
 }
 
 func (node *QueryNode) GetDataDistribution(ctx context.Context, req *querypb.GetDataDistributionRequest) (*querypb.GetDataDistributionResponse, error) {
+	tr := timerecord.NewTimeRecorder("")
 	log := log.Ctx(ctx).With(
 		zap.Int64("msgID", req.GetBase().GetMsgID()),
 		zap.Int64("nodeID", node.GetNodeID()),
@@ -1473,6 +1474,7 @@ func (node *QueryNode) GetDataDistribution(ctx context.Context, req *querypb.Get
 		}, nil
 	}
 	defer node.lifetime.Done()
+	lifetimeAddDur := tr.RecordSpan()
 
 	lastModifyTs := node.getDistributionModifyTS()
 	distributionChange := func() bool {
@@ -1482,6 +1484,7 @@ func (node *QueryNode) GetDataDistribution(ctx context.Context, req *querypb.Get
 
 		return req.GetLastUpdateTs() < lastModifyTs
 	}
+	checkModifyDur := tr.RecordSpan()
 
 	if !distributionChange() {
 		return &querypb.GetDataDistributionResponse{
@@ -1492,6 +1495,7 @@ func (node *QueryNode) GetDataDistribution(ctx context.Context, req *querypb.Get
 	}
 
 	sealedSegments := node.manager.Segment.GetBy(segments.WithType(commonpb.SegmentState_Sealed))
+	getSealedSegmentsDur := tr.RecordSpan()
 	segmentVersionInfos := make([]*querypb.SegmentVersionInfo, 0, len(sealedSegments))
 	for _, s := range sealedSegments {
 		segmentVersionInfos = append(segmentVersionInfos, &querypb.SegmentVersionInfo{
@@ -1511,21 +1515,36 @@ func (node *QueryNode) GetDataDistribution(ctx context.Context, req *querypb.Get
 			DataVersion:   proto.Int32(s.LoadInfo().GetDataVersion()),
 		})
 	}
+	buildSegmentVersionsDur := tr.RecordSpan()
 
 	channelVersionInfos := make([]*querypb.ChannelVersionInfo, 0)
 	leaderViews := make([]*querypb.LeaderView, 0)
+	var (
+		serviceableCheckDur time.Duration
+		getSegmentInfoDur   time.Duration
+		buildSealedDistDur  time.Duration
+		buildGrowingDistDur time.Duration
+		getQueryViewDur     time.Duration
+	)
 
 	node.delegators.Range(func(key string, delegator delegator.ShardDelegator) bool {
+		stepStart := time.Now()
 		if !delegator.Serviceable() {
 			return true
 		}
+		serviceableCheckDur += time.Since(stepStart)
+
 		channelVersionInfos = append(channelVersionInfos, &querypb.ChannelVersionInfo{
 			Channel:    key,
 			Collection: delegator.Collection(),
 			Version:    delegator.Version(),
 		})
 
+		stepStart = time.Now()
 		sealed, growing := delegator.GetSegmentInfo(false)
+		getSegmentInfoDur += time.Since(stepStart)
+
+		stepStart = time.Now()
 		sealedSegments := make(map[int64]*querypb.SegmentDist)
 		for _, item := range sealed {
 			for _, segment := range item.Segments {
@@ -1535,7 +1554,9 @@ func (node *QueryNode) GetDataDistribution(ctx context.Context, req *querypb.Get
 				}
 			}
 		}
+		buildSealedDistDur += time.Since(stepStart)
 
+		stepStart = time.Now()
 		numOfGrowingRows := int64(0)
 		growingSegments := make(map[int64]*msgpb.MsgPosition)
 		for _, entry := range growing {
@@ -1548,8 +1569,11 @@ func (node *QueryNode) GetDataDistribution(ctx context.Context, req *querypb.Get
 			growingSegments[entry.SegmentID] = segment.StartPosition()
 			numOfGrowingRows += segment.InsertCount()
 		}
+		buildGrowingDistDur += time.Since(stepStart)
 
+		stepStart = time.Now()
 		queryView := delegator.GetChannelQueryView()
+		getQueryViewDur += time.Since(stepStart)
 		leaderViews = append(leaderViews, &querypb.LeaderView{
 			Collection:             delegator.Collection(),
 			Channel:                key,
@@ -1565,6 +1589,21 @@ func (node *QueryNode) GetDataDistribution(ctx context.Context, req *querypb.Get
 		})
 		return true
 	})
+	buildDelegatorDistDur := tr.RecordSpan()
+
+	log.Info("get data distribution done",
+		zap.Int64("nodeID", node.GetNodeID()),
+		zap.Duration("lifetimeAddDur", lifetimeAddDur),
+		zap.Duration("checkModifyDur", checkModifyDur),
+		zap.Duration("getSealedSegmentsDur", getSealedSegmentsDur),
+		zap.Duration("buildSegmentVersionsDur", buildSegmentVersionsDur),
+		zap.Duration("buildDelegatorDistDur", buildDelegatorDistDur),
+		zap.Duration("serviceableCheckDur", serviceableCheckDur),
+		zap.Duration("getSegmentInfoDur", getSegmentInfoDur),
+		zap.Duration("buildSealedDistDur", buildSealedDistDur),
+		zap.Duration("buildGrowingDistDur", buildGrowingDistDur),
+		zap.Duration("getQueryViewDur", getQueryViewDur),
+		zap.Duration("totalDur", tr.ElapseSpan()))
 
 	return &querypb.GetDataDistributionResponse{
 		Status:          merr.Success(),
