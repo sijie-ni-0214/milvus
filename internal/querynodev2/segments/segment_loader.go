@@ -676,7 +676,7 @@ func (loader *segmentLoader) loadSingleBloomFilterSet(ctx context.Context, colle
 	}
 	pkField := GetPkField(collection.Schema())
 
-	log.Info("start loading remote...", zap.Int("segmentNum", 1))
+	log.Debug("start loading remote bloom filter", zap.Int("segmentNum", 1))
 
 	// For external collections, return empty bloom filter set.
 	// External collections use ExternalSegmentCandidate for PK checking (set on segment)
@@ -688,7 +688,7 @@ func (loader *segmentLoader) loadSingleBloomFilterSet(ctx context.Context, colle
 		return bfs, nil
 	}
 
-	log.Info("loading bloom filter for remote...")
+	log.Debug("loading bloom filter for remote")
 	pkStatsBinlogs, err := packed.NewStatsResolverFromLoadInfo(loadInfo).BloomFilterPaths(pkField.GetFieldID())
 	if err != nil {
 		return nil, err
@@ -778,13 +778,13 @@ func (loader *segmentLoader) LoadBloomFilterSet(ctx context.Context, collectionI
 		}
 	}()
 
-	log.Info("start loading remote...", zap.Int("segmentNum", segmentNum))
+	log.Debug("start loading remote bloom filters", zap.Int("segmentNum", segmentNum))
 
 	loadRemoteFunc := func(idx int) error {
 		loadInfo := infos[idx]
 		bfs := bfSets[idx]
 
-		log.Info("loading bloom filter for remote...")
+		log.Debug("loading bloom filter for remote")
 		pkStatsBinlogs, err := packed.NewStatsResolverFromLoadInfo(loadInfo).BloomFilterPaths(pkFieldID)
 		if err != nil {
 			return err
