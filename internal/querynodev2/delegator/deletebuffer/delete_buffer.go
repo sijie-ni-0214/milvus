@@ -274,7 +274,7 @@ func (c *doubleCacheBuffer[T]) Pin(ts uint64, segmentID int64) {
 	}
 	c.pinnedTimestamps[ts][segmentID] = struct{}{}
 
-	log.Info("pin timestamp for segment",
+	log.Debug("pin timestamp for segment",
 		zap.Uint64("timestamp", ts),
 		zap.Int64("segmentID", segmentID),
 		zap.Time("physicalTime", tsoutil.PhysicalTime(ts)),
@@ -293,7 +293,7 @@ func (c *doubleCacheBuffer[T]) Unpin(ts uint64, segmentID int64) {
 		}
 	}
 
-	log.Info("unpin timestamp for segment",
+	log.Debug("unpin timestamp for segment",
 		zap.Uint64("timestamp", ts),
 		zap.Int64("segmentID", segmentID),
 		zap.Time("physicalTime", tsoutil.PhysicalTime(ts)),

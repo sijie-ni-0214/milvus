@@ -254,7 +254,7 @@ func (loader *segmentLoader) Load(ctx context.Context,
 	defer loader.unregister(infos...)
 
 	// continue to wait other task done
-	log.Info("start loading...", zap.Int("segmentNum", len(segments)), zap.Int("afterFilter", len(infos)))
+	log.Debug("start loading segments", zap.Int("segmentNum", len(segments)), zap.Int("afterFilter", len(infos)))
 
 	var err error
 	var requestResourceResult requestResourceResult
@@ -428,7 +428,7 @@ func (loader *segmentLoader) Load(ctx context.Context,
 		return nil, err
 	}
 
-	log.Info("all segment load done")
+	log.Debug("all segment load done")
 	var result []Segment
 	loaded.Range(func(_ int64, s Segment) bool {
 		result = append(result, s)
@@ -1101,7 +1101,7 @@ func (loader *segmentLoader) loadSealedSegment(ctx context.Context, loadInfo *qu
 		return err
 	}
 	patchEntryNumberSpan := tr.RecordSpan()
-	log.Info("Finish loading segment",
+	log.Debug("finish loading segment",
 		zap.Duration("patchEntryNumberSpan", patchEntryNumberSpan),
 	)
 	return nil
