@@ -180,7 +180,9 @@ IndexFactory::VecIndexLoadResource(
     }
 
     knowhere::expected<knowhere::Resource> resource;
-    uint64_t download_buffer_size_in_bytes = DEFAULT_FIELD_MAX_MEMORY_LIMIT;
+    uint64_t download_buffer_size_in_bytes =
+        std::min(index_size_in_bytes,
+                 static_cast<uint64_t>(DEFAULT_FIELD_MAX_MEMORY_LIMIT));
 
     bool has_raw_data = false;
     switch (field_type) {
