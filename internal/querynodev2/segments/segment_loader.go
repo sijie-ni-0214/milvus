@@ -383,6 +383,9 @@ func (loader *segmentLoader) Load(ctx context.Context,
 						zap.Int64("segmentID2", collidingID),
 						zap.Int64("truncatedID", loadInfo.GetSegmentID()&0xFFFFFFFF))
 				}
+			} else if segment.Type() == SegmentTypeSealed {
+				log.Debug("skip loading worker bloom filter for sealed segment",
+					zap.Int64("segmentID", segment.ID()))
 			} else if paramtable.Get().CommonCfg.BloomFilterEnabled.GetAsBool() {
 				bfs, err := loader.loadSingleBloomFilterSet(ctx, loadInfo.GetCollectionID(), loadInfo, segment.Type())
 				if err != nil {
