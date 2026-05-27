@@ -407,7 +407,7 @@ func NewSegment(ctx context.Context,
 		logger.Warn("create segment failed", zap.Error(err))
 		return nil, err
 	}
-	logger.Info("create segment done")
+	logger.Debug("create segment done")
 
 	segment := &LocalSegment{
 		baseSegment:        base,
