@@ -2608,6 +2608,28 @@ func (suite *TaskSuite) TestTaskStaleBySegmentInDist() {
 		ChannelName:  Params.CommonCfg.RootCoordDml.GetValue() + "-test",
 	}
 
+	suite.Run("SegmentAlreadyInDistOnAdd", func() {
+		segmentID := suite.loadSegments[0]
+		suite.dist.SegmentDistManager.Update(targetNode, utils.CreateTestSegment(suite.collection, 1, segmentID, targetNode, 1, channel.ChannelName))
+
+		task, err := NewSegmentTask(
+			ctx,
+			timeout,
+			WrapIDSource(0),
+			suite.collection,
+			suite.replica,
+			commonpb.LoadPriority_LOW,
+			NewSegmentAction(targetNode, ActionTypeGrow, channel.GetChannelName(), segmentID),
+		)
+		suite.NoError(err)
+
+		err = suite.scheduler.Add(task)
+		suite.ErrorContains(err, "segment already loaded in dist")
+		suite.Equal(TaskStatusCanceled, task.Status())
+
+		suite.dist.SegmentDistManager.Update(targetNode)
+	})
+
 	// Test case: Grow task should be stale when segment already exists in dist
 	suite.Run("SegmentAlreadyInDist", func() {
 		// Set up channel distribution
