@@ -87,6 +87,7 @@ func (dh *distHandler) startPullLoop(ctx context.Context) {
 	ticker := time.NewTicker(distInterval)
 	defer ticker.Stop()
 	failures := 0
+	lastTick := time.Now()
 	for {
 		select {
 		case <-ctx.Done():
@@ -96,6 +97,14 @@ func (dh *distHandler) startPullLoop(ctx context.Context) {
 			log.Ctx(ctx).Info("close dist pull loop", zap.Int64("nodeID", dh.nodeID))
 			return
 		case <-ticker.C:
+			tickGap := time.Since(lastTick)
+			if tickGap > 2*distInterval {
+				log.Ctx(ctx).Info("dist pull loop tick delayed",
+					zap.Int64("nodeID", dh.nodeID),
+					zap.Duration("tickGap", tickGap),
+					zap.Duration("distInterval", distInterval))
+			}
+			lastTick = time.Now()
 			dh.pullDist(ctx, &failures, false)
 			// only reset when interval updated
 			newDistInterval := Params.QueryCoordCfg.DistPullInterval.GetAsDuration(time.Millisecond)
@@ -115,6 +124,7 @@ func (dh *distHandler) startDispatchLoop(ctx context.Context) {
 	dispatchInterval := Params.QueryCoordCfg.DistPullInterval.GetAsDuration(time.Millisecond)
 	ticker := time.NewTicker(dispatchInterval)
 	defer ticker.Stop()
+	lastTick := time.Now()
 	for {
 		select {
 		case <-ctx.Done():
@@ -124,6 +134,14 @@ func (dh *distHandler) startDispatchLoop(ctx context.Context) {
 			log.Ctx(ctx).Info("close dist dispatch loop", zap.Int64("nodeID", dh.nodeID))
 			return
 		case <-ticker.C:
+			tickGap := time.Since(lastTick)
+			if tickGap > 2*dispatchInterval {
+				log.Ctx(ctx).Info("dist dispatch loop tick delayed",
+					zap.Int64("nodeID", dh.nodeID),
+					zap.Duration("tickGap", tickGap),
+					zap.Duration("dispatchInterval", dispatchInterval))
+			}
+			lastTick = time.Now()
 			dh.scheduler.Dispatch(dh.nodeID)
 			newDispatchInterval := Params.QueryCoordCfg.DistPullInterval.GetAsDuration(time.Millisecond)
 			if newDispatchInterval != dispatchInterval {
@@ -395,8 +413,15 @@ func checkDelegatorServiceable(ctx context.Context, dh *distHandler, view *meta.
 }
 
 func (dh *distHandler) getDistribution(ctx context.Context) (*querypb.GetDataDistributionResponse, error) {
+	lockStart := time.Now()
 	dh.mu.Lock()
+	lockWait := time.Since(lockStart)
 	defer dh.mu.Unlock()
+	if lockWait > 100*time.Millisecond {
+		log.Ctx(ctx).Info("dist handler waited distribution mutex",
+			zap.Int64("nodeID", dh.nodeID),
+			zap.Duration("lockWait", lockWait))
+	}
 
 	ctx, cancel := context.WithTimeout(ctx, paramtable.Get().QueryCoordCfg.DistributionRequestTimeout.GetAsDuration(time.Millisecond))
 	defer cancel()

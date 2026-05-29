@@ -19,6 +19,7 @@ package task
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -53,7 +54,10 @@ const (
 	TaskTypeDropIndex
 )
 
-const schedulerDispatchTimingLogInterval = 5 * time.Second
+const (
+	schedulerDispatchTimingLogInterval = 5 * time.Second
+	segmentAlreadyLoadedInDistMsg      = "segment already loaded in dist"
+)
 
 var schedulerDispatchTiming = newSchedulerDispatchTimingStats()
 
@@ -777,6 +781,9 @@ func (scheduler *taskScheduler) preAdd(task Task) error {
 		}
 
 		taskType := GetTaskType(task)
+		if err := scheduler.checkSegmentLoadedInDist(task, taskType); err != nil {
+			return err
+		}
 
 		if taskType == TaskTypeMove {
 			leader := scheduler.getReplicaShardLeader(task.Shard(), task.ReplicaID())
@@ -863,6 +870,32 @@ func (scheduler *taskScheduler) preAdd(task Task) error {
 	return nil
 }
 
+func (scheduler *taskScheduler) checkSegmentLoadedInDist(task *SegmentTask, taskType Type) error {
+	if taskType != TaskTypeGrow {
+		return nil
+	}
+
+	replica := scheduler.meta.Get(scheduler.ctx, task.ReplicaID())
+	if replica == nil {
+		return nil
+	}
+
+	existsInDist := scheduler.distMgr.SegmentDistManager.GetByFilter(
+		meta.WithCollectionID(task.CollectionID()),
+		meta.WithReplica(replica),
+		meta.WithSegmentID(task.SegmentID()),
+	)
+	if len(existsInDist) == 0 {
+		return nil
+	}
+
+	log.Ctx(task.Context()).Debug("skip adding stale segment grow task because segment already loaded in dist",
+		zap.Int64("segmentID", task.SegmentID()),
+		zap.Int64("collectionID", task.CollectionID()),
+		zap.Int64("replicaID", task.ReplicaID()))
+	return merr.WrapErrServiceInternal(segmentAlreadyLoadedInDistMsg)
+}
+
 func (scheduler *taskScheduler) getReplicaShardLeader(channelName string, replicaID int64) *meta.DmChannel {
 	replica := scheduler.meta.Get(scheduler.ctx, replicaID)
 	if replica == nil {
@@ -880,10 +913,15 @@ func (scheduler *taskScheduler) tryPromoteAll() {
 		if err != nil {
 			task.Cancel(err)
 			toRemove = append(toRemove, task)
-			log.Ctx(scheduler.ctx).Warn("failed to promote task",
+			fields := []zap.Field{
 				zap.Int64("taskID", task.ID()),
 				zap.Error(err),
-			)
+			}
+			if isSegmentAlreadyLoadedInDistErr(err) {
+				log.Ctx(scheduler.ctx).Debug("skip stale task during promote", fields...)
+			} else {
+				log.Ctx(scheduler.ctx).Warn("failed to promote task", fields...)
+			}
 		} else {
 			toPromote = append(toPromote, task)
 		}
@@ -929,8 +967,15 @@ func (scheduler *taskScheduler) Dispatch(node int64) {
 		log.Ctx(scheduler.ctx).Info("scheduler stopped")
 
 	default:
+		lockStart := time.Now()
 		scheduler.scheduleMu.Lock()
+		lockWait := time.Since(lockStart)
 		defer scheduler.scheduleMu.Unlock()
+		if lockWait > 100*time.Millisecond {
+			log.Ctx(scheduler.ctx).Info("scheduler dispatch waited schedule lock",
+				zap.Int64("nodeID", node),
+				zap.Duration("lockWait", lockWait))
+		}
 		scheduler.schedule(node)
 	}
 }
@@ -1261,22 +1306,45 @@ func (scheduler *taskScheduler) check(task Task, checkDistExist bool) error {
 	return err
 }
 
+func isSegmentAlreadyLoadedInDistErr(err error) bool {
+	return err != nil && strings.Contains(err.Error(), segmentAlreadyLoadedInDistMsg)
+}
+
 func (scheduler *taskScheduler) RemoveByNode(node int64) {
+	start := time.Now()
+	lockStart := time.Now()
 	scheduler.scheduleMu.Lock()
+	lockWait := time.Since(lockStart)
 	defer scheduler.scheduleMu.Unlock()
 
+	scannedSegmentTasks := 0
+	removedSegmentTasks := 0
 	scheduler.segmentTasks.Range(func(_ replicaSegmentIndex, task Task) bool {
+		scannedSegmentTasks++
 		if scheduler.isRelated(task, node) {
 			scheduler.remove(task)
+			removedSegmentTasks++
 		}
 		return true
 	})
+	scannedChannelTasks := 0
+	removedChannelTasks := 0
 	scheduler.channelTasks.Range(func(_ replicaChannelIndex, task Task) bool {
+		scannedChannelTasks++
 		if scheduler.isRelated(task, node) {
 			scheduler.remove(task)
+			removedChannelTasks++
 		}
 		return true
 	})
+	log.Ctx(scheduler.ctx).Info("scheduler remove tasks by node done",
+		zap.Int64("nodeID", node),
+		zap.Int("scannedSegmentTasks", scannedSegmentTasks),
+		zap.Int("removedSegmentTasks", removedSegmentTasks),
+		zap.Int("scannedChannelTasks", scannedChannelTasks),
+		zap.Int("removedChannelTasks", removedChannelTasks),
+		zap.Duration("lockWait", lockWait),
+		zap.Duration("totalDur", time.Since(start)))
 }
 
 func (scheduler *taskScheduler) recordSegmentTaskError(task *SegmentTask) {
@@ -1445,7 +1513,7 @@ func (scheduler *taskScheduler) checkStale(task Task, checkDistExist bool) error
 				log.Info("task stale due to segment already loaded in dist",
 					zap.String("task", task.String()),
 					zap.Int64("segmentID", segmentTask.SegmentID()))
-				return merr.WrapErrServiceInternal("segment already loaded in dist")
+				return merr.WrapErrServiceInternal(segmentAlreadyLoadedInDistMsg)
 			}
 		}
 	}
