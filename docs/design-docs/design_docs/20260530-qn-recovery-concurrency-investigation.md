@@ -128,10 +128,14 @@
 
 - `099dd902d0 enhance: add qn recovery load timing logs`
 - 已推送到 `origin/optimize-load-partition`。
-- 后续补充 QC scheduler dispatch 聚合日志，准备单独提交并触发新镜像构建。
+- `fe4a62d6fd enhance: add qc scheduler dispatch timing logs`
+- 已推送到 `origin/optimize-load-partition`。
 
 镜像构建：
 
 - 已触发社区镜像构建，buildRecordId：`4404`。
 - 目标 tag：`harbor.milvus.io/milvusdb/milvus:optimize-load-partition-20260530-099dd902d0-amd64`。
 - 构建分支：`sijie-ni-0214/milvus:optimize-load-partition`。
+- 已触发包含 QC scheduler 日志的第二个构建，buildRecordId：`4405`。
+- 新目标 tag：`harbor.milvus.io/milvusdb/milvus:optimize-load-partition-20260530-fe4a62d6fd-amd64`。
+- 后续测试以 `fe4a62d6fd` 镜像为准。
