@@ -53,6 +53,162 @@ const (
 	TaskTypeDropIndex
 )
 
+const schedulerDispatchTimingLogInterval = 5 * time.Second
+
+var schedulerDispatchTiming = newSchedulerDispatchTimingStats()
+
+type schedulerDispatchTimingStats struct {
+	count               *atomic.Int64
+	totalScanned        *atomic.Int64
+	totalToProcess      *atomic.Int64
+	totalCommitted      *atomic.Int64
+	totalToRemove       *atomic.Int64
+	totalPromote        *atomic.Int64
+	totalPreprocess     *atomic.Int64
+	totalProcess        *atomic.Int64
+	totalDispatch       *atomic.Int64
+	maxPromote          *atomic.Int64
+	maxPreprocess       *atomic.Int64
+	maxProcess          *atomic.Int64
+	maxDispatch         *atomic.Int64
+	lastNodeID          *atomic.Int64
+	lastProcessQueueLen *atomic.Int64
+	lastWaitingQueueLen *atomic.Int64
+	lastSegmentTaskNum  *atomic.Int64
+	lastChannelTaskNum  *atomic.Int64
+	lastLogUnixNano     *atomic.Int64
+}
+
+func newSchedulerDispatchTimingStats() *schedulerDispatchTimingStats {
+	return &schedulerDispatchTimingStats{
+		count:               atomic.NewInt64(0),
+		totalScanned:        atomic.NewInt64(0),
+		totalToProcess:      atomic.NewInt64(0),
+		totalCommitted:      atomic.NewInt64(0),
+		totalToRemove:       atomic.NewInt64(0),
+		totalPromote:        atomic.NewInt64(0),
+		totalPreprocess:     atomic.NewInt64(0),
+		totalProcess:        atomic.NewInt64(0),
+		totalDispatch:       atomic.NewInt64(0),
+		maxPromote:          atomic.NewInt64(0),
+		maxPreprocess:       atomic.NewInt64(0),
+		maxProcess:          atomic.NewInt64(0),
+		maxDispatch:         atomic.NewInt64(0),
+		lastNodeID:          atomic.NewInt64(0),
+		lastProcessQueueLen: atomic.NewInt64(0),
+		lastWaitingQueueLen: atomic.NewInt64(0),
+		lastSegmentTaskNum:  atomic.NewInt64(0),
+		lastChannelTaskNum:  atomic.NewInt64(0),
+		lastLogUnixNano:     atomic.NewInt64(time.Now().UnixNano()),
+	}
+}
+
+func updateMaxDuration(max *atomic.Int64, value time.Duration) {
+	v := int64(value)
+	for {
+		old := max.Load()
+		if v <= old || max.CompareAndSwap(old, v) {
+			return
+		}
+	}
+}
+
+func avgDuration(total int64, count int64) time.Duration {
+	if count == 0 {
+		return 0
+	}
+	return time.Duration(total / count)
+}
+
+func avgInt(total int64, count int64) int64 {
+	if count == 0 {
+		return 0
+	}
+	return total / count
+}
+
+func (s *schedulerDispatchTimingStats) record(
+	nodeID int64,
+	scannedTaskNum int,
+	toProcessNum int,
+	committedNum int32,
+	toRemoveNum int,
+	promoteDur time.Duration,
+	preprocessDur time.Duration,
+	processDur time.Duration,
+	totalDur time.Duration,
+	processQueueLen int,
+	waitingQueueLen int,
+	segmentTaskNum int,
+	channelTaskNum int,
+) {
+	s.count.Inc()
+	s.totalScanned.Add(int64(scannedTaskNum))
+	s.totalToProcess.Add(int64(toProcessNum))
+	s.totalCommitted.Add(int64(committedNum))
+	s.totalToRemove.Add(int64(toRemoveNum))
+	s.totalPromote.Add(int64(promoteDur))
+	s.totalPreprocess.Add(int64(preprocessDur))
+	s.totalProcess.Add(int64(processDur))
+	s.totalDispatch.Add(int64(totalDur))
+	updateMaxDuration(s.maxPromote, promoteDur)
+	updateMaxDuration(s.maxPreprocess, preprocessDur)
+	updateMaxDuration(s.maxProcess, processDur)
+	updateMaxDuration(s.maxDispatch, totalDur)
+	s.lastNodeID.Store(nodeID)
+	s.lastProcessQueueLen.Store(int64(processQueueLen))
+	s.lastWaitingQueueLen.Store(int64(waitingQueueLen))
+	s.lastSegmentTaskNum.Store(int64(segmentTaskNum))
+	s.lastChannelTaskNum.Store(int64(channelTaskNum))
+
+	now := time.Now()
+	last := s.lastLogUnixNano.Load()
+	if now.UnixNano()-last < int64(schedulerDispatchTimingLogInterval) {
+		return
+	}
+	if !s.lastLogUnixNano.CompareAndSwap(last, now.UnixNano()) {
+		return
+	}
+
+	count := s.count.Swap(0)
+	totalScanned := s.totalScanned.Swap(0)
+	totalToProcess := s.totalToProcess.Swap(0)
+	totalCommitted := s.totalCommitted.Swap(0)
+	totalToRemove := s.totalToRemove.Swap(0)
+	totalPromote := s.totalPromote.Swap(0)
+	totalPreprocess := s.totalPreprocess.Swap(0)
+	totalProcess := s.totalProcess.Swap(0)
+	totalDispatch := s.totalDispatch.Swap(0)
+	maxPromote := s.maxPromote.Swap(0)
+	maxPreprocess := s.maxPreprocess.Swap(0)
+	maxProcess := s.maxProcess.Swap(0)
+	maxDispatch := s.maxDispatch.Swap(0)
+	if count == 0 {
+		return
+	}
+
+	log.Warn("scheduler dispatch timing stats",
+		zap.Int64("count", count),
+		zap.Int64("avgScannedTaskNum", avgInt(totalScanned, count)),
+		zap.Int64("avgToProcessNum", avgInt(totalToProcess, count)),
+		zap.Int64("avgCommittedNum", avgInt(totalCommitted, count)),
+		zap.Int64("avgToRemoveNum", avgInt(totalToRemove, count)),
+		zap.Duration("avgPromoteDur", avgDuration(totalPromote, count)),
+		zap.Duration("avgPreprocessDur", avgDuration(totalPreprocess, count)),
+		zap.Duration("avgProcessDur", avgDuration(totalProcess, count)),
+		zap.Duration("avgTotalDur", avgDuration(totalDispatch, count)),
+		zap.Duration("maxPromoteDur", time.Duration(maxPromote)),
+		zap.Duration("maxPreprocessDur", time.Duration(maxPreprocess)),
+		zap.Duration("maxProcessDur", time.Duration(maxProcess)),
+		zap.Duration("maxTotalDur", time.Duration(maxDispatch)),
+		zap.Int64("lastNodeID", s.lastNodeID.Load()),
+		zap.Int64("lastProcessQueueLen", s.lastProcessQueueLen.Load()),
+		zap.Int64("lastWaitingQueueLen", s.lastWaitingQueueLen.Load()),
+		zap.Int64("lastSegmentTaskNum", s.lastSegmentTaskNum.Load()),
+		zap.Int64("lastChannelTaskNum", s.lastChannelTaskNum.Load()),
+	)
+}
+
 var TaskTypeName = map[Type]string{
 	TaskTypeGrow:        "Grow",
 	TaskTypeReduce:      "Reduce",
@@ -904,7 +1060,9 @@ func (scheduler *taskScheduler) schedule(node int64) {
 	// Process tasks
 	toProcess := make([]Task, 0)
 	toRemove := make([]Task, 0)
+	scannedTaskNum := 0
 	scheduler.processQueue.RangeByNode(node, func(task Task) bool {
+		scannedTaskNum++
 		scheduler.preProcess(task)
 		if task.Status() == TaskStatusStarted {
 			toProcess = append(toProcess, task)
@@ -932,15 +1090,32 @@ func (scheduler *taskScheduler) schedule(node int64) {
 	}
 
 	scheduler.updateTaskMetrics()
+	totalDur := tr.ElapseSpan()
+	schedulerDispatchTiming.record(
+		node,
+		scannedTaskNum,
+		len(toProcess),
+		commmittedNum.Load(),
+		len(toRemove),
+		promoteDur,
+		preprocessDur,
+		processDur,
+		totalDur,
+		scheduler.processQueue.LenByNode(node),
+		scheduler.waitQueue.Len(),
+		scheduler.segmentTasks.Len(),
+		scheduler.channelTasks.Len(),
+	)
 
 	log.Info("processed tasks",
+		zap.Int("scannedTaskNum", scannedTaskNum),
 		zap.Int("toProcessNum", len(toProcess)),
 		zap.Int32("committedNum", commmittedNum.Load()),
 		zap.Int("toRemoveNum", len(toRemove)),
 		zap.Duration("promoteDur", promoteDur),
 		zap.Duration("preprocessDUr", preprocessDur),
 		zap.Duration("processDUr", processDur),
-		zap.Duration("totalDur", tr.ElapseSpan()),
+		zap.Duration("totalDur", totalDur),
 	)
 
 	log.Info("process tasks related to node done",
