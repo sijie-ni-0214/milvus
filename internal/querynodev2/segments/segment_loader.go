@@ -75,6 +75,200 @@ const (
 
 var errRetryTimerNotified = errors.New("retry timer notified")
 
+const requestResourceTimingLogInterval = 5 * time.Second
+
+var requestResourceTiming = newRequestResourceTimingStats()
+var segmentLoadTiming = newSegmentLoadTimingStats()
+
+type requestResourceTimingStats struct {
+	count           *atomic.Int64
+	totalEstimate   *atomic.Int64
+	totalLockWait   *atomic.Int64
+	totalLockHold   *atomic.Int64
+	totalRequest    *atomic.Int64
+	maxEstimate     *atomic.Int64
+	maxLockWait     *atomic.Int64
+	maxLockHold     *atomic.Int64
+	maxRequest      *atomic.Int64
+	lastLogUnixNano *atomic.Int64
+}
+
+func newRequestResourceTimingStats() *requestResourceTimingStats {
+	return &requestResourceTimingStats{
+		count:           atomic.NewInt64(0),
+		totalEstimate:   atomic.NewInt64(0),
+		totalLockWait:   atomic.NewInt64(0),
+		totalLockHold:   atomic.NewInt64(0),
+		totalRequest:    atomic.NewInt64(0),
+		maxEstimate:     atomic.NewInt64(0),
+		maxLockWait:     atomic.NewInt64(0),
+		maxLockHold:     atomic.NewInt64(0),
+		maxRequest:      atomic.NewInt64(0),
+		lastLogUnixNano: atomic.NewInt64(time.Now().UnixNano()),
+	}
+}
+
+func updateMaxDuration(max *atomic.Int64, value time.Duration) {
+	v := int64(value)
+	for {
+		old := max.Load()
+		if v <= old || max.CompareAndSwap(old, v) {
+			return
+		}
+	}
+}
+
+func avgDuration(total int64, count int64) time.Duration {
+	if count == 0 {
+		return 0
+	}
+	return time.Duration(total / count)
+}
+
+type segmentLoadTimingStats struct {
+	count            *atomic.Int64
+	totalLoadData    *atomic.Int64
+	totalDeltaLog    *atomic.Int64
+	totalPKCandidate *atomic.Int64
+	totalPut         *atomic.Int64
+	totalNotify      *atomic.Int64
+	totalSegment     *atomic.Int64
+	maxLoadData      *atomic.Int64
+	maxDeltaLog      *atomic.Int64
+	maxPKCandidate   *atomic.Int64
+	maxPut           *atomic.Int64
+	maxNotify        *atomic.Int64
+	maxSegment       *atomic.Int64
+	lastLogUnixNano  *atomic.Int64
+}
+
+func newSegmentLoadTimingStats() *segmentLoadTimingStats {
+	return &segmentLoadTimingStats{
+		count:            atomic.NewInt64(0),
+		totalLoadData:    atomic.NewInt64(0),
+		totalDeltaLog:    atomic.NewInt64(0),
+		totalPKCandidate: atomic.NewInt64(0),
+		totalPut:         atomic.NewInt64(0),
+		totalNotify:      atomic.NewInt64(0),
+		totalSegment:     atomic.NewInt64(0),
+		maxLoadData:      atomic.NewInt64(0),
+		maxDeltaLog:      atomic.NewInt64(0),
+		maxPKCandidate:   atomic.NewInt64(0),
+		maxPut:           atomic.NewInt64(0),
+		maxNotify:        atomic.NewInt64(0),
+		maxSegment:       atomic.NewInt64(0),
+		lastLogUnixNano:  atomic.NewInt64(time.Now().UnixNano()),
+	}
+}
+
+func (s *segmentLoadTimingStats) record(loadDataDur, deltaLogDur, pkCandidateDur, putDur, notifyDur, totalDur time.Duration) {
+	s.count.Inc()
+	s.totalLoadData.Add(int64(loadDataDur))
+	s.totalDeltaLog.Add(int64(deltaLogDur))
+	s.totalPKCandidate.Add(int64(pkCandidateDur))
+	s.totalPut.Add(int64(putDur))
+	s.totalNotify.Add(int64(notifyDur))
+	s.totalSegment.Add(int64(totalDur))
+	updateMaxDuration(s.maxLoadData, loadDataDur)
+	updateMaxDuration(s.maxDeltaLog, deltaLogDur)
+	updateMaxDuration(s.maxPKCandidate, pkCandidateDur)
+	updateMaxDuration(s.maxPut, putDur)
+	updateMaxDuration(s.maxNotify, notifyDur)
+	updateMaxDuration(s.maxSegment, totalDur)
+
+	now := time.Now()
+	last := s.lastLogUnixNano.Load()
+	if now.UnixNano()-last < int64(requestResourceTimingLogInterval) {
+		return
+	}
+	if !s.lastLogUnixNano.CompareAndSwap(last, now.UnixNano()) {
+		return
+	}
+
+	count := s.count.Swap(0)
+	totalLoadData := s.totalLoadData.Swap(0)
+	totalDeltaLog := s.totalDeltaLog.Swap(0)
+	totalPKCandidate := s.totalPKCandidate.Swap(0)
+	totalPut := s.totalPut.Swap(0)
+	totalNotify := s.totalNotify.Swap(0)
+	totalSegment := s.totalSegment.Swap(0)
+	maxLoadData := s.maxLoadData.Swap(0)
+	maxDeltaLog := s.maxDeltaLog.Swap(0)
+	maxPKCandidate := s.maxPKCandidate.Swap(0)
+	maxPut := s.maxPut.Swap(0)
+	maxNotify := s.maxNotify.Swap(0)
+	maxSegment := s.maxSegment.Swap(0)
+	if count == 0 {
+		return
+	}
+
+	pool := GetLoadPool()
+	log.Warn("segment load timing stats",
+		zap.Int64("count", count),
+		zap.Duration("avgLoadDataDur", avgDuration(totalLoadData, count)),
+		zap.Duration("avgDeltaLogDur", avgDuration(totalDeltaLog, count)),
+		zap.Duration("avgPKCandidateDur", avgDuration(totalPKCandidate, count)),
+		zap.Duration("avgPutDur", avgDuration(totalPut, count)),
+		zap.Duration("avgNotifyDur", avgDuration(totalNotify, count)),
+		zap.Duration("avgTotalDur", avgDuration(totalSegment, count)),
+		zap.Duration("maxLoadDataDur", time.Duration(maxLoadData)),
+		zap.Duration("maxDeltaLogDur", time.Duration(maxDeltaLog)),
+		zap.Duration("maxPKCandidateDur", time.Duration(maxPKCandidate)),
+		zap.Duration("maxPutDur", time.Duration(maxPut)),
+		zap.Duration("maxNotifyDur", time.Duration(maxNotify)),
+		zap.Duration("maxTotalDur", time.Duration(maxSegment)),
+		zap.Int("loadPoolCap", pool.Cap()),
+		zap.Int("loadPoolRunning", pool.Running()),
+		zap.Int("loadPoolWaiting", pool.Waiting()),
+	)
+}
+
+func (s *requestResourceTimingStats) record(estimateDur, lockWaitDur, lockHoldDur, totalDur time.Duration) {
+	s.count.Inc()
+	s.totalEstimate.Add(int64(estimateDur))
+	s.totalLockWait.Add(int64(lockWaitDur))
+	s.totalLockHold.Add(int64(lockHoldDur))
+	s.totalRequest.Add(int64(totalDur))
+	updateMaxDuration(s.maxEstimate, estimateDur)
+	updateMaxDuration(s.maxLockWait, lockWaitDur)
+	updateMaxDuration(s.maxLockHold, lockHoldDur)
+	updateMaxDuration(s.maxRequest, totalDur)
+
+	now := time.Now()
+	last := s.lastLogUnixNano.Load()
+	if now.UnixNano()-last < int64(requestResourceTimingLogInterval) {
+		return
+	}
+	if !s.lastLogUnixNano.CompareAndSwap(last, now.UnixNano()) {
+		return
+	}
+
+	count := s.count.Swap(0)
+	totalEstimate := s.totalEstimate.Swap(0)
+	totalLockWait := s.totalLockWait.Swap(0)
+	totalLockHold := s.totalLockHold.Swap(0)
+	totalRequest := s.totalRequest.Swap(0)
+	maxEstimate := s.maxEstimate.Swap(0)
+	maxLockWait := s.maxLockWait.Swap(0)
+	maxLockHold := s.maxLockHold.Swap(0)
+	maxRequest := s.maxRequest.Swap(0)
+	if count == 0 {
+		return
+	}
+
+	log.Warn("request resource timing stats",
+		zap.Int64("count", count),
+		zap.Duration("avgEstimateDur", avgDuration(totalEstimate, count)),
+		zap.Duration("avgLockWaitDur", avgDuration(totalLockWait, count)),
+		zap.Duration("avgLockHoldDur", avgDuration(totalLockHold, count)),
+		zap.Duration("avgTotalDur", avgDuration(totalRequest, count)),
+		zap.Duration("maxEstimateDur", time.Duration(maxEstimate)),
+		zap.Duration("maxLockWaitDur", time.Duration(maxLockWait)),
+		zap.Duration("maxLockHoldDur", time.Duration(maxLockHold)),
+		zap.Duration("maxTotalDur", time.Duration(maxRequest)),
+	)
+}
+
 type Loader interface {
 	// Load loads binlogs, and spawn segments,
 	// NOTE: make sure the ref count of the corresponding collection will never go down to 0 during this
@@ -331,6 +525,12 @@ func (loader *segmentLoader) Load(ctx context.Context,
 		partitionID := loadInfo.PartitionID
 		segmentID := loadInfo.SegmentID
 		segment, _ := newSegments.Get(segmentID)
+		segmentLoadStart := time.Now()
+		var loadDataDur time.Duration
+		var deltaLogDur time.Duration
+		var pkCandidateDur time.Duration
+		var putDur time.Duration
+		var notifyDur time.Duration
 
 		logger := log.With(zap.Int64("partitionID", partitionID),
 			zap.Int64("segmentID", segmentID),
@@ -338,6 +538,7 @@ func (loader *segmentLoader) Load(ctx context.Context,
 		metrics.QueryNodeLoadSegmentConcurrency.WithLabelValues(paramtable.GetStringNodeID(), "LoadSegment").Inc()
 		defer func() {
 			metrics.QueryNodeLoadSegmentConcurrency.WithLabelValues(paramtable.GetStringNodeID(), "LoadSegment").Dec()
+			segmentLoadTiming.record(loadDataDur, deltaLogDur, pkCandidateDur, putDur, notifyDur, time.Since(segmentLoadStart))
 			if err != nil {
 				logger.Warn("load segment failed when load data into memory", zap.Error(err))
 			}
@@ -349,17 +550,24 @@ func (loader *segmentLoader) Load(ctx context.Context,
 		// L0 segment has no index or data to be load.
 		if loadInfo.GetLevel() != datapb.SegmentLevel_L0 {
 			// lazy load segment do not load segment at first time.
+			stageStart := time.Now()
 			if err = loader.LoadSegment(ctx, segment, loadInfo); err != nil {
+				loadDataDur = time.Since(stageStart)
 				return errors.Wrap(err, "At LoadSegment")
 			}
+			loadDataDur = time.Since(stageStart)
 		}
 		// Skip delta logs for external collections (they are read-only, no deletions)
 		if !typeutil.IsExternalCollection(collection.Schema()) {
+			stageStart := time.Now()
 			if err = loader.loadDeltalogs(ctx, segment, loadInfo); err != nil {
+				deltaLogDur = time.Since(stageStart)
 				return errors.Wrap(err, "At LoadDeltaLogs")
 			}
+			deltaLogDur = time.Since(stageStart)
 		}
 
+		stageStart := time.Now()
 		if !segment.PkCandidateExist() {
 			log.Debug("loading PK candidate for segment", zap.Int64("segmentID", segment.ID()))
 			// For external collections, use ExternalSegmentCandidate instead of BloomFilterSet
@@ -391,13 +599,18 @@ func (loader *segmentLoader) Load(ctx context.Context,
 				bfs.Charge()
 			}
 		}
+		pkCandidateDur = time.Since(stageStart)
 
+		stageStart = time.Now()
 		if segment.Level() != datapb.SegmentLevel_L0 {
 			loader.manager.Segment.Put(ctx, segmentType, segment)
 		}
+		putDur = time.Since(stageStart)
 		newSegments.GetAndRemove(segmentID)
 		loaded.Insert(segmentID, segment)
+		stageStart = time.Now()
 		loader.notifyLoadFinish(loadInfo)
+		notifyDur = time.Since(stageStart)
 
 		metrics.QueryNodeLoadSegmentLatency.WithLabelValues(paramtable.GetStringNodeID()).Observe(float64(tr.ElapseSpan().Milliseconds()))
 		return nil
@@ -478,6 +691,7 @@ func (loader *segmentLoader) notifyLoadFinish(segments ...*querypb.SegmentLoadIn
 // requestResource requests memory & storage to load segments,
 // returns the memory usage, disk usage and concurrency with the gained memory.
 func (loader *segmentLoader) requestResource(ctx context.Context, infos ...*querypb.SegmentLoadInfo) (requestResourceResult, error) {
+	requestStart := time.Now()
 	// we need to deal with empty infos case separately,
 	// because the following judgement for requested resources are based on current status and static config
 	// which may block empty-load operations by accident
@@ -501,14 +715,23 @@ func (loader *segmentLoader) requestResource(ctx context.Context, infos ...*quer
 	}
 	diskCap := paramtable.Get().QueryNodeCfg.DiskCapacityLimit.GetAsUint64()
 
+	estimateStart := time.Now()
 	loadingUsage, maxSegmentSize, err := loader.estimateSegmentLoadingResourceUsage(ctx, infos...)
+	estimateDur := time.Since(estimateStart)
 	if err != nil {
 		log.Warn("no sufficient physical resource to load segments", zap.Error(err))
 		return requestResourceResult{}, err
 	}
 
+	lockWaitStart := time.Now()
 	loader.mut.Lock()
-	defer loader.mut.Unlock()
+	lockWaitDur := time.Since(lockWaitStart)
+	lockHoldStart := time.Now()
+	defer func() {
+		lockHoldDur := time.Since(lockHoldStart)
+		loader.mut.Unlock()
+		requestResourceTiming.record(estimateDur, lockWaitDur, lockHoldDur, time.Since(requestStart))
+	}()
 
 	result := requestResourceResult{
 		CommittedResource: loader.committedResource,
