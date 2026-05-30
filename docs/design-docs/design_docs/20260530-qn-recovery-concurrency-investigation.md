@@ -37,7 +37,12 @@
 - `555361e8c1 enhance: skip stale segment load tasks earlier`
   - 在 QC task add/promote 阶段检查 segment 是否已经出现在 dist。
   - 若 segment 已加载完成但旧 grow task 仍残留在队列中，则提前 cancel/remove，减少恢复后期对 wait/process queue 的重复扫描和 promote 成本。
-- 当前 worktree 还有未提交改动：在 `requestResource()` 上补充 5 秒聚合的 estimate/lock wait/lock hold/total 耗时日志，尚未进入当前部署镜像。
+- `099dd902d0 enhance: add qn recovery load timing logs`
+  - 在 `requestResource()`、QN segment load worker、SN delegator post-load 路径补充 5 秒聚合耗时日志。
+- `fe4a62d6fd enhance: add qc scheduler dispatch timing logs`
+  - 在 QC scheduler dispatch 路径补充 5 秒聚合耗时日志，用于判断扫描、promote、preprocess、process 的占比。
+- `82a0b40c2b enhance: log active delegator load requests`
+  - 在 SN delegator 聚合日志中补充当前活跃 LoadSegments request 数。
 
 ## 排查假设
 
@@ -144,3 +149,39 @@
 - 已触发包含 SN delegator active request 日志的最终构建，buildRecordId：`4406`。
 - 最终目标 tag：`harbor.milvus.io/milvusdb/milvus:optimize-load-partition-20260530-82a0b40c2b-amd64`。
 - 后续测试以 `82a0b40c2b` 镜像为准。
+
+## 2026-05-30 部署前镜像同步状态
+
+- `4405` 构建完成后直接部署到 4am，Kubernetes event 显示 `harbor.milvus.io/milvusdb/milvus:optimize-load-partition-20260530-fe4a62d6fd-amd64: not found`，新 pod 进入 `ImagePullBackOff`。
+- 该现象说明 QTP community 构建完成后还需要显式同步到 `harbor.milvus.io`，否则 4am 节点不可拉取。
+- 已将 CR 镜像回滚到 `harbor.milvus.io/milvusdb/milvus:optimize-load-partition-20260529-d4bb170b3d-v2-amd64`，当前 DN/MixCoord/Proxy/SN 已在旧镜像上 Ready，QN 仍保持旧 pod Ready。
+- 已触发 `4405` 同步，`syncBuildId=5701`，同步状态 `COMPLETE`。
+- `4406` 构建已完成，目标镜像 `harbor.milvus.io/milvusdb/milvus:optimize-load-partition-20260530-82a0b40c2b-amd64`，已触发同步，`syncBuildId=5702`。
+- 下一轮部署以 `4406` 镜像为准，避免先部署 `4405` 再重复滚动。
+
+## 2026-05-30 并发链路代码确认
+
+- QC `Executor.GetTotalTaskExecutionCap()` 使用 `nodeInfo.CPUNum * queryCoord.queryNodeTaskParallelismFactor`，只有 `nodeInfo.CPUNum==0` 时才回退到 `queryCoord.taskExecutionCap`。
+- QC scheduler 每轮 dispatch 会先 `tryPromoteAll()`，再按 `dispatchScanBudgetFactor * executor.GetTotalTaskExecutionCap()` 扫描 process queue，并用 `hardware.GetCPUNum()` 并行调用 `scheduler.process()` 提交 RPC。
+- QC `loadSegment()` 最终把请求发给 shard leader，也就是单 shard streaming 模式下的 SN/SQN delegator。
+- SN delegator 收到 `LoadSegments` 后会调用 worker QN 的 `LoadSegments`，worker 返回后进入 post-load：加载/注册 bloom filter、BM25 stats、stream delete，并把 segment 加入 delegator distribution。
+- Worker QN `segmentLoader.requestResource()` 对单 segment RPC 的 `ConcurrencyLevel` 为 `min(hardware.GetCPUNum(), len(infos))`。当前 QC/SN 链路通常是一段一个 RPC，因此单个 RPC 内部并发为 1。
+- 因此 QN `LoadPool` active 是否能上去，核心取决于同时到达 Worker QN 的 LoadSegments RPC 数；单纯调大 QN `LoadPool` 或 high/middle thread pool 不能保证 active 上升。
+- 下一轮日志重点看：
+  - QC `committedNum` 是否持续足够高；
+  - SN `activeRequests` 是否接近 QC committed 的供给；
+  - SN `avgWorkerLoadDur` 与 `avgPostLoadDur` 哪个占主导；
+  - QN `requestResource` lock wait/hold 是否明显；
+  - QN `LoadPool running/waiting` 是否仍明显低于 capacity。
+
+## 2026-05-30 17:45：拆分 SN post-load 排队和实际工作耗时
+
+- 上一轮恢复日志中，SN delegator 的 `avgPostLoadDur` 约 6-9s，`postLoadCap=320` 且 `postLoadCurrent=320`，`activeRequests` 长期数千。
+- 原有 `avgPostOtherDur` 同时包含 `withPostLoadLimit()` semaphore 排队等待和 bloom/BM25/delete 之外的轻量逻辑，无法直接证明慢在排队还是实际工作。
+- 本轮在 `internal/querynodev2/delegator/delegator_data.go` 增加：
+  - `avgPostLoadWaitDur` / `maxPostLoadWaitDur`：等待 post-load 信号量的耗时。
+  - `avgPostLoadWorkDur` / `maxPostLoadWorkDur`：拿到信号量后的实际 post-load 工作耗时。
+  - `avgPostOtherDur` 只统计拿到信号量后的剩余耗时，不再包含排队等待。
+- 下一轮判断标准：
+  - 如果 `avgPostLoadWaitDur` 接近原来的 6-9s，瓶颈就是 SN post-load 并发限制，优先调大 `queryNode.delegatorPostLoadConcurrencyFactor`。
+  - 如果 `avgPostLoadWorkDur` 或新的 `avgPostOtherDur` 仍然很高，继续拆分 distribution、delete buffer、IDF/BM25 注册等实际工作阶段。

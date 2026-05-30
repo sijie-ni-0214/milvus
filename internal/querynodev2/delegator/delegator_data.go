@@ -61,7 +61,10 @@ import (
 
 const delegatorLoadTimingLogInterval = 5 * time.Second
 
-var delegatorLoadTiming = newDelegatorLoadTimingStats()
+var (
+	delegatorLoadTiming         = newDelegatorLoadTimingStats()
+	delegatorStreamDeleteTiming = newDelegatorStreamDeleteTimingStats()
+)
 
 type delegatorLoadTimingStats struct {
 	active            *atomic.Int64
@@ -69,6 +72,8 @@ type delegatorLoadTimingStats struct {
 	segmentCount      *atomic.Int64
 	totalWorkerLoad   *atomic.Int64
 	totalPostLoad     *atomic.Int64
+	totalPostLoadWait *atomic.Int64
+	totalPostLoadWork *atomic.Int64
 	totalPostOther    *atomic.Int64
 	totalBloomFilter  *atomic.Int64
 	totalBM25Stats    *atomic.Int64
@@ -76,12 +81,53 @@ type delegatorLoadTimingStats struct {
 	totalLoadSegments *atomic.Int64
 	maxWorkerLoad     *atomic.Int64
 	maxPostLoad       *atomic.Int64
+	maxPostLoadWait   *atomic.Int64
+	maxPostLoadWork   *atomic.Int64
 	maxPostOther      *atomic.Int64
 	maxBloomFilter    *atomic.Int64
 	maxBM25Stats      *atomic.Int64
 	maxStreamDelete   *atomic.Int64
 	maxLoadSegments   *atomic.Int64
 	lastLogUnixNano   *atomic.Int64
+}
+
+type streamDeleteTiming struct {
+	phase0ForwardL0Dur       time.Duration
+	phase1LockWaitDur        time.Duration
+	phase1LockHoldDur        time.Duration
+	phase2SnapshotProcessDur time.Duration
+	phase3LockWaitDur        time.Duration
+	phase3CatchUpDur         time.Duration
+	phase3FlushDur           time.Duration
+	phase3AddDistributionDur time.Duration
+	phase3LockHoldDur        time.Duration
+	totalDur                 time.Duration
+}
+
+type delegatorStreamDeleteTimingStats struct {
+	count                      *atomic.Int64
+	segmentCount               *atomic.Int64
+	totalPhase0ForwardL0       *atomic.Int64
+	totalPhase1LockWait        *atomic.Int64
+	totalPhase1LockHold        *atomic.Int64
+	totalPhase2SnapshotProcess *atomic.Int64
+	totalPhase3LockWait        *atomic.Int64
+	totalPhase3CatchUp         *atomic.Int64
+	totalPhase3Flush           *atomic.Int64
+	totalPhase3AddDistribution *atomic.Int64
+	totalPhase3LockHold        *atomic.Int64
+	totalStreamDelete          *atomic.Int64
+	maxPhase0ForwardL0         *atomic.Int64
+	maxPhase1LockWait          *atomic.Int64
+	maxPhase1LockHold          *atomic.Int64
+	maxPhase2SnapshotProcess   *atomic.Int64
+	maxPhase3LockWait          *atomic.Int64
+	maxPhase3CatchUp           *atomic.Int64
+	maxPhase3Flush             *atomic.Int64
+	maxPhase3AddDistribution   *atomic.Int64
+	maxPhase3LockHold          *atomic.Int64
+	maxStreamDelete            *atomic.Int64
+	lastLogUnixNano            *atomic.Int64
 }
 
 func newDelegatorLoadTimingStats() *delegatorLoadTimingStats {
@@ -91,6 +137,8 @@ func newDelegatorLoadTimingStats() *delegatorLoadTimingStats {
 		segmentCount:      atomic.NewInt64(0),
 		totalWorkerLoad:   atomic.NewInt64(0),
 		totalPostLoad:     atomic.NewInt64(0),
+		totalPostLoadWait: atomic.NewInt64(0),
+		totalPostLoadWork: atomic.NewInt64(0),
 		totalPostOther:    atomic.NewInt64(0),
 		totalBloomFilter:  atomic.NewInt64(0),
 		totalBM25Stats:    atomic.NewInt64(0),
@@ -98,12 +146,42 @@ func newDelegatorLoadTimingStats() *delegatorLoadTimingStats {
 		totalLoadSegments: atomic.NewInt64(0),
 		maxWorkerLoad:     atomic.NewInt64(0),
 		maxPostLoad:       atomic.NewInt64(0),
+		maxPostLoadWait:   atomic.NewInt64(0),
+		maxPostLoadWork:   atomic.NewInt64(0),
 		maxPostOther:      atomic.NewInt64(0),
 		maxBloomFilter:    atomic.NewInt64(0),
 		maxBM25Stats:      atomic.NewInt64(0),
 		maxStreamDelete:   atomic.NewInt64(0),
 		maxLoadSegments:   atomic.NewInt64(0),
 		lastLogUnixNano:   atomic.NewInt64(time.Now().UnixNano()),
+	}
+}
+
+func newDelegatorStreamDeleteTimingStats() *delegatorStreamDeleteTimingStats {
+	return &delegatorStreamDeleteTimingStats{
+		count:                      atomic.NewInt64(0),
+		segmentCount:               atomic.NewInt64(0),
+		totalPhase0ForwardL0:       atomic.NewInt64(0),
+		totalPhase1LockWait:        atomic.NewInt64(0),
+		totalPhase1LockHold:        atomic.NewInt64(0),
+		totalPhase2SnapshotProcess: atomic.NewInt64(0),
+		totalPhase3LockWait:        atomic.NewInt64(0),
+		totalPhase3CatchUp:         atomic.NewInt64(0),
+		totalPhase3Flush:           atomic.NewInt64(0),
+		totalPhase3AddDistribution: atomic.NewInt64(0),
+		totalPhase3LockHold:        atomic.NewInt64(0),
+		totalStreamDelete:          atomic.NewInt64(0),
+		maxPhase0ForwardL0:         atomic.NewInt64(0),
+		maxPhase1LockWait:          atomic.NewInt64(0),
+		maxPhase1LockHold:          atomic.NewInt64(0),
+		maxPhase2SnapshotProcess:   atomic.NewInt64(0),
+		maxPhase3LockWait:          atomic.NewInt64(0),
+		maxPhase3CatchUp:           atomic.NewInt64(0),
+		maxPhase3Flush:             atomic.NewInt64(0),
+		maxPhase3AddDistribution:   atomic.NewInt64(0),
+		maxPhase3LockHold:          atomic.NewInt64(0),
+		maxStreamDelete:            atomic.NewInt64(0),
+		lastLogUnixNano:            atomic.NewInt64(time.Now().UnixNano()),
 	}
 }
 
@@ -124,8 +202,97 @@ func avgDuration(total int64, count int64) time.Duration {
 	return time.Duration(total / count)
 }
 
-func (s *delegatorLoadTimingStats) record(segmentNum int, workerLoadDur, postLoadDur, bloomFilterDur, bm25StatsDur, streamDeleteDur, totalDur time.Duration, postLoadCap int, postLoadCurrent int) {
-	postOtherDur := postLoadDur - bloomFilterDur - bm25StatsDur - streamDeleteDur
+func (s *delegatorStreamDeleteTimingStats) record(segmentNum int, timing streamDeleteTiming) {
+	s.count.Inc()
+	s.segmentCount.Add(int64(segmentNum))
+	s.totalPhase0ForwardL0.Add(int64(timing.phase0ForwardL0Dur))
+	s.totalPhase1LockWait.Add(int64(timing.phase1LockWaitDur))
+	s.totalPhase1LockHold.Add(int64(timing.phase1LockHoldDur))
+	s.totalPhase2SnapshotProcess.Add(int64(timing.phase2SnapshotProcessDur))
+	s.totalPhase3LockWait.Add(int64(timing.phase3LockWaitDur))
+	s.totalPhase3CatchUp.Add(int64(timing.phase3CatchUpDur))
+	s.totalPhase3Flush.Add(int64(timing.phase3FlushDur))
+	s.totalPhase3AddDistribution.Add(int64(timing.phase3AddDistributionDur))
+	s.totalPhase3LockHold.Add(int64(timing.phase3LockHoldDur))
+	s.totalStreamDelete.Add(int64(timing.totalDur))
+	updateMaxDuration(s.maxPhase0ForwardL0, timing.phase0ForwardL0Dur)
+	updateMaxDuration(s.maxPhase1LockWait, timing.phase1LockWaitDur)
+	updateMaxDuration(s.maxPhase1LockHold, timing.phase1LockHoldDur)
+	updateMaxDuration(s.maxPhase2SnapshotProcess, timing.phase2SnapshotProcessDur)
+	updateMaxDuration(s.maxPhase3LockWait, timing.phase3LockWaitDur)
+	updateMaxDuration(s.maxPhase3CatchUp, timing.phase3CatchUpDur)
+	updateMaxDuration(s.maxPhase3Flush, timing.phase3FlushDur)
+	updateMaxDuration(s.maxPhase3AddDistribution, timing.phase3AddDistributionDur)
+	updateMaxDuration(s.maxPhase3LockHold, timing.phase3LockHoldDur)
+	updateMaxDuration(s.maxStreamDelete, timing.totalDur)
+
+	now := time.Now()
+	last := s.lastLogUnixNano.Load()
+	if now.UnixNano()-last < int64(delegatorLoadTimingLogInterval) {
+		return
+	}
+	if !s.lastLogUnixNano.CompareAndSwap(last, now.UnixNano()) {
+		return
+	}
+
+	count := s.count.Swap(0)
+	segmentCount := s.segmentCount.Swap(0)
+	totalPhase0ForwardL0 := s.totalPhase0ForwardL0.Swap(0)
+	totalPhase1LockWait := s.totalPhase1LockWait.Swap(0)
+	totalPhase1LockHold := s.totalPhase1LockHold.Swap(0)
+	totalPhase2SnapshotProcess := s.totalPhase2SnapshotProcess.Swap(0)
+	totalPhase3LockWait := s.totalPhase3LockWait.Swap(0)
+	totalPhase3CatchUp := s.totalPhase3CatchUp.Swap(0)
+	totalPhase3Flush := s.totalPhase3Flush.Swap(0)
+	totalPhase3AddDistribution := s.totalPhase3AddDistribution.Swap(0)
+	totalPhase3LockHold := s.totalPhase3LockHold.Swap(0)
+	totalStreamDelete := s.totalStreamDelete.Swap(0)
+	maxPhase0ForwardL0 := s.maxPhase0ForwardL0.Swap(0)
+	maxPhase1LockWait := s.maxPhase1LockWait.Swap(0)
+	maxPhase1LockHold := s.maxPhase1LockHold.Swap(0)
+	maxPhase2SnapshotProcess := s.maxPhase2SnapshotProcess.Swap(0)
+	maxPhase3LockWait := s.maxPhase3LockWait.Swap(0)
+	maxPhase3CatchUp := s.maxPhase3CatchUp.Swap(0)
+	maxPhase3Flush := s.maxPhase3Flush.Swap(0)
+	maxPhase3AddDistribution := s.maxPhase3AddDistribution.Swap(0)
+	maxPhase3LockHold := s.maxPhase3LockHold.Swap(0)
+	maxStreamDelete := s.maxStreamDelete.Swap(0)
+	if count == 0 {
+		return
+	}
+
+	log.Warn("delegator stream delete timing stats",
+		zap.Int64("requestCount", count),
+		zap.Int64("segmentCount", segmentCount),
+		zap.Duration("avgPhase0ForwardL0Dur", avgDuration(totalPhase0ForwardL0, count)),
+		zap.Duration("avgPhase1LockWaitDur", avgDuration(totalPhase1LockWait, count)),
+		zap.Duration("avgPhase1LockHoldDur", avgDuration(totalPhase1LockHold, count)),
+		zap.Duration("avgPhase2SnapshotProcessDur", avgDuration(totalPhase2SnapshotProcess, count)),
+		zap.Duration("avgPhase3LockWaitDur", avgDuration(totalPhase3LockWait, count)),
+		zap.Duration("avgPhase3CatchUpDur", avgDuration(totalPhase3CatchUp, count)),
+		zap.Duration("avgPhase3FlushDur", avgDuration(totalPhase3Flush, count)),
+		zap.Duration("avgPhase3AddDistributionDur", avgDuration(totalPhase3AddDistribution, count)),
+		zap.Duration("avgPhase3LockHoldDur", avgDuration(totalPhase3LockHold, count)),
+		zap.Duration("avgTotalDur", avgDuration(totalStreamDelete, count)),
+		zap.Duration("maxPhase0ForwardL0Dur", time.Duration(maxPhase0ForwardL0)),
+		zap.Duration("maxPhase1LockWaitDur", time.Duration(maxPhase1LockWait)),
+		zap.Duration("maxPhase1LockHoldDur", time.Duration(maxPhase1LockHold)),
+		zap.Duration("maxPhase2SnapshotProcessDur", time.Duration(maxPhase2SnapshotProcess)),
+		zap.Duration("maxPhase3LockWaitDur", time.Duration(maxPhase3LockWait)),
+		zap.Duration("maxPhase3CatchUpDur", time.Duration(maxPhase3CatchUp)),
+		zap.Duration("maxPhase3FlushDur", time.Duration(maxPhase3Flush)),
+		zap.Duration("maxPhase3AddDistributionDur", time.Duration(maxPhase3AddDistribution)),
+		zap.Duration("maxPhase3LockHoldDur", time.Duration(maxPhase3LockHold)),
+		zap.Duration("maxTotalDur", time.Duration(maxStreamDelete)),
+	)
+}
+
+func (s *delegatorLoadTimingStats) record(segmentNum int, workerLoadDur, postLoadDur, postLoadWaitDur, bloomFilterDur, bm25StatsDur, streamDeleteDur, totalDur time.Duration, postLoadCap int, postLoadCurrent int) {
+	postLoadWorkDur := postLoadDur - postLoadWaitDur
+	if postLoadWorkDur < 0 {
+		postLoadWorkDur = 0
+	}
+	postOtherDur := postLoadWorkDur - bloomFilterDur - bm25StatsDur - streamDeleteDur
 	if postOtherDur < 0 {
 		postOtherDur = 0
 	}
@@ -133,6 +300,8 @@ func (s *delegatorLoadTimingStats) record(segmentNum int, workerLoadDur, postLoa
 	s.segmentCount.Add(int64(segmentNum))
 	s.totalWorkerLoad.Add(int64(workerLoadDur))
 	s.totalPostLoad.Add(int64(postLoadDur))
+	s.totalPostLoadWait.Add(int64(postLoadWaitDur))
+	s.totalPostLoadWork.Add(int64(postLoadWorkDur))
 	s.totalPostOther.Add(int64(postOtherDur))
 	s.totalBloomFilter.Add(int64(bloomFilterDur))
 	s.totalBM25Stats.Add(int64(bm25StatsDur))
@@ -140,6 +309,8 @@ func (s *delegatorLoadTimingStats) record(segmentNum int, workerLoadDur, postLoa
 	s.totalLoadSegments.Add(int64(totalDur))
 	updateMaxDuration(s.maxWorkerLoad, workerLoadDur)
 	updateMaxDuration(s.maxPostLoad, postLoadDur)
+	updateMaxDuration(s.maxPostLoadWait, postLoadWaitDur)
+	updateMaxDuration(s.maxPostLoadWork, postLoadWorkDur)
 	updateMaxDuration(s.maxPostOther, postOtherDur)
 	updateMaxDuration(s.maxBloomFilter, bloomFilterDur)
 	updateMaxDuration(s.maxBM25Stats, bm25StatsDur)
@@ -159,6 +330,8 @@ func (s *delegatorLoadTimingStats) record(segmentNum int, workerLoadDur, postLoa
 	segmentCount := s.segmentCount.Swap(0)
 	totalWorkerLoad := s.totalWorkerLoad.Swap(0)
 	totalPostLoad := s.totalPostLoad.Swap(0)
+	totalPostLoadWait := s.totalPostLoadWait.Swap(0)
+	totalPostLoadWork := s.totalPostLoadWork.Swap(0)
 	totalPostOther := s.totalPostOther.Swap(0)
 	totalBloomFilter := s.totalBloomFilter.Swap(0)
 	totalBM25Stats := s.totalBM25Stats.Swap(0)
@@ -166,6 +339,8 @@ func (s *delegatorLoadTimingStats) record(segmentNum int, workerLoadDur, postLoa
 	totalLoadSegments := s.totalLoadSegments.Swap(0)
 	maxWorkerLoad := s.maxWorkerLoad.Swap(0)
 	maxPostLoad := s.maxPostLoad.Swap(0)
+	maxPostLoadWait := s.maxPostLoadWait.Swap(0)
+	maxPostLoadWork := s.maxPostLoadWork.Swap(0)
 	maxPostOther := s.maxPostOther.Swap(0)
 	maxBloomFilter := s.maxBloomFilter.Swap(0)
 	maxBM25Stats := s.maxBM25Stats.Swap(0)
@@ -180,6 +355,8 @@ func (s *delegatorLoadTimingStats) record(segmentNum int, workerLoadDur, postLoa
 		zap.Int64("segmentCount", segmentCount),
 		zap.Duration("avgWorkerLoadDur", avgDuration(totalWorkerLoad, count)),
 		zap.Duration("avgPostLoadDur", avgDuration(totalPostLoad, count)),
+		zap.Duration("avgPostLoadWaitDur", avgDuration(totalPostLoadWait, count)),
+		zap.Duration("avgPostLoadWorkDur", avgDuration(totalPostLoadWork, count)),
 		zap.Duration("avgPostOtherDur", avgDuration(totalPostOther, count)),
 		zap.Duration("avgBloomFilterDur", avgDuration(totalBloomFilter, count)),
 		zap.Duration("avgBM25StatsDur", avgDuration(totalBM25Stats, count)),
@@ -187,6 +364,8 @@ func (s *delegatorLoadTimingStats) record(segmentNum int, workerLoadDur, postLoa
 		zap.Duration("avgTotalDur", avgDuration(totalLoadSegments, count)),
 		zap.Duration("maxWorkerLoadDur", time.Duration(maxWorkerLoad)),
 		zap.Duration("maxPostLoadDur", time.Duration(maxPostLoad)),
+		zap.Duration("maxPostLoadWaitDur", time.Duration(maxPostLoadWait)),
+		zap.Duration("maxPostLoadWorkDur", time.Duration(maxPostLoadWork)),
 		zap.Duration("maxPostOtherDur", time.Duration(maxPostOther)),
 		zap.Duration("maxBloomFilterDur", time.Duration(maxBloomFilter)),
 		zap.Duration("maxBM25StatsDur", time.Duration(maxBM25Stats)),
@@ -695,6 +874,7 @@ func (sd *shardDelegator) LoadSegments(ctx context.Context, req *querypb.LoadSeg
 	delegatorLoadTiming.active.Inc()
 	var workerLoadDur time.Duration
 	var postLoadDur time.Duration
+	var postLoadWaitDur time.Duration
 	var bloomFilterDur time.Duration
 	var bm25StatsDur time.Duration
 	var streamDeleteDur time.Duration
@@ -709,6 +889,7 @@ func (sd *shardDelegator) LoadSegments(ctx context.Context, req *querypb.LoadSeg
 			len(req.GetInfos()),
 			workerLoadDur,
 			postLoadDur,
+			postLoadWaitDur,
 			bloomFilterDur,
 			bm25StatsDur,
 			streamDeleteDur,
@@ -798,7 +979,7 @@ func (sd *shardDelegator) LoadSegments(ctx context.Context, req *querypb.LoadSeg
 	}
 
 	postLoadStart := time.Now()
-	err = sd.withPostLoadLimit(ctx, func() error {
+	postLoadWaitDur, err = sd.withPostLoadLimit(ctx, func() error {
 		infos := lo.Filter(req.GetInfos(), func(info *querypb.SegmentLoadInfo, _ int) bool {
 			return !sd.distribution.SealedSegmentExistsOnNode(info.GetSegmentID(), targetNodeID)
 		})
@@ -862,23 +1043,24 @@ func (sd *shardDelegator) LoadSegments(ctx context.Context, req *querypb.LoadSeg
 	return err
 }
 
-func (sd *shardDelegator) withPostLoadLimit(ctx context.Context, fn func() error) error {
+func (sd *shardDelegator) withPostLoadLimit(ctx context.Context, fn func() error) (time.Duration, error) {
 	if sd.postLoadSem == nil {
-		return fn()
+		return 0, fn()
 	}
 
 	start := time.Now()
 	if err := sd.postLoadSem.Acquire(ctx); err != nil {
-		return err
+		return time.Since(start), err
 	}
+	waitDur := time.Since(start)
 	defer sd.postLoadSem.Release()
 
 	log.Ctx(ctx).Debug("delegator acquired post-load slot",
-		zap.Duration("wait", time.Since(start)),
+		zap.Duration("wait", waitDur),
 		zap.Int("capacity", sd.postLoadSem.Cap()),
 		zap.Int("current", sd.postLoadSem.Current()))
 
-	return fn()
+	return waitDur, fn()
 }
 
 func (sd *shardDelegator) addDistributionIfVersionOK(version uint64, entries ...SegmentEntry) error {
@@ -1102,6 +1284,13 @@ func (sd *shardDelegator) loadStreamDelete(ctx context.Context,
 	entries []SegmentEntry,
 	schemaVersion uint64,
 ) error {
+	totalStart := time.Now()
+	timing := streamDeleteTiming{}
+	defer func() {
+		timing.totalDur = time.Since(totalStart)
+		delegatorStreamDeleteTiming.record(len(infos), timing)
+	}()
+
 	log := sd.getLogger(ctx)
 
 	idCandidates := lo.SliceToMap(candidates, func(candidate *pkoracle.BloomFilterSet) (int64, *pkoracle.BloomFilterSet) {
@@ -1109,6 +1298,7 @@ func (sd *shardDelegator) loadStreamDelete(ctx context.Context,
 	})
 
 	// Phase 0: Forward L0 deletions (no lock needed, unchanged)
+	phaseStart := time.Now()
 	for _, info := range infos {
 		candidate := idCandidates[info.GetSegmentID()]
 		err := sd.forwardL0Deletion(ctx, info, req, candidate, targetNodeID, worker)
@@ -1116,9 +1306,13 @@ func (sd *shardDelegator) loadStreamDelete(ctx context.Context,
 			return err
 		}
 	}
+	timing.phase0ForwardL0Dur = time.Since(phaseStart)
 
 	// === Phase 1: Snapshot delete buffer entries under RLock (fast — microseconds) ===
+	lockStart := time.Now()
 	sd.deleteMut.RLock()
+	timing.phase1LockWaitDur = time.Since(lockStart)
+	phaseStart = time.Now()
 	snapshots := make([]segDeleteSnapshot, len(infos))
 	for i, info := range infos {
 		records := sd.deleteBuffer.ListAfter(segmentEffectiveTs(info))
@@ -1137,6 +1331,7 @@ func (sd *shardDelegator) loadStreamDelete(ctx context.Context,
 		}
 	}
 	sd.deleteMut.RUnlock()
+	timing.phase1LockHoldDur = time.Since(phaseStart)
 	// RLock released — WAL pipeline (ProcessDelete) is now unblocked
 
 	// Create one forwarder per segment, shared across Phase 2 and Phase 3, flushed once at the end.
@@ -1155,6 +1350,7 @@ func (sd *shardDelegator) loadStreamDelete(ctx context.Context,
 	}
 
 	// === Phase 2: Process snapshot WITHOUT lock (expensive — seconds) ===
+	phaseStart = time.Now()
 	for i, info := range infos {
 		candidate := idCandidates[info.GetSegmentID()]
 		start := time.Now()
@@ -1171,10 +1367,13 @@ func (sd *shardDelegator) loadStreamDelete(ctx context.Context,
 			zap.Int64("bfCost", time.Since(start).Milliseconds()),
 		)
 	}
+	timing.phase2SnapshotProcessDur = time.Since(phaseStart)
 
 	// === Phase 3: Catch-up new entries + flush + add distribution under RLock (fast — milliseconds) ===
+	lockStart = time.Now()
 	sd.deleteMut.RLock()
-	defer sd.deleteMut.RUnlock()
+	timing.phase3LockWaitDur = time.Since(lockStart)
+	phaseStart = time.Now()
 
 	for i, info := range infos {
 		candidate := idCandidates[info.GetSegmentID()]
@@ -1188,11 +1387,15 @@ func (sd *shardDelegator) loadStreamDelete(ctx context.Context,
 		if snapshots[i].snapshotMaxTs > 0 {
 			catchUpTs = snapshots[i].snapshotMaxTs + 1
 		}
+		catchUpStart := time.Now()
 		newRecords := sd.deleteBuffer.ListAfter(catchUpTs)
 		if len(newRecords) > 0 {
 			start := time.Now()
 			tsHit, bfHit, err := sd.processDeleteRecords(candidate, newRecords, forwarders[i])
 			if err != nil {
+				sd.deleteMut.RUnlock()
+				timing.phase3CatchUpDur += time.Since(catchUpStart)
+				timing.phase3LockHoldDur = time.Since(phaseStart)
 				return err
 			}
 			log.Info("forward delete to worker (phase 3: catch-up)...",
@@ -1203,19 +1406,31 @@ func (sd *shardDelegator) loadStreamDelete(ctx context.Context,
 				zap.Int64("bfCost", time.Since(start).Milliseconds()),
 			)
 		}
+		timing.phase3CatchUpDur += time.Since(catchUpStart)
 
 		// Flush once per segment after both phases are done
+		flushStart := time.Now()
 		if err := forwarders[i].Flush(); err != nil {
+			sd.deleteMut.RUnlock()
+			timing.phase3LockHoldDur = time.Since(phaseStart)
 			return err
 		}
+		timing.phase3FlushDur += time.Since(flushStart)
 	}
 
 	// Atomically add to distribution while still holding RLock.
 	// This guarantees no ProcessDelete can run between catch-up and distribution update,
 	// so there is no gap between "deletes applied" and "segment visible".
+	addDistributionStart := time.Now()
 	if err := sd.addDistributionIfVersionOK(schemaVersion, entries...); err != nil {
+		sd.deleteMut.RUnlock()
+		timing.phase3AddDistributionDur = time.Since(addDistributionStart)
+		timing.phase3LockHoldDur = time.Since(phaseStart)
 		return err
 	}
+	timing.phase3AddDistributionDur = time.Since(addDistributionStart)
+	sd.deleteMut.RUnlock()
+	timing.phase3LockHoldDur = time.Since(phaseStart)
 	log.Info("load stream delete done")
 	return nil
 }

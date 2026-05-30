@@ -77,8 +77,11 @@ var errRetryTimerNotified = errors.New("retry timer notified")
 
 const requestResourceTimingLogInterval = 5 * time.Second
 
-var requestResourceTiming = newRequestResourceTimingStats()
-var segmentLoadTiming = newSegmentLoadTimingStats()
+var (
+	requestResourceTiming = newRequestResourceTimingStats()
+	segmentLoadTiming     = newSegmentLoadTimingStats()
+	bloomFilterLoadTiming = newBloomFilterLoadTimingStats()
+)
 
 type requestResourceTimingStats struct {
 	count           *atomic.Int64
@@ -142,6 +145,26 @@ type segmentLoadTimingStats struct {
 	lastLogUnixNano  *atomic.Int64
 }
 
+type bloomFilterLoadTimingStats struct {
+	count                *atomic.Int64
+	segmentCount         *atomic.Int64
+	totalStub            *atomic.Int64
+	totalMetadata        *atomic.Int64
+	totalMemoryEstimate  *atomic.Int64
+	totalReserve         *atomic.Int64
+	totalRemoteLoad      *atomic.Int64
+	totalCharge          *atomic.Int64
+	totalBloomFilterLoad *atomic.Int64
+	maxStub              *atomic.Int64
+	maxMetadata          *atomic.Int64
+	maxMemoryEstimate    *atomic.Int64
+	maxReserve           *atomic.Int64
+	maxRemoteLoad        *atomic.Int64
+	maxCharge            *atomic.Int64
+	maxBloomFilterLoad   *atomic.Int64
+	lastLogUnixNano      *atomic.Int64
+}
+
 func newSegmentLoadTimingStats() *segmentLoadTimingStats {
 	return &segmentLoadTimingStats{
 		count:            atomic.NewInt64(0),
@@ -158,6 +181,28 @@ func newSegmentLoadTimingStats() *segmentLoadTimingStats {
 		maxNotify:        atomic.NewInt64(0),
 		maxSegment:       atomic.NewInt64(0),
 		lastLogUnixNano:  atomic.NewInt64(time.Now().UnixNano()),
+	}
+}
+
+func newBloomFilterLoadTimingStats() *bloomFilterLoadTimingStats {
+	return &bloomFilterLoadTimingStats{
+		count:                atomic.NewInt64(0),
+		segmentCount:         atomic.NewInt64(0),
+		totalStub:            atomic.NewInt64(0),
+		totalMetadata:        atomic.NewInt64(0),
+		totalMemoryEstimate:  atomic.NewInt64(0),
+		totalReserve:         atomic.NewInt64(0),
+		totalRemoteLoad:      atomic.NewInt64(0),
+		totalCharge:          atomic.NewInt64(0),
+		totalBloomFilterLoad: atomic.NewInt64(0),
+		maxStub:              atomic.NewInt64(0),
+		maxMetadata:          atomic.NewInt64(0),
+		maxMemoryEstimate:    atomic.NewInt64(0),
+		maxReserve:           atomic.NewInt64(0),
+		maxRemoteLoad:        atomic.NewInt64(0),
+		maxCharge:            atomic.NewInt64(0),
+		maxBloomFilterLoad:   atomic.NewInt64(0),
+		lastLogUnixNano:      atomic.NewInt64(time.Now().UnixNano()),
 	}
 }
 
@@ -220,6 +265,73 @@ func (s *segmentLoadTimingStats) record(loadDataDur, deltaLogDur, pkCandidateDur
 		zap.Int("loadPoolCap", pool.Cap()),
 		zap.Int("loadPoolRunning", pool.Running()),
 		zap.Int("loadPoolWaiting", pool.Waiting()),
+	)
+}
+
+func (s *bloomFilterLoadTimingStats) record(segmentNum int, stubDur, metadataDur, memoryEstimateDur, reserveDur, remoteLoadDur, chargeDur, totalDur time.Duration) {
+	s.count.Inc()
+	s.segmentCount.Add(int64(segmentNum))
+	s.totalStub.Add(int64(stubDur))
+	s.totalMetadata.Add(int64(metadataDur))
+	s.totalMemoryEstimate.Add(int64(memoryEstimateDur))
+	s.totalReserve.Add(int64(reserveDur))
+	s.totalRemoteLoad.Add(int64(remoteLoadDur))
+	s.totalCharge.Add(int64(chargeDur))
+	s.totalBloomFilterLoad.Add(int64(totalDur))
+	updateMaxDuration(s.maxStub, stubDur)
+	updateMaxDuration(s.maxMetadata, metadataDur)
+	updateMaxDuration(s.maxMemoryEstimate, memoryEstimateDur)
+	updateMaxDuration(s.maxReserve, reserveDur)
+	updateMaxDuration(s.maxRemoteLoad, remoteLoadDur)
+	updateMaxDuration(s.maxCharge, chargeDur)
+	updateMaxDuration(s.maxBloomFilterLoad, totalDur)
+
+	now := time.Now()
+	last := s.lastLogUnixNano.Load()
+	if now.UnixNano()-last < int64(requestResourceTimingLogInterval) {
+		return
+	}
+	if !s.lastLogUnixNano.CompareAndSwap(last, now.UnixNano()) {
+		return
+	}
+
+	count := s.count.Swap(0)
+	segmentCount := s.segmentCount.Swap(0)
+	totalStub := s.totalStub.Swap(0)
+	totalMetadata := s.totalMetadata.Swap(0)
+	totalMemoryEstimate := s.totalMemoryEstimate.Swap(0)
+	totalReserve := s.totalReserve.Swap(0)
+	totalRemoteLoad := s.totalRemoteLoad.Swap(0)
+	totalCharge := s.totalCharge.Swap(0)
+	totalBloomFilterLoad := s.totalBloomFilterLoad.Swap(0)
+	maxStub := s.maxStub.Swap(0)
+	maxMetadata := s.maxMetadata.Swap(0)
+	maxMemoryEstimate := s.maxMemoryEstimate.Swap(0)
+	maxReserve := s.maxReserve.Swap(0)
+	maxRemoteLoad := s.maxRemoteLoad.Swap(0)
+	maxCharge := s.maxCharge.Swap(0)
+	maxBloomFilterLoad := s.maxBloomFilterLoad.Swap(0)
+	if count == 0 {
+		return
+	}
+
+	log.Warn("bloom filter load timing stats",
+		zap.Int64("requestCount", count),
+		zap.Int64("segmentCount", segmentCount),
+		zap.Duration("avgStubDur", avgDuration(totalStub, count)),
+		zap.Duration("avgMetadataDur", avgDuration(totalMetadata, count)),
+		zap.Duration("avgMemoryEstimateDur", avgDuration(totalMemoryEstimate, count)),
+		zap.Duration("avgReserveDur", avgDuration(totalReserve, count)),
+		zap.Duration("avgRemoteLoadDur", avgDuration(totalRemoteLoad, count)),
+		zap.Duration("avgChargeDur", avgDuration(totalCharge, count)),
+		zap.Duration("avgTotalDur", avgDuration(totalBloomFilterLoad, count)),
+		zap.Duration("maxStubDur", time.Duration(maxStub)),
+		zap.Duration("maxMetadataDur", time.Duration(maxMetadata)),
+		zap.Duration("maxMemoryEstimateDur", time.Duration(maxMemoryEstimate)),
+		zap.Duration("maxReserveDur", time.Duration(maxReserve)),
+		zap.Duration("maxRemoteLoadDur", time.Duration(maxRemoteLoad)),
+		zap.Duration("maxChargeDur", time.Duration(maxCharge)),
+		zap.Duration("maxTotalDur", time.Duration(maxBloomFilterLoad)),
 	)
 }
 
@@ -977,23 +1089,40 @@ func (loader *segmentLoader) LoadBloomFilterSet(ctx context.Context, collectionI
 		log.Info("no segment to load")
 		return nil, nil
 	}
+	totalStart := time.Now()
+	var (
+		stubDur           time.Duration
+		metadataDur       time.Duration
+		memoryEstimateDur time.Duration
+		reserveDur        time.Duration
+		remoteLoadDur     time.Duration
+		chargeDur         time.Duration
+	)
+	defer func() {
+		bloomFilterLoadTiming.record(segmentNum, stubDur, metadataDur, memoryEstimateDur, reserveDur, remoteLoadDur, chargeDur, time.Since(totalStart))
+	}()
 
 	// Phase 1: always create metadata-only stubs (segmentID / partitionID / type).
 	// This gives callers valid candidates even when BF data is not loaded,
 	// so partition filtering and type-based delete-scope logic never need nil guards.
+	stageStart := time.Now()
 	bfSets := make([]*pkoracle.BloomFilterSet, segmentNum)
 	for i, info := range infos {
 		bfSets[i] = pkoracle.NewBloomFilterSet(info.GetSegmentID(), info.GetPartitionID(), commonpb.SegmentState_Sealed)
 	}
+	stubDur = time.Since(stageStart)
 
 	// Phase 2: load BF stats into the stubs (skip when disabled or external collection).
+	stageStart = time.Now()
 	if !paramtable.Get().CommonCfg.BloomFilterEnabled.GetAsBool() {
+		metadataDur = time.Since(stageStart)
 		log.Info("bloom filter disabled: returning metadata-only stubs")
 		return bfSets, nil
 	}
 
 	collection := loader.manager.Collection.Get(collectionID)
 	if collection == nil {
+		metadataDur = time.Since(stageStart)
 		err := merr.WrapErrCollectionNotFound(collectionID)
 		log.Warn("failed to get collection while loading segment", zap.Error(err))
 		return nil, err
@@ -1003,26 +1132,33 @@ func (loader *segmentLoader) LoadBloomFilterSet(ctx context.Context, collectionI
 
 	// External collections use ExternalSegmentCandidate for PK checking and have no stats logs.
 	if typeutil.IsExternalCollection(collection.Schema()) {
+		metadataDur = time.Since(stageStart)
 		return bfSets, nil
 	}
+	metadataDur = time.Since(stageStart)
 
 	// Calculate total memory size needed for bloom filters (PK stats)
+	stageStart = time.Now()
 	var totalMemorySize int64
 	for _, info := range infos {
 		memSize, _ := packed.NewStatsResolverFromLoadInfo(info).BloomFilterMemorySize(pkFieldID)
 		totalMemorySize += memSize
 	}
+	memoryEstimateDur = time.Since(stageStart)
 
 	// Reserve memory resource if tiered eviction is enabled
 	if paramtable.Get().QueryNodeCfg.TieredEvictionEnabled.GetAsBool() && totalMemorySize > 0 {
+		stageStart = time.Now()
 		if ok := C.TryReserveLoadingResourceWithTimeout(C.CResourceUsage{
 			// double loading memory size for bloom filters to avoid OOM during loading
 			memory_bytes: C.int64_t(totalMemorySize * 2),
 			disk_bytes:   C.int64_t(0),
 		}, 1000); !ok {
+			reserveDur = time.Since(stageStart)
 			return nil, fmt.Errorf("failed to reserve loading resource for bloom filters, totalMemorySize = %v MB",
 				logutil.ToMB(float64(totalMemorySize)))
 		}
+		reserveDur = time.Since(stageStart)
 		log.Info("reserved loading resource for bloom filters", zap.Float64("totalMemorySizeMB", logutil.ToMB(float64(totalMemorySize))))
 	}
 
@@ -1059,7 +1195,9 @@ func (loader *segmentLoader) LoadBloomFilterSet(ctx context.Context, collectionI
 		return nil
 	}
 
+	stageStart = time.Now()
 	err := funcutil.ProcessFuncParallel(segmentNum, segmentNum, loadRemoteFunc, "loadRemoteFunc")
+	remoteLoadDur = time.Since(stageStart)
 	if err != nil {
 		// no partial success here
 		log.Warn("failed to load remote segment", zap.Error(err))
@@ -1067,9 +1205,11 @@ func (loader *segmentLoader) LoadBloomFilterSet(ctx context.Context, collectionI
 	}
 
 	// Charge loaded resource for bloom filters
+	stageStart = time.Now()
 	for _, bfs := range bfSets {
 		bfs.Charge()
 	}
+	chargeDur = time.Since(stageStart)
 
 	return bfSets, nil
 }
