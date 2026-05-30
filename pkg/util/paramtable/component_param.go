@@ -3559,6 +3559,7 @@ type queryNodeConfig struct {
 	StreamingDeltaForwardPolicy        ParamItem `refreshable:"true"`
 	ForwardBatchSize                   ParamItem `refreshable:"true"`
 	DelegatorPostLoadConcurrencyFactor ParamItem `refreshable:"true"`
+	DelegatorSnapshotUpdateDebounce    ParamItem `refreshable:"true"`
 
 	// loader
 	DeltaDataExpansionRate      ParamItem `refreshable:"true"`
@@ -4643,6 +4644,16 @@ Max read concurrency must greater than or equal to 1, and less than or equal to 
 		Export: true,
 	}
 	p.DelegatorPostLoadConcurrencyFactor.Init(base.mgr)
+
+	p.DelegatorSnapshotUpdateDebounce = ParamItem{
+		Key:          "queryNode.delegatorSnapshotUpdateDebounce",
+		Version:      "2.6.16",
+		Doc:          "debounce interval for delegator distribution snapshot regeneration after segment distribution changes. It supports duration strings such as 200ms and 1s. A bare number is interpreted as milliseconds for compatibility.",
+		DefaultValue: "0ms",
+		Formatter:    formatDurationWithMillisecondFallback,
+		Export:       true,
+	}
+	p.DelegatorSnapshotUpdateDebounce.Init(base.mgr)
 
 	p.DeltaDataExpansionRate = ParamItem{
 		Key:          "querynode.deltaDataExpansionRate",

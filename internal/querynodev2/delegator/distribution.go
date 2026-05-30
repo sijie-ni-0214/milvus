@@ -381,6 +381,9 @@ func (d *distribution) snapshotLoop() {
 		case <-d.snapshotClose:
 			return
 		case <-d.snapshotNotifier:
+			if !d.waitSnapshotDebounce() {
+				return
+			}
 			totalStart := time.Now()
 			lockStart := time.Now()
 			d.mut.Lock()
@@ -397,6 +400,32 @@ func (d *distribution) snapshotLoop() {
 			d.mut.Unlock()
 			lockHoldDur := time.Since(lockHoldStart)
 			distributionSnapshotTiming.record(sealedNum, growingNum, lockWaitDur, snapshotDur, serviceDur, lockHoldDur, time.Since(totalStart))
+		}
+	}
+}
+
+func (d *distribution) waitSnapshotDebounce() bool {
+	interval := paramtable.Get().QueryNodeCfg.DelegatorSnapshotUpdateDebounce.GetAsDurationByParse()
+	if interval <= 0 {
+		return true
+	}
+
+	timer := time.NewTimer(interval)
+	defer timer.Stop()
+
+	select {
+	case <-d.snapshotClose:
+		return false
+	case <-timer.C:
+	}
+
+	for {
+		select {
+		case <-d.snapshotClose:
+			return false
+		case <-d.snapshotNotifier:
+		default:
+			return true
 		}
 	}
 }

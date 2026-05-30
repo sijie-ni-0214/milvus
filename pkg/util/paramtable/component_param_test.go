@@ -541,6 +541,12 @@ func TestComponentParam(t *testing.T) {
 		params.Save(Params.DelegatorPostLoadConcurrencyFactor.Key, "0")
 		assert.Equal(t, hardware.GetCPUNum(), Params.DelegatorPostLoadConcurrencyFactor.GetAsInt())
 		params.Reset(Params.DelegatorPostLoadConcurrencyFactor.Key)
+		assert.Equal(t, time.Duration(0), Params.DelegatorSnapshotUpdateDebounce.GetAsDurationByParse())
+		params.Save(Params.DelegatorSnapshotUpdateDebounce.Key, "200ms")
+		assert.Equal(t, 200*time.Millisecond, Params.DelegatorSnapshotUpdateDebounce.GetAsDurationByParse())
+		params.Save(Params.DelegatorSnapshotUpdateDebounce.Key, "200")
+		assert.Equal(t, 200*time.Millisecond, Params.DelegatorSnapshotUpdateDebounce.GetAsDurationByParse())
+		params.Reset(Params.DelegatorSnapshotUpdateDebounce.Key)
 
 		assert.Equal(t, true, Params.SkipGrowingSegmentBF.GetAsBool())
 		assert.Equal(t, true, Params.EnableSegmentFilter.GetAsBool())

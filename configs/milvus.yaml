@@ -587,6 +587,7 @@ queryNode:
   streamingDeltaForwardPolicy: FilterByBF # delegator streaming deletion forward policy, possible option["FilterByBF", "Direct"]
   forwardBatchSize: 4194304 # the batch size delegator uses for forwarding stream delete in loading procedure
   delegatorPostLoadConcurrencyFactor: 1 # delegator post-load concurrency factor after worker LoadSegments returns. Concurrency is hardware.GetCPUNum * factor
+  delegatorSnapshotUpdateDebounce: 0ms # debounce interval for delegator distribution snapshot regeneration after segment distribution changes
   exprCache:
     enabled: false # enable expression result cache
     capacityBytes: 268435456 # max capacity in bytes for expression result cache
