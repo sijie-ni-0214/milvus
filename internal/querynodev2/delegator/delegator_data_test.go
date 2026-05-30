@@ -1009,7 +1009,7 @@ func (s *DelegatorDataSuite) TestPostLoadLimiter() {
 			go func() {
 				defer wg.Done()
 				<-start
-				err := sd.withPostLoadLimit(context.Background(), func() error {
+				_, err := sd.withPostLoadLimit(context.Background(), func() error {
 					running := atomic.AddInt32(&current, 1)
 					for {
 						maxValue := atomic.LoadInt32(&maxConcurrent)
@@ -1044,11 +1044,12 @@ func (s *DelegatorDataSuite) TestPostLoadLimiter() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Millisecond)
 		defer cancel()
 		called := false
-		err := sd.withPostLoadLimit(ctx, func() error {
+		waitDur, err := sd.withPostLoadLimit(ctx, func() error {
 			called = true
 			return nil
 		})
 		s.ErrorIs(err, context.DeadlineExceeded)
+		s.Greater(waitDur, time.Duration(0))
 		s.False(called)
 	})
 }

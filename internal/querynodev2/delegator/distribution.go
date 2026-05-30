@@ -18,6 +18,7 @@ package delegator
 
 import (
 	"sync"
+	"time"
 
 	"github.com/samber/lo"
 	"go.uber.org/atomic"
@@ -33,6 +34,194 @@ import (
 	"github.com/milvus-io/milvus/pkg/v3/util/paramtable"
 	"github.com/milvus-io/milvus/pkg/v3/util/typeutil"
 )
+
+var (
+	distributionAddTiming      = newDistributionAddTimingStats()
+	distributionSnapshotTiming = newDistributionSnapshotTimingStats()
+)
+
+type distributionAddTimingStats struct {
+	count           *atomic.Int64
+	entryCount      *atomic.Int64
+	totalLockWait   *atomic.Int64
+	totalLockHold   *atomic.Int64
+	totalNotify     *atomic.Int64
+	totalRefund     *atomic.Int64
+	totalAdd        *atomic.Int64
+	maxLockWait     *atomic.Int64
+	maxLockHold     *atomic.Int64
+	maxNotify       *atomic.Int64
+	maxRefund       *atomic.Int64
+	maxAdd          *atomic.Int64
+	lastLogUnixNano *atomic.Int64
+}
+
+type distributionSnapshotTimingStats struct {
+	count           *atomic.Int64
+	sealedCount     *atomic.Int64
+	growingCount    *atomic.Int64
+	totalLockWait   *atomic.Int64
+	totalSnapshot   *atomic.Int64
+	totalService    *atomic.Int64
+	totalLockHold   *atomic.Int64
+	totalLoop       *atomic.Int64
+	maxLockWait     *atomic.Int64
+	maxSnapshot     *atomic.Int64
+	maxService      *atomic.Int64
+	maxLockHold     *atomic.Int64
+	maxLoop         *atomic.Int64
+	lastLogUnixNano *atomic.Int64
+}
+
+func newDistributionAddTimingStats() *distributionAddTimingStats {
+	return &distributionAddTimingStats{
+		count:           atomic.NewInt64(0),
+		entryCount:      atomic.NewInt64(0),
+		totalLockWait:   atomic.NewInt64(0),
+		totalLockHold:   atomic.NewInt64(0),
+		totalNotify:     atomic.NewInt64(0),
+		totalRefund:     atomic.NewInt64(0),
+		totalAdd:        atomic.NewInt64(0),
+		maxLockWait:     atomic.NewInt64(0),
+		maxLockHold:     atomic.NewInt64(0),
+		maxNotify:       atomic.NewInt64(0),
+		maxRefund:       atomic.NewInt64(0),
+		maxAdd:          atomic.NewInt64(0),
+		lastLogUnixNano: atomic.NewInt64(time.Now().UnixNano()),
+	}
+}
+
+func newDistributionSnapshotTimingStats() *distributionSnapshotTimingStats {
+	return &distributionSnapshotTimingStats{
+		count:           atomic.NewInt64(0),
+		sealedCount:     atomic.NewInt64(0),
+		growingCount:    atomic.NewInt64(0),
+		totalLockWait:   atomic.NewInt64(0),
+		totalSnapshot:   atomic.NewInt64(0),
+		totalService:    atomic.NewInt64(0),
+		totalLockHold:   atomic.NewInt64(0),
+		totalLoop:       atomic.NewInt64(0),
+		maxLockWait:     atomic.NewInt64(0),
+		maxSnapshot:     atomic.NewInt64(0),
+		maxService:      atomic.NewInt64(0),
+		maxLockHold:     atomic.NewInt64(0),
+		maxLoop:         atomic.NewInt64(0),
+		lastLogUnixNano: atomic.NewInt64(time.Now().UnixNano()),
+	}
+}
+
+func (s *distributionAddTimingStats) record(entryNum int, lockWaitDur, lockHoldDur, notifyDur, refundDur, totalDur time.Duration) {
+	s.count.Inc()
+	s.entryCount.Add(int64(entryNum))
+	s.totalLockWait.Add(int64(lockWaitDur))
+	s.totalLockHold.Add(int64(lockHoldDur))
+	s.totalNotify.Add(int64(notifyDur))
+	s.totalRefund.Add(int64(refundDur))
+	s.totalAdd.Add(int64(totalDur))
+	updateMaxDuration(s.maxLockWait, lockWaitDur)
+	updateMaxDuration(s.maxLockHold, lockHoldDur)
+	updateMaxDuration(s.maxNotify, notifyDur)
+	updateMaxDuration(s.maxRefund, refundDur)
+	updateMaxDuration(s.maxAdd, totalDur)
+
+	now := time.Now()
+	last := s.lastLogUnixNano.Load()
+	if now.UnixNano()-last < int64(delegatorLoadTimingLogInterval) {
+		return
+	}
+	if !s.lastLogUnixNano.CompareAndSwap(last, now.UnixNano()) {
+		return
+	}
+
+	count := s.count.Swap(0)
+	entryCount := s.entryCount.Swap(0)
+	totalLockWait := s.totalLockWait.Swap(0)
+	totalLockHold := s.totalLockHold.Swap(0)
+	totalNotify := s.totalNotify.Swap(0)
+	totalRefund := s.totalRefund.Swap(0)
+	totalAdd := s.totalAdd.Swap(0)
+	maxLockWait := s.maxLockWait.Swap(0)
+	maxLockHold := s.maxLockHold.Swap(0)
+	maxNotify := s.maxNotify.Swap(0)
+	maxRefund := s.maxRefund.Swap(0)
+	maxAdd := s.maxAdd.Swap(0)
+	if count == 0 {
+		return
+	}
+
+	log.Warn("delegator distribution add timing stats",
+		zap.Int64("requestCount", count),
+		zap.Int64("entryCount", entryCount),
+		zap.Duration("avgLockWaitDur", avgDuration(totalLockWait, count)),
+		zap.Duration("avgLockHoldDur", avgDuration(totalLockHold, count)),
+		zap.Duration("avgNotifyDur", avgDuration(totalNotify, count)),
+		zap.Duration("avgRefundDur", avgDuration(totalRefund, count)),
+		zap.Duration("avgTotalDur", avgDuration(totalAdd, count)),
+		zap.Duration("maxLockWaitDur", time.Duration(maxLockWait)),
+		zap.Duration("maxLockHoldDur", time.Duration(maxLockHold)),
+		zap.Duration("maxNotifyDur", time.Duration(maxNotify)),
+		zap.Duration("maxRefundDur", time.Duration(maxRefund)),
+		zap.Duration("maxTotalDur", time.Duration(maxAdd)),
+	)
+}
+
+func (s *distributionSnapshotTimingStats) record(sealedNum int, growingNum int, lockWaitDur, snapshotDur, serviceDur, lockHoldDur, totalDur time.Duration) {
+	s.count.Inc()
+	s.sealedCount.Add(int64(sealedNum))
+	s.growingCount.Add(int64(growingNum))
+	s.totalLockWait.Add(int64(lockWaitDur))
+	s.totalSnapshot.Add(int64(snapshotDur))
+	s.totalService.Add(int64(serviceDur))
+	s.totalLockHold.Add(int64(lockHoldDur))
+	s.totalLoop.Add(int64(totalDur))
+	updateMaxDuration(s.maxLockWait, lockWaitDur)
+	updateMaxDuration(s.maxSnapshot, snapshotDur)
+	updateMaxDuration(s.maxService, serviceDur)
+	updateMaxDuration(s.maxLockHold, lockHoldDur)
+	updateMaxDuration(s.maxLoop, totalDur)
+
+	now := time.Now()
+	last := s.lastLogUnixNano.Load()
+	if now.UnixNano()-last < int64(delegatorLoadTimingLogInterval) {
+		return
+	}
+	if !s.lastLogUnixNano.CompareAndSwap(last, now.UnixNano()) {
+		return
+	}
+
+	count := s.count.Swap(0)
+	sealedCount := s.sealedCount.Swap(0)
+	growingCount := s.growingCount.Swap(0)
+	totalLockWait := s.totalLockWait.Swap(0)
+	totalSnapshot := s.totalSnapshot.Swap(0)
+	totalService := s.totalService.Swap(0)
+	totalLockHold := s.totalLockHold.Swap(0)
+	totalLoop := s.totalLoop.Swap(0)
+	maxLockWait := s.maxLockWait.Swap(0)
+	maxSnapshot := s.maxSnapshot.Swap(0)
+	maxService := s.maxService.Swap(0)
+	maxLockHold := s.maxLockHold.Swap(0)
+	maxLoop := s.maxLoop.Swap(0)
+	if count == 0 {
+		return
+	}
+
+	log.Warn("delegator distribution snapshot timing stats",
+		zap.Int64("snapshotCount", count),
+		zap.Int64("avgSealedSegmentNum", sealedCount/count),
+		zap.Int64("avgGrowingSegmentNum", growingCount/count),
+		zap.Duration("avgLockWaitDur", avgDuration(totalLockWait, count)),
+		zap.Duration("avgSnapshotDur", avgDuration(totalSnapshot, count)),
+		zap.Duration("avgServiceDur", avgDuration(totalService, count)),
+		zap.Duration("avgLockHoldDur", avgDuration(totalLockHold, count)),
+		zap.Duration("avgTotalDur", avgDuration(totalLoop, count)),
+		zap.Duration("maxLockWaitDur", time.Duration(maxLockWait)),
+		zap.Duration("maxSnapshotDur", time.Duration(maxSnapshot)),
+		zap.Duration("maxServiceDur", time.Duration(maxService)),
+		zap.Duration("maxLockHoldDur", time.Duration(maxLockHold)),
+		zap.Duration("maxTotalDur", time.Duration(maxLoop)),
+	)
+}
 
 const (
 	// wildcardNodeID matches any nodeID, used for force distribution correction.
@@ -192,10 +381,22 @@ func (d *distribution) snapshotLoop() {
 		case <-d.snapshotClose:
 			return
 		case <-d.snapshotNotifier:
+			totalStart := time.Now()
+			lockStart := time.Now()
 			d.mut.Lock()
+			lockWaitDur := time.Since(lockStart)
+			lockHoldStart := time.Now()
+			sealedNum := len(d.sealedSegments)
+			growingNum := len(d.growingSegments)
+			snapshotStart := time.Now()
 			d.genSnapshot()
+			snapshotDur := time.Since(snapshotStart)
+			serviceStart := time.Now()
 			d.updateServiceable("snapshotLoop")
+			serviceDur := time.Since(serviceStart)
 			d.mut.Unlock()
+			lockHoldDur := time.Since(lockHoldStart)
+			distributionSnapshotTiming.record(sealedNum, growingNum, lockWaitDur, snapshotDur, serviceDur, lockHoldDur, time.Since(totalStart))
 		}
 	}
 }
@@ -377,6 +578,7 @@ func (d *distribution) updateServiceable(triggerAction string) {
 
 // AddDistributions add multiple segment entries.
 func (d *distribution) AddDistributions(entries ...SegmentEntry) {
+	start := time.Now()
 	var toRefund []pkoracle.Candidate
 
 	if d.closed.Load() {
@@ -385,11 +587,16 @@ func (d *distribution) AddDistributions(entries ...SegmentEntry) {
 				toRefund = append(toRefund, entry.Candidate)
 			}
 		}
+		refundStart := time.Now()
 		refundCandidates(toRefund)
+		distributionAddTiming.record(len(entries), 0, 0, 0, time.Since(refundStart), time.Since(start))
 		return
 	}
 
+	lockStart := time.Now()
 	d.mut.Lock()
+	lockWaitDur := time.Since(lockStart)
+	lockHoldStart := time.Now()
 	for _, entry := range entries {
 		oldEntry, ok := d.sealedSegments[entry.SegmentID]
 		if ok && oldEntry.Version >= entry.Version {
@@ -417,9 +624,15 @@ func (d *distribution) AddDistributions(entries ...SegmentEntry) {
 		d.sealedSegments[entry.SegmentID] = entry
 	}
 	d.mut.Unlock()
+	lockHoldDur := time.Since(lockHoldStart)
 
+	notifyStart := time.Now()
 	d.notifySnapshotUpdate()
+	notifyDur := time.Since(notifyStart)
+	refundStart := time.Now()
 	refundCandidates(toRefund)
+	refundDur := time.Since(refundStart)
+	distributionAddTiming.record(len(entries), lockWaitDur, lockHoldDur, notifyDur, refundDur, time.Since(start))
 }
 
 // refundCandidates refunds resources for removed candidates.
