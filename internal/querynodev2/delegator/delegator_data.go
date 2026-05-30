@@ -64,6 +64,7 @@ const delegatorLoadTimingLogInterval = 5 * time.Second
 var delegatorLoadTiming = newDelegatorLoadTimingStats()
 
 type delegatorLoadTimingStats struct {
+	active            *atomic.Int64
 	count             *atomic.Int64
 	segmentCount      *atomic.Int64
 	totalWorkerLoad   *atomic.Int64
@@ -85,6 +86,7 @@ type delegatorLoadTimingStats struct {
 
 func newDelegatorLoadTimingStats() *delegatorLoadTimingStats {
 	return &delegatorLoadTimingStats{
+		active:            atomic.NewInt64(0),
 		count:             atomic.NewInt64(0),
 		segmentCount:      atomic.NewInt64(0),
 		totalWorkerLoad:   atomic.NewInt64(0),
@@ -190,6 +192,7 @@ func (s *delegatorLoadTimingStats) record(segmentNum int, workerLoadDur, postLoa
 		zap.Duration("maxBM25StatsDur", time.Duration(maxBM25Stats)),
 		zap.Duration("maxStreamDeleteDur", time.Duration(maxStreamDelete)),
 		zap.Duration("maxTotalDur", time.Duration(maxLoadSegments)),
+		zap.Int64("activeRequests", s.active.Load()),
 		zap.Int("postLoadCap", postLoadCap),
 		zap.Int("postLoadCurrent", postLoadCurrent),
 	)
@@ -689,6 +692,7 @@ func (sd *shardDelegator) LoadSegments(ctx context.Context, req *querypb.LoadSeg
 		return nil
 	}
 	loadSegmentsStart := time.Now()
+	delegatorLoadTiming.active.Inc()
 	var workerLoadDur time.Duration
 	var postLoadDur time.Duration
 	var bloomFilterDur time.Duration
@@ -712,6 +716,7 @@ func (sd *shardDelegator) LoadSegments(ctx context.Context, req *querypb.LoadSeg
 			postLoadCap,
 			postLoadCurrent,
 		)
+		delegatorLoadTiming.active.Dec()
 	}()
 
 	log := sd.getLogger(ctx)

@@ -116,6 +116,7 @@
   - post-load 总耗时
   - post-load 中 `LoadBloomFilterSet`、`loadBM25Stats`、`loadStreamDelete`
   - post-load 其他耗时约等于 semaphore wait + 轻量逻辑开销
+  - SN delegator 当前活跃 LoadSegments request 数
   - post-load semaphore cap/current
 
 本地校验：
