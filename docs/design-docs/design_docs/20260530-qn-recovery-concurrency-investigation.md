@@ -95,6 +95,11 @@
 
 新增：
 
+- QC scheduler 侧 `scheduler dispatch timing stats`，每 5 秒聚合输出：
+  - dispatch 调用次数
+  - 平均 scanned/toProcess/committed/toRemove task 数
+  - promote/preprocess/process/dispatch 总耗时
+  - 最新 process/wait queue 长度和 segment/channel task 总数
 - QN worker 侧 `segment load timing stats`，每 5 秒聚合输出：
   - `avg/max LoadSegment`
   - `avg/max LoadDeltaLogs`
@@ -118,3 +123,15 @@
 - `git diff --check` 通过。
 - `go test ./internal/querynodev2/segments`：本地链接阶段失败，原因是 `libmilvus_core.dylib` 缺少 `LC_RPATH`，Go 编译已通过到 test binary 启动阶段。
 - `go test ./internal/querynodev2/delegator`：当前 worktree 下失败于既有测试依赖 `undefined: streaming.SetupNoopWALForTest`，不是本次日志代码引入的编译错误。
+
+提交：
+
+- `099dd902d0 enhance: add qn recovery load timing logs`
+- 已推送到 `origin/optimize-load-partition`。
+- 后续补充 QC scheduler dispatch 聚合日志，准备单独提交并触发新镜像构建。
+
+镜像构建：
+
+- 已触发社区镜像构建，buildRecordId：`4404`。
+- 目标 tag：`harbor.milvus.io/milvusdb/milvus:optimize-load-partition-20260530-099dd902d0-amd64`。
+- 构建分支：`sijie-ni-0214/milvus:optimize-load-partition`。
