@@ -131,6 +131,8 @@
 - 已推送到 `origin/optimize-load-partition`。
 - `fe4a62d6fd enhance: add qc scheduler dispatch timing logs`
 - 已推送到 `origin/optimize-load-partition`。
+- `82a0b40c2b enhance: log active delegator load requests`
+- 已推送到 `origin/optimize-load-partition`。
 
 镜像构建：
 
@@ -139,4 +141,6 @@
 - 构建分支：`sijie-ni-0214/milvus:optimize-load-partition`。
 - 已触发包含 QC scheduler 日志的第二个构建，buildRecordId：`4405`。
 - 新目标 tag：`harbor.milvus.io/milvusdb/milvus:optimize-load-partition-20260530-fe4a62d6fd-amd64`。
-- 后续测试以 `fe4a62d6fd` 镜像为准。
+- 已触发包含 SN delegator active request 日志的最终构建，buildRecordId：`4406`。
+- 最终目标 tag：`harbor.milvus.io/milvusdb/milvus:optimize-load-partition-20260530-82a0b40c2b-amd64`。
+- 后续测试以 `82a0b40c2b` 镜像为准。
