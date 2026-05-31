@@ -49,13 +49,39 @@ type BloomFilterSet struct {
 	currentStat  *storage.PkStatistics
 	historyStats []*storage.PkStatistics
 
+	lazyOnce sync.Once
+	lazyLoad func(*BloomFilterSet) error
+	lazyErr  error
+
 	// Resource tracking
 	trackedSize     int64 // memory size that was charged
 	resourceCharged bool  // tracks whether memory resources were charged for this bloom filter set
 }
 
+func (s *BloomFilterSet) ensureLazyLoaded() error {
+	if s.lazyLoad == nil {
+		return nil
+	}
+
+	s.lazyOnce.Do(func() {
+		s.lazyErr = s.lazyLoad(s)
+		if s.lazyErr != nil {
+			log.Warn("failed to lazy load bloom filter set",
+				zap.Int64("segmentID", s.segmentID),
+				zap.Error(s.lazyErr))
+			return
+		}
+		s.Charge()
+	})
+	return s.lazyErr
+}
+
 // MayPkExist returns whether any bloom filters returns positive.
 func (s *BloomFilterSet) MayPkExist(lc *storage.LocationsCache) bool {
+	if err := s.ensureLazyLoaded(); err != nil {
+		return true
+	}
+
 	s.statsMutex.RLock()
 	defer s.statsMutex.RUnlock()
 	if s.currentStat != nil && s.currentStat.TestLocationCache(lc) {
@@ -72,6 +98,14 @@ func (s *BloomFilterSet) MayPkExist(lc *storage.LocationsCache) bool {
 }
 
 func (s *BloomFilterSet) BatchPkExist(lc *storage.BatchLocationsCache) []bool {
+	if err := s.ensureLazyLoaded(); err != nil {
+		hits := make([]bool, lc.Size())
+		for i := 0; i < lc.Size(); i++ {
+			hits[i] = true
+		}
+		return hits
+	}
+
 	s.statsMutex.RLock()
 	defer s.statsMutex.RUnlock()
 
@@ -103,16 +137,28 @@ func (s *BloomFilterSet) Type() commonpb.SegmentState {
 
 // Stats returns the current bloom filter statistics.
 func (s *BloomFilterSet) Stats() *storage.PkStatistics {
+	if err := s.ensureLazyLoaded(); err != nil {
+		return nil
+	}
+
 	return s.currentStat
 }
 
 // PkCandidateExist reports whether bloom filter data has been loaded (current or historical).
 func (s *BloomFilterSet) PkCandidateExist() bool {
+	if err := s.ensureLazyLoaded(); err != nil {
+		return false
+	}
+
 	return s.currentStat != nil || s.historyStats != nil
 }
 
 // UpdatePkCandidate updates currentStats with provided pks.
 func (s *BloomFilterSet) UpdatePkCandidate(pks []storage.PrimaryKey) {
+	if err := s.ensureLazyLoaded(); err != nil {
+		return
+	}
+
 	s.statsMutex.Lock()
 	defer s.statsMutex.Unlock()
 
@@ -147,6 +193,10 @@ func (s *BloomFilterSet) UpdatePkCandidate(pks []storage.PrimaryKey) {
 // GetMinPk returns the global minimum PK across all statistics (current + historical).
 // Returns nil if no statistics with a valid MinPK are available.
 func (s *BloomFilterSet) GetMinPk() *storage.PrimaryKey {
+	if err := s.ensureLazyLoaded(); err != nil {
+		return nil
+	}
+
 	s.statsMutex.RLock()
 	defer s.statsMutex.RUnlock()
 
@@ -171,6 +221,10 @@ func (s *BloomFilterSet) GetMinPk() *storage.PrimaryKey {
 // GetMaxPk returns the global maximum PK across all statistics (current + historical).
 // Returns nil if no statistics with a valid MaxPK are available.
 func (s *BloomFilterSet) GetMaxPk() *storage.PrimaryKey {
+	if err := s.ensureLazyLoaded(); err != nil {
+		return nil
+	}
+
 	s.statsMutex.RLock()
 	defer s.statsMutex.RUnlock()
 
@@ -303,5 +357,14 @@ func NewBloomFilterSet(segmentID int64, partitionID int64, segType commonpb.Segm
 		segmentID:   segmentID,
 		partitionID: partitionID,
 		segType:     segType,
+	}
+}
+
+func NewLazyBloomFilterSet(segmentID int64, partitionID int64, segType commonpb.SegmentState, lazyLoad func(*BloomFilterSet) error) *BloomFilterSet {
+	return &BloomFilterSet{
+		segmentID:   segmentID,
+		partitionID: partitionID,
+		segType:     segType,
+		lazyLoad:    lazyLoad,
 	}
 }

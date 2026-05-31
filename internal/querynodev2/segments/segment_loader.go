@@ -713,7 +713,6 @@ func (loader *segmentLoader) GetChunkManager() storage.ChunkManager {
 func (loader *segmentLoader) loadSingleBloomFilterSet(ctx context.Context, collectionID int64, loadInfo *querypb.SegmentLoadInfo, segtype SegmentType) (*pkoracle.BloomFilterSet, error) {
 	partitionID := loadInfo.PartitionID
 	segmentID := loadInfo.SegmentID
-	bfs := pkoracle.NewBloomFilterSet(segmentID, partitionID, segtype)
 
 	collection := loader.manager.Collection.Get(collectionID)
 	if collection == nil {
@@ -730,33 +729,48 @@ func (loader *segmentLoader) loadSingleBloomFilterSet(ctx context.Context, colle
 		HasExternalPrimaryKey(schema)
 	if !paramtable.Get().CommonCfg.BloomFilterEnabled.GetAsBool() && !isMilvusTableRealPK {
 		mlog.Info(context.TODO(), "skip loading bloom filter for remote segment because bloom filter is disabled")
-		return bfs, nil
+		return pkoracle.NewBloomFilterSet(segmentID, partitionID, segtype), nil
 	}
 	if isExternalCollection && !isMilvusTableRealPK {
 		mlog.Debug(context.TODO(), "virtual-PK external collection: returning empty bloom filter set")
-		return bfs, nil
+		return pkoracle.NewBloomFilterSet(segmentID, partitionID, segtype), nil
 	}
 
 	pkField := GetPkField(schema)
-	mlog.Info(context.TODO(), "loading bloom filter for remote...")
-	pkStatsBinlogs, err := packed.NewStatsResolverFromLoadInfo(loadInfo).BloomFilterPaths(pkField.GetFieldID())
-	if err != nil {
-		return nil, err
-	}
-	err = loader.loadBloomFilter(ctx, segmentID, bfs, pkStatsBinlogs, loader.bloomFilterDownloader(collection, isMilvusTableRealPK))
-	if err != nil {
-		mlog.Warn(context.TODO(), "load remote segment bloom filter failed",
-			mlog.Int64("partitionID", partitionID),
-			mlog.Int64("segmentID", segmentID),
-			mlog.Err(err),
-		)
-		return nil, err
-	}
-	if isMilvusTableRealPK && !bfs.PkCandidateExist() {
-		return nil, merr.WrapErrServiceInternalMsg("milvus-table real-PK segment missing bloom filter stats")
-	}
+	lazyCtx := context.WithoutCancel(ctx)
+	pkFieldID := pkField.GetFieldID()
+	return pkoracle.NewLazyBloomFilterSet(segmentID, partitionID, segtype, func(bfs *pkoracle.BloomFilterSet) error {
+		start := time.Now()
+		mlog.Info(context.TODO(), "lazy loading bloom filter for remote segment")
 
-	return bfs, nil
+		stageStart := time.Now()
+		pkStatsBinlogs, err := packed.NewStatsResolverFromLoadInfo(loadInfo).BloomFilterPaths(pkFieldID)
+		resolveDur := time.Since(stageStart)
+		if err != nil {
+			return err
+		}
+		if isMilvusTableRealPK && len(pkStatsBinlogs) == 0 {
+			return merr.WrapErrServiceInternalMsg("milvus-table real-PK segment missing bloom filter stats")
+		}
+
+		stageStart = time.Now()
+		err = loader.loadBloomFilter(lazyCtx, segmentID, bfs, pkStatsBinlogs, loader.bloomFilterDownloader(collection, isMilvusTableRealPK))
+		loadDur := time.Since(stageStart)
+		if err != nil {
+			mlog.Warn(context.TODO(), "load remote segment bloom filter failed",
+				mlog.Int64("partitionID", partitionID),
+				mlog.Int64("segmentID", segmentID),
+				mlog.Err(err),
+			)
+			return err
+		}
+		mlog.Info(context.TODO(), "lazy loaded bloom filter for remote segment",
+			mlog.Int("pathNum", len(pkStatsBinlogs)),
+			mlog.Duration("resolvePathsDur", resolveDur),
+			mlog.Duration("loadBloomFilterDur", loadDur),
+			mlog.Duration("totalDur", time.Since(start)))
+		return nil
+	}), nil
 }
 
 func (loader *segmentLoader) LoadBloomFilterSet(ctx context.Context, collectionID int64, infos ...*querypb.SegmentLoadInfo) ([]*pkoracle.BloomFilterSet, error) {
@@ -803,74 +817,31 @@ func (loader *segmentLoader) LoadBloomFilterSet(ctx context.Context, collectionI
 
 	pkField := GetPkField(schema)
 	pkFieldID := pkField.GetFieldID()
+	lazyCtx := context.WithoutCancel(ctx)
+	for i, info := range infos {
+		info := info
+		segmentID := info.GetSegmentID()
+		partitionID := info.GetPartitionID()
+		bfSets[i] = pkoracle.NewLazyBloomFilterSet(segmentID, partitionID, commonpb.SegmentState_Sealed, func(bfs *pkoracle.BloomFilterSet) error {
+			pkStatsBinlogs, err := packed.NewStatsResolverFromLoadInfo(info).BloomFilterPaths(pkFieldID)
+			if err != nil {
+				return err
+			}
+			if isMilvusTableRealPK && len(pkStatsBinlogs) == 0 {
+				return merr.WrapErrServiceInternalMsg("milvus-table real-PK segment missing bloom filter stats")
+			}
 
-	// Calculate total memory size needed for bloom filters (PK stats)
-	var totalMemorySize int64
-	for _, info := range infos {
-		memSize, _ := packed.NewStatsResolverFromLoadInfo(info).BloomFilterMemorySize(pkFieldID)
-		totalMemorySize += memSize
-	}
-
-	// Reserve memory resource if tiered eviction is enabled
-	if paramtable.Get().QueryNodeCfg.TieredEvictionEnabled.GetAsBool() && totalMemorySize > 0 {
-		if ok := C.TryReserveLoadingResourceWithTimeout(C.CResourceUsage{
-			// double loading memory size for bloom filters to avoid OOM during loading
-			memory_bytes: C.int64_t(totalMemorySize * 2),
-			disk_bytes:   C.int64_t(0),
-		}, 1000); !ok {
-			return nil, merr.WrapErrSegmentRequestResourceFailed("memory",
-				fmt.Sprintf("failed to reserve loading resource for bloom filters, totalMemorySize = %v MB",
-					logutil.ToMB(float64(totalMemorySize))))
-		}
-		mlog.Info(context.TODO(), "reserved loading resource for bloom filters", mlog.Float64("totalMemorySizeMB", logutil.ToMB(float64(totalMemorySize))))
-	}
-
-	defer func() {
-		if paramtable.Get().QueryNodeCfg.TieredEvictionEnabled.GetAsBool() && totalMemorySize > 0 {
-			C.ReleaseLoadingResource(C.CResourceUsage{
-				memory_bytes: C.int64_t(totalMemorySize * 2),
-				disk_bytes:   C.int64_t(0),
-			})
-			mlog.Info(context.TODO(), "released loading resource for bloom filters", mlog.Float64("totalMemorySizeMB", logutil.ToMB(float64(totalMemorySize))))
-		}
-	}()
-
-	mlog.Info(context.TODO(), "start loading remote...", mlog.Int("segmentNum", segmentNum))
-
-	loadRemoteFunc := func(idx int) error {
-		loadInfo := infos[idx]
-		bfs := bfSets[idx]
-
-		mlog.Info(context.TODO(), "loading bloom filter for remote...")
-		pkStatsBinlogs, err := packed.NewStatsResolverFromLoadInfo(loadInfo).BloomFilterPaths(pkFieldID)
-		if err != nil {
-			return err
-		}
-		err = loader.loadBloomFilter(ctx, bfs.ID(), bfs, pkStatsBinlogs, loader.bloomFilterDownloader(collection, isMilvusTableRealPK))
-		if err != nil {
-			mlog.Warn(context.TODO(), "load remote segment bloom filter failed",
-				mlog.Int64("partitionID", bfs.Partition()),
-				mlog.Int64("segmentID", bfs.ID()),
-				mlog.Err(err),
-			)
-			return err
-		}
-		if isMilvusTableRealPK && !bfs.PkCandidateExist() {
-			return merr.WrapErrServiceInternalMsg("milvus-table real-PK segment missing bloom filter stats")
-		}
-		return nil
-	}
-
-	err := funcutil.ProcessFuncParallel(segmentNum, segmentNum, loadRemoteFunc, "loadRemoteFunc")
-	if err != nil {
-		// no partial success here
-		mlog.Warn(context.TODO(), "failed to load remote segment", mlog.Err(err))
-		return nil, err
-	}
-
-	// Charge loaded resource for bloom filters
-	for _, bfs := range bfSets {
-		bfs.Charge()
+			err = loader.loadBloomFilter(lazyCtx, bfs.ID(), bfs, pkStatsBinlogs, loader.bloomFilterDownloader(collection, isMilvusTableRealPK))
+			if err != nil {
+				mlog.Warn(context.TODO(), "load remote segment bloom filter failed",
+					mlog.Int64("partitionID", bfs.Partition()),
+					mlog.Int64("segmentID", bfs.ID()),
+					mlog.Err(err),
+				)
+				return err
+			}
+			return nil
+		})
 	}
 
 	return bfSets, nil
