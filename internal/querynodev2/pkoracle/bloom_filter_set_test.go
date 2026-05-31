@@ -17,6 +17,7 @@
 package pkoracle
 
 import (
+	"errors"
 	"strconv"
 	"testing"
 
@@ -186,5 +187,38 @@ func TestMemSize(t *testing.T) {
 
 		size := bfs.MemSize()
 		assert.Greater(t, size, int64(0))
+	})
+}
+
+func TestLazyBloomFilterSet(t *testing.T) {
+	paramtable.Init()
+
+	t.Run("load on first pk access", func(t *testing.T) {
+		loadCount := 0
+		bfs := NewLazyBloomFilterSet(1, 1, commonpb.SegmentState_Sealed, func(bfs *BloomFilterSet) error {
+			loadCount++
+			bfs.historyStats = make([]*storage.PkStatistics, 0)
+			return nil
+		})
+
+		assert.Equal(t, 0, loadCount)
+		assert.Equal(t, int64(0), bfs.MemSize())
+		assert.Equal(t, 0, loadCount)
+
+		assert.True(t, bfs.PkCandidateExist())
+		assert.Equal(t, 1, loadCount)
+
+		assert.True(t, bfs.PkCandidateExist())
+		assert.Equal(t, 1, loadCount)
+	})
+
+	t.Run("conservative on load error", func(t *testing.T) {
+		bfs := NewLazyBloomFilterSet(1, 1, commonpb.SegmentState_Sealed, func(bfs *BloomFilterSet) error {
+			return errors.New("lazy load failed")
+		})
+
+		lc := storage.NewLocationsCache(storage.NewInt64PrimaryKey(1))
+		assert.True(t, bfs.MayPkExist(lc))
+		assert.False(t, bfs.PkCandidateExist())
 	})
 }
