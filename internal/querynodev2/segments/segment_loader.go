@@ -1031,9 +1031,9 @@ func (loader *segmentLoader) loadSingleBloomFilterSet(ctx context.Context, colle
 
 	partitionID := loadInfo.PartitionID
 	segmentID := loadInfo.SegmentID
-	bfs := pkoracle.NewBloomFilterSet(segmentID, partitionID, segtype)
 
 	if !paramtable.Get().CommonCfg.BloomFilterEnabled.GetAsBool() {
+		bfs := pkoracle.NewBloomFilterSet(segmentID, partitionID, segtype)
 		log.Info("skip loading bloom filter for remote segment because bloom filter is disabled")
 		return bfs, nil
 	}
@@ -1054,26 +1054,42 @@ func (loader *segmentLoader) loadSingleBloomFilterSet(ctx context.Context, colle
 	// NOTE: This is a defensive guard. Normal external collection load path uses
 	// ExternalSegmentCandidate directly and should not reach here.
 	if typeutil.IsExternalCollection(collection.Schema()) {
+		bfs := pkoracle.NewBloomFilterSet(segmentID, partitionID, segtype)
 		log.Debug("external collection: returning empty bloom filter set (defensive path)")
 		return bfs, nil
 	}
 
-	log.Info("loading bloom filter for remote...")
-	pkStatsBinlogs, err := packed.NewStatsResolverFromLoadInfo(loadInfo).BloomFilterPaths(pkField.GetFieldID())
-	if err != nil {
-		return nil, err
-	}
-	err = loader.loadBloomFilter(ctx, segmentID, bfs, pkStatsBinlogs)
-	if err != nil {
-		log.Warn("load remote segment bloom filter failed",
-			zap.Int64("partitionID", partitionID),
-			zap.Int64("segmentID", segmentID),
-			zap.Error(err),
-		)
-		return nil, err
-	}
+	lazyCtx := context.WithoutCancel(ctx)
+	pkFieldID := pkField.GetFieldID()
+	return pkoracle.NewLazyBloomFilterSet(segmentID, partitionID, segtype, func(bfs *pkoracle.BloomFilterSet) error {
+		start := time.Now()
+		log.Info("lazy loading bloom filter for remote segment")
 
-	return bfs, nil
+		stageStart := time.Now()
+		pkStatsBinlogs, err := packed.NewStatsResolverFromLoadInfo(loadInfo).BloomFilterPaths(pkFieldID)
+		resolveDur := time.Since(stageStart)
+		if err != nil {
+			return err
+		}
+
+		stageStart = time.Now()
+		err = loader.loadBloomFilter(lazyCtx, segmentID, bfs, pkStatsBinlogs)
+		loadDur := time.Since(stageStart)
+		if err != nil {
+			log.Warn("load remote segment bloom filter failed",
+				zap.Int64("partitionID", partitionID),
+				zap.Int64("segmentID", segmentID),
+				zap.Error(err),
+			)
+			return err
+		}
+		log.Info("lazy loaded bloom filter for remote segment",
+			zap.Int("pathNum", len(pkStatsBinlogs)),
+			zap.Duration("resolvePathsDur", resolveDur),
+			zap.Duration("loadBloomFilterDur", loadDur),
+			zap.Duration("totalDur", time.Since(start)))
+		return nil
+	}), nil
 }
 
 func (loader *segmentLoader) LoadBloomFilterSet(ctx context.Context, collectionID int64, infos ...*querypb.SegmentLoadInfo) ([]*pkoracle.BloomFilterSet, error) {
@@ -1137,79 +1153,42 @@ func (loader *segmentLoader) LoadBloomFilterSet(ctx context.Context, collectionI
 	}
 	metadataDur = time.Since(stageStart)
 
-	// Calculate total memory size needed for bloom filters (PK stats)
 	stageStart = time.Now()
-	var totalMemorySize int64
-	for _, info := range infos {
-		memSize, _ := packed.NewStatsResolverFromLoadInfo(info).BloomFilterMemorySize(pkFieldID)
-		totalMemorySize += memSize
-	}
-	memoryEstimateDur = time.Since(stageStart)
+	lazyCtx := context.WithoutCancel(ctx)
+	for i, info := range infos {
+		info := info
+		segmentID := info.GetSegmentID()
+		partitionID := info.GetPartitionID()
+		bfSets[i] = pkoracle.NewLazyBloomFilterSet(segmentID, partitionID, commonpb.SegmentState_Sealed, func(bfs *pkoracle.BloomFilterSet) error {
+			start := time.Now()
+			stageStart := time.Now()
+			pkStatsBinlogs, err := packed.NewStatsResolverFromLoadInfo(info).BloomFilterPaths(pkFieldID)
+			resolveDur := time.Since(stageStart)
+			if err != nil {
+				return err
+			}
 
-	// Reserve memory resource if tiered eviction is enabled
-	if paramtable.Get().QueryNodeCfg.TieredEvictionEnabled.GetAsBool() && totalMemorySize > 0 {
-		stageStart = time.Now()
-		if ok := C.TryReserveLoadingResourceWithTimeout(C.CResourceUsage{
-			// double loading memory size for bloom filters to avoid OOM during loading
-			memory_bytes: C.int64_t(totalMemorySize * 2),
-			disk_bytes:   C.int64_t(0),
-		}, 1000); !ok {
-			reserveDur = time.Since(stageStart)
-			return nil, fmt.Errorf("failed to reserve loading resource for bloom filters, totalMemorySize = %v MB",
-				logutil.ToMB(float64(totalMemorySize)))
-		}
-		reserveDur = time.Since(stageStart)
-		log.Info("reserved loading resource for bloom filters", zap.Float64("totalMemorySizeMB", logutil.ToMB(float64(totalMemorySize))))
-	}
-
-	defer func() {
-		if paramtable.Get().QueryNodeCfg.TieredEvictionEnabled.GetAsBool() && totalMemorySize > 0 {
-			C.ReleaseLoadingResource(C.CResourceUsage{
-				memory_bytes: C.int64_t(totalMemorySize * 2),
-				disk_bytes:   C.int64_t(0),
-			})
-			log.Info("released loading resource for bloom filters", zap.Float64("totalMemorySizeMB", logutil.ToMB(float64(totalMemorySize))))
-		}
-	}()
-
-	log.Info("start loading remote...", zap.Int("segmentNum", segmentNum))
-
-	loadRemoteFunc := func(idx int) error {
-		loadInfo := infos[idx]
-		bfs := bfSets[idx]
-
-		log.Info("loading bloom filter for remote...")
-		pkStatsBinlogs, err := packed.NewStatsResolverFromLoadInfo(loadInfo).BloomFilterPaths(pkFieldID)
-		if err != nil {
-			return err
-		}
-		err = loader.loadBloomFilter(ctx, bfs.ID(), bfs, pkStatsBinlogs)
-		if err != nil {
-			log.Warn("load remote segment bloom filter failed",
-				zap.Int64("partitionID", bfs.Partition()),
+			stageStart = time.Now()
+			err = loader.loadBloomFilter(lazyCtx, bfs.ID(), bfs, pkStatsBinlogs)
+			loadDur := time.Since(stageStart)
+			if err != nil {
+				log.Warn("load remote segment bloom filter failed",
+					zap.Int64("partitionID", bfs.Partition()),
+					zap.Int64("segmentID", bfs.ID()),
+					zap.Error(err),
+				)
+				return err
+			}
+			log.Info("lazy loaded bloom filter for remote segment",
 				zap.Int64("segmentID", bfs.ID()),
-				zap.Error(err),
-			)
-			return err
-		}
-		return nil
+				zap.Int("pathNum", len(pkStatsBinlogs)),
+				zap.Duration("resolvePathsDur", resolveDur),
+				zap.Duration("loadBloomFilterDur", loadDur),
+				zap.Duration("totalDur", time.Since(start)))
+			return nil
+		})
 	}
-
-	stageStart = time.Now()
-	err := funcutil.ProcessFuncParallel(segmentNum, segmentNum, loadRemoteFunc, "loadRemoteFunc")
-	remoteLoadDur = time.Since(stageStart)
-	if err != nil {
-		// no partial success here
-		log.Warn("failed to load remote segment", zap.Error(err))
-		return nil, err
-	}
-
-	// Charge loaded resource for bloom filters
-	stageStart = time.Now()
-	for _, bfs := range bfSets {
-		bfs.Charge()
-	}
-	chargeDur = time.Since(stageStart)
+	stubDur += time.Since(stageStart)
 
 	return bfSets, nil
 }
