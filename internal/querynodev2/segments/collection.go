@@ -23,6 +23,7 @@ import (
 	"github.com/samber/lo"
 	"go.uber.org/atomic"
 	"go.uber.org/zap"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/milvus-io/milvus-proto/go-api/v3/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v3/schemapb"
@@ -88,7 +89,35 @@ func (m *collectionManager) Get(collectionID int64) *Collection {
 	return m.collections[collectionID]
 }
 
+func (m *collectionManager) refExistingCollectionIfUnchanged(collectionID int64, schemaVersion uint64, meta *segcorepb.CollectionIndexMeta) bool {
+	m.mut.RLock()
+	collection, ok := m.collections[collectionID]
+	if !ok || schemaVersion > collection.SchemaVersion() {
+		m.mut.RUnlock()
+		return false
+	}
+	currentMeta := collection.ccollection.IndexMeta()
+	m.mut.RUnlock()
+
+	if meta != nil && !proto.Equal(currentMeta, meta) {
+		return false
+	}
+
+	m.mut.Lock()
+	defer m.mut.Unlock()
+
+	if current, ok := m.collections[collectionID]; ok && current == collection {
+		current.Ref(1)
+		return true
+	}
+	return false
+}
+
 func (m *collectionManager) PutOrRef(collectionID int64, schema *schemapb.CollectionSchema, meta *segcorepb.CollectionIndexMeta, loadMeta *querypb.LoadMetaInfo) error {
+	if m.refExistingCollectionIfUnchanged(collectionID, loadMeta.GetSchemaVersion(), meta) {
+		return nil
+	}
+
 	m.mut.Lock()
 	defer m.mut.Unlock()
 	if collection, ok := m.collections[collectionID]; ok {
@@ -103,9 +132,10 @@ func (m *collectionManager) PutOrRef(collectionID int64, schema *schemapb.Collec
 				zap.Any("schema", schema),
 			)
 		}
-		// Always update index meta to ensure newly indexed fields are visible
-		// for search plan creation (CollectionIndexMeta::HasField check).
-		if meta != nil {
+		// Update index meta only when it really changes. LoadSegment recovery
+		// sends the same collection-level meta for many segments, and SetIndexMeta
+		// runs under the collection manager lock.
+		if meta != nil && !proto.Equal(collection.ccollection.IndexMeta(), meta) {
 			if err := collection.ccollection.UpdateIndexMeta(meta); err != nil {
 				return err
 			}

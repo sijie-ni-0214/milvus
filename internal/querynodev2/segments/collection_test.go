@@ -22,12 +22,14 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/suite"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/milvus-io/milvus-proto/go-api/v3/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v3/schemapb"
 	"github.com/milvus-io/milvus/internal/mocks/util/mock_segcore"
 	"github.com/milvus-io/milvus/pkg/v3/common"
 	"github.com/milvus-io/milvus/pkg/v3/proto/querypb"
+	"github.com/milvus-io/milvus/pkg/v3/proto/segcorepb"
 	"github.com/milvus-io/milvus/pkg/v3/util/paramtable"
 )
 
@@ -200,6 +202,23 @@ func (s *CollectionManagerSuite) TestPutOrRefUpdateIndexMeta() {
 	s.True(found,
 		"PutOrRef should update IndexMeta for existing collections; field %d is missing",
 		newVecFieldID)
+}
+
+func (s *CollectionManagerSuite) TestPutOrRefSkipSameIndexMeta() {
+	coll := s.cm.Get(1)
+	s.Require().NotNil(coll)
+	originIndexMeta := coll.GetCCollection().IndexMeta()
+	s.Require().NotNil(originIndexMeta)
+
+	sameIndexMeta := proto.Clone(originIndexMeta).(*segcorepb.CollectionIndexMeta)
+	err := s.cm.PutOrRef(1, coll.Schema(), sameIndexMeta, &querypb.LoadMetaInfo{
+		LoadType:      querypb.LoadType_LoadCollection,
+		SchemaVersion: coll.SchemaVersion(),
+	})
+	s.Require().NoError(err)
+	defer s.cm.Unref(1, 1)
+
+	s.Same(originIndexMeta, coll.GetCCollection().IndexMeta())
 }
 
 func (s *CollectionManagerSuite) TestRef() {
