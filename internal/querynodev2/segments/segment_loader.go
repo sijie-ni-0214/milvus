@@ -80,6 +80,7 @@ const requestResourceTimingLogInterval = 5 * time.Second
 var (
 	requestResourceTiming = newRequestResourceTimingStats()
 	segmentLoadTiming     = newSegmentLoadTimingStats()
+	sealedLoadTiming      = newSealedLoadTimingStats()
 	bloomFilterLoadTiming = newBloomFilterLoadTimingStats()
 )
 
@@ -145,6 +146,23 @@ type segmentLoadTimingStats struct {
 	lastLogUnixNano  *atomic.Int64
 }
 
+type sealedLoadTimingStats struct {
+	count              *atomic.Int64
+	totalStateLock     *atomic.Int64
+	totalPoolWait      *atomic.Int64
+	totalCgoLoad       *atomic.Int64
+	totalSyncJSONStats *atomic.Int64
+	totalPatchEntry    *atomic.Int64
+	totalSealedLoad    *atomic.Int64
+	maxStateLock       *atomic.Int64
+	maxPoolWait        *atomic.Int64
+	maxCgoLoad         *atomic.Int64
+	maxSyncJSONStats   *atomic.Int64
+	maxPatchEntry      *atomic.Int64
+	maxSealedLoad      *atomic.Int64
+	lastLogUnixNano    *atomic.Int64
+}
+
 type bloomFilterLoadTimingStats struct {
 	count                *atomic.Int64
 	segmentCount         *atomic.Int64
@@ -163,6 +181,25 @@ type bloomFilterLoadTimingStats struct {
 	maxCharge            *atomic.Int64
 	maxBloomFilterLoad   *atomic.Int64
 	lastLogUnixNano      *atomic.Int64
+}
+
+func newSealedLoadTimingStats() *sealedLoadTimingStats {
+	return &sealedLoadTimingStats{
+		count:              atomic.NewInt64(0),
+		totalStateLock:     atomic.NewInt64(0),
+		totalPoolWait:      atomic.NewInt64(0),
+		totalCgoLoad:       atomic.NewInt64(0),
+		totalSyncJSONStats: atomic.NewInt64(0),
+		totalPatchEntry:    atomic.NewInt64(0),
+		totalSealedLoad:    atomic.NewInt64(0),
+		maxStateLock:       atomic.NewInt64(0),
+		maxPoolWait:        atomic.NewInt64(0),
+		maxCgoLoad:         atomic.NewInt64(0),
+		maxSyncJSONStats:   atomic.NewInt64(0),
+		maxPatchEntry:      atomic.NewInt64(0),
+		maxSealedLoad:      atomic.NewInt64(0),
+		lastLogUnixNano:    atomic.NewInt64(time.Now().UnixNano()),
+	}
 }
 
 func newSegmentLoadTimingStats() *segmentLoadTimingStats {
@@ -204,6 +241,68 @@ func newBloomFilterLoadTimingStats() *bloomFilterLoadTimingStats {
 		maxBloomFilterLoad:   atomic.NewInt64(0),
 		lastLogUnixNano:      atomic.NewInt64(time.Now().UnixNano()),
 	}
+}
+
+func (s *sealedLoadTimingStats) record(stateLockDur, poolWaitDur, cgoLoadDur, syncJSONStatsDur, patchEntryDur, totalDur time.Duration) {
+	s.count.Inc()
+	s.totalStateLock.Add(int64(stateLockDur))
+	s.totalPoolWait.Add(int64(poolWaitDur))
+	s.totalCgoLoad.Add(int64(cgoLoadDur))
+	s.totalSyncJSONStats.Add(int64(syncJSONStatsDur))
+	s.totalPatchEntry.Add(int64(patchEntryDur))
+	s.totalSealedLoad.Add(int64(totalDur))
+	updateMaxDuration(s.maxStateLock, stateLockDur)
+	updateMaxDuration(s.maxPoolWait, poolWaitDur)
+	updateMaxDuration(s.maxCgoLoad, cgoLoadDur)
+	updateMaxDuration(s.maxSyncJSONStats, syncJSONStatsDur)
+	updateMaxDuration(s.maxPatchEntry, patchEntryDur)
+	updateMaxDuration(s.maxSealedLoad, totalDur)
+
+	now := time.Now()
+	last := s.lastLogUnixNano.Load()
+	if now.UnixNano()-last < int64(requestResourceTimingLogInterval) {
+		return
+	}
+	if !s.lastLogUnixNano.CompareAndSwap(last, now.UnixNano()) {
+		return
+	}
+
+	count := s.count.Swap(0)
+	totalStateLock := s.totalStateLock.Swap(0)
+	totalPoolWait := s.totalPoolWait.Swap(0)
+	totalCgoLoad := s.totalCgoLoad.Swap(0)
+	totalSyncJSONStats := s.totalSyncJSONStats.Swap(0)
+	totalPatchEntry := s.totalPatchEntry.Swap(0)
+	totalSealedLoad := s.totalSealedLoad.Swap(0)
+	maxStateLock := s.maxStateLock.Swap(0)
+	maxPoolWait := s.maxPoolWait.Swap(0)
+	maxCgoLoad := s.maxCgoLoad.Swap(0)
+	maxSyncJSONStats := s.maxSyncJSONStats.Swap(0)
+	maxPatchEntry := s.maxPatchEntry.Swap(0)
+	maxSealedLoad := s.maxSealedLoad.Swap(0)
+	if count == 0 {
+		return
+	}
+
+	pool := GetLoadPool()
+	log.Warn("sealed segment load timing stats",
+		zap.Int64("count", count),
+		zap.Duration("avgStateLockDur", avgDuration(totalStateLock, count)),
+		zap.Duration("avgPoolWaitDur", avgDuration(totalPoolWait, count)),
+		zap.Duration("avgCgoLoadDur", avgDuration(totalCgoLoad, count)),
+		zap.Duration("avgSyncJSONStatsDur", avgDuration(totalSyncJSONStats, count)),
+		zap.Duration("avgPatchEntryDur", avgDuration(totalPatchEntry, count)),
+		zap.Duration("avgTotalDur", avgDuration(totalSealedLoad, count)),
+		zap.Duration("maxStateLockDur", time.Duration(maxStateLock)),
+		zap.Duration("maxPoolWaitDur", time.Duration(maxPoolWait)),
+		zap.Duration("maxCgoLoadDur", time.Duration(maxCgoLoad)),
+		zap.Duration("maxSyncJSONStatsDur", time.Duration(maxSyncJSONStats)),
+		zap.Duration("maxPatchEntryDur", time.Duration(maxPatchEntry)),
+		zap.Duration("maxTotalDur", time.Duration(maxSealedLoad)),
+		zap.Int("loadPoolCap", pool.Cap()),
+		zap.Int("loadPoolRunning", pool.Running()),
+		zap.Int("loadPoolWaiting", pool.Waiting()),
+	)
 }
 
 func (s *segmentLoadTimingStats) record(loadDataDur, deltaLogDur, pkCandidateDur, putDur, notifyDur, totalDur time.Duration) {
@@ -1398,7 +1497,9 @@ func separateLoadInfoV2(loadInfo *querypb.SegmentLoadInfo, schema *schemapb.Coll
 func (loader *segmentLoader) loadSealedSegment(ctx context.Context, loadInfo *querypb.SegmentLoadInfo, segment *LocalSegment) (err error) {
 	// TODO: we should create a transaction-like api to load segment for segment interface,
 	// but not do many things in segment loader.
+	loadStart := time.Now()
 	stateLockGuard, err := segment.StartLoadData()
+	stateLockDur := time.Since(loadStart)
 	// segment can not do load now.
 	if err != nil {
 		return err
@@ -1406,7 +1507,12 @@ func (loader *segmentLoader) loadSealedSegment(ctx context.Context, loadInfo *qu
 	if stateLockGuard == nil {
 		return nil
 	}
+	var poolWaitDur time.Duration
+	var cgoLoadDur time.Duration
+	var syncJSONStatsDur time.Duration
+	var patchEntryNumberSpan time.Duration
 	defer func() {
+		sealedLoadTiming.record(stateLockDur, poolWaitDur, cgoLoadDur, syncJSONStatsDur, patchEntryNumberSpan, time.Since(loadStart))
 		if err != nil {
 			// Release partial loaded segment data if load failed.
 			segment.ReleaseSegmentData()
@@ -1425,10 +1531,19 @@ func (loader *segmentLoader) loadSealedSegment(ctx context.Context, loadInfo *qu
 		zap.Int64s("unindexed text fields", lo.Keys(unindexedTextFields)),
 		zap.Int64s("indexed json key fields", lo.Keys(jsonKeyStats)),
 	)
+	submitStart := time.Now()
 	_, err = GetLoadPool().Submit(func() (any, error) {
-		if err = segment.Load(ctx); err != nil {
+		poolWaitDur = time.Since(submitStart)
+		cgoLoadStart := time.Now()
+		if err = segment.csegment.Load(ctx); err != nil {
+			cgoLoadDur = time.Since(cgoLoadStart)
 			return struct{}{}, errors.Wrap(err, "At Load")
 		}
+		cgoLoadDur = time.Since(cgoLoadStart)
+
+		syncJSONStatsStart := time.Now()
+		segment.syncFieldJSONStatsFromLoadInfo(ctx, segment.LoadInfo())
+		syncJSONStatsDur = time.Since(syncJSONStatsStart)
 
 		return struct{}{}, nil
 	}).Await()
@@ -1449,12 +1564,15 @@ func (loader *segmentLoader) loadSealedSegment(ctx context.Context, loadInfo *qu
 	// 4. rectify entries number for binlog in very rare cases
 	// https://github.com/milvus-io/milvus/23654
 	// legacy entry num = 0
+	patchEntryStart := time.Now()
 	if err := loader.patchEntryNumber(ctx, segment, loadInfo); err != nil {
 		return err
 	}
-	patchEntryNumberSpan := tr.RecordSpan()
+	patchEntryNumberSpan = time.Since(patchEntryStart)
+	sealedLoadSpan := tr.RecordSpan()
 	log.Info("Finish loading segment",
 		zap.Duration("patchEntryNumberSpan", patchEntryNumberSpan),
+		zap.Duration("sealedLoadSpan", sealedLoadSpan),
 	)
 	return nil
 }

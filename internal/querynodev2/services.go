@@ -25,6 +25,7 @@ import (
 
 	"github.com/samber/lo"
 	"go.opentelemetry.io/otel/trace"
+	"go.uber.org/atomic"
 	"go.uber.org/zap"
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/protobuf/proto"
@@ -63,6 +64,232 @@ import (
 	"github.com/milvus-io/milvus/pkg/v3/util/tsoutil"
 	"github.com/milvus-io/milvus/pkg/v3/util/typeutil"
 )
+
+const queryNodeLoadSegmentsTimingLogInterval = 5 * time.Second
+
+var queryNodeLoadSegmentsTiming = newQueryNodeLoadSegmentsTimingStats()
+
+type queryNodeLoadSegmentsTimingPhase struct {
+	healthCheckDur        time.Duration
+	indexCheckDur         time.Duration
+	fallbackBinlogDur     time.Duration
+	transferDur           time.Duration
+	collectionDur         time.Duration
+	scopeHandlerDur       time.Duration
+	loaderDur             time.Duration
+	collectionRefDur      time.Duration
+	publishMetricsDur     time.Duration
+	updateDistributionDur time.Duration
+	totalDur              time.Duration
+}
+
+type queryNodeLoadSegmentsTimingStats struct {
+	count              *atomic.Int64
+	segmentCount       *atomic.Int64
+	transferCount      *atomic.Int64
+	defaultScopeCount  *atomic.Int64
+	deltaScopeCount    *atomic.Int64
+	indexScopeCount    *atomic.Int64
+	statsScopeCount    *atomic.Int64
+	reopenScopeCount   *atomic.Int64
+	totalHealthCheck   *atomic.Int64
+	totalIndexCheck    *atomic.Int64
+	totalFallback      *atomic.Int64
+	totalTransfer      *atomic.Int64
+	totalCollection    *atomic.Int64
+	totalScopeHandler  *atomic.Int64
+	totalLoader        *atomic.Int64
+	totalCollectionRef *atomic.Int64
+	totalMetrics       *atomic.Int64
+	totalUpdateDist    *atomic.Int64
+	totalRequest       *atomic.Int64
+	maxHealthCheck     *atomic.Int64
+	maxIndexCheck      *atomic.Int64
+	maxFallback        *atomic.Int64
+	maxTransfer        *atomic.Int64
+	maxCollection      *atomic.Int64
+	maxScopeHandler    *atomic.Int64
+	maxLoader          *atomic.Int64
+	maxCollectionRef   *atomic.Int64
+	maxMetrics         *atomic.Int64
+	maxUpdateDist      *atomic.Int64
+	maxRequest         *atomic.Int64
+	lastLogUnixNano    *atomic.Int64
+}
+
+func newQueryNodeLoadSegmentsTimingStats() *queryNodeLoadSegmentsTimingStats {
+	return &queryNodeLoadSegmentsTimingStats{
+		count:              atomic.NewInt64(0),
+		segmentCount:       atomic.NewInt64(0),
+		transferCount:      atomic.NewInt64(0),
+		defaultScopeCount:  atomic.NewInt64(0),
+		deltaScopeCount:    atomic.NewInt64(0),
+		indexScopeCount:    atomic.NewInt64(0),
+		statsScopeCount:    atomic.NewInt64(0),
+		reopenScopeCount:   atomic.NewInt64(0),
+		totalHealthCheck:   atomic.NewInt64(0),
+		totalIndexCheck:    atomic.NewInt64(0),
+		totalFallback:      atomic.NewInt64(0),
+		totalTransfer:      atomic.NewInt64(0),
+		totalCollection:    atomic.NewInt64(0),
+		totalScopeHandler:  atomic.NewInt64(0),
+		totalLoader:        atomic.NewInt64(0),
+		totalCollectionRef: atomic.NewInt64(0),
+		totalMetrics:       atomic.NewInt64(0),
+		totalUpdateDist:    atomic.NewInt64(0),
+		totalRequest:       atomic.NewInt64(0),
+		maxHealthCheck:     atomic.NewInt64(0),
+		maxIndexCheck:      atomic.NewInt64(0),
+		maxFallback:        atomic.NewInt64(0),
+		maxTransfer:        atomic.NewInt64(0),
+		maxCollection:      atomic.NewInt64(0),
+		maxScopeHandler:    atomic.NewInt64(0),
+		maxLoader:          atomic.NewInt64(0),
+		maxCollectionRef:   atomic.NewInt64(0),
+		maxMetrics:         atomic.NewInt64(0),
+		maxUpdateDist:      atomic.NewInt64(0),
+		maxRequest:         atomic.NewInt64(0),
+		lastLogUnixNano:    atomic.NewInt64(time.Now().UnixNano()),
+	}
+}
+
+func updateQueryNodeLoadSegmentsMaxDuration(max *atomic.Int64, value time.Duration) {
+	for {
+		old := max.Load()
+		if int64(value) <= old {
+			return
+		}
+		if max.CompareAndSwap(old, int64(value)) {
+			return
+		}
+	}
+}
+
+func avgQueryNodeLoadSegmentsDuration(total int64, count int64) time.Duration {
+	if count == 0 {
+		return 0
+	}
+	return time.Duration(total / count)
+}
+
+func (s *queryNodeLoadSegmentsTimingStats) record(loadScope querypb.LoadScope, needTransfer bool, segmentNum int, timing queryNodeLoadSegmentsTimingPhase) {
+	s.count.Inc()
+	s.segmentCount.Add(int64(segmentNum))
+	if needTransfer {
+		s.transferCount.Inc()
+	}
+	switch loadScope {
+	case querypb.LoadScope_Delta:
+		s.deltaScopeCount.Inc()
+	case querypb.LoadScope_Index:
+		s.indexScopeCount.Inc()
+	case querypb.LoadScope_Stats:
+		s.statsScopeCount.Inc()
+	case querypb.LoadScope_Reopen:
+		s.reopenScopeCount.Inc()
+	default:
+		s.defaultScopeCount.Inc()
+	}
+
+	s.totalHealthCheck.Add(int64(timing.healthCheckDur))
+	s.totalIndexCheck.Add(int64(timing.indexCheckDur))
+	s.totalFallback.Add(int64(timing.fallbackBinlogDur))
+	s.totalTransfer.Add(int64(timing.transferDur))
+	s.totalCollection.Add(int64(timing.collectionDur))
+	s.totalScopeHandler.Add(int64(timing.scopeHandlerDur))
+	s.totalLoader.Add(int64(timing.loaderDur))
+	s.totalCollectionRef.Add(int64(timing.collectionRefDur))
+	s.totalMetrics.Add(int64(timing.publishMetricsDur))
+	s.totalUpdateDist.Add(int64(timing.updateDistributionDur))
+	s.totalRequest.Add(int64(timing.totalDur))
+	updateQueryNodeLoadSegmentsMaxDuration(s.maxHealthCheck, timing.healthCheckDur)
+	updateQueryNodeLoadSegmentsMaxDuration(s.maxIndexCheck, timing.indexCheckDur)
+	updateQueryNodeLoadSegmentsMaxDuration(s.maxFallback, timing.fallbackBinlogDur)
+	updateQueryNodeLoadSegmentsMaxDuration(s.maxTransfer, timing.transferDur)
+	updateQueryNodeLoadSegmentsMaxDuration(s.maxCollection, timing.collectionDur)
+	updateQueryNodeLoadSegmentsMaxDuration(s.maxScopeHandler, timing.scopeHandlerDur)
+	updateQueryNodeLoadSegmentsMaxDuration(s.maxLoader, timing.loaderDur)
+	updateQueryNodeLoadSegmentsMaxDuration(s.maxCollectionRef, timing.collectionRefDur)
+	updateQueryNodeLoadSegmentsMaxDuration(s.maxMetrics, timing.publishMetricsDur)
+	updateQueryNodeLoadSegmentsMaxDuration(s.maxUpdateDist, timing.updateDistributionDur)
+	updateQueryNodeLoadSegmentsMaxDuration(s.maxRequest, timing.totalDur)
+
+	now := time.Now()
+	last := s.lastLogUnixNano.Load()
+	if now.UnixNano()-last < int64(queryNodeLoadSegmentsTimingLogInterval) {
+		return
+	}
+	if !s.lastLogUnixNano.CompareAndSwap(last, now.UnixNano()) {
+		return
+	}
+
+	count := s.count.Swap(0)
+	segmentCount := s.segmentCount.Swap(0)
+	transferCount := s.transferCount.Swap(0)
+	defaultScopeCount := s.defaultScopeCount.Swap(0)
+	deltaScopeCount := s.deltaScopeCount.Swap(0)
+	indexScopeCount := s.indexScopeCount.Swap(0)
+	statsScopeCount := s.statsScopeCount.Swap(0)
+	reopenScopeCount := s.reopenScopeCount.Swap(0)
+	totalHealthCheck := s.totalHealthCheck.Swap(0)
+	totalIndexCheck := s.totalIndexCheck.Swap(0)
+	totalFallback := s.totalFallback.Swap(0)
+	totalTransfer := s.totalTransfer.Swap(0)
+	totalCollection := s.totalCollection.Swap(0)
+	totalScopeHandler := s.totalScopeHandler.Swap(0)
+	totalLoader := s.totalLoader.Swap(0)
+	totalCollectionRef := s.totalCollectionRef.Swap(0)
+	totalMetrics := s.totalMetrics.Swap(0)
+	totalUpdateDist := s.totalUpdateDist.Swap(0)
+	totalRequest := s.totalRequest.Swap(0)
+	maxHealthCheck := s.maxHealthCheck.Swap(0)
+	maxIndexCheck := s.maxIndexCheck.Swap(0)
+	maxFallback := s.maxFallback.Swap(0)
+	maxTransfer := s.maxTransfer.Swap(0)
+	maxCollection := s.maxCollection.Swap(0)
+	maxScopeHandler := s.maxScopeHandler.Swap(0)
+	maxLoader := s.maxLoader.Swap(0)
+	maxCollectionRef := s.maxCollectionRef.Swap(0)
+	maxMetrics := s.maxMetrics.Swap(0)
+	maxUpdateDist := s.maxUpdateDist.Swap(0)
+	maxRequest := s.maxRequest.Swap(0)
+	if count == 0 {
+		return
+	}
+
+	log.Warn("querynode load segments timing stats",
+		zap.Int64("requestCount", count),
+		zap.Int64("segmentCount", segmentCount),
+		zap.Int64("transferCount", transferCount),
+		zap.Int64("defaultScopeCount", defaultScopeCount),
+		zap.Int64("deltaScopeCount", deltaScopeCount),
+		zap.Int64("indexScopeCount", indexScopeCount),
+		zap.Int64("statsScopeCount", statsScopeCount),
+		zap.Int64("reopenScopeCount", reopenScopeCount),
+		zap.Duration("avgHealthCheckDur", avgQueryNodeLoadSegmentsDuration(totalHealthCheck, count)),
+		zap.Duration("avgIndexCheckDur", avgQueryNodeLoadSegmentsDuration(totalIndexCheck, count)),
+		zap.Duration("avgFallbackBinlogDur", avgQueryNodeLoadSegmentsDuration(totalFallback, count)),
+		zap.Duration("avgTransferDur", avgQueryNodeLoadSegmentsDuration(totalTransfer, count)),
+		zap.Duration("avgCollectionDur", avgQueryNodeLoadSegmentsDuration(totalCollection, count)),
+		zap.Duration("avgScopeHandlerDur", avgQueryNodeLoadSegmentsDuration(totalScopeHandler, count)),
+		zap.Duration("avgLoaderDur", avgQueryNodeLoadSegmentsDuration(totalLoader, count)),
+		zap.Duration("avgCollectionRefDur", avgQueryNodeLoadSegmentsDuration(totalCollectionRef, count)),
+		zap.Duration("avgPublishMetricsDur", avgQueryNodeLoadSegmentsDuration(totalMetrics, count)),
+		zap.Duration("avgUpdateDistributionDur", avgQueryNodeLoadSegmentsDuration(totalUpdateDist, count)),
+		zap.Duration("avgTotalDur", avgQueryNodeLoadSegmentsDuration(totalRequest, count)),
+		zap.Duration("maxHealthCheckDur", time.Duration(maxHealthCheck)),
+		zap.Duration("maxIndexCheckDur", time.Duration(maxIndexCheck)),
+		zap.Duration("maxFallbackBinlogDur", time.Duration(maxFallback)),
+		zap.Duration("maxTransferDur", time.Duration(maxTransfer)),
+		zap.Duration("maxCollectionDur", time.Duration(maxCollection)),
+		zap.Duration("maxScopeHandlerDur", time.Duration(maxScopeHandler)),
+		zap.Duration("maxLoaderDur", time.Duration(maxLoader)),
+		zap.Duration("maxCollectionRefDur", time.Duration(maxCollectionRef)),
+		zap.Duration("maxPublishMetricsDur", time.Duration(maxMetrics)),
+		zap.Duration("maxUpdateDistributionDur", time.Duration(maxUpdateDist)),
+		zap.Duration("maxTotalDur", time.Duration(maxRequest)),
+	)
+}
 
 // GetComponentStates returns information about whether the node is healthy
 func (node *QueryNode) GetComponentStates(ctx context.Context, req *milvuspb.GetComponentStatesRequest) (*milvuspb.ComponentStates, error) {
@@ -431,7 +658,18 @@ func (node *QueryNode) LoadPartitions(ctx context.Context, req *querypb.LoadPart
 
 // LoadSegments load historical data into query node, historical data can be vector data or index
 func (node *QueryNode) LoadSegments(ctx context.Context, req *querypb.LoadSegmentsRequest) (*commonpb.Status, error) {
-	defer node.updateDistributionModifyTS()
+	handlerStart := time.Now()
+	timing := queryNodeLoadSegmentsTimingPhase{}
+	loadScope := req.GetLoadScope()
+	needTransfer := req.GetNeedTransfer()
+	segmentNum := len(req.GetInfos())
+	defer func() {
+		updateDistributionStart := time.Now()
+		node.updateDistributionModifyTS()
+		timing.updateDistributionDur = time.Since(updateDistributionStart)
+		timing.totalDur = time.Since(handlerStart)
+		queryNodeLoadSegmentsTiming.record(loadScope, needTransfer, segmentNum, timing)
+	}()
 	segment := req.GetInfos()[0]
 
 	log := log.Ctx(ctx).With(
@@ -449,18 +687,25 @@ func (node *QueryNode) LoadSegments(ctx context.Context, req *querypb.LoadSegmen
 		zap.Bool("needTransfer", req.GetNeedTransfer()),
 		zap.String("loadScope", req.GetLoadScope().String()))
 	// check node healthy
+	healthCheckStart := time.Now()
 	if err := node.lifetime.Add(merr.IsHealthy); err != nil {
+		timing.healthCheckDur = time.Since(healthCheckStart)
 		return merr.Status(err), nil
 	}
+	timing.healthCheckDur = time.Since(healthCheckStart)
 	defer node.lifetime.Done()
 
 	// check index
+	indexCheckStart := time.Now()
 	if len(req.GetIndexInfoList()) == 0 {
+		timing.indexCheckDur = time.Since(indexCheckStart)
 		err := merr.WrapErrIndexNotFoundForCollection(req.GetSchema().GetName())
 		return merr.Status(err), nil
 	}
+	timing.indexCheckDur = time.Since(indexCheckStart)
 
 	// fallback binlog memory size to log size when it is zero
+	fallbackStart := time.Now()
 	fallbackBinlogMemorySize := func(binlogs []*datapb.FieldBinlog) {
 		for _, insertBinlogs := range binlogs {
 			for _, b := range insertBinlogs.GetBinlogs() {
@@ -475,11 +720,14 @@ func (node *QueryNode) LoadSegments(ctx context.Context, req *querypb.LoadSegmen
 		fallbackBinlogMemorySize(s.GetStatslogs())
 		fallbackBinlogMemorySize(s.GetDeltalogs())
 	}
+	timing.fallbackBinlogDur = time.Since(fallbackStart)
 
 	// Delegates request to workers
 	if req.GetNeedTransfer() {
+		transferStart := time.Now()
 		delegator, ok := node.delegators.Get(segment.GetInsertChannel())
 		if !ok {
+			timing.transferDur = time.Since(transferStart)
 			msg := "failed to load segments, delegator not found"
 			log.Warn(msg)
 			err := merr.WrapErrChannelNotFound(segment.GetInsertChannel())
@@ -497,15 +745,19 @@ func (node *QueryNode) LoadSegments(ctx context.Context, req *querypb.LoadSegmen
 		req.NeedTransfer = false
 		err := delegator.LoadSegments(ctx, req)
 		if err != nil {
+			timing.transferDur = time.Since(transferStart)
 			log.Warn("delegator failed to load segments", zap.Error(err))
 			return merr.Status(err), nil
 		}
+		timing.transferDur = time.Since(transferStart)
 
 		return merr.Success(), nil
 	}
 
+	collectionStart := time.Now()
 	err := node.manager.Collection.PutOrRef(req.GetCollectionID(), req.GetSchema(),
 		node.composeIndexMeta(ctx, req.GetIndexInfoList(), req.GetSchema()), req.GetLoadMeta())
+	timing.collectionDur = time.Since(collectionStart)
 	if err != nil {
 		log.Warn("failed to ref collection", zap.Error(err))
 		return merr.Status(err), nil
@@ -514,35 +766,57 @@ func (node *QueryNode) LoadSegments(ctx context.Context, req *querypb.LoadSegmen
 
 	switch req.GetLoadScope() {
 	case querypb.LoadScope_Delta:
+		scopeHandlerStart := time.Now()
+		defer func() {
+			timing.scopeHandlerDur = time.Since(scopeHandlerStart)
+		}()
 		return node.loadDeltaLogs(ctx, req), nil
 	case querypb.LoadScope_Index:
+		scopeHandlerStart := time.Now()
+		defer func() {
+			timing.scopeHandlerDur = time.Since(scopeHandlerStart)
+		}()
 		return node.loadIndex(ctx, req), nil
 	case querypb.LoadScope_Stats:
+		scopeHandlerStart := time.Now()
+		defer func() {
+			timing.scopeHandlerDur = time.Since(scopeHandlerStart)
+		}()
 		return node.reopenSegments(ctx, req), nil
 	case querypb.LoadScope_Reopen:
+		scopeHandlerStart := time.Now()
+		defer func() {
+			timing.scopeHandlerDur = time.Since(scopeHandlerStart)
+		}()
 		return node.reopenSegments(ctx, req), nil
 	}
 
 	// Actual load segment
 	log.Info("start to load segments...")
+	loaderStart := time.Now()
 	loaded, err := node.loader.Load(ctx,
 		req.GetCollectionID(),
 		segments.SegmentTypeSealed,
 		req.GetVersion(),
 		req.GetInfos()...,
 	)
+	timing.loaderDur = time.Since(loaderStart)
 	if err != nil {
 		return merr.Status(err), nil
 	}
 
+	collectionRefStart := time.Now()
 	node.manager.Collection.Ref(req.GetCollectionID(), uint32(len(loaded)))
+	timing.collectionRefDur = time.Since(collectionRefStart)
 
 	log.Info("load segments done...",
 		zap.Int64s("segments", lo.Map(loaded, func(s segments.Segment, _ int) int64 { return s.ID() })))
 
 	// Publish filesystem metrics after load task completion
 	// Use default filesystem (empty path) for load tasks
+	publishMetricsStart := time.Now()
 	storagev2.PublishDefaultFilesystemMetrics()
+	timing.publishMetricsDur = time.Since(publishMetricsStart)
 
 	return merr.Success(), nil
 }
