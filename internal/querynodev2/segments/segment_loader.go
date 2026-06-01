@@ -179,6 +179,7 @@ func NewLoader(
 		loadingSegments:           typeutil.NewConcurrentMap[int64, *loadResult](),
 		committedResourceNotifier: syncutil.NewVersionedNotifier(),
 		duf:                       duf,
+		totalMemory:               hardware.GetMemoryCount(),
 	}
 
 	return loader
@@ -223,6 +224,8 @@ type segmentLoader struct {
 	committedResourceNotifier *syncutil.VersionedNotifier
 
 	duf *diskUsageFetcher
+
+	totalMemory uint64
 }
 
 var _ Loader = (*segmentLoader)(nil)
@@ -516,7 +519,10 @@ func (loader *segmentLoader) requestResource(ctx context.Context, infos ...*quer
 	defer loader.mut.Unlock()
 
 	physicalMemoryUsage := hardware.GetUsedMemoryCount()
-	totalMemory := hardware.GetMemoryCount()
+	totalMemory := loader.totalMemory
+	if totalMemory == 0 {
+		totalMemory = hardware.GetMemoryCount()
+	}
 
 	physicalDiskUsage, err := loader.duf.GetDiskUsage()
 	if err != nil {

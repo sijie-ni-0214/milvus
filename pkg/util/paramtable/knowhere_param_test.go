@@ -76,6 +76,25 @@ func TestKnowhereConfig_GetIndexParam(t *testing.T) {
 	}
 }
 
+func TestKnowhereConfig_GetIndexParamCacheInvalidation(t *testing.T) {
+	bt := NewBaseTable(SkipRemote(true))
+	cfg := &knowhereConfig{}
+	cfg.init(bt)
+
+	key := "knowhere.HNSW.load.test_param"
+	valStr, _ := json.Marshal(1)
+	bt.Save(key, string(valStr))
+
+	result := cfg.getIndexParam("HNSW", LoadStage)
+	assert.Equal(t, "1", result["test_param"])
+
+	valStr, _ = json.Marshal(2)
+	bt.Save(key, string(valStr))
+
+	result = cfg.getIndexParam("HNSW", LoadStage)
+	assert.Equal(t, "2", result["test_param"])
+}
+
 func TestKnowhereConfig_GetRuntimeParameter(t *testing.T) {
 	cfg := &knowhereConfig{}
 
