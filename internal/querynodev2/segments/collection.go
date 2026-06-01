@@ -23,6 +23,7 @@ import (
 
 	"github.com/samber/lo"
 	"go.uber.org/atomic"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/milvus-io/milvus-proto/go-api/v3/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v3/schemapb"
@@ -102,11 +103,49 @@ func (m *collectionManager) Get(collectionID int64) *Collection {
 	return m.collections[collectionID]
 }
 
-func (m *collectionManager) PutOrRef(collectionID int64, schema *schemapb.CollectionSchema, meta *segcorepb.CollectionIndexMeta, loadMeta *querypb.LoadMetaInfo) error {
+func (m *collectionManager) refExistingCollectionIfUnchanged(collectionID int64, logicalSchemaVersion uint64, schemaBarrierTs uint64, meta *segcorepb.CollectionIndexMeta) bool {
+	m.mut.RLock()
+	collection, ok := m.collections[collectionID]
+	if !ok {
+		m.mut.RUnlock()
+		return false
+	}
+	if _, shouldUpdate := prepareCollectionSchemaUpdate(collection, logicalSchemaVersion, schemaBarrierTs); shouldUpdate {
+		m.mut.RUnlock()
+		return false
+	}
+	currentMeta := collection.ccollection.IndexMeta()
+	m.mut.RUnlock()
+
+	if meta != nil && !proto.Equal(currentMeta, meta) {
+		return false
+	}
+
 	m.mut.Lock()
 	defer m.mut.Unlock()
+
+	if current, ok := m.collections[collectionID]; ok && current == collection {
+		if _, shouldUpdate := prepareCollectionSchemaUpdate(current, logicalSchemaVersion, schemaBarrierTs); shouldUpdate {
+			return false
+		}
+		if meta != nil && !proto.Equal(current.ccollection.IndexMeta(), meta) {
+			return false
+		}
+		current.Ref(1)
+		return true
+	}
+	return false
+}
+
+func (m *collectionManager) PutOrRef(collectionID int64, schema *schemapb.CollectionSchema, meta *segcorepb.CollectionIndexMeta, loadMeta *querypb.LoadMetaInfo) error {
 	logicalSchemaVersion := getLoadMetaSchemaVersion(schema, loadMeta)
 	schemaBarrierTs := loadMeta.GetSchemaBarrierTs()
+	if m.refExistingCollectionIfUnchanged(collectionID, logicalSchemaVersion, schemaBarrierTs, meta) {
+		return nil
+	}
+
+	m.mut.Lock()
+	defer m.mut.Unlock()
 	if collection, ok := m.collections[collectionID]; ok {
 		// Existing collections may be reached by a later load result or by a
 		// same-version properties refresh. Keep the Go-side logical schema version
@@ -125,9 +164,10 @@ func (m *collectionManager) PutOrRef(collectionID int64, schema *schemapb.Collec
 				mlog.Any("schema", schema),
 			)
 		}
-		// Always update index meta to ensure newly indexed fields are visible
-		// for search plan creation (CollectionIndexMeta::HasField check).
-		if meta != nil {
+		// Update index meta only when it really changes. LoadSegment recovery
+		// sends the same collection-level meta for many segments, and SetIndexMeta
+		// runs under the collection manager lock.
+		if meta != nil && !proto.Equal(collection.ccollection.IndexMeta(), meta) {
 			if err := collection.ccollection.UpdateIndexMeta(meta); err != nil {
 				return err
 			}

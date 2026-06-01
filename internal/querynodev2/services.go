@@ -19,6 +19,7 @@ package querynodev2
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strconv"
 	"sync"
 	"time"
@@ -32,6 +33,7 @@ import (
 	"github.com/milvus-io/milvus-proto/go-api/v3/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v3/milvuspb"
 	"github.com/milvus-io/milvus-proto/go-api/v3/msgpb"
+	"github.com/milvus-io/milvus-proto/go-api/v3/schemapb"
 	"github.com/milvus-io/milvus/internal/distributed/streaming"
 	"github.com/milvus-io/milvus/internal/flushcommon/syncmgr"
 	"github.com/milvus-io/milvus/internal/querynodev2/delegator"
@@ -51,8 +53,10 @@ import (
 	"github.com/milvus-io/milvus/pkg/v3/metrics"
 	"github.com/milvus-io/milvus/pkg/v3/mlog"
 	"github.com/milvus-io/milvus/pkg/v3/proto/datapb"
+	"github.com/milvus-io/milvus/pkg/v3/proto/indexpb"
 	"github.com/milvus-io/milvus/pkg/v3/proto/internalpb"
 	"github.com/milvus-io/milvus/pkg/v3/proto/querypb"
+	"github.com/milvus-io/milvus/pkg/v3/proto/segcorepb"
 	"github.com/milvus-io/milvus/pkg/v3/util/commonpbutil"
 	"github.com/milvus-io/milvus/pkg/v3/util/conc"
 	"github.com/milvus-io/milvus/pkg/v3/util/contextutil"
@@ -172,6 +176,45 @@ func (node *QueryNode) GetStatistics(ctx context.Context, req *querypb.GetStatis
 	log.Debug(ctx, "reduce statistic result done")
 
 	return ret, nil
+}
+
+func (node *QueryNode) composeIndexMeta(ctx context.Context, indexInfos []*indexpb.IndexInfo, schema *schemapb.CollectionSchema) *segcorepb.CollectionIndexMeta {
+	fieldIndexMetas := make([]*segcorepb.FieldIndexMeta, 0)
+	for _, info := range indexInfos {
+		fieldIndexMetas = append(fieldIndexMetas, &segcorepb.FieldIndexMeta{
+			CollectionID:    info.GetCollectionID(),
+			FieldID:         info.GetFieldID(),
+			IndexName:       info.GetIndexName(),
+			TypeParams:      info.GetTypeParams(),
+			IndexParams:     info.GetIndexParams(),
+			IsAutoIndex:     info.GetIsAutoIndex(),
+			UserIndexParams: info.GetUserIndexParams(),
+		})
+	}
+	sort.Slice(fieldIndexMetas, func(i, j int) bool {
+		left, right := fieldIndexMetas[i], fieldIndexMetas[j]
+		if left.GetCollectionID() != right.GetCollectionID() {
+			return left.GetCollectionID() < right.GetCollectionID()
+		}
+		if left.GetFieldID() != right.GetFieldID() {
+			return left.GetFieldID() < right.GetFieldID()
+		}
+		return left.GetIndexName() < right.GetIndexName()
+	})
+	sizePerRecord, err := typeutil.EstimateSizePerRecord(schema)
+	maxIndexRecordPerSegment := int64(0)
+	if err != nil || sizePerRecord == 0 {
+		mlog.Warn(ctx, "failed to transfer segment size to collection, because failed to estimate size per record", mlog.Err(err))
+	} else {
+		threshold := paramtable.Get().DataCoordCfg.SegmentMaxSize.GetAsFloat() * 1024 * 1024
+		proportion := paramtable.Get().DataCoordCfg.SegmentSealProportion.GetAsFloat()
+		maxIndexRecordPerSegment = int64(threshold * proportion / float64(sizePerRecord))
+	}
+
+	return &segcorepb.CollectionIndexMeta{
+		IndexMetas:       fieldIndexMetas,
+		MaxIndexRowCount: maxIndexRecordPerSegment,
+	}
 }
 
 // WatchDmChannels create consumers on dmChannels to receive Incremental data，which is the important part of real-time query
