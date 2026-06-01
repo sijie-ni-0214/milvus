@@ -4,16 +4,19 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync"
 
 	"github.com/milvus-io/milvus-proto/go-api/v3/commonpb"
 	"github.com/milvus-io/milvus/pkg/v3/common"
+	"github.com/milvus-io/milvus/pkg/v3/config"
 	"github.com/milvus-io/milvus/pkg/v3/mlog"
 	"github.com/milvus-io/milvus/pkg/v3/util/hardware"
 )
 
 type knowhereConfig struct {
-	Enable     ParamItem  `refreshable:"true"`
-	IndexParam ParamGroup `refreshable:"true"`
+	Enable          ParamItem  `refreshable:"true"`
+	IndexParam      ParamGroup `refreshable:"true"`
+	indexParamCache sync.Map
 }
 
 const (
@@ -60,6 +63,12 @@ func (p *knowhereConfig) init(base *BaseTable) {
 		},
 	}
 	p.IndexParam.Init(base.mgr)
+	base.mgr.Dispatcher.RegisterForKeyPrefix(p.IndexParam.KeyPrefix, config.NewHandler("clear.knowhere.index.param.cache", func(event *config.Event) {
+		p.indexParamCache.Range(func(key, value any) bool {
+			p.indexParamCache.Delete(key)
+			return true
+		})
+	}))
 
 	p.Enable = ParamItem{
 		Key:          "knowhere.enable",
@@ -72,6 +81,11 @@ func (p *knowhereConfig) init(base *BaseTable) {
 }
 
 func (p *knowhereConfig) getIndexParam(indexType string, stage string) map[string]string {
+	cacheKey := indexType + "." + stage
+	if cached, ok := p.indexParamCache.Load(cacheKey); ok {
+		return cached.(map[string]string)
+	}
+
 	matchedParam := make(map[string]string)
 
 	params := p.IndexParam.GetValue()
@@ -83,6 +97,9 @@ func (p *knowhereConfig) getIndexParam(indexType string, stage string) map[strin
 		}
 	}
 
+	if cached, loaded := p.indexParamCache.LoadOrStore(cacheKey, matchedParam); loaded {
+		return cached.(map[string]string)
+	}
 	return matchedParam
 }
 
