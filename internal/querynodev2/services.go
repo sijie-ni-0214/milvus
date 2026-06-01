@@ -19,6 +19,7 @@ package querynodev2
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strconv"
 	"sync"
 	"time"
@@ -408,6 +409,16 @@ func (node *QueryNode) composeIndexMeta(ctx context.Context, indexInfos []*index
 			UserIndexParams: info.GetUserIndexParams(),
 		})
 	}
+	sort.Slice(fieldIndexMetas, func(i, j int) bool {
+		left, right := fieldIndexMetas[i], fieldIndexMetas[j]
+		if left.GetCollectionID() != right.GetCollectionID() {
+			return left.GetCollectionID() < right.GetCollectionID()
+		}
+		if left.GetFieldID() != right.GetFieldID() {
+			return left.GetFieldID() < right.GetFieldID()
+		}
+		return left.GetIndexName() < right.GetIndexName()
+	})
 	sizePerRecord, err := typeutil.EstimateSizePerRecord(schema)
 	maxIndexRecordPerSegment := int64(0)
 	if err != nil || sizePerRecord == 0 {
