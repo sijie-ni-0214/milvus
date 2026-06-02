@@ -957,9 +957,22 @@ func (s *Server) postFlush(ctx context.Context, segmentID UniqueID) error {
 	}
 
 	if enableSortCompaction() {
+		statsTaskCh := getStatsTaskChSingleton()
 		select {
-		case getStatsTaskChSingleton() <- segmentID:
+		case statsTaskCh <- segmentID:
+		case <-ctx.Done():
+			return ctx.Err()
 		default:
+			log.WithRateGroup("datacoord.postFlush.statsTaskCh", 1, 60).
+				RatedWarn(1, "stats task channel is full, wait to enqueue sort compaction trigger",
+					zap.Int64("segmentID", segmentID),
+					zap.Int("queueLen", len(statsTaskCh)),
+					zap.Int("queueCap", cap(statsTaskCh)))
+			select {
+			case statsTaskCh <- segmentID:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
 		}
 	} else {
 		select {

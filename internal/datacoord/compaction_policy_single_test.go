@@ -83,6 +83,20 @@ func (s *SingleCompactionPolicySuite) TestTrigger() {
 	s.Equal(0, len(gotViews))
 }
 
+func (s *SingleCompactionPolicySuite) TestEnableWithSortCompaction() {
+	paramtable.Get().Save(paramtable.Get().DataCoordCfg.EnableCompaction.Key, "true")
+	paramtable.Get().Save(paramtable.Get().DataCoordCfg.EnableSortCompaction.Key, "true")
+	paramtable.Get().Save(paramtable.Get().DataCoordCfg.EnableAutoCompaction.Key, "false")
+	defer paramtable.Get().Reset(paramtable.Get().DataCoordCfg.EnableCompaction.Key)
+	defer paramtable.Get().Reset(paramtable.Get().DataCoordCfg.EnableSortCompaction.Key)
+	defer paramtable.Get().Reset(paramtable.Get().DataCoordCfg.EnableAutoCompaction.Key)
+
+	s.True(s.singlePolicy.Enable())
+
+	paramtable.Get().Save(paramtable.Get().DataCoordCfg.EnableSortCompaction.Key, "false")
+	s.False(s.singlePolicy.Enable())
+}
+
 func buildTestSegment(id int64,
 	collId int64,
 	level datapb.SegmentLevel,
@@ -219,6 +233,45 @@ func (s *SingleCompactionPolicySuite) TestSortCompaction() {
 	_, sortViews, _, err := s.singlePolicy.triggerOneCollection(context.TODO(), collID, false)
 	s.NoError(err)
 	s.Equal(3, len(sortViews))
+}
+
+func (s *SingleCompactionPolicySuite) TestSortCompactionTriggerCountLimitsInvisibleSegments() {
+	paramtable.Get().Save(paramtable.Get().DataCoordCfg.IndexBasedCompaction.Key, "false")
+	paramtable.Get().Save(paramtable.Get().DataCoordCfg.SortCompactionTriggerCount.Key, "2")
+	defer paramtable.Get().Reset(paramtable.Get().DataCoordCfg.IndexBasedCompaction.Key)
+	defer paramtable.Get().Reset(paramtable.Get().DataCoordCfg.SortCompactionTriggerCount.Key)
+
+	collID := int64(100)
+	coll := &collectionInfo{
+		ID:     collID,
+		Schema: newTestSchema(),
+	}
+	s.handler.EXPECT().GetCollection(mock.Anything, mock.Anything).Return(coll, nil)
+
+	segments := make(map[UniqueID]*SegmentInfo, 0)
+	for i := int64(1); i <= 3; i++ {
+		segments[i] = buildTestSegment(i, collID, datapb.SegmentLevel_L1, 0, 10000, 1, false, true)
+	}
+	for i := int64(4); i <= 6; i++ {
+		segments[i] = buildTestSegment(i, collID, datapb.SegmentLevel_L1, 0, 10000, 1, false, false)
+	}
+	segmentsInfo := &SegmentsInfo{
+		segments: segments,
+		secondaryIndexes: segmentInfoIndexes{
+			coll2Segments: map[UniqueID]map[UniqueID]*SegmentInfo{
+				collID: segments,
+			},
+		},
+	}
+
+	s.singlePolicy.meta = &meta{
+		compactionTaskMeta: newTestCompactionTaskMeta(s.T()),
+		segments:           segmentsInfo,
+	}
+
+	sortViews, err := s.singlePolicy.triggerSortCompaction(context.TODO(), 1, collID, 0)
+	s.NoError(err)
+	s.Equal(4, len(sortViews))
 }
 
 func (s *SingleCompactionPolicySuite) TestSegmentSortCompaction() {

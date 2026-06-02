@@ -48,7 +48,7 @@ func newSingleCompactionPolicy(meta *meta, allocator allocator.Allocator, handle
 }
 
 func (policy *singleCompactionPolicy) Enable() bool {
-	return Params.DataCoordCfg.EnableAutoCompaction.GetAsBool()
+	return Params.DataCoordCfg.EnableAutoCompaction.GetAsBool() || enableSortCompaction()
 }
 
 func (policy *singleCompactionPolicy) TriggerInline(_ context.Context) (map[CompactionTriggerType][]CompactionView, error) {
@@ -202,9 +202,13 @@ func (policy *singleCompactionPolicy) triggerSortCompaction(
 	gbSegments := lo.GroupBy(triggerableSegments, func(seg *SegmentInfo) bool {
 		return seg.GetIsInvisible()
 	})
+	triggerLimit := Params.DataCoordCfg.SortCompactionTriggerCount.GetAsInt()
 	invisibleSegments, ok := gbSegments[true]
 	if ok {
-		for _, segment := range invisibleSegments {
+		for i, segment := range invisibleSegments {
+			if i >= triggerLimit {
+				break
+			}
 			segmentViews := GetViewsByInfo(segment)
 			view := &MixSegmentView{
 				label:         segmentViews[0].label,
@@ -219,7 +223,7 @@ func (policy *singleCompactionPolicy) triggerSortCompaction(
 	visibleSegments, ok := gbSegments[false]
 	if ok {
 		for i, segment := range visibleSegments {
-			if i > Params.DataCoordCfg.SortCompactionTriggerCount.GetAsInt() {
+			if i >= triggerLimit {
 				break
 			}
 			segmentViews := GetViewsByInfo(segment)
