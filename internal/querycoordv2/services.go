@@ -619,7 +619,11 @@ func (s *Server) LoadBalance(ctx context.Context, req *querypb.LoadBalanceReques
 	}
 	srcNode := req.GetSourceNodeIDs()[0]
 	replica := s.meta.GetByCollectionAndNode(ctx, req.GetCollectionID(), srcNode)
-	if replica == nil || !replica.ContainRWNode(srcNode) {
+	segmentRWNodes := typeutil.NewUniqueSet()
+	if replica != nil {
+		segmentRWNodes.Insert(utils.GetSegmentRWNodes(replica)...)
+	}
+	if replica == nil || !segmentRWNodes.Contain(srcNode) {
 		err := merr.WrapErrNodeNotFound(srcNode, fmt.Sprintf("source node not found in any replica of collection %d", req.GetCollectionID()))
 		msg := "source node not found in any replica"
 		mlog.Warn(ctx, msg)
@@ -632,11 +636,11 @@ func (s *Server) LoadBalance(ctx context.Context, req *querypb.LoadBalanceReques
 	// when no dst node specified, default to use all other nodes in same
 	dstNodeSet := typeutil.NewUniqueSet()
 	if len(req.GetDstNodeIDs()) == 0 {
-		dstNodeSet.Insert(replica.GetRWNodes()...)
+		dstNodeSet.Insert(segmentRWNodes.Collect()...)
 	} else {
 		for _, dstNode := range req.GetDstNodeIDs() {
-			if !replica.Contains(dstNode) {
-				err := merr.WrapErrNodeNotFound(dstNode, "destination node not found in the same replica")
+			if !segmentRWNodes.Contain(dstNode) {
+				err := merr.WrapErrNodeNotFound(dstNode, "destination node not found in segment-assignable nodes of the replica")
 				mlog.Warn(context.TODO(), "failed to balance to the destination node", mlog.Err(err))
 				return merr.Status(err), nil
 			}

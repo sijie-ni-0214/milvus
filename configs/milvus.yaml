@@ -444,6 +444,7 @@ proxy:
 
 # Related configuration of queryCoord, used to manage topology and load balancing for the query nodes, and handoff from growing segments to sealed segments.
 queryCoord:
+  enableSQNServeSegments: false # Whether to allow streaming query nodes to serve historical segments.
   taskMergeCap: 1
   taskExecutionCap: 360
   dispatchScanBudgetFactor: 8 # The multiplier used to compute the per-node dispatch scan budget from queryCoord.taskExecutionCap.
