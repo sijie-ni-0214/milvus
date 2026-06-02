@@ -49,3 +49,13 @@ func (h *BalanceReplicaHelper) GetRWAndRONodesForChannels(replica *meta.Replica)
 	}
 	return replica.GetRWNodes(), replica.GetRONodes()
 }
+
+// GetRWNodesForSegments returns the RW nodes for sealed segment balancing.
+func (h *BalanceReplicaHelper) GetRWNodesForSegments(replica *meta.Replica) []int64 {
+	return utils.GetSegmentRWNodes(replica)
+}
+
+// GetRWAndRONodesForSegments returns both RW and RO nodes for sealed segment balancing.
+func (h *BalanceReplicaHelper) GetRWAndRONodesForSegments(replica *meta.Replica) (rwNodes []int64, roNodes []int64) {
+	return utils.GetSegmentRWAndRONodes(replica)
+}

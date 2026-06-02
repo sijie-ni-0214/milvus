@@ -109,7 +109,7 @@ func (b *RoundRobinBalancer) balanceChannels(ctx context.Context, replica *meta.
 // balanceSegments generates segment balance plans for a replica.
 // It requires at least 2 RW nodes to perform balancing.
 func (b *RoundRobinBalancer) balanceSegments(ctx context.Context, replica *meta.Replica) []assign.SegmentAssignPlan {
-	rwNodes := replica.GetRWNodes()
+	rwNodes := b.GetRWNodesForSegments(replica)
 	if len(rwNodes) < 2 {
 		return nil
 	}
