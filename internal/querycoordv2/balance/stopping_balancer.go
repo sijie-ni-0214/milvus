@@ -106,7 +106,7 @@ func (b *StoppingBalancer) balanceChannels(ctx context.Context, br *balanceRepor
 }
 
 func (b *StoppingBalancer) balanceSegments(ctx context.Context, br *balanceReport, replica *meta.Replica) []assign.SegmentAssignPlan {
-	rwNodes, roNodes := replica.GetRWNodes(), replica.GetRONodes()
+	rwNodes, roNodes := b.GetRWAndRONodesForSegments(replica)
 	// If there are no RW nodes or no RO nodes, no stopping balance is needed
 	if len(rwNodes) == 0 || len(roNodes) == 0 {
 		br.AddRecord(StrRecordf("no stopping balance needed: rwNodes=%d, roNodes=%d", len(rwNodes), len(roNodes)))

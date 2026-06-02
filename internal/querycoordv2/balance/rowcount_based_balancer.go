@@ -93,7 +93,7 @@ func (b *RowCountBasedBalancer) balanceChannels(ctx context.Context, br *balance
 // balanceSegments generates segment balance plans for a replica.
 // It requires at least 2 RW nodes to perform balancing.
 func (b *RowCountBasedBalancer) balanceSegments(ctx context.Context, br *balanceReport, replica *meta.Replica) []assign.SegmentAssignPlan {
-	rwNodes := replica.GetRWNodes()
+	rwNodes := b.GetRWNodesForSegments(replica)
 	if len(rwNodes) < 2 {
 		br.AddRecord(StrRecord("no enough rwNodes to balance segments"))
 		return nil
