@@ -27,6 +27,7 @@ import (
 	"github.com/milvus-io/milvus/internal/querycoordv2/meta"
 	"github.com/milvus-io/milvus/internal/querycoordv2/session"
 	"github.com/milvus-io/milvus/internal/storagev2/packed"
+	"github.com/milvus-io/milvus/internal/util/streamingutil"
 	"github.com/milvus-io/milvus/pkg/v3/log"
 	"github.com/milvus-io/milvus/pkg/v3/proto/querypb"
 	"github.com/milvus-io/milvus/pkg/v3/util/merr"
@@ -341,4 +342,22 @@ func filterNodeLessThan260(nodes []int64, nodeManager *session.NodeManager) []in
 		filteredNodes = append(filteredNodes, nodeID)
 	}
 	return filteredNodes
+}
+
+// GetSegmentRWNodes returns the nodes that can hold sealed segment replicas.
+func GetSegmentRWNodes(replica *meta.Replica) []int64 {
+	if streamingutil.IsStreamingServiceEnabled() &&
+		paramtable.Get().QueryCoordCfg.EnableSQNServeSegments.GetAsBool() {
+		return replica.GetRWSQNodes()
+	}
+	return replica.GetRWNodes()
+}
+
+// GetSegmentRWAndRONodes returns RW and RO nodes for sealed segment balancing.
+func GetSegmentRWAndRONodes(replica *meta.Replica) ([]int64, []int64) {
+	if streamingutil.IsStreamingServiceEnabled() &&
+		paramtable.Get().QueryCoordCfg.EnableSQNServeSegments.GetAsBool() {
+		return replica.GetRWSQNodes(), replica.GetROSQNodes()
+	}
+	return replica.GetRWNodes(), replica.GetRONodes()
 }
