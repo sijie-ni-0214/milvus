@@ -448,6 +448,20 @@ func (node *QueryNode) WatchDmChannels(ctx context.Context, req *querypb.WatchDm
 	log.Info("received watch channel request",
 		zap.Int64("version", req.GetVersion()),
 	)
+	watchStart := time.Now()
+	stageStart := watchStart
+	logWatchStage := func(stage string, startedAt time.Time) {
+		log.Warn("watch dm channel timing",
+			zap.String("stage", stage),
+			zap.Duration("stageDur", time.Since(startedAt)),
+			zap.Duration("totalDur", time.Since(watchStart)),
+			zap.Int("flushedSegmentNum", len(channel.GetFlushedSegmentIds())),
+			zap.Int("unflushedSegmentNum", len(channel.GetUnflushedSegmentIds())),
+			zap.Int("droppedSegmentNum", len(channel.GetDroppedSegmentIds())),
+			zap.Int("levelZeroSegmentNum", len(channel.GetLevelZeroSegmentIds())),
+			zap.Int("sealedSegmentRowCountNum", len(req.GetSealedSegmentRowCount())),
+		)
+	}
 
 	// check node healthy
 	if err := node.lifetime.Add(merr.IsHealthy); err != nil {
@@ -487,6 +501,8 @@ func (node *QueryNode) WatchDmChannels(ctx context.Context, req *querypb.WatchDm
 		log.Warn("failed to ref collection", zap.Error(err))
 		return merr.Status(err), nil
 	}
+	logWatchStage("put_or_ref_collection", stageStart)
+	stageStart = time.Now()
 	defer func() {
 		if !merr.Ok(status) {
 			node.manager.Collection.Unref(req.GetCollectionID(), 1)
@@ -520,6 +536,8 @@ func (node *QueryNode) WatchDmChannels(ctx context.Context, req *querypb.WatchDm
 		return merr.Status(err), nil
 	}
 	node.delegators.Insert(channel.GetChannelName(), delegator)
+	logWatchStage("new_shard_delegator", stageStart)
+	stageStart = time.Now()
 	defer func() {
 		if err != nil {
 			node.delegators.GetAndRemove(channel.GetChannelName())
@@ -533,6 +551,8 @@ func (node *QueryNode) WatchDmChannels(ctx context.Context, req *querypb.WatchDm
 		log.Warn(msg, zap.Error(err))
 		return merr.Status(err), nil
 	}
+	logWatchStage("add_pipeline", stageStart)
+	stageStart = time.Now()
 	defer func() {
 		if err != nil {
 			node.pipelineManager.Remove(channel.GetChannelName())
@@ -554,6 +574,8 @@ func (node *QueryNode) WatchDmChannels(ctx context.Context, req *querypb.WatchDm
 		return id, typeutil.MaxTimestamp
 	})
 	delegator.AddExcludedSegments(droppedInfo)
+	logWatchStage("add_excluded_segments", stageStart)
+	stageStart = time.Now()
 
 	defer func() {
 		if err != nil {
@@ -568,12 +590,16 @@ func (node *QueryNode) WatchDmChannels(ctx context.Context, req *querypb.WatchDm
 		log.Warn("failed to load l0 segments", zap.Error(err))
 		return merr.Status(err), nil
 	}
+	logWatchStage("load_l0_segments", stageStart)
+	stageStart = time.Now()
 	err = loadGrowingSegments(ctx, delegator, req)
 	if err != nil {
 		msg := "failed to load growing segments"
 		log.Warn(msg, zap.Error(err))
 		return merr.Status(err), nil
 	}
+	logWatchStage("load_growing_segments", stageStart)
+	stageStart = time.Now()
 
 	// Use seekPosition directly to start consuming the message stream.
 	//
@@ -602,11 +628,14 @@ func (node *QueryNode) WatchDmChannels(ctx context.Context, req *querypb.WatchDm
 		)
 		return merr.Status(err), nil
 	}
+	logWatchStage("consume_msg_stream", stageStart)
+	stageStart = time.Now()
 
 	// start pipeline
 	pipeline.Start()
 	// delegator after all steps done
 	delegator.Start()
+	logWatchStage("start_pipeline_and_delegator", stageStart)
 	log.Info("watch dml channel success")
 	return merr.Success(), nil
 }
