@@ -514,22 +514,44 @@ func (ex *Executor) subscribeChannel(task *ChannelTask, step int) error {
 	req.SealedSegmentRowCount = sealedSegmentRowCount
 
 	ts := dmChannel.GetSeekPosition().GetTimestamp()
-	log.Info("subscribe channel...",
+	prepareDur := time.Since(startTs)
+	log.Warn("subscribe channel rpc start",
 		zap.Uint64("checkpoint", ts),
 		zap.Duration("sinceCheckpoint", time.Since(tsoutil.PhysicalTime(ts))),
+		zap.Duration("prepareDur", prepareDur),
+		zap.Int("partitionNum", len(partitions)),
+		zap.Int("sealedSegmentNum", len(sealedSegments)),
+		zap.Int("flushedSegmentNum", len(dmChannel.GetFlushedSegmentIds())),
+		zap.Int("unflushedSegmentNum", len(dmChannel.GetUnflushedSegmentIds())),
+		zap.Int("droppedSegmentNum", len(dmChannel.GetDroppedSegmentIds())),
+		zap.Int("excludeInfoNum", len(req.GetExcludeInfos())),
 	)
+	rpcStart := time.Now()
 	status, err := ex.cluster.WatchDmChannels(ctx, action.Node(), req)
+	rpcDur := time.Since(rpcStart)
 	if err != nil {
-		log.Warn("failed to subscribe channel, it may be a false failure", zap.Error(err))
+		log.Warn("failed to subscribe channel, it may be a false failure",
+			zap.Duration("prepareDur", prepareDur),
+			zap.Duration("rpcDur", rpcDur),
+			zap.Duration("totalDur", time.Since(startTs)),
+			zap.Error(err))
 		return err
 	}
 	if !merr.Ok(status) {
 		err = merr.Error(status)
-		log.Warn("failed to subscribe channel", zap.Error(err))
+		log.Warn("failed to subscribe channel",
+			zap.Duration("prepareDur", prepareDur),
+			zap.Duration("rpcDur", rpcDur),
+			zap.Duration("totalDur", time.Since(startTs)),
+			zap.Error(err))
 		return err
 	}
 	elapsed := time.Since(startTs)
-	log.Info("subscribe channel done", zap.Int64("taskID", task.ID()), zap.Duration("time taken", elapsed))
+	log.Warn("subscribe channel done",
+		zap.Int64("taskID", task.ID()),
+		zap.Duration("prepareDur", prepareDur),
+		zap.Duration("rpcDur", rpcDur),
+		zap.Duration("time taken", elapsed))
 	return nil
 }
 
