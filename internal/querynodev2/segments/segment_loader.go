@@ -940,13 +940,7 @@ func (loader *segmentLoader) requestResource(ctx context.Context, infos ...*quer
 	}
 	diskCap := paramtable.Get().QueryNodeCfg.DiskCapacityLimit.GetAsUint64()
 
-	estimateStart := time.Now()
-	loadingUsage, maxSegmentSize, err := loader.estimateSegmentLoadingResourceUsage(ctx, infos...)
-	estimateDur := time.Since(estimateStart)
-	if err != nil {
-		log.Warn("no sufficient physical resource to load segments", zap.Error(err))
-		return requestResourceResult{}, err
-	}
+	var estimateDur time.Duration
 
 	lockWaitStart := time.Now()
 	loader.mut.Lock()
@@ -978,7 +972,9 @@ func (loader *segmentLoader) requestResource(ctx context.Context, infos ...*quer
 	// }
 
 	// then get physical resource usage for loading segments
+	estimateStart := time.Now()
 	mu, du, err := loader.checkSegmentSize(ctx, infos, totalMemory, physicalMemoryUsage, physicalDiskUsage)
+	estimateDur = time.Since(estimateStart)
 	if err != nil {
 		log.Warn("no sufficient physical resource to load segments", zap.Error(err))
 		return result, err
