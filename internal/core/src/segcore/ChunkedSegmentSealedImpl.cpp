@@ -1555,19 +1555,25 @@ ChunkedSegmentSealedImpl::LoadVecIndex(LoadIndexInfo& info, bool is_replace) {
         info.field_id,
         id_);
     auto& field_meta = schema_->operator[](field_id);
-    stage_start = std::chrono::steady_clock::now();
-    LoadResourceRequest request =
-        milvus::index::IndexFactory::GetInstance().VecIndexLoadResource(
-            field_meta.get_data_type(),
-            info.element_type,
-            info.index_engine_version,
-            info.index_size,
-            info.index_params,
-            info.enable_mmap,
-            info.num_rows,
-            info.dim);
-    timing.resource_ns = DurationNs(stage_start);
-    timing.has_raw_data = request.has_raw_data;
+    bool has_raw_data;
+    if (info.has_raw_data.has_value()) {
+        has_raw_data = *info.has_raw_data;
+    } else {
+        stage_start = std::chrono::steady_clock::now();
+        LoadResourceRequest request =
+            milvus::index::IndexFactory::GetInstance().VecIndexLoadResource(
+                field_meta.get_data_type(),
+                info.element_type,
+                info.index_engine_version,
+                info.index_size,
+                info.index_params,
+                info.enable_mmap,
+                info.num_rows,
+                info.dim);
+        timing.resource_ns = DurationNs(stage_start);
+        has_raw_data = request.has_raw_data;
+    }
+    timing.has_raw_data = has_raw_data;
 
     // Note: raw data lifecycle (eviction/drop) is handled by LoadDiff + ApplyLoadDiff,
     // not here. This avoids unsafe ManualEvictCache on column groups.
@@ -1580,7 +1586,7 @@ ChunkedSegmentSealedImpl::LoadVecIndex(LoadIndexInfo& info, bool is_replace) {
     vector_indexings_.append_field_indexing(
         field_id, metric_type, std::move(info.cache_index));
     set_bit(index_ready_bitset_, field_id, true);
-    index_has_raw_data_[field_id] = request.has_raw_data;
+    index_has_raw_data_[field_id] = has_raw_data;
     LOG_INFO("Has load vec index done, fieldID:{}. segmentID:{}, ",
              info.field_id,
              id_);
@@ -1683,27 +1689,33 @@ ChunkedSegmentSealedImpl::LoadScalarIndex(LoadIndexInfo& info,
     }
     timing.register_ns += DurationNs(stage_start);
 
-    stage_start = std::chrono::steady_clock::now();
-    LoadResourceRequest request =
-        milvus::index::IndexFactory::GetInstance().ScalarIndexLoadResource(
-            field_meta.get_data_type(),
-            info.index_engine_version,
-            info.index_size,
-            info.index_params,
-            info.enable_mmap);
-    timing.resource_ns = DurationNs(stage_start);
-    timing.has_raw_data = request.has_raw_data;
+    bool has_raw_data;
+    if (info.has_raw_data.has_value()) {
+        has_raw_data = *info.has_raw_data;
+    } else {
+        stage_start = std::chrono::steady_clock::now();
+        LoadResourceRequest request =
+            milvus::index::IndexFactory::GetInstance().ScalarIndexLoadResource(
+                field_meta.get_data_type(),
+                info.index_engine_version,
+                info.index_size,
+                info.index_params,
+                info.enable_mmap);
+        timing.resource_ns = DurationNs(stage_start);
+        has_raw_data = request.has_raw_data;
+    }
+    timing.has_raw_data = has_raw_data;
 
     stage_start = std::chrono::steady_clock::now();
     set_bit(index_ready_bitset_, field_id, true);
-    index_has_raw_data_[field_id] = request.has_raw_data;
+    index_has_raw_data_[field_id] = has_raw_data;
     // Note: raw data lifecycle (eviction/drop) is handled by LoadDiff + ApplyLoadDiff,
     // not here. This avoids unsafe ManualEvictCache on column groups.
     LOG_INFO(
         "Has load scalar index done, fieldID:{}. segmentID:{}, has_raw_data:{}",
         info.field_id,
         id_,
-        request.has_raw_data);
+        has_raw_data);
     timing.register_ns += DurationNs(stage_start);
     timing.total_ns = DurationNs(total_start);
     index_register_timing_stats.Record(timing);

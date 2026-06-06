@@ -18,6 +18,7 @@
 
 #include <iostream>
 #include <map>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -57,6 +58,7 @@ struct LoadIndexInfo {
     int64_t dim;
     std::string
         warmup_policy;  // "disable", "sync", or "async"; empty means use global config
+    std::optional<bool> has_raw_data;
 
     // Default constructor
     LoadIndexInfo() = default;
@@ -90,7 +92,8 @@ struct LoadIndexInfo {
           index_size(other.index_size),
           num_rows(other.num_rows),
           dim(other.dim),
-          warmup_policy(other.warmup_policy) {
+          warmup_policy(other.warmup_policy),
+          has_raw_data(other.has_raw_data) {
     }
 
     // Copy assignment operator
@@ -119,6 +122,7 @@ struct LoadIndexInfo {
             num_rows = other.num_rows;
             dim = other.dim;
             warmup_policy = other.warmup_policy;
+            has_raw_data = other.has_raw_data;
         }
         return *this;
     }

@@ -335,7 +335,9 @@ SegmentLoadInfo::BuildCache() {
         converted_index_infos_.push_back(load_index_info);
 
         stage_start = std::chrono::steady_clock::now();
-        if (CheckIndexHasRawData(load_index_info)) {
+        auto has_raw_data = CheckIndexHasRawData(load_index_info);
+        load_index_info.has_raw_data = has_raw_data;
+        if (has_raw_data) {
             field_index_has_raw_data_.insert(field_id);
             timing.raw_data_index_count++;
         }
