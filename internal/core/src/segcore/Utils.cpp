@@ -15,6 +15,8 @@
 #include <cxxabi.h>
 #include <folly/ExceptionWrapper.h>
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <exception>
 #include <future>
@@ -99,6 +101,142 @@ InitEmptyVectorArrayRow(proto::schema::VectorField* row,
         }
     }
 }
+
+constexpr int64_t kIndexTimingLogIntervalNs = 5LL * 1000 * 1000 * 1000;
+
+int64_t
+NowNs() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
+int64_t
+DurationNs(std::chrono::steady_clock::time_point start) {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::steady_clock::now() - start)
+        .count();
+}
+
+double
+AvgMs(int64_t total_ns, int64_t count) {
+    if (count == 0) {
+        return 0.0;
+    }
+    return static_cast<double>(total_ns) / static_cast<double>(count) /
+           1000000.0;
+}
+
+double
+NsToMs(int64_t ns) {
+    return static_cast<double>(ns) / 1000000.0;
+}
+
+void
+UpdateMax(std::atomic<int64_t>& max_value, int64_t value) {
+    auto old = max_value.load(std::memory_order_relaxed);
+    while (
+        value > old &&
+        !max_value.compare_exchange_weak(
+            old, value, std::memory_order_relaxed, std::memory_order_relaxed)) {
+    }
+}
+
+struct IndexLoadDataTiming {
+    int64_t config_ns = 0;
+    int64_t file_manager_ns = 0;
+    int64_t translator_ns = 0;
+    int64_t cache_slot_ns = 0;
+    int64_t total_ns = 0;
+    bool is_vector = false;
+    bool enable_mmap = false;
+};
+
+class IndexLoadDataTimingStats {
+ public:
+    void
+    Record(const IndexLoadDataTiming& timing) {
+        count_.fetch_add(1, std::memory_order_relaxed);
+        total_config_ns_.fetch_add(timing.config_ns, std::memory_order_relaxed);
+        total_file_manager_ns_.fetch_add(timing.file_manager_ns,
+                                         std::memory_order_relaxed);
+        total_translator_ns_.fetch_add(timing.translator_ns,
+                                       std::memory_order_relaxed);
+        total_cache_slot_ns_.fetch_add(timing.cache_slot_ns,
+                                       std::memory_order_relaxed);
+        total_ns_.fetch_add(timing.total_ns, std::memory_order_relaxed);
+        vector_count_.fetch_add(timing.is_vector ? 1 : 0,
+                                std::memory_order_relaxed);
+        mmap_count_.fetch_add(timing.enable_mmap ? 1 : 0,
+                              std::memory_order_relaxed);
+        UpdateMax(max_total_ns_, timing.total_ns);
+        MaybeLog();
+    }
+
+ private:
+    void
+    MaybeLog() {
+        auto now = NowNs();
+        auto last = last_log_ns_.load(std::memory_order_relaxed);
+        if (last != 0 && now - last < kIndexTimingLogIntervalNs) {
+            return;
+        }
+        if (!last_log_ns_.compare_exchange_strong(last,
+                                                  now,
+                                                  std::memory_order_relaxed,
+                                                  std::memory_order_relaxed)) {
+            return;
+        }
+
+        auto count = count_.exchange(0, std::memory_order_relaxed);
+        if (count == 0) {
+            return;
+        }
+        auto total_config_ns =
+            total_config_ns_.exchange(0, std::memory_order_relaxed);
+        auto total_file_manager_ns =
+            total_file_manager_ns_.exchange(0, std::memory_order_relaxed);
+        auto total_translator_ns =
+            total_translator_ns_.exchange(0, std::memory_order_relaxed);
+        auto total_cache_slot_ns =
+            total_cache_slot_ns_.exchange(0, std::memory_order_relaxed);
+        auto total_ns = total_ns_.exchange(0, std::memory_order_relaxed);
+        auto vector_count =
+            vector_count_.exchange(0, std::memory_order_relaxed);
+        auto mmap_count = mmap_count_.exchange(0, std::memory_order_relaxed);
+        auto max_total_ns =
+            max_total_ns_.exchange(0, std::memory_order_relaxed);
+
+        LOG_WARN(
+            "segcore load index data timing stats count={} "
+            "avgConfigMs={:.3f} avgFileManagerMs={:.3f} "
+            "avgTranslatorMs={:.3f} avgCreateCacheSlotMs={:.3f} "
+            "avgTotalMs={:.3f} maxTotalMs={:.3f} vectorRatio={:.2f} "
+            "mmapRatio={:.2f}",
+            count,
+            AvgMs(total_config_ns, count),
+            AvgMs(total_file_manager_ns, count),
+            AvgMs(total_translator_ns, count),
+            AvgMs(total_cache_slot_ns, count),
+            AvgMs(total_ns, count),
+            NsToMs(max_total_ns),
+            static_cast<double>(vector_count) / count,
+            static_cast<double>(mmap_count) / count);
+    }
+
+    std::atomic<int64_t> count_{0};
+    std::atomic<int64_t> total_config_ns_{0};
+    std::atomic<int64_t> total_file_manager_ns_{0};
+    std::atomic<int64_t> total_translator_ns_{0};
+    std::atomic<int64_t> total_cache_slot_ns_{0};
+    std::atomic<int64_t> total_ns_{0};
+    std::atomic<int64_t> vector_count_{0};
+    std::atomic<int64_t> mmap_count_{0};
+    std::atomic<int64_t> max_total_ns_{0};
+    std::atomic<int64_t> last_log_ns_{0};
+};
+
+static IndexLoadDataTimingStats index_load_data_timing_stats;
 
 }  // namespace
 
@@ -1469,10 +1607,16 @@ void
 LoadIndexData(milvus::tracer::TraceContext& ctx,
               milvus::segcore::LoadIndexInfo* load_index_info,
               milvus::OpContext* op_ctx) {
+    auto total_start = std::chrono::steady_clock::now();
+    IndexLoadDataTiming timing;
+
     auto& index_params = load_index_info->index_params;
     auto field_type = load_index_info->field_type;
     auto engine_version = load_index_info->index_engine_version;
+    timing.is_vector = milvus::IsVectorDataType(field_type);
+    timing.enable_mmap = load_index_info->enable_mmap;
 
+    auto stage_start = std::chrono::steady_clock::now();
     milvus::index::CreateIndexInfo index_info;
     index_info.field_type = load_index_info->field_type;
     index_info.field_name = load_index_info->schema.name();
@@ -1540,8 +1684,10 @@ LoadIndexData(milvus::tracer::TraceContext& ctx,
                            .value());
         index_info.ngram_params = std::make_optional(ngram_params);
     }
+    timing.config_ns = DurationNs(stage_start);
 
     // init file manager
+    stage_start = std::chrono::steady_clock::now();
     milvus::storage::FieldDataMeta field_meta{load_index_info->collection_id,
                                               load_index_info->partition_id,
                                               load_index_info->segment_id,
@@ -1566,16 +1712,23 @@ LoadIndexData(milvus::tracer::TraceContext& ctx,
     milvus::storage::FileManagerContext file_manager_context(
         field_meta, index_meta, remote_chunk_manager, fs);
     file_manager_context.set_for_loading_index(true);
+    timing.file_manager_ns = DurationNs(stage_start);
 
     // use cache layer to load vector/scalar index
+    stage_start = std::chrono::steady_clock::now();
     std::unique_ptr<milvus::cachinglayer::Translator<milvus::index::IndexBase>>
         translator = std::make_unique<
             milvus::segcore::storagev1translator::SealedIndexTranslator>(
             index_info, load_index_info, ctx, file_manager_context, config);
+    timing.translator_ns = DurationNs(stage_start);
 
+    stage_start = std::chrono::steady_clock::now();
     load_index_info->cache_index =
         milvus::cachinglayer::Manager::GetInstance().CreateCacheSlot(
             std::move(translator), op_ctx);
+    timing.cache_slot_ns = DurationNs(stage_start);
+    timing.total_ns = DurationNs(total_start);
+    index_load_data_timing_stats.Record(timing);
 }
 
 FieldDataPtr

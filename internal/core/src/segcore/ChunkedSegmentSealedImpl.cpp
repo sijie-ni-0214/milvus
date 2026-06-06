@@ -18,6 +18,7 @@
 #include <folly/Try.h>
 #include <simdjson.h>
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <ctime>
@@ -148,6 +149,490 @@
 
 namespace milvus::segcore {
 using namespace milvus::cachinglayer;
+
+namespace {
+
+constexpr int64_t kTimingLogIntervalNs = 5LL * 1000 * 1000 * 1000;
+
+int64_t
+NowNs() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
+int64_t
+DurationNs(std::chrono::steady_clock::time_point start) {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::steady_clock::now() - start)
+        .count();
+}
+
+double
+AvgMs(int64_t total_ns, int64_t count) {
+    if (count == 0) {
+        return 0.0;
+    }
+    return static_cast<double>(total_ns) / static_cast<double>(count) /
+           1000000.0;
+}
+
+double
+NsToMs(int64_t ns) {
+    return static_cast<double>(ns) / 1000000.0;
+}
+
+void
+UpdateMax(std::atomic<int64_t>& max_value, int64_t value) {
+    auto old = max_value.load(std::memory_order_relaxed);
+    while (
+        value > old &&
+        !max_value.compare_exchange_weak(
+            old, value, std::memory_order_relaxed, std::memory_order_relaxed)) {
+    }
+}
+
+struct SegcoreLoadTiming {
+    int64_t reopen_lock_wait_ns = 0;
+    int64_t prepare_load_info_ns = 0;
+    int64_t get_diff_ns = 0;
+    int64_t apply_diff_ns = 0;
+    int64_t total_ns = 0;
+};
+
+class SegcoreLoadTimingStats {
+ public:
+    void
+    Record(const SegcoreLoadTiming& timing) {
+        count_.fetch_add(1, std::memory_order_relaxed);
+        total_reopen_lock_wait_ns_.fetch_add(timing.reopen_lock_wait_ns,
+                                             std::memory_order_relaxed);
+        total_prepare_load_info_ns_.fetch_add(timing.prepare_load_info_ns,
+                                              std::memory_order_relaxed);
+        total_get_diff_ns_.fetch_add(timing.get_diff_ns,
+                                     std::memory_order_relaxed);
+        total_apply_diff_ns_.fetch_add(timing.apply_diff_ns,
+                                       std::memory_order_relaxed);
+        total_ns_.fetch_add(timing.total_ns, std::memory_order_relaxed);
+        UpdateMax(max_total_ns_, timing.total_ns);
+        MaybeLog();
+    }
+
+ private:
+    void
+    MaybeLog() {
+        auto now = NowNs();
+        auto last = last_log_ns_.load(std::memory_order_relaxed);
+        if (last != 0 && now - last < kTimingLogIntervalNs) {
+            return;
+        }
+        if (!last_log_ns_.compare_exchange_strong(last,
+                                                  now,
+                                                  std::memory_order_relaxed,
+                                                  std::memory_order_relaxed)) {
+            return;
+        }
+
+        auto count = count_.exchange(0, std::memory_order_relaxed);
+        if (count == 0) {
+            return;
+        }
+        auto total_reopen_lock_wait_ns =
+            total_reopen_lock_wait_ns_.exchange(0, std::memory_order_relaxed);
+        auto total_prepare_load_info_ns =
+            total_prepare_load_info_ns_.exchange(0, std::memory_order_relaxed);
+        auto total_get_diff_ns =
+            total_get_diff_ns_.exchange(0, std::memory_order_relaxed);
+        auto total_apply_diff_ns =
+            total_apply_diff_ns_.exchange(0, std::memory_order_relaxed);
+        auto total_ns = total_ns_.exchange(0, std::memory_order_relaxed);
+        auto max_total_ns =
+            max_total_ns_.exchange(0, std::memory_order_relaxed);
+
+        LOG_WARN(
+            "segcore sealed segment load timing stats count={} "
+            "avgReopenLockWaitMs={:.3f} avgPrepareLoadInfoMs={:.3f} "
+            "avgGetDiffMs={:.3f} avgApplyDiffMs={:.3f} avgTotalMs={:.3f} "
+            "maxTotalMs={:.3f}",
+            count,
+            AvgMs(total_reopen_lock_wait_ns, count),
+            AvgMs(total_prepare_load_info_ns, count),
+            AvgMs(total_get_diff_ns, count),
+            AvgMs(total_apply_diff_ns, count),
+            AvgMs(total_ns, count),
+            NsToMs(max_total_ns));
+    }
+
+    std::atomic<int64_t> count_{0};
+    std::atomic<int64_t> total_reopen_lock_wait_ns_{0};
+    std::atomic<int64_t> total_prepare_load_info_ns_{0};
+    std::atomic<int64_t> total_get_diff_ns_{0};
+    std::atomic<int64_t> total_apply_diff_ns_{0};
+    std::atomic<int64_t> total_ns_{0};
+    std::atomic<int64_t> max_total_ns_{0};
+    std::atomic<int64_t> last_log_ns_{0};
+};
+
+struct ApplyLoadDiffTiming {
+    int64_t indexes_load_ns = 0;
+    int64_t indexes_replace_ns = 0;
+    int64_t reload_fields_ns = 0;
+    int64_t prepare_column_groups_ns = 0;
+    int64_t column_groups_load_ns = 0;
+    int64_t column_groups_lazy_load_ns = 0;
+    int64_t column_groups_replace_ns = 0;
+    int64_t column_groups_lazy_replace_ns = 0;
+    int64_t init_text_lob_ns = 0;
+    int64_t binlogs_load_ns = 0;
+    int64_t binlogs_replace_ns = 0;
+    int64_t drop_index_ns = 0;
+    int64_t text_indexes_load_ns = 0;
+    int64_t json_stats_load_ns = 0;
+    int64_t json_stats_replace_ns = 0;
+    int64_t json_stats_drop_ns = 0;
+    int64_t fill_default_ns = 0;
+    int64_t text_indexes_create_ns = 0;
+    int64_t field_data_drop_ns = 0;
+    int64_t total_ns = 0;
+    int64_t index_load_count = 0;
+    int64_t index_replace_count = 0;
+    int64_t column_group_count = 0;
+    int64_t binlog_group_count = 0;
+    int64_t text_index_count = 0;
+    int64_t json_stats_count = 0;
+};
+
+template <typename T>
+int64_t
+CountIndexInfos(const T& field_to_indexes) {
+    int64_t count = 0;
+    for (const auto& [_, infos] : field_to_indexes) {
+        count += infos.size();
+    }
+    return count;
+}
+
+template <typename T>
+int64_t
+CountColumnGroups(const T& groups) {
+    return groups.size();
+}
+
+class ApplyLoadDiffTimingStats {
+ public:
+    void
+    Record(const ApplyLoadDiffTiming& timing) {
+        count_.fetch_add(1, std::memory_order_relaxed);
+        total_indexes_load_ns_.fetch_add(timing.indexes_load_ns,
+                                         std::memory_order_relaxed);
+        total_indexes_replace_ns_.fetch_add(timing.indexes_replace_ns,
+                                            std::memory_order_relaxed);
+        total_reload_fields_ns_.fetch_add(timing.reload_fields_ns,
+                                          std::memory_order_relaxed);
+        total_prepare_column_groups_ns_.fetch_add(
+            timing.prepare_column_groups_ns, std::memory_order_relaxed);
+        total_column_groups_load_ns_.fetch_add(timing.column_groups_load_ns,
+                                               std::memory_order_relaxed);
+        total_column_groups_lazy_load_ns_.fetch_add(
+            timing.column_groups_lazy_load_ns, std::memory_order_relaxed);
+        total_column_groups_replace_ns_.fetch_add(
+            timing.column_groups_replace_ns, std::memory_order_relaxed);
+        total_column_groups_lazy_replace_ns_.fetch_add(
+            timing.column_groups_lazy_replace_ns, std::memory_order_relaxed);
+        total_init_text_lob_ns_.fetch_add(timing.init_text_lob_ns,
+                                          std::memory_order_relaxed);
+        total_binlogs_load_ns_.fetch_add(timing.binlogs_load_ns,
+                                         std::memory_order_relaxed);
+        total_binlogs_replace_ns_.fetch_add(timing.binlogs_replace_ns,
+                                            std::memory_order_relaxed);
+        total_drop_index_ns_.fetch_add(timing.drop_index_ns,
+                                       std::memory_order_relaxed);
+        total_text_indexes_load_ns_.fetch_add(timing.text_indexes_load_ns,
+                                              std::memory_order_relaxed);
+        total_json_stats_load_ns_.fetch_add(timing.json_stats_load_ns,
+                                            std::memory_order_relaxed);
+        total_json_stats_replace_ns_.fetch_add(timing.json_stats_replace_ns,
+                                               std::memory_order_relaxed);
+        total_json_stats_drop_ns_.fetch_add(timing.json_stats_drop_ns,
+                                            std::memory_order_relaxed);
+        total_fill_default_ns_.fetch_add(timing.fill_default_ns,
+                                         std::memory_order_relaxed);
+        total_text_indexes_create_ns_.fetch_add(timing.text_indexes_create_ns,
+                                                std::memory_order_relaxed);
+        total_field_data_drop_ns_.fetch_add(timing.field_data_drop_ns,
+                                            std::memory_order_relaxed);
+        total_ns_.fetch_add(timing.total_ns, std::memory_order_relaxed);
+        total_index_load_count_.fetch_add(timing.index_load_count,
+                                          std::memory_order_relaxed);
+        total_index_replace_count_.fetch_add(timing.index_replace_count,
+                                             std::memory_order_relaxed);
+        total_column_group_count_.fetch_add(timing.column_group_count,
+                                            std::memory_order_relaxed);
+        total_binlog_group_count_.fetch_add(timing.binlog_group_count,
+                                            std::memory_order_relaxed);
+        total_text_index_count_.fetch_add(timing.text_index_count,
+                                          std::memory_order_relaxed);
+        total_json_stats_count_.fetch_add(timing.json_stats_count,
+                                          std::memory_order_relaxed);
+        UpdateMax(max_total_ns_, timing.total_ns);
+        MaybeLog();
+    }
+
+ private:
+    void
+    MaybeLog() {
+        auto now = NowNs();
+        auto last = last_log_ns_.load(std::memory_order_relaxed);
+        if (last != 0 && now - last < kTimingLogIntervalNs) {
+            return;
+        }
+        if (!last_log_ns_.compare_exchange_strong(last,
+                                                  now,
+                                                  std::memory_order_relaxed,
+                                                  std::memory_order_relaxed)) {
+            return;
+        }
+
+        auto count = count_.exchange(0, std::memory_order_relaxed);
+        if (count == 0) {
+            return;
+        }
+#define SWAP_TIMING(field) field.exchange(0, std::memory_order_relaxed)
+        auto total_indexes_load_ns = SWAP_TIMING(total_indexes_load_ns_);
+        auto total_indexes_replace_ns = SWAP_TIMING(total_indexes_replace_ns_);
+        auto total_reload_fields_ns = SWAP_TIMING(total_reload_fields_ns_);
+        auto total_prepare_column_groups_ns =
+            SWAP_TIMING(total_prepare_column_groups_ns_);
+        auto total_column_groups_load_ns =
+            SWAP_TIMING(total_column_groups_load_ns_);
+        auto total_column_groups_lazy_load_ns =
+            SWAP_TIMING(total_column_groups_lazy_load_ns_);
+        auto total_column_groups_replace_ns =
+            SWAP_TIMING(total_column_groups_replace_ns_);
+        auto total_column_groups_lazy_replace_ns =
+            SWAP_TIMING(total_column_groups_lazy_replace_ns_);
+        auto total_init_text_lob_ns = SWAP_TIMING(total_init_text_lob_ns_);
+        auto total_binlogs_load_ns = SWAP_TIMING(total_binlogs_load_ns_);
+        auto total_binlogs_replace_ns = SWAP_TIMING(total_binlogs_replace_ns_);
+        auto total_drop_index_ns = SWAP_TIMING(total_drop_index_ns_);
+        auto total_text_indexes_load_ns =
+            SWAP_TIMING(total_text_indexes_load_ns_);
+        auto total_json_stats_load_ns = SWAP_TIMING(total_json_stats_load_ns_);
+        auto total_json_stats_replace_ns =
+            SWAP_TIMING(total_json_stats_replace_ns_);
+        auto total_json_stats_drop_ns = SWAP_TIMING(total_json_stats_drop_ns_);
+        auto total_fill_default_ns = SWAP_TIMING(total_fill_default_ns_);
+        auto total_text_indexes_create_ns =
+            SWAP_TIMING(total_text_indexes_create_ns_);
+        auto total_field_data_drop_ns = SWAP_TIMING(total_field_data_drop_ns_);
+        auto total_ns = SWAP_TIMING(total_ns_);
+        auto total_index_load_count = SWAP_TIMING(total_index_load_count_);
+        auto total_index_replace_count =
+            SWAP_TIMING(total_index_replace_count_);
+        auto total_column_group_count = SWAP_TIMING(total_column_group_count_);
+        auto total_binlog_group_count = SWAP_TIMING(total_binlog_group_count_);
+        auto total_text_index_count = SWAP_TIMING(total_text_index_count_);
+        auto total_json_stats_count = SWAP_TIMING(total_json_stats_count_);
+        auto max_total_ns = SWAP_TIMING(max_total_ns_);
+#undef SWAP_TIMING
+
+        LOG_WARN(
+            "segcore apply load diff timing stats count={} "
+            "avgIndexesLoadMs={:.3f} avgIndexesReplaceMs={:.3f} "
+            "avgReloadFieldsMs={:.3f} avgPrepareColumnGroupsMs={:.3f} "
+            "avgColumnGroupsLoadMs={:.3f} avgColumnGroupsLazyLoadMs={:.3f} "
+            "avgColumnGroupsReplaceMs={:.3f} "
+            "avgColumnGroupsLazyReplaceMs={:.3f} avgInitTextLobMs={:.3f} "
+            "avgBinlogsLoadMs={:.3f} avgBinlogsReplaceMs={:.3f} "
+            "avgDropIndexMs={:.3f} avgTextIndexesLoadMs={:.3f} "
+            "avgJsonStatsLoadMs={:.3f} avgJsonStatsReplaceMs={:.3f} "
+            "avgJsonStatsDropMs={:.3f} avgFillDefaultMs={:.3f} "
+            "avgTextIndexesCreateMs={:.3f} avgFieldDataDropMs={:.3f} "
+            "avgTotalMs={:.3f} maxTotalMs={:.3f} "
+            "avgIndexLoadCount={:.2f} avgIndexReplaceCount={:.2f} "
+            "avgColumnGroupCount={:.2f} avgBinlogGroupCount={:.2f} "
+            "avgTextIndexCount={:.2f} avgJsonStatsCount={:.2f}",
+            count,
+            AvgMs(total_indexes_load_ns, count),
+            AvgMs(total_indexes_replace_ns, count),
+            AvgMs(total_reload_fields_ns, count),
+            AvgMs(total_prepare_column_groups_ns, count),
+            AvgMs(total_column_groups_load_ns, count),
+            AvgMs(total_column_groups_lazy_load_ns, count),
+            AvgMs(total_column_groups_replace_ns, count),
+            AvgMs(total_column_groups_lazy_replace_ns, count),
+            AvgMs(total_init_text_lob_ns, count),
+            AvgMs(total_binlogs_load_ns, count),
+            AvgMs(total_binlogs_replace_ns, count),
+            AvgMs(total_drop_index_ns, count),
+            AvgMs(total_text_indexes_load_ns, count),
+            AvgMs(total_json_stats_load_ns, count),
+            AvgMs(total_json_stats_replace_ns, count),
+            AvgMs(total_json_stats_drop_ns, count),
+            AvgMs(total_fill_default_ns, count),
+            AvgMs(total_text_indexes_create_ns, count),
+            AvgMs(total_field_data_drop_ns, count),
+            AvgMs(total_ns, count),
+            NsToMs(max_total_ns),
+            static_cast<double>(total_index_load_count) / count,
+            static_cast<double>(total_index_replace_count) / count,
+            static_cast<double>(total_column_group_count) / count,
+            static_cast<double>(total_binlog_group_count) / count,
+            static_cast<double>(total_text_index_count) / count,
+            static_cast<double>(total_json_stats_count) / count);
+    }
+
+    std::atomic<int64_t> count_{0};
+    std::atomic<int64_t> total_indexes_load_ns_{0};
+    std::atomic<int64_t> total_indexes_replace_ns_{0};
+    std::atomic<int64_t> total_reload_fields_ns_{0};
+    std::atomic<int64_t> total_prepare_column_groups_ns_{0};
+    std::atomic<int64_t> total_column_groups_load_ns_{0};
+    std::atomic<int64_t> total_column_groups_lazy_load_ns_{0};
+    std::atomic<int64_t> total_column_groups_replace_ns_{0};
+    std::atomic<int64_t> total_column_groups_lazy_replace_ns_{0};
+    std::atomic<int64_t> total_init_text_lob_ns_{0};
+    std::atomic<int64_t> total_binlogs_load_ns_{0};
+    std::atomic<int64_t> total_binlogs_replace_ns_{0};
+    std::atomic<int64_t> total_drop_index_ns_{0};
+    std::atomic<int64_t> total_text_indexes_load_ns_{0};
+    std::atomic<int64_t> total_json_stats_load_ns_{0};
+    std::atomic<int64_t> total_json_stats_replace_ns_{0};
+    std::atomic<int64_t> total_json_stats_drop_ns_{0};
+    std::atomic<int64_t> total_fill_default_ns_{0};
+    std::atomic<int64_t> total_text_indexes_create_ns_{0};
+    std::atomic<int64_t> total_field_data_drop_ns_{0};
+    std::atomic<int64_t> total_ns_{0};
+    std::atomic<int64_t> total_index_load_count_{0};
+    std::atomic<int64_t> total_index_replace_count_{0};
+    std::atomic<int64_t> total_column_group_count_{0};
+    std::atomic<int64_t> total_binlog_group_count_{0};
+    std::atomic<int64_t> total_text_index_count_{0};
+    std::atomic<int64_t> total_json_stats_count_{0};
+    std::atomic<int64_t> max_total_ns_{0};
+    std::atomic<int64_t> last_log_ns_{0};
+};
+
+struct ColumnGroupTiming {
+    int64_t schema_policy_ns = 0;
+    int64_t get_chunk_reader_ns = 0;
+    int64_t create_translator_ns = 0;
+    int64_t create_chunk_group_ns = 0;
+    int64_t proxy_column_ns = 0;
+    int64_t total_ns = 0;
+    int64_t field_count = 0;
+    bool eager_load = false;
+    bool use_mmap = false;
+    bool is_vector = false;
+};
+
+class ColumnGroupTimingStats {
+ public:
+    void
+    Record(const ColumnGroupTiming& timing) {
+        count_.fetch_add(1, std::memory_order_relaxed);
+        total_schema_policy_ns_.fetch_add(timing.schema_policy_ns,
+                                          std::memory_order_relaxed);
+        total_get_chunk_reader_ns_.fetch_add(timing.get_chunk_reader_ns,
+                                             std::memory_order_relaxed);
+        total_create_translator_ns_.fetch_add(timing.create_translator_ns,
+                                              std::memory_order_relaxed);
+        total_create_chunk_group_ns_.fetch_add(timing.create_chunk_group_ns,
+                                               std::memory_order_relaxed);
+        total_proxy_column_ns_.fetch_add(timing.proxy_column_ns,
+                                         std::memory_order_relaxed);
+        total_ns_.fetch_add(timing.total_ns, std::memory_order_relaxed);
+        total_field_count_.fetch_add(timing.field_count,
+                                     std::memory_order_relaxed);
+        eager_count_.fetch_add(timing.eager_load ? 1 : 0,
+                               std::memory_order_relaxed);
+        mmap_count_.fetch_add(timing.use_mmap ? 1 : 0,
+                              std::memory_order_relaxed);
+        vector_count_.fetch_add(timing.is_vector ? 1 : 0,
+                                std::memory_order_relaxed);
+        UpdateMax(max_total_ns_, timing.total_ns);
+        MaybeLog();
+    }
+
+ private:
+    void
+    MaybeLog() {
+        auto now = NowNs();
+        auto last = last_log_ns_.load(std::memory_order_relaxed);
+        if (last != 0 && now - last < kTimingLogIntervalNs) {
+            return;
+        }
+        if (!last_log_ns_.compare_exchange_strong(last,
+                                                  now,
+                                                  std::memory_order_relaxed,
+                                                  std::memory_order_relaxed)) {
+            return;
+        }
+        auto count = count_.exchange(0, std::memory_order_relaxed);
+        if (count == 0) {
+            return;
+        }
+        auto schema_policy_ns =
+            total_schema_policy_ns_.exchange(0, std::memory_order_relaxed);
+        auto get_chunk_reader_ns =
+            total_get_chunk_reader_ns_.exchange(0, std::memory_order_relaxed);
+        auto create_translator_ns =
+            total_create_translator_ns_.exchange(0, std::memory_order_relaxed);
+        auto create_chunk_group_ns =
+            total_create_chunk_group_ns_.exchange(0, std::memory_order_relaxed);
+        auto proxy_column_ns =
+            total_proxy_column_ns_.exchange(0, std::memory_order_relaxed);
+        auto total_ns = total_ns_.exchange(0, std::memory_order_relaxed);
+        auto field_count =
+            total_field_count_.exchange(0, std::memory_order_relaxed);
+        auto eager_count = eager_count_.exchange(0, std::memory_order_relaxed);
+        auto mmap_count = mmap_count_.exchange(0, std::memory_order_relaxed);
+        auto vector_count =
+            vector_count_.exchange(0, std::memory_order_relaxed);
+        auto max_total_ns =
+            max_total_ns_.exchange(0, std::memory_order_relaxed);
+
+        LOG_WARN(
+            "segcore load column group timing stats count={} "
+            "avgSchemaPolicyMs={:.3f} avgGetChunkReaderMs={:.3f} "
+            "avgCreateTranslatorMs={:.3f} avgCreateChunkGroupMs={:.3f} "
+            "avgProxyColumnMs={:.3f} avgTotalMs={:.3f} maxTotalMs={:.3f} "
+            "avgFieldCount={:.2f} eagerRatio={:.2f} mmapRatio={:.2f} "
+            "vectorRatio={:.2f}",
+            count,
+            AvgMs(schema_policy_ns, count),
+            AvgMs(get_chunk_reader_ns, count),
+            AvgMs(create_translator_ns, count),
+            AvgMs(create_chunk_group_ns, count),
+            AvgMs(proxy_column_ns, count),
+            AvgMs(total_ns, count),
+            NsToMs(max_total_ns),
+            static_cast<double>(field_count) / count,
+            static_cast<double>(eager_count) / count,
+            static_cast<double>(mmap_count) / count,
+            static_cast<double>(vector_count) / count);
+    }
+
+    std::atomic<int64_t> count_{0};
+    std::atomic<int64_t> total_schema_policy_ns_{0};
+    std::atomic<int64_t> total_get_chunk_reader_ns_{0};
+    std::atomic<int64_t> total_create_translator_ns_{0};
+    std::atomic<int64_t> total_create_chunk_group_ns_{0};
+    std::atomic<int64_t> total_proxy_column_ns_{0};
+    std::atomic<int64_t> total_ns_{0};
+    std::atomic<int64_t> total_field_count_{0};
+    std::atomic<int64_t> eager_count_{0};
+    std::atomic<int64_t> mmap_count_{0};
+    std::atomic<int64_t> vector_count_{0};
+    std::atomic<int64_t> max_total_ns_{0};
+    std::atomic<int64_t> last_log_ns_{0};
+};
+
+static SegcoreLoadTimingStats sealed_load_timing_stats;
+static ApplyLoadDiffTimingStats apply_load_diff_timing_stats;
+static ColumnGroupTimingStats column_group_timing_stats;
+
+}  // namespace
 
 static inline void
 set_bit(BitsetType& bitset, FieldId field_id, bool flag = true) {
@@ -4583,28 +5068,50 @@ void
 ChunkedSegmentSealedImpl::ApplyLoadDiff(milvus::OpContext* op_ctx,
                                         SegmentLoadInfo& segment_load_info,
                                         LoadDiff& diff) {
+    auto total_start = std::chrono::steady_clock::now();
+    ApplyLoadDiffTiming timing;
+    timing.index_load_count = CountIndexInfos(diff.indexes_to_load);
+    timing.index_replace_count = CountIndexInfos(diff.indexes_to_replace);
+    timing.column_group_count =
+        CountColumnGroups(diff.column_groups_to_load) +
+        CountColumnGroups(diff.column_groups_to_replace) +
+        CountColumnGroups(diff.column_groups_to_lazyload) +
+        CountColumnGroups(diff.column_groups_to_lazyreplace);
+    timing.binlog_group_count =
+        diff.binlogs_to_load.size() + diff.binlogs_to_replace.size();
+    timing.text_index_count =
+        diff.text_indexes_to_load.size() + diff.text_indexes_to_create.size();
+    timing.json_stats_count =
+        diff.json_stats_to_load.size() + diff.json_stats_to_replace.size();
+
     // TODO: pass trace_ctx separately when needed
     milvus::tracer::TraceContext trace_ctx;
 
     CheckCancellation(op_ctx, id_, "ChunkedSegmentSealedImpl::ApplyLoadDiff()");
 
     // Load new indexes (fields without existing index)
+    auto stage_start = std::chrono::steady_clock::now();
     if (!diff.indexes_to_load.empty()) {
         LoadBatchIndexes(trace_ctx, diff.indexes_to_load, op_ctx);
     }
+    timing.indexes_load_ns = DurationNs(stage_start);
     CheckCancellation(op_ctx, id_, "ChunkedSegmentSealedImpl::ApplyLoadDiff()");
 
     // Replace indexes (fields that already have an index loaded)
+    stage_start = std::chrono::steady_clock::now();
     if (!diff.indexes_to_replace.empty()) {
         LoadBatchIndexes(trace_ctx, diff.indexes_to_replace, op_ctx, true);
     }
+    timing.indexes_replace_ns = DurationNs(stage_start);
 
     CheckCancellation(op_ctx, id_, "ChunkedSegmentSealedImpl::ApplyLoadDiff()");
 
     // reload fields (warmup for fields already in memory)
+    stage_start = std::chrono::steady_clock::now();
     if (!diff.fields_to_reload.empty()) {
         ReloadColumns(diff.fields_to_reload, op_ctx);
     }
+    timing.reload_fields_ns = DurationNs(stage_start);
 
     // Load field data from storage BEFORE dropping indexes, so that queries
     // always have a data source available during the transition.
@@ -4614,13 +5121,16 @@ ChunkedSegmentSealedImpl::ApplyLoadDiff(milvus::OpContext* op_ctx,
     // load column groups
     if (diff.load_external_manifest) {
         // External collections: load via manifest path
+        stage_start = std::chrono::steady_clock::now();
         LoadColumnGroups(segment_load_info.GetManifestPath(), op_ctx);
+        timing.column_groups_load_ns = DurationNs(stage_start);
     } else {
         bool has_cg_changes = !diff.column_groups_to_load.empty() ||
                               !diff.column_groups_to_replace.empty() ||
                               !diff.column_groups_to_lazyload.empty() ||
                               !diff.column_groups_to_lazyreplace.empty();
         if (has_cg_changes) {
+            stage_start = std::chrono::steady_clock::now();
             auto properties =
                 milvus::storage::LoonFFIPropertiesSingleton::GetInstance()
                     .GetProperties();
@@ -4640,7 +5150,9 @@ ChunkedSegmentSealedImpl::ApplyLoadDiff(milvus::OpContext* op_ctx,
                 reader_ = milvus_storage::api::Reader::create(
                     column_groups, arrow_schema, needed_columns, *properties);
             }
+            timing.prepare_column_groups_ns = DurationNs(stage_start);
             // New column group fields
+            stage_start = std::chrono::steady_clock::now();
             if (!diff.column_groups_to_load.empty()) {
                 LoadColumnGroups(column_groups,
                                  properties,
@@ -4648,6 +5160,8 @@ ChunkedSegmentSealedImpl::ApplyLoadDiff(milvus::OpContext* op_ctx,
                                  true,
                                  op_ctx);
             }
+            timing.column_groups_load_ns = DurationNs(stage_start);
+            stage_start = std::chrono::steady_clock::now();
             if (!diff.column_groups_to_lazyload.empty()) {
                 LoadColumnGroups(column_groups,
                                  properties,
@@ -4655,7 +5169,9 @@ ChunkedSegmentSealedImpl::ApplyLoadDiff(milvus::OpContext* op_ctx,
                                  false,
                                  op_ctx);
             }
+            timing.column_groups_lazy_load_ns = DurationNs(stage_start);
             // Replace column group fields
+            stage_start = std::chrono::steady_clock::now();
             if (!diff.column_groups_to_replace.empty()) {
                 LoadColumnGroups(column_groups,
                                  properties,
@@ -4664,6 +5180,8 @@ ChunkedSegmentSealedImpl::ApplyLoadDiff(milvus::OpContext* op_ctx,
                                  op_ctx,
                                  true);
             }
+            timing.column_groups_replace_ns = DurationNs(stage_start);
+            stage_start = std::chrono::steady_clock::now();
             if (!diff.column_groups_to_lazyreplace.empty()) {
                 LoadColumnGroups(column_groups,
                                  properties,
@@ -4672,33 +5190,41 @@ ChunkedSegmentSealedImpl::ApplyLoadDiff(milvus::OpContext* op_ctx,
                                  op_ctx,
                                  true);
             }
+            timing.column_groups_lazy_replace_ns = DurationNs(stage_start);
         }
     }
 
     CheckCancellation(op_ctx, id_, "ChunkedSegmentSealedImpl::ApplyLoadDiff()");
 
     // Initialize LOB paths for TEXT fields after any column group loading
+    stage_start = std::chrono::steady_clock::now();
     if (segment_load_info.HasManifestPath()) {
         InitTextLobPaths(segment_load_info.GetManifestPath());
     }
+    timing.init_text_lob_ns = DurationNs(stage_start);
 
     CheckCancellation(op_ctx, id_, "ChunkedSegmentSealedImpl::ApplyLoadDiff()");
 
     // Load new field binlogs
+    stage_start = std::chrono::steady_clock::now();
     if (!diff.binlogs_to_load.empty()) {
         LoadBatchFieldData(trace_ctx, diff.binlogs_to_load, op_ctx);
     }
+    timing.binlogs_load_ns = DurationNs(stage_start);
     CheckCancellation(op_ctx, id_, "ChunkedSegmentSealedImpl::ApplyLoadDiff()");
 
     // Replace field binlogs
+    stage_start = std::chrono::steady_clock::now();
     if (!diff.binlogs_to_replace.empty()) {
         LoadBatchFieldData(trace_ctx, diff.binlogs_to_replace, op_ctx, true);
     }
+    timing.binlogs_replace_ns = DurationNs(stage_start);
 
     CheckCancellation(op_ctx, id_, "ChunkedSegmentSealedImpl::ApplyLoadDiff()");
 
     // drop index — field data is already loaded/restored above, so queries
     // can fall back to raw data after the index is dropped.
+    stage_start = std::chrono::steady_clock::now();
     if (!diff.indexes_to_drop.empty()) {
         for (auto field_id : diff.indexes_to_drop) {
             // Skip drop if this field already has a replacement or new index loaded
@@ -4709,22 +5235,30 @@ ChunkedSegmentSealedImpl::ApplyLoadDiff(milvus::OpContext* op_ctx,
             DropIndex(field_id);
         }
     }
+    timing.drop_index_ns = DurationNs(stage_start);
 
     CheckCancellation(op_ctx, id_, "ChunkedSegmentSealedImpl::ApplyLoadDiff()");
 
     // load pre-built text indexes
+    stage_start = std::chrono::steady_clock::now();
     if (!diff.text_indexes_to_load.empty()) {
         LoadBatchTextIndexes(op_ctx, diff.text_indexes_to_load);
     }
+    timing.text_indexes_load_ns = DurationNs(stage_start);
 
     CheckCancellation(op_ctx, id_, "ChunkedSegmentSealedImpl::ApplyLoadDiff()");
 
+    stage_start = std::chrono::steady_clock::now();
     if (!diff.json_stats_to_load.empty()) {
         LoadBatchJsonKeyIndexes(op_ctx, diff.json_stats_to_load);
     }
+    timing.json_stats_load_ns = DurationNs(stage_start);
+    stage_start = std::chrono::steady_clock::now();
     if (!diff.json_stats_to_replace.empty()) {
         LoadBatchJsonKeyIndexes(op_ctx, diff.json_stats_to_replace);
     }
+    timing.json_stats_replace_ns = DurationNs(stage_start);
+    stage_start = std::chrono::steady_clock::now();
     if (!diff.json_stats_to_drop.empty()) {
         for (auto field_id : diff.json_stats_to_drop) {
             if (diff.json_stats_to_load.count(field_id) > 0 ||
@@ -4742,33 +5276,42 @@ ChunkedSegmentSealedImpl::ApplyLoadDiff(milvus::OpContext* op_ctx,
             RemoveJsonStats(field_id);
         }
     }
+    timing.json_stats_drop_ns = DurationNs(stage_start);
 
     CheckCancellation(op_ctx, id_, "ChunkedSegmentSealedImpl::ApplyLoadDiff()");
 
     // fill default values for fields without data sources (schema evolution)
+    stage_start = std::chrono::steady_clock::now();
     if (!diff.fields_to_fill_default.empty()) {
         FillDefaultValueFields(diff.fields_to_fill_default);
         RecordDefaultFieldsFilled(diff.fields_to_fill_default);
     }
+    timing.fill_default_ns = DurationNs(stage_start);
 
     CheckCancellation(op_ctx, id_, "ChunkedSegmentSealedImpl::ApplyLoadDiff()");
 
     // create text indexes from raw data
+    stage_start = std::chrono::steady_clock::now();
     if (!diff.text_indexes_to_create.empty()) {
         for (const auto& field_id : diff.text_indexes_to_create) {
             CreateTextIndex(field_id, op_ctx);
         }
     }
+    timing.text_indexes_create_ns = DurationNs(stage_start);
 
     CheckCancellation(op_ctx, id_, "ChunkedSegmentSealedImpl::ApplyLoadDiff()");
 
     // Drop field data — only for schema evolution scenarios where
     // the field has been removed from the data source (binlogs/column_groups).
+    stage_start = std::chrono::steady_clock::now();
     if (!diff.field_data_to_drop.empty()) {
         for (auto field_id : diff.field_data_to_drop) {
             DropFieldData(field_id);
         }
     }
+    timing.field_data_drop_ns = DurationNs(stage_start);
+    timing.total_ns = DurationNs(total_start);
+    apply_load_diff_timing_stats.Record(timing);
 }
 
 void
@@ -5070,6 +5613,11 @@ ChunkedSegmentSealedImpl::LoadColumnGroup(
     bool eager_load,
     milvus::OpContext* op_ctx,
     bool is_replace) {
+    auto total_start = std::chrono::steady_clock::now();
+    ColumnGroupTiming timing;
+    timing.field_count = milvus_field_ids.size();
+    timing.eager_load = eager_load;
+
     AssertInfo(index < column_groups->size(),
                "load column group index out of range");
     AssertInfo(!milvus_field_ids.empty(),
@@ -5091,6 +5639,7 @@ ChunkedSegmentSealedImpl::LoadColumnGroup(
     bool mmap_enabled = false;
     bool has_warmup_setting = false;
     std::string aggregated_warmup_policy = "disable";
+    auto stage_start = std::chrono::steady_clock::now();
     for (auto& [field_id, field_meta] : field_metas) {
         if (IsVectorDataType(field_meta.get_data_type())) {
             is_vector = true;
@@ -5122,11 +5671,14 @@ ChunkedSegmentSealedImpl::LoadColumnGroup(
             }
         }
     }
+    timing.schema_policy_ns = DurationNs(stage_start);
+    timing.is_vector = is_vector;
 
     auto& mmap_config = storage::MmapManager::GetInstance().GetMmapConfig();
     bool global_use_mmap = is_vector ? mmap_config.GetVectorFieldEnableMmap()
                                      : mmap_config.GetScalarFieldEnableMmap();
     auto use_mmap = has_mmap_setting ? mmap_enabled : global_use_mmap;
+    timing.use_mmap = use_mmap;
 
     // The set of columns this entry projects is exactly the field_ids the
     // diff handed us. For lazy entries, SegmentLoadInfo::ComputeDiffColumnGroups
@@ -5138,6 +5690,7 @@ ChunkedSegmentSealedImpl::LoadColumnGroup(
     for (const auto& fid : milvus_field_ids) {
         needed_columns->push_back(schema_->get_storage_column_name(fid));
     }
+    stage_start = std::chrono::steady_clock::now();
     auto chunk_reader_result = reader_->get_chunk_reader(index, needed_columns);
     AssertInfo(chunk_reader_result.ok(),
                "get chunk reader failed, segment {}, column group index {}, "
@@ -5147,6 +5700,7 @@ ChunkedSegmentSealedImpl::LoadColumnGroup(
                chunk_reader_result.status().ToString());
 
     auto chunk_reader = std::move(chunk_reader_result).ValueOrDie();
+    timing.get_chunk_reader_ns = DurationNs(stage_start);
 
     LOG_INFO("[StorageV2] segment {} loads manifest cg index {}",
              this->get_segment_id(),
@@ -5170,6 +5724,7 @@ ChunkedSegmentSealedImpl::LoadColumnGroup(
         cache_key_suffix = std::to_string(milvus_field_ids.front().get());
     }
 
+    stage_start = std::chrono::steady_clock::now();
     auto translator =
         std::make_unique<storagev2translator::ManifestGroupTranslator>(
             get_segment_id(),
@@ -5186,10 +5741,14 @@ ChunkedSegmentSealedImpl::LoadColumnGroup(
             warmup_policy,
             cache_key_suffix,
             load_info->GetEstimatedBytesPerRow());
+    timing.create_translator_ns = DurationNs(stage_start);
+    stage_start = std::chrono::steady_clock::now();
     auto chunked_column_group =
         std::make_shared<ChunkedColumnGroup>(std::move(translator));
+    timing.create_chunk_group_ns = DurationNs(stage_start);
 
     // Create ProxyChunkColumn for each field
+    stage_start = std::chrono::steady_clock::now();
     for (const auto& field_id : milvus_field_ids) {
         const auto& field_meta = field_metas.at(field_id);
         auto column = std::make_shared<ProxyChunkColumn>(
@@ -5216,6 +5775,9 @@ ChunkedSegmentSealedImpl::LoadColumnGroup(
             }
         }
     }
+    timing.proxy_column_ns = DurationNs(stage_start);
+    timing.total_ns = DurationNs(total_start);
+    column_group_timing_stats.Record(timing);
 }
 
 void
@@ -5466,27 +6028,40 @@ ChunkedSegmentSealedImpl::LoadBatchFieldData(
 void
 ChunkedSegmentSealedImpl::Load(milvus::tracer::TraceContext& trace_ctx,
                                milvus::OpContext* op_ctx) {
+    auto total_start = std::chrono::steady_clock::now();
+    SegcoreLoadTiming timing;
+
     // Serialize with Reopen(pb)/SetLoadInfo. Runtime-only updates produced by
     // ApplyLoadDiff are committed through COW helpers after the data is loaded.
-    std::lock_guard<std::mutex> reopen_guard(reopen_mutex_);
+    auto lock_start = std::chrono::steady_clock::now();
+    std::unique_lock<std::mutex> reopen_guard(reopen_mutex_);
+    timing.reopen_lock_wait_ns = DurationNs(lock_start);
 
     auto snapshot = std::atomic_load(&segment_load_info_);
     auto num_rows = snapshot->GetNumOfRows();
     LOG_INFO("Loading segment {} with {} rows", id_, num_rows);
 
     // reopen_mutex_ synchronizes this read with all schema_ writers.
+    auto stage_start = std::chrono::steady_clock::now();
     SegmentLoadInfo mutable_copy(snapshot->GetProto(), schema_);
     mutable_copy.SetFieldsFilledWithDefault(
         snapshot->GetFieldsFilledWithDefault());
     for (auto fid : snapshot->GetCreatedTextIndexes()) {
         mutable_copy.SetTextIndexCreated(fid);
     }
+    timing.prepare_load_info_ns = DurationNs(stage_start);
+    stage_start = std::chrono::steady_clock::now();
     auto diff = mutable_copy.GetLoadDiff();
+    timing.get_diff_ns = DurationNs(stage_start);
     LOG_WARN("Load segment {} with diff {}", id_, diff.ToString());
 
+    stage_start = std::chrono::steady_clock::now();
     ApplyLoadDiff(op_ctx, mutable_copy, diff);
+    timing.apply_diff_ns = DurationNs(stage_start);
 
     LOG_INFO("Successfully loaded segment {} with {} rows", id_, num_rows);
+    timing.total_ns = DurationNs(total_start);
+    sealed_load_timing_stats.Record(timing);
 }
 
 void
