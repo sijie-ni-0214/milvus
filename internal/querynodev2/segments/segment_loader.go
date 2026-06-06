@@ -78,10 +78,11 @@ var errRetryTimerNotified = errors.New("retry timer notified")
 const requestResourceTimingLogInterval = 5 * time.Second
 
 var (
-	requestResourceTiming = newRequestResourceTimingStats()
-	segmentLoadTiming     = newSegmentLoadTimingStats()
-	sealedLoadTiming      = newSealedLoadTimingStats()
-	bloomFilterLoadTiming = newBloomFilterLoadTimingStats()
+	requestResourceTiming   = newRequestResourceTimingStats()
+	segmentLoaderLoadTiming = newSegmentLoaderLoadTimingStats()
+	segmentLoadTiming       = newSegmentLoadTimingStats()
+	sealedLoadTiming        = newSealedLoadTimingStats()
+	bloomFilterLoadTiming   = newBloomFilterLoadTimingStats()
 )
 
 type requestResourceTimingStats struct {
@@ -127,6 +128,77 @@ func avgDuration(total int64, count int64) time.Duration {
 		return 0
 	}
 	return time.Duration(total / count)
+}
+
+type segmentLoaderLoadTimingPhase struct {
+	segmentNum         int
+	afterFilter        int
+	concurrencyLevel   int
+	collectionDur      time.Duration
+	configureDur       time.Duration
+	prepareDur         time.Duration
+	requestResourceDur time.Duration
+	createSegmentDur   time.Duration
+	processDur         time.Duration
+	waitDoneDur        time.Duration
+	resultDur          time.Duration
+	totalDur           time.Duration
+}
+
+type segmentLoaderLoadTimingStats struct {
+	count                *atomic.Int64
+	segmentCount         *atomic.Int64
+	afterFilterCount     *atomic.Int64
+	totalCollection      *atomic.Int64
+	totalConfigure       *atomic.Int64
+	totalPrepare         *atomic.Int64
+	totalRequestResource *atomic.Int64
+	totalCreateSegment   *atomic.Int64
+	totalProcess         *atomic.Int64
+	totalWaitDone        *atomic.Int64
+	totalResult          *atomic.Int64
+	totalLoad            *atomic.Int64
+	maxCollection        *atomic.Int64
+	maxConfigure         *atomic.Int64
+	maxPrepare           *atomic.Int64
+	maxRequestResource   *atomic.Int64
+	maxCreateSegment     *atomic.Int64
+	maxProcess           *atomic.Int64
+	maxWaitDone          *atomic.Int64
+	maxResult            *atomic.Int64
+	maxLoad              *atomic.Int64
+	lastConcurrencyLevel *atomic.Int64
+	lastAfterFilter      *atomic.Int64
+	lastLogUnixNano      *atomic.Int64
+}
+
+func newSegmentLoaderLoadTimingStats() *segmentLoaderLoadTimingStats {
+	return &segmentLoaderLoadTimingStats{
+		count:                atomic.NewInt64(0),
+		segmentCount:         atomic.NewInt64(0),
+		afterFilterCount:     atomic.NewInt64(0),
+		totalCollection:      atomic.NewInt64(0),
+		totalConfigure:       atomic.NewInt64(0),
+		totalPrepare:         atomic.NewInt64(0),
+		totalRequestResource: atomic.NewInt64(0),
+		totalCreateSegment:   atomic.NewInt64(0),
+		totalProcess:         atomic.NewInt64(0),
+		totalWaitDone:        atomic.NewInt64(0),
+		totalResult:          atomic.NewInt64(0),
+		totalLoad:            atomic.NewInt64(0),
+		maxCollection:        atomic.NewInt64(0),
+		maxConfigure:         atomic.NewInt64(0),
+		maxPrepare:           atomic.NewInt64(0),
+		maxRequestResource:   atomic.NewInt64(0),
+		maxCreateSegment:     atomic.NewInt64(0),
+		maxProcess:           atomic.NewInt64(0),
+		maxWaitDone:          atomic.NewInt64(0),
+		maxResult:            atomic.NewInt64(0),
+		maxLoad:              atomic.NewInt64(0),
+		lastConcurrencyLevel: atomic.NewInt64(0),
+		lastAfterFilter:      atomic.NewInt64(0),
+		lastLogUnixNano:      atomic.NewInt64(time.Now().UnixNano()),
+	}
 }
 
 type segmentLoadTimingStats struct {
@@ -434,6 +506,92 @@ func (s *bloomFilterLoadTimingStats) record(segmentNum int, stubDur, metadataDur
 	)
 }
 
+func (s *segmentLoaderLoadTimingStats) record(timing segmentLoaderLoadTimingPhase) {
+	s.count.Inc()
+	s.segmentCount.Add(int64(timing.segmentNum))
+	s.afterFilterCount.Add(int64(timing.afterFilter))
+	s.totalCollection.Add(int64(timing.collectionDur))
+	s.totalConfigure.Add(int64(timing.configureDur))
+	s.totalPrepare.Add(int64(timing.prepareDur))
+	s.totalRequestResource.Add(int64(timing.requestResourceDur))
+	s.totalCreateSegment.Add(int64(timing.createSegmentDur))
+	s.totalProcess.Add(int64(timing.processDur))
+	s.totalWaitDone.Add(int64(timing.waitDoneDur))
+	s.totalResult.Add(int64(timing.resultDur))
+	s.totalLoad.Add(int64(timing.totalDur))
+	updateMaxDuration(s.maxCollection, timing.collectionDur)
+	updateMaxDuration(s.maxConfigure, timing.configureDur)
+	updateMaxDuration(s.maxPrepare, timing.prepareDur)
+	updateMaxDuration(s.maxRequestResource, timing.requestResourceDur)
+	updateMaxDuration(s.maxCreateSegment, timing.createSegmentDur)
+	updateMaxDuration(s.maxProcess, timing.processDur)
+	updateMaxDuration(s.maxWaitDone, timing.waitDoneDur)
+	updateMaxDuration(s.maxResult, timing.resultDur)
+	updateMaxDuration(s.maxLoad, timing.totalDur)
+	s.lastConcurrencyLevel.Store(int64(timing.concurrencyLevel))
+	s.lastAfterFilter.Store(int64(timing.afterFilter))
+
+	now := time.Now()
+	last := s.lastLogUnixNano.Load()
+	if now.UnixNano()-last < int64(requestResourceTimingLogInterval) {
+		return
+	}
+	if !s.lastLogUnixNano.CompareAndSwap(last, now.UnixNano()) {
+		return
+	}
+
+	count := s.count.Swap(0)
+	segmentCount := s.segmentCount.Swap(0)
+	afterFilterCount := s.afterFilterCount.Swap(0)
+	totalCollection := s.totalCollection.Swap(0)
+	totalConfigure := s.totalConfigure.Swap(0)
+	totalPrepare := s.totalPrepare.Swap(0)
+	totalRequestResource := s.totalRequestResource.Swap(0)
+	totalCreateSegment := s.totalCreateSegment.Swap(0)
+	totalProcess := s.totalProcess.Swap(0)
+	totalWaitDone := s.totalWaitDone.Swap(0)
+	totalResult := s.totalResult.Swap(0)
+	totalLoad := s.totalLoad.Swap(0)
+	maxCollection := s.maxCollection.Swap(0)
+	maxConfigure := s.maxConfigure.Swap(0)
+	maxPrepare := s.maxPrepare.Swap(0)
+	maxRequestResource := s.maxRequestResource.Swap(0)
+	maxCreateSegment := s.maxCreateSegment.Swap(0)
+	maxProcess := s.maxProcess.Swap(0)
+	maxWaitDone := s.maxWaitDone.Swap(0)
+	maxResult := s.maxResult.Swap(0)
+	maxLoad := s.maxLoad.Swap(0)
+	if count == 0 {
+		return
+	}
+
+	log.Warn("segment loader load timing stats",
+		zap.Int64("requestCount", count),
+		zap.Int64("segmentCount", segmentCount),
+		zap.Int64("afterFilterCount", afterFilterCount),
+		zap.Duration("avgCollectionDur", avgDuration(totalCollection, count)),
+		zap.Duration("avgConfigureDur", avgDuration(totalConfigure, count)),
+		zap.Duration("avgPrepareDur", avgDuration(totalPrepare, count)),
+		zap.Duration("avgRequestResourceDur", avgDuration(totalRequestResource, count)),
+		zap.Duration("avgCreateSegmentDur", avgDuration(totalCreateSegment, count)),
+		zap.Duration("avgProcessDur", avgDuration(totalProcess, count)),
+		zap.Duration("avgWaitDoneDur", avgDuration(totalWaitDone, count)),
+		zap.Duration("avgResultDur", avgDuration(totalResult, count)),
+		zap.Duration("avgTotalDur", avgDuration(totalLoad, count)),
+		zap.Duration("maxCollectionDur", time.Duration(maxCollection)),
+		zap.Duration("maxConfigureDur", time.Duration(maxConfigure)),
+		zap.Duration("maxPrepareDur", time.Duration(maxPrepare)),
+		zap.Duration("maxRequestResourceDur", time.Duration(maxRequestResource)),
+		zap.Duration("maxCreateSegmentDur", time.Duration(maxCreateSegment)),
+		zap.Duration("maxProcessDur", time.Duration(maxProcess)),
+		zap.Duration("maxWaitDoneDur", time.Duration(maxWaitDone)),
+		zap.Duration("maxResultDur", time.Duration(maxResult)),
+		zap.Duration("maxTotalDur", time.Duration(maxLoad)),
+		zap.Int64("lastConcurrencyLevel", s.lastConcurrencyLevel.Load()),
+		zap.Int64("lastAfterFilter", s.lastAfterFilter.Load()),
+	)
+}
+
 func (s *requestResourceTimingStats) record(estimateDur, lockWaitDur, lockHoldDur, totalDur time.Duration) {
 	s.count.Inc()
 	s.totalEstimate.Add(int64(estimateDur))
@@ -641,6 +799,15 @@ func (loader *segmentLoader) Load(ctx context.Context,
 	version int64,
 	segments ...*querypb.SegmentLoadInfo,
 ) ([]Segment, error) {
+	loadStart := time.Now()
+	loadTiming := segmentLoaderLoadTimingPhase{
+		segmentNum: len(segments),
+	}
+	defer func() {
+		loadTiming.totalDur = time.Since(loadStart)
+		segmentLoaderLoadTiming.record(loadTiming)
+	}()
+
 	log := log.Ctx(ctx).With(
 		zap.Int64("collectionID", collectionID),
 		zap.String("segmentType", segmentType.String()),
@@ -651,17 +818,25 @@ func (loader *segmentLoader) Load(ctx context.Context,
 		return nil, nil
 	}
 
+	stageStart := time.Now()
 	collection := loader.manager.Collection.Get(collectionID)
+	loadTiming.collectionDur = time.Since(stageStart)
 	if collection == nil {
 		err := merr.WrapErrCollectionNotFound(collectionID)
 		log.Warn("failed to get collection", zap.Error(err))
 		return nil, err
 	}
+	stageStart = time.Now()
 	for _, segment := range segments {
 		configureUseTakeForOutput(segment, collection.Schema())
 	}
+	loadTiming.configureDur = time.Since(stageStart)
+
 	// Filter out loaded & loading segments
+	stageStart = time.Now()
 	infos := loader.prepare(ctx, segmentType, segments...)
+	loadTiming.prepareDur = time.Since(stageStart)
+	loadTiming.afterFilter = len(infos)
 	defer loader.unregister(infos...)
 
 	// continue to wait other task done
@@ -672,7 +847,10 @@ func (loader *segmentLoader) Load(ctx context.Context,
 
 	// Check memory & storage limit
 	// no need to check resource for lazy load here
+	stageStart = time.Now()
 	requestResourceResult, err = loader.requestResource(ctx, infos...)
+	loadTiming.requestResourceDur = time.Since(stageStart)
+	loadTiming.concurrencyLevel = requestResourceResult.ConcurrencyLevel
 	if err != nil {
 		log.Warn("request resource failed", zap.Error(err))
 		return nil, err
@@ -692,6 +870,7 @@ func (loader *segmentLoader) Load(ctx context.Context,
 		})
 	}()
 
+	stageStart = time.Now()
 	for _, info := range infos {
 		loadInfo := info
 
@@ -736,6 +915,7 @@ func (loader *segmentLoader) Load(ctx context.Context,
 
 		newSegments.Insert(loadInfo.GetSegmentID(), segment)
 	}
+	loadTiming.createSegmentDur = time.Since(stageStart)
 
 	loadSegmentFunc := func(idx int) (err error) {
 		loadInfo := infos[idx]
@@ -839,8 +1019,10 @@ func (loader *segmentLoader) Load(ctx context.Context,
 		zap.Int("segmentNum", len(infos)),
 		zap.Int("concurrencyLevel", requestResourceResult.ConcurrencyLevel))
 
+	stageStart = time.Now()
 	err = funcutil.ProcessFuncParallel(len(infos),
 		requestResourceResult.ConcurrencyLevel, loadSegmentFunc, "loadSegmentFunc")
+	loadTiming.processDur = time.Since(stageStart)
 	if err != nil {
 		log.Warn("failed to load some segments", zap.Error(err))
 		return nil, err
@@ -848,17 +1030,22 @@ func (loader *segmentLoader) Load(ctx context.Context,
 
 	// Wait for all segments loaded
 	segmentIDs := lo.Map(segments, func(info *querypb.SegmentLoadInfo, _ int) int64 { return info.GetSegmentID() })
+	stageStart = time.Now()
 	if err := loader.waitSegmentLoadDone(ctx, segmentType, segmentIDs, version); err != nil {
+		loadTiming.waitDoneDur = time.Since(stageStart)
 		log.Warn("failed to wait the filtered out segments load done", zap.Error(err))
 		return nil, err
 	}
+	loadTiming.waitDoneDur = time.Since(stageStart)
 
 	log.Info("all segment load done")
+	stageStart = time.Now()
 	var result []Segment
 	loaded.Range(func(_ int64, s Segment) bool {
 		result = append(result, s)
 		return true
 	})
+	loadTiming.resultDur = time.Since(stageStart)
 	return result, nil
 }
 
