@@ -6678,6 +6678,10 @@ ChunkedSegmentSealedImpl::LoadBatchFieldData(
         // Build FieldBinlogInfo
         FieldBinlogInfo field_binlog_info;
         field_binlog_info.field_id = group_id;
+        field_binlog_info.child_field_ids.reserve(fields_to_load.size());
+        for (const auto& field_id : fields_to_load) {
+            field_binlog_info.child_field_ids.push_back(field_id.get());
+        }
 
         // Calculate total row count and collect binlog paths
         int64_t total_entries = 0;
