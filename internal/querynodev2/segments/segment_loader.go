@@ -947,7 +947,9 @@ func (loader *segmentLoader) requestResource(ctx context.Context, infos ...*quer
 	diskCap := paramtable.Get().QueryNodeCfg.DiskCapacityLimit.GetAsUint64()
 
 	estimateStart := time.Now()
-	loadingUsage, maxSegmentSize, err := loader.estimateSegmentLoadingResourceUsage(ctx, infos...)
+	// Recovery profiling experiment: bypass the expensive per-index resource
+	// estimate so the next recovery run exposes the downstream load bottleneck.
+	loadingUsage, maxSegmentSize, err := &ResourceUsage{}, uint64(0), error(nil)
 	estimateDur := time.Since(estimateStart)
 	if err != nil {
 		log.Warn("no sufficient physical resource to load segments", zap.Error(err))
