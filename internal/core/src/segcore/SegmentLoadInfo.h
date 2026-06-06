@@ -1072,39 +1072,7 @@ class SegmentLoadInfo {
 
  private:
     void
-    BuildCache() {
-        field_binlog_cache_.clear();
-        // Build binlog cache
-        for (int i = 0; i < info_.binlog_paths_size(); i++) {
-            const auto& binlog = info_.binlog_paths(i);
-            auto field_id = FieldId(binlog.fieldid());
-            field_binlog_cache_[field_id] = &binlog;
-        }
-
-        // Convert index infos to LoadIndexInfo and build per-field cache
-        converted_index_infos_.clear();
-        converted_field_index_cache_.clear();
-        field_index_has_raw_data_.clear();
-        for (int i = 0; i < info_.index_infos_size(); i++) {
-            const auto& index_info = info_.index_infos(i);
-            if (index_info.index_file_paths_size() == 0) {
-                continue;
-            }
-            auto field_id = FieldId(index_info.fieldid());
-            if (!HasFieldInSchema(field_id)) {
-                continue;
-            }
-            auto load_index_info = ConvertFieldIndexInfoToLoadIndexInfo(
-                &index_info, info_.segmentid());
-            converted_index_infos_.push_back(load_index_info);
-            // Check if index has raw data before moving
-            if (CheckIndexHasRawData(load_index_info)) {
-                field_index_has_raw_data_.insert(field_id);
-            }
-            converted_field_index_cache_[field_id].push_back(
-                std::move(load_index_info));
-        }
-    }
+    BuildCache();
 
     void
     ComputeDiffIndexes(LoadDiff& diff, SegmentLoadInfo& new_info);

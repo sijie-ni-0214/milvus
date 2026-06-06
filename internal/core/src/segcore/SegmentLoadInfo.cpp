@@ -10,7 +10,9 @@
 // or implied. See the License for the specific language governing permissions and limitations under the License
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
+#include <chrono>
 #include <iterator>
 #include <memory>
 
@@ -35,6 +37,148 @@
 #include "storage/loon_ffi/util.h"
 
 namespace milvus::segcore {
+
+namespace {
+
+constexpr int64_t kSegmentLoadInfoTimingLogIntervalNs =
+    5LL * 1000 * 1000 * 1000;
+
+int64_t
+NowNs() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
+int64_t
+DurationNs(std::chrono::steady_clock::time_point start) {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::steady_clock::now() - start)
+        .count();
+}
+
+double
+AvgMs(int64_t total_ns, int64_t count) {
+    if (count == 0) {
+        return 0.0;
+    }
+    return static_cast<double>(total_ns) / static_cast<double>(count) /
+           1000000.0;
+}
+
+double
+NsToMs(int64_t ns) {
+    return static_cast<double>(ns) / 1000000.0;
+}
+
+void
+UpdateMax(std::atomic<int64_t>& max_value, int64_t value) {
+    auto old = max_value.load(std::memory_order_relaxed);
+    while (
+        value > old &&
+        !max_value.compare_exchange_weak(
+            old, value, std::memory_order_relaxed, std::memory_order_relaxed)) {
+    }
+}
+
+struct BuildCacheTiming {
+    int64_t binlog_cache_ns = 0;
+    int64_t index_convert_ns = 0;
+    int64_t index_raw_data_ns = 0;
+    int64_t total_ns = 0;
+    int64_t binlog_group_count = 0;
+    int64_t index_count = 0;
+    int64_t raw_data_index_count = 0;
+};
+
+class BuildCacheTimingStats {
+ public:
+    void
+    Record(const BuildCacheTiming& timing) {
+        count_.fetch_add(1, std::memory_order_relaxed);
+        total_binlog_cache_ns_.fetch_add(timing.binlog_cache_ns,
+                                         std::memory_order_relaxed);
+        total_index_convert_ns_.fetch_add(timing.index_convert_ns,
+                                          std::memory_order_relaxed);
+        total_index_raw_data_ns_.fetch_add(timing.index_raw_data_ns,
+                                           std::memory_order_relaxed);
+        total_ns_.fetch_add(timing.total_ns, std::memory_order_relaxed);
+        total_binlog_group_count_.fetch_add(timing.binlog_group_count,
+                                            std::memory_order_relaxed);
+        total_index_count_.fetch_add(timing.index_count,
+                                     std::memory_order_relaxed);
+        total_raw_data_index_count_.fetch_add(timing.raw_data_index_count,
+                                              std::memory_order_relaxed);
+        UpdateMax(max_total_ns_, timing.total_ns);
+        MaybeLog();
+    }
+
+ private:
+    void
+    MaybeLog() {
+        auto now = NowNs();
+        auto last = last_log_ns_.load(std::memory_order_relaxed);
+        if (last != 0 && now - last < kSegmentLoadInfoTimingLogIntervalNs) {
+            return;
+        }
+        if (!last_log_ns_.compare_exchange_strong(last,
+                                                  now,
+                                                  std::memory_order_relaxed,
+                                                  std::memory_order_relaxed)) {
+            return;
+        }
+        auto count = count_.exchange(0, std::memory_order_relaxed);
+        if (count == 0) {
+            return;
+        }
+        auto binlog_cache_ns =
+            total_binlog_cache_ns_.exchange(0, std::memory_order_relaxed);
+        auto index_convert_ns =
+            total_index_convert_ns_.exchange(0, std::memory_order_relaxed);
+        auto index_raw_data_ns =
+            total_index_raw_data_ns_.exchange(0, std::memory_order_relaxed);
+        auto total_ns = total_ns_.exchange(0, std::memory_order_relaxed);
+        auto binlog_group_count =
+            total_binlog_group_count_.exchange(0, std::memory_order_relaxed);
+        auto index_count =
+            total_index_count_.exchange(0, std::memory_order_relaxed);
+        auto raw_data_index_count =
+            total_raw_data_index_count_.exchange(0, std::memory_order_relaxed);
+        auto max_total_ns =
+            max_total_ns_.exchange(0, std::memory_order_relaxed);
+
+        LOG_WARN(
+            "segment load info build cache timing stats count={} "
+            "avgBinlogCacheMs={:.3f} avgIndexConvertMs={:.3f} "
+            "avgIndexRawDataMs={:.3f} avgTotalMs={:.3f} maxTotalMs={:.3f} "
+            "avgBinlogGroupCount={:.2f} avgIndexCount={:.2f} "
+            "avgRawDataIndexCount={:.2f}",
+            count,
+            AvgMs(binlog_cache_ns, count),
+            AvgMs(index_convert_ns, count),
+            AvgMs(index_raw_data_ns, count),
+            AvgMs(total_ns, count),
+            NsToMs(max_total_ns),
+            static_cast<double>(binlog_group_count) / count,
+            static_cast<double>(index_count) / count,
+            static_cast<double>(raw_data_index_count) / count);
+    }
+
+    std::atomic<int64_t> count_{0};
+    std::atomic<int64_t> total_binlog_cache_ns_{0};
+    std::atomic<int64_t> total_index_convert_ns_{0};
+    std::atomic<int64_t> total_index_raw_data_ns_{0};
+    std::atomic<int64_t> total_ns_{0};
+    std::atomic<int64_t> total_binlog_group_count_{0};
+    std::atomic<int64_t> total_index_count_{0};
+    std::atomic<int64_t> total_raw_data_index_count_{0};
+    std::atomic<int64_t> max_total_ns_{0};
+    std::atomic<int64_t> last_log_ns_{0};
+};
+
+static BuildCacheTimingStats build_cache_timing_stats;
+
+}  // namespace
 
 std::shared_ptr<milvus_storage::api::ColumnGroups>
 SegmentLoadInfo::GetColumnGroups() const {
@@ -152,6 +296,57 @@ SegmentLoadInfo::CheckIndexHasRawData(const LoadIndexInfo& load_index_info) {
         load_index_info.dim);
 
     return request.has_raw_data;
+}
+
+void
+SegmentLoadInfo::BuildCache() {
+    auto total_start = std::chrono::steady_clock::now();
+    BuildCacheTiming timing;
+
+    auto stage_start = std::chrono::steady_clock::now();
+    field_binlog_cache_.clear();
+    for (int i = 0; i < info_.binlog_paths_size(); i++) {
+        const auto& binlog = info_.binlog_paths(i);
+        auto field_id = FieldId(binlog.fieldid());
+        field_binlog_cache_[field_id] = &binlog;
+    }
+    timing.binlog_group_count = info_.binlog_paths_size();
+    timing.binlog_cache_ns = DurationNs(stage_start);
+
+    converted_index_infos_.clear();
+    converted_field_index_cache_.clear();
+    field_index_has_raw_data_.clear();
+    for (int i = 0; i < info_.index_infos_size(); i++) {
+        const auto& index_info = info_.index_infos(i);
+        if (index_info.index_file_paths_size() == 0) {
+            continue;
+        }
+        auto field_id = FieldId(index_info.fieldid());
+        if (!HasFieldInSchema(field_id)) {
+            continue;
+        }
+
+        stage_start = std::chrono::steady_clock::now();
+        auto load_index_info = ConvertFieldIndexInfoToLoadIndexInfo(
+            &index_info, info_.segmentid());
+        timing.index_convert_ns += DurationNs(stage_start);
+        timing.index_count++;
+
+        converted_index_infos_.push_back(load_index_info);
+
+        stage_start = std::chrono::steady_clock::now();
+        if (CheckIndexHasRawData(load_index_info)) {
+            field_index_has_raw_data_.insert(field_id);
+            timing.raw_data_index_count++;
+        }
+        timing.index_raw_data_ns += DurationNs(stage_start);
+
+        converted_field_index_cache_[field_id].push_back(
+            std::move(load_index_info));
+    }
+
+    timing.total_ns = DurationNs(total_start);
+    build_cache_timing_stats.Record(timing);
 }
 
 std::shared_ptr<proto::indexcgo::LoadTextIndexInfo>
