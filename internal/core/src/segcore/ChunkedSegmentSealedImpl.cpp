@@ -923,12 +923,292 @@ class FieldDataInternalTimingStats {
     std::atomic<int64_t> last_log_ns_{0};
 };
 
+struct StorageV2FieldDataTiming {
+    int64_t resolve_fields_ns = 0;
+    int64_t schema_meta_ns = 0;
+    int64_t metadata_ns = 0;
+    int64_t create_translator_ns = 0;
+    int64_t create_chunk_group_ns = 0;
+    int64_t proxy_common_ns = 0;
+    int64_t total_ns = 0;
+    int64_t field_count = 0;
+    int64_t stats_field_count = 0;
+    bool enable_mmap = false;
+    bool has_vector = false;
+};
+
+class StorageV2FieldDataTimingStats {
+ public:
+    void
+    Record(const StorageV2FieldDataTiming& timing) {
+        count_.fetch_add(1, std::memory_order_relaxed);
+        total_resolve_fields_ns_.fetch_add(timing.resolve_fields_ns,
+                                           std::memory_order_relaxed);
+        total_schema_meta_ns_.fetch_add(timing.schema_meta_ns,
+                                        std::memory_order_relaxed);
+        total_metadata_ns_.fetch_add(timing.metadata_ns,
+                                     std::memory_order_relaxed);
+        total_create_translator_ns_.fetch_add(timing.create_translator_ns,
+                                              std::memory_order_relaxed);
+        total_create_chunk_group_ns_.fetch_add(timing.create_chunk_group_ns,
+                                               std::memory_order_relaxed);
+        total_proxy_common_ns_.fetch_add(timing.proxy_common_ns,
+                                         std::memory_order_relaxed);
+        total_ns_.fetch_add(timing.total_ns, std::memory_order_relaxed);
+        total_field_count_.fetch_add(timing.field_count,
+                                     std::memory_order_relaxed);
+        total_stats_field_count_.fetch_add(timing.stats_field_count,
+                                           std::memory_order_relaxed);
+        mmap_count_.fetch_add(timing.enable_mmap ? 1 : 0,
+                              std::memory_order_relaxed);
+        vector_count_.fetch_add(timing.has_vector ? 1 : 0,
+                                std::memory_order_relaxed);
+        UpdateMax(max_total_ns_, timing.total_ns);
+        MaybeLog();
+    }
+
+ private:
+    void
+    MaybeLog() {
+        auto now = NowNs();
+        auto last = last_log_ns_.load(std::memory_order_relaxed);
+        if (last != 0 && now - last < kTimingLogIntervalNs) {
+            return;
+        }
+        if (!last_log_ns_.compare_exchange_strong(last,
+                                                  now,
+                                                  std::memory_order_relaxed,
+                                                  std::memory_order_relaxed)) {
+            return;
+        }
+        auto count = count_.exchange(0, std::memory_order_relaxed);
+        if (count == 0) {
+            return;
+        }
+        auto resolve_fields_ns =
+            total_resolve_fields_ns_.exchange(0, std::memory_order_relaxed);
+        auto schema_meta_ns =
+            total_schema_meta_ns_.exchange(0, std::memory_order_relaxed);
+        auto metadata_ns =
+            total_metadata_ns_.exchange(0, std::memory_order_relaxed);
+        auto create_translator_ns =
+            total_create_translator_ns_.exchange(0, std::memory_order_relaxed);
+        auto create_chunk_group_ns =
+            total_create_chunk_group_ns_.exchange(0, std::memory_order_relaxed);
+        auto proxy_common_ns =
+            total_proxy_common_ns_.exchange(0, std::memory_order_relaxed);
+        auto total_ns = total_ns_.exchange(0, std::memory_order_relaxed);
+        auto field_count =
+            total_field_count_.exchange(0, std::memory_order_relaxed);
+        auto stats_field_count =
+            total_stats_field_count_.exchange(0, std::memory_order_relaxed);
+        auto mmap_count = mmap_count_.exchange(0, std::memory_order_relaxed);
+        auto vector_count =
+            vector_count_.exchange(0, std::memory_order_relaxed);
+        auto max_total_ns =
+            max_total_ns_.exchange(0, std::memory_order_relaxed);
+
+        LOG_WARN(
+            "segcore load storage v2 field data timing stats count={} "
+            "avgResolveFieldsMs={:.3f} avgSchemaMetaMs={:.3f} "
+            "avgMetadataMs={:.3f} avgCreateTranslatorMs={:.3f} "
+            "avgCreateChunkGroupMs={:.3f} avgProxyCommonMs={:.3f} "
+            "avgTotalMs={:.3f} maxTotalMs={:.3f} avgFieldCount={:.2f} "
+            "avgStatsFieldCount={:.2f} mmapRatio={:.2f} vectorRatio={:.2f}",
+            count,
+            AvgMs(resolve_fields_ns, count),
+            AvgMs(schema_meta_ns, count),
+            AvgMs(metadata_ns, count),
+            AvgMs(create_translator_ns, count),
+            AvgMs(create_chunk_group_ns, count),
+            AvgMs(proxy_common_ns, count),
+            AvgMs(total_ns, count),
+            NsToMs(max_total_ns),
+            static_cast<double>(field_count) / count,
+            static_cast<double>(stats_field_count) / count,
+            static_cast<double>(mmap_count) / count,
+            static_cast<double>(vector_count) / count);
+    }
+
+    std::atomic<int64_t> count_{0};
+    std::atomic<int64_t> total_resolve_fields_ns_{0};
+    std::atomic<int64_t> total_schema_meta_ns_{0};
+    std::atomic<int64_t> total_metadata_ns_{0};
+    std::atomic<int64_t> total_create_translator_ns_{0};
+    std::atomic<int64_t> total_create_chunk_group_ns_{0};
+    std::atomic<int64_t> total_proxy_common_ns_{0};
+    std::atomic<int64_t> total_ns_{0};
+    std::atomic<int64_t> total_field_count_{0};
+    std::atomic<int64_t> total_stats_field_count_{0};
+    std::atomic<int64_t> mmap_count_{0};
+    std::atomic<int64_t> vector_count_{0};
+    std::atomic<int64_t> max_total_ns_{0};
+    std::atomic<int64_t> last_log_ns_{0};
+};
+
+struct FieldDataCommonTiming {
+    int64_t initial_lock_ns = 0;
+    int64_t nullable_ns = 0;
+    int64_t memory_stats_ns = 0;
+    int64_t skip_index_ns = 0;
+    int64_t pk_index_ns = 0;
+    int64_t interim_index_ns = 0;
+    int64_t final_lock_ns = 0;
+    int64_t array_offsets_ns = 0;
+    int64_t total_ns = 0;
+    bool system = false;
+    bool vector = false;
+    bool variable = false;
+    bool proxy = false;
+    bool mmap = false;
+    bool pk = false;
+    bool nullable = false;
+};
+
+class FieldDataCommonTimingStats {
+ public:
+    void
+    Record(const FieldDataCommonTiming& timing) {
+        count_.fetch_add(1, std::memory_order_relaxed);
+        total_initial_lock_ns_.fetch_add(timing.initial_lock_ns,
+                                         std::memory_order_relaxed);
+        total_nullable_ns_.fetch_add(timing.nullable_ns,
+                                     std::memory_order_relaxed);
+        total_memory_stats_ns_.fetch_add(timing.memory_stats_ns,
+                                         std::memory_order_relaxed);
+        total_skip_index_ns_.fetch_add(timing.skip_index_ns,
+                                       std::memory_order_relaxed);
+        total_pk_index_ns_.fetch_add(timing.pk_index_ns,
+                                     std::memory_order_relaxed);
+        total_interim_index_ns_.fetch_add(timing.interim_index_ns,
+                                          std::memory_order_relaxed);
+        total_final_lock_ns_.fetch_add(timing.final_lock_ns,
+                                       std::memory_order_relaxed);
+        total_array_offsets_ns_.fetch_add(timing.array_offsets_ns,
+                                          std::memory_order_relaxed);
+        total_ns_.fetch_add(timing.total_ns, std::memory_order_relaxed);
+        system_count_.fetch_add(timing.system ? 1 : 0,
+                                std::memory_order_relaxed);
+        vector_count_.fetch_add(timing.vector ? 1 : 0,
+                                std::memory_order_relaxed);
+        variable_count_.fetch_add(timing.variable ? 1 : 0,
+                                  std::memory_order_relaxed);
+        proxy_count_.fetch_add(timing.proxy ? 1 : 0, std::memory_order_relaxed);
+        mmap_count_.fetch_add(timing.mmap ? 1 : 0, std::memory_order_relaxed);
+        pk_count_.fetch_add(timing.pk ? 1 : 0, std::memory_order_relaxed);
+        nullable_count_.fetch_add(timing.nullable ? 1 : 0,
+                                  std::memory_order_relaxed);
+        UpdateMax(max_total_ns_, timing.total_ns);
+        MaybeLog();
+    }
+
+ private:
+    void
+    MaybeLog() {
+        auto now = NowNs();
+        auto last = last_log_ns_.load(std::memory_order_relaxed);
+        if (last != 0 && now - last < kTimingLogIntervalNs) {
+            return;
+        }
+        if (!last_log_ns_.compare_exchange_strong(last,
+                                                  now,
+                                                  std::memory_order_relaxed,
+                                                  std::memory_order_relaxed)) {
+            return;
+        }
+        auto count = count_.exchange(0, std::memory_order_relaxed);
+        if (count == 0) {
+            return;
+        }
+        auto initial_lock_ns =
+            total_initial_lock_ns_.exchange(0, std::memory_order_relaxed);
+        auto nullable_ns =
+            total_nullable_ns_.exchange(0, std::memory_order_relaxed);
+        auto memory_stats_ns =
+            total_memory_stats_ns_.exchange(0, std::memory_order_relaxed);
+        auto skip_index_ns =
+            total_skip_index_ns_.exchange(0, std::memory_order_relaxed);
+        auto pk_index_ns =
+            total_pk_index_ns_.exchange(0, std::memory_order_relaxed);
+        auto interim_index_ns =
+            total_interim_index_ns_.exchange(0, std::memory_order_relaxed);
+        auto final_lock_ns =
+            total_final_lock_ns_.exchange(0, std::memory_order_relaxed);
+        auto array_offsets_ns =
+            total_array_offsets_ns_.exchange(0, std::memory_order_relaxed);
+        auto total_ns = total_ns_.exchange(0, std::memory_order_relaxed);
+        auto system_count =
+            system_count_.exchange(0, std::memory_order_relaxed);
+        auto vector_count =
+            vector_count_.exchange(0, std::memory_order_relaxed);
+        auto variable_count =
+            variable_count_.exchange(0, std::memory_order_relaxed);
+        auto proxy_count = proxy_count_.exchange(0, std::memory_order_relaxed);
+        auto mmap_count = mmap_count_.exchange(0, std::memory_order_relaxed);
+        auto pk_count = pk_count_.exchange(0, std::memory_order_relaxed);
+        auto nullable_count =
+            nullable_count_.exchange(0, std::memory_order_relaxed);
+        auto max_total_ns =
+            max_total_ns_.exchange(0, std::memory_order_relaxed);
+
+        LOG_WARN(
+            "segcore load field data common timing stats count={} "
+            "avgInitialLockMs={:.3f} avgNullableMs={:.3f} "
+            "avgMemoryStatsMs={:.3f} avgSkipIndexMs={:.3f} "
+            "avgPKIndexMs={:.3f} avgInterimIndexMs={:.3f} "
+            "avgFinalLockMs={:.3f} avgArrayOffsetsMs={:.3f} "
+            "avgTotalMs={:.3f} maxTotalMs={:.3f} systemRatio={:.2f} "
+            "vectorRatio={:.2f} variableRatio={:.2f} proxyRatio={:.2f} "
+            "mmapRatio={:.2f} pkRatio={:.2f} nullableRatio={:.2f}",
+            count,
+            AvgMs(initial_lock_ns, count),
+            AvgMs(nullable_ns, count),
+            AvgMs(memory_stats_ns, count),
+            AvgMs(skip_index_ns, count),
+            AvgMs(pk_index_ns, count),
+            AvgMs(interim_index_ns, count),
+            AvgMs(final_lock_ns, count),
+            AvgMs(array_offsets_ns, count),
+            AvgMs(total_ns, count),
+            NsToMs(max_total_ns),
+            static_cast<double>(system_count) / count,
+            static_cast<double>(vector_count) / count,
+            static_cast<double>(variable_count) / count,
+            static_cast<double>(proxy_count) / count,
+            static_cast<double>(mmap_count) / count,
+            static_cast<double>(pk_count) / count,
+            static_cast<double>(nullable_count) / count);
+    }
+
+    std::atomic<int64_t> count_{0};
+    std::atomic<int64_t> total_initial_lock_ns_{0};
+    std::atomic<int64_t> total_nullable_ns_{0};
+    std::atomic<int64_t> total_memory_stats_ns_{0};
+    std::atomic<int64_t> total_skip_index_ns_{0};
+    std::atomic<int64_t> total_pk_index_ns_{0};
+    std::atomic<int64_t> total_interim_index_ns_{0};
+    std::atomic<int64_t> total_final_lock_ns_{0};
+    std::atomic<int64_t> total_array_offsets_ns_{0};
+    std::atomic<int64_t> total_ns_{0};
+    std::atomic<int64_t> system_count_{0};
+    std::atomic<int64_t> vector_count_{0};
+    std::atomic<int64_t> variable_count_{0};
+    std::atomic<int64_t> proxy_count_{0};
+    std::atomic<int64_t> mmap_count_{0};
+    std::atomic<int64_t> pk_count_{0};
+    std::atomic<int64_t> nullable_count_{0};
+    std::atomic<int64_t> max_total_ns_{0};
+    std::atomic<int64_t> last_log_ns_{0};
+};
+
 static SegcoreLoadTimingStats sealed_load_timing_stats;
 static ApplyLoadDiffTimingStats apply_load_diff_timing_stats;
 static ColumnGroupTimingStats column_group_timing_stats;
 static IndexRegisterTimingStats index_register_timing_stats;
 static BatchFieldDataTimingStats batch_field_data_timing_stats;
 static FieldDataInternalTimingStats field_data_internal_timing_stats;
+static StorageV2FieldDataTimingStats storage_v2_field_data_timing_stats;
+static FieldDataCommonTimingStats field_data_common_timing_stats;
 
 }  // namespace
 
@@ -1791,6 +2071,11 @@ ChunkedSegmentSealedImpl::load_column_group_data_internal(
     auto& mmap_config = storage::MmapManager::GetInstance().GetMmapConfig();
 
     for (auto& [id, info] : load_info.field_infos) {
+        auto total_start = std::chrono::steady_clock::now();
+        auto stage_start = std::chrono::steady_clock::now();
+        StorageV2FieldDataTiming timing;
+        timing.enable_mmap = info.enable_mmap;
+
         AssertInfo(info.row_count > 0,
                    "[StorageV2] The row count of field data is 0");
 
@@ -1807,10 +2092,12 @@ ChunkedSegmentSealedImpl::load_column_group_data_internal(
         } else {
             field_id_list = milvus_storage::FieldIDList(info.child_field_ids);
         }
+        timing.resolve_fields_ns = DurationNs(stage_start);
 
         // if multiple fields share same column group
         // hint for not loading certain field shall not be working for now
         // warmup will be disabled only when all columns are not in load list
+        stage_start = std::chrono::steady_clock::now();
         bool merged_in_load_list = false;
         std::vector<FieldId> milvus_field_ids;
         milvus_field_ids.reserve(field_id_list.size());
@@ -1853,6 +2140,18 @@ ChunkedSegmentSealedImpl::load_column_group_data_internal(
                 }
             }
         }
+        timing.field_count = milvus_field_ids.size();
+        timing.stats_field_count = fields_for_stats.size();
+        for (auto field_id : milvus_field_ids) {
+            const auto& field_meta = field_metas.at(field_id);
+            if (IsVectorDataType(field_meta.get_data_type())) {
+                timing.has_vector = true;
+                break;
+            }
+        }
+        timing.schema_meta_ns = DurationNs(stage_start);
+
+        stage_start = std::chrono::steady_clock::now();
         auto metadata = LoadGroupChunkMetadata(
             insert_files,
             fields_for_stats,
@@ -1860,7 +2159,9 @@ ChunkedSegmentSealedImpl::load_column_group_data_internal(
                 "seg_{}_cg_{}", get_segment_id(), column_group_id.get()));
         auto parquet_stats_by_field =
             std::move(metadata.parquet_stats_by_field);
+        timing.metadata_ns = DurationNs(stage_start);
 
+        stage_start = std::chrono::steady_clock::now();
         auto translator =
             std::make_unique<storagev2translator::GroupChunkTranslator>(
                 get_segment_id(),
@@ -1874,10 +2175,15 @@ ChunkedSegmentSealedImpl::load_column_group_data_internal(
                 milvus_field_ids.size(),
                 load_info.load_priority,
                 info.warmup_policy);
+        timing.create_translator_ns = DurationNs(stage_start);
+
+        stage_start = std::chrono::steady_clock::now();
         auto chunked_column_group =
             std::make_shared<ChunkedColumnGroup>(std::move(translator));
+        timing.create_chunk_group_ns = DurationNs(stage_start);
 
         // Create ProxyChunkColumn for each field in this column group
+        stage_start = std::chrono::steady_clock::now();
         for (const auto& field_id : milvus_field_ids) {
             const auto& field_meta = field_metas.at(field_id);
             auto column = std::make_shared<ProxyChunkColumn>(
@@ -1908,6 +2214,9 @@ ChunkedSegmentSealedImpl::load_column_group_data_internal(
                 }
             }
         }
+        timing.proxy_common_ns = DurationNs(stage_start);
+        timing.total_ns = DurationNs(total_start);
+        storage_v2_field_data_timing_stats.Record(timing);
 
         if (column_group_id.get() == DEFAULT_SHORT_COLUMN_GROUP_ID) {
             stats_.mem_size += chunked_column_group->memory_size();
@@ -5113,6 +5422,18 @@ ChunkedSegmentSealedImpl::load_field_data_common(
     std::optional<ParquetStatistics> statistics,
     milvus::OpContext* op_ctx,
     bool is_replace) {
+    auto total_start = std::chrono::steady_clock::now();
+    auto stage_start = std::chrono::steady_clock::now();
+    FieldDataCommonTiming timing;
+    timing.system = SystemProperty::Instance().IsSystem(field_id);
+    timing.vector = IsVectorDataType(data_type);
+    timing.variable = IsVariableDataType(data_type);
+    timing.proxy = is_proxy_column;
+    timing.mmap = enable_mmap;
+    timing.pk = schema_->get_primary_field_id().value_or(FieldId(-1)).get() ==
+                field_id.get();
+    timing.nullable = column->IsNullable();
+
     {
         std::unique_lock lck(mutex_);
         if (is_replace) {
@@ -5146,12 +5467,17 @@ ChunkedSegmentSealedImpl::load_field_data_common(
             mmap_field_ids_.insert(field_id);
         }
     }
+    timing.initial_lock_ns = DurationNs(stage_start);
+
     // system field only needs to emplace column to fields_ map
-    if (SystemProperty::Instance().IsSystem(field_id)) {
+    if (timing.system) {
+        timing.total_ns = DurationNs(total_start);
+        field_data_common_timing_stats.Record(timing);
         return;
     }
 
-    if (column->IsNullable() && IsVectorDataType(data_type)) {
+    stage_start = std::chrono::steady_clock::now();
+    if (timing.nullable && timing.vector) {
         bool lazy_inited = false;
         // For VECTOR_ARRAY, Parquet num_values is the child vector count, not
         // the outer row count. Empty non-null rows would corrupt physical row
@@ -5179,7 +5505,9 @@ ChunkedSegmentSealedImpl::load_field_data_common(
             column->BuildValidRowIds(op_ctx);
         }
     }
+    timing.nullable_ns = DurationNs(stage_start);
 
+    stage_start = std::chrono::steady_clock::now();
     if (!enable_mmap) {
         if (!is_proxy_column ||
             (is_proxy_column &&
@@ -5192,10 +5520,13 @@ ChunkedSegmentSealedImpl::load_field_data_common(
                 field_id, num_rows, column->DataByteSize());
         }
     }
+    timing.memory_stats_ns = DurationNs(stage_start);
+
     // Skip index construction: for proxy columns (external tables) with no
     // statistics, skip building the skip index during load to avoid triggering
     // S3 data fetches when warmup=disable. The skip index will be unavailable
     // for these segments, which only affects skip-index-based pruning.
+    stage_start = std::chrono::steady_clock::now();
     if (!IsVariableDataType(data_type) || IsStringDataType(data_type)) {
         if (statistics) {
             LoadSkipIndexFromStatistics(
@@ -5204,9 +5535,11 @@ ChunkedSegmentSealedImpl::load_field_data_common(
             LoadSkipIndex(field_id, data_type, column);
         }
     }
+    timing.skip_index_ns = DurationNs(stage_start);
 
     // set pks to offset
-    if (schema_->get_primary_field_id().value_or(FieldId(-1)) == field_id) {
+    stage_start = std::chrono::steady_clock::now();
+    if (timing.pk) {
         if (std::atomic_load(&segment_load_info_)->GetStorageVersion() >=
             STORAGE_V2) {
             init_storage_v2_pk_index(field_id, column, data_type);
@@ -5214,13 +5547,17 @@ ChunkedSegmentSealedImpl::load_field_data_common(
             init_storage_v1_pk_index(field_id, column, data_type, is_replace);
         }
     }
+    timing.pk_index_ns = DurationNs(stage_start);
 
     // now interim index does not touch column warmup
+    stage_start = std::chrono::steady_clock::now();
     generate_interim_index(field_id, num_rows);
+    timing.interim_index_ns = DurationNs(stage_start);
 
     std::string struct_name;
     const FieldMeta* field_meta_ptr = nullptr;
 
+    stage_start = std::chrono::steady_clock::now();
     {
         std::unique_lock lck(mutex_);
         if (!is_replace) {
@@ -5251,8 +5588,10 @@ ChunkedSegmentSealedImpl::load_field_data_common(
             }
         }
     }
+    timing.final_lock_ns = DurationNs(stage_start);
 
     // Build ArrayOffsetsSealed outside lock (expensive operation)
+    stage_start = std::chrono::steady_clock::now();
     if (field_meta_ptr) {
         auto new_offsets =
             ArrayOffsetsSealed::BuildFromSegment(this, *field_meta_ptr);
@@ -5267,6 +5606,9 @@ ChunkedSegmentSealedImpl::load_field_data_common(
             array_offsets_map_[field_id] = it->second;
         }
     }
+    timing.array_offsets_ns = DurationNs(stage_start);
+    timing.total_ns = DurationNs(total_start);
+    field_data_common_timing_stats.Record(timing);
 }
 
 static TimestampIndex
