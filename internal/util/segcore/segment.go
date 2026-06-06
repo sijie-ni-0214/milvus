@@ -17,9 +17,11 @@ import (
 	"fmt"
 	"runtime"
 	"strings"
+	"time"
 	"unsafe"
 
 	"github.com/cockroachdb/errors"
+	"go.uber.org/atomic"
 	"go.uber.org/zap"
 	"google.golang.org/protobuf/proto"
 
@@ -56,6 +58,130 @@ type CreateCSegmentRequest struct {
 	LoadInfo    *querypb.SegmentLoadInfo
 }
 
+const createCSegmentTimingLogInterval = 5 * time.Second
+
+type createCSegmentTimingPhase struct {
+	withLoadInfo bool
+	convertDur   time.Duration
+	marshalDur   time.Duration
+	cgoNewDur    time.Duration
+	commitTsDur  time.Duration
+	totalDur     time.Duration
+}
+
+type createCSegmentTimingStats struct {
+	count             *atomic.Int64
+	withLoadInfoCount *atomic.Int64
+	totalConvert      *atomic.Int64
+	totalMarshal      *atomic.Int64
+	totalCGONew       *atomic.Int64
+	totalCommitTs     *atomic.Int64
+	total             *atomic.Int64
+	maxConvert        *atomic.Int64
+	maxMarshal        *atomic.Int64
+	maxCGONew         *atomic.Int64
+	maxCommitTs       *atomic.Int64
+	maxTotal          *atomic.Int64
+	lastLogUnixNano   *atomic.Int64
+}
+
+func newCreateCSegmentTimingStats() *createCSegmentTimingStats {
+	return &createCSegmentTimingStats{
+		count:             atomic.NewInt64(0),
+		withLoadInfoCount: atomic.NewInt64(0),
+		totalConvert:      atomic.NewInt64(0),
+		totalMarshal:      atomic.NewInt64(0),
+		totalCGONew:       atomic.NewInt64(0),
+		totalCommitTs:     atomic.NewInt64(0),
+		total:             atomic.NewInt64(0),
+		maxConvert:        atomic.NewInt64(0),
+		maxMarshal:        atomic.NewInt64(0),
+		maxCGONew:         atomic.NewInt64(0),
+		maxCommitTs:       atomic.NewInt64(0),
+		maxTotal:          atomic.NewInt64(0),
+		lastLogUnixNano:   atomic.NewInt64(time.Now().UnixNano()),
+	}
+}
+
+var cSegmentTiming = newCreateCSegmentTimingStats()
+
+func avgCreateCSegmentDuration(total int64, count int64) time.Duration {
+	if count == 0 {
+		return 0
+	}
+	return time.Duration(total / count)
+}
+
+func updateCreateCSegmentMax(max *atomic.Int64, dur time.Duration) {
+	value := int64(dur)
+	for {
+		old := max.Load()
+		if value <= old {
+			return
+		}
+		if max.CompareAndSwap(old, value) {
+			return
+		}
+	}
+}
+
+func (s *createCSegmentTimingStats) record(timing createCSegmentTimingPhase) {
+	s.count.Inc()
+	if timing.withLoadInfo {
+		s.withLoadInfoCount.Inc()
+	}
+	s.totalConvert.Add(int64(timing.convertDur))
+	s.totalMarshal.Add(int64(timing.marshalDur))
+	s.totalCGONew.Add(int64(timing.cgoNewDur))
+	s.totalCommitTs.Add(int64(timing.commitTsDur))
+	s.total.Add(int64(timing.totalDur))
+	updateCreateCSegmentMax(s.maxConvert, timing.convertDur)
+	updateCreateCSegmentMax(s.maxMarshal, timing.marshalDur)
+	updateCreateCSegmentMax(s.maxCGONew, timing.cgoNewDur)
+	updateCreateCSegmentMax(s.maxCommitTs, timing.commitTsDur)
+	updateCreateCSegmentMax(s.maxTotal, timing.totalDur)
+
+	now := time.Now()
+	last := s.lastLogUnixNano.Load()
+	if now.UnixNano()-last < int64(createCSegmentTimingLogInterval) {
+		return
+	}
+	if !s.lastLogUnixNano.CompareAndSwap(last, now.UnixNano()) {
+		return
+	}
+
+	count := s.count.Swap(0)
+	withLoadInfoCount := s.withLoadInfoCount.Swap(0)
+	totalConvert := s.totalConvert.Swap(0)
+	totalMarshal := s.totalMarshal.Swap(0)
+	totalCGONew := s.totalCGONew.Swap(0)
+	totalCommitTs := s.totalCommitTs.Swap(0)
+	total := s.total.Swap(0)
+	maxConvert := s.maxConvert.Swap(0)
+	maxMarshal := s.maxMarshal.Swap(0)
+	maxCGONew := s.maxCGONew.Swap(0)
+	maxCommitTs := s.maxCommitTs.Swap(0)
+	maxTotal := s.maxTotal.Swap(0)
+	if count == 0 {
+		return
+	}
+
+	log.Warn("create csegment timing stats",
+		zap.Int64("requestCount", count),
+		zap.Int64("withLoadInfoCount", withLoadInfoCount),
+		zap.Duration("avgConvertDur", avgCreateCSegmentDuration(totalConvert, count)),
+		zap.Duration("avgMarshalDur", avgCreateCSegmentDuration(totalMarshal, count)),
+		zap.Duration("avgCGONewDur", avgCreateCSegmentDuration(totalCGONew, count)),
+		zap.Duration("avgCommitTsDur", avgCreateCSegmentDuration(totalCommitTs, count)),
+		zap.Duration("avgTotalDur", avgCreateCSegmentDuration(total, count)),
+		zap.Duration("maxConvertDur", time.Duration(maxConvert)),
+		zap.Duration("maxMarshalDur", time.Duration(maxMarshal)),
+		zap.Duration("maxCGONewDur", time.Duration(maxCGONew)),
+		zap.Duration("maxCommitTsDur", time.Duration(maxCommitTs)),
+		zap.Duration("maxTotalDur", time.Duration(maxTotal)),
+	)
+}
+
 func (req *CreateCSegmentRequest) getCSegmentType() C.SegmentType {
 	var segmentType C.SegmentType
 	switch req.SegmentType {
@@ -71,18 +197,35 @@ func (req *CreateCSegmentRequest) getCSegmentType() C.SegmentType {
 
 // CreateCSegment creates a segment from a CreateCSegmentRequest.
 func CreateCSegment(req *CreateCSegmentRequest) (CSegment, error) {
+	createStart := time.Now()
+	timing := createCSegmentTimingPhase{
+		withLoadInfo: req.LoadInfo != nil,
+	}
+	defer func() {
+		timing.totalDur = time.Since(createStart)
+		cSegmentTiming.record(timing)
+	}()
+
 	var ptr C.CSegmentInterface
 	var status C.CStatus
 	if req.LoadInfo != nil {
+		stageStart := time.Now()
 		segLoadInfo := ConvertToSegcoreSegmentLoadInfo(req.LoadInfo)
+		timing.convertDur = time.Since(stageStart)
+		stageStart = time.Now()
 		loadInfoBlob, err := proto.Marshal(segLoadInfo)
+		timing.marshalDur = time.Since(stageStart)
 		if err != nil {
 			return nil, err
 		}
 
+		stageStart = time.Now()
 		status = C.NewSegmentWithLoadInfo(req.Collection.rawPointer(), req.getCSegmentType(), C.int64_t(req.SegmentID), &ptr, C.bool(req.IsSorted), (*C.uint8_t)(unsafe.Pointer(&loadInfoBlob[0])), C.int64_t(len(loadInfoBlob)))
+		timing.cgoNewDur = time.Since(stageStart)
 	} else {
+		stageStart := time.Now()
 		status = C.NewSegment(req.Collection.rawPointer(), req.getCSegmentType(), C.int64_t(req.SegmentID), &ptr, C.bool(req.IsSorted))
+		timing.cgoNewDur = time.Since(stageStart)
 	}
 	if err := ConsumeCStatusIntoError(&status); err != nil {
 		return nil, err
@@ -90,10 +233,13 @@ func CreateCSegment(req *CreateCSegmentRequest) (CSegment, error) {
 	seg := &cSegmentImpl{id: req.SegmentID, ptr: ptr}
 	if req.LoadInfo != nil {
 		if commitTs := req.LoadInfo.GetCommitTimestamp(); commitTs != 0 {
+			stageStart := time.Now()
 			if err := seg.SetCommitTimestamp(commitTs); err != nil {
+				timing.commitTsDur = time.Since(stageStart)
 				C.DeleteSegment(ptr)
 				return nil, errors.Wrap(err, "failed to set commit timestamp on segment")
 			}
+			timing.commitTsDur = time.Since(stageStart)
 		}
 	}
 	return seg, nil

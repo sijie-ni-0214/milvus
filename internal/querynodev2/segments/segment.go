@@ -353,6 +353,126 @@ type LocalSegment struct {
 	fieldJSONStatsMu   sync.RWMutex
 }
 
+type newSegmentTimingPhase struct {
+	baseSegmentDur       time.Duration
+	loadStateLockDur     time.Duration
+	dynamicPoolWaitDur   time.Duration
+	createCSegmentDur    time.Duration
+	localStructDur       time.Duration
+	initializeSegmentDur time.Duration
+	totalDur             time.Duration
+}
+
+type newSegmentTimingStats struct {
+	count                  *atomic.Int64
+	totalBaseSegment       *atomic.Int64
+	totalLoadStateLock     *atomic.Int64
+	totalDynamicPoolWait   *atomic.Int64
+	totalCreateCSegment    *atomic.Int64
+	totalLocalStruct       *atomic.Int64
+	totalInitializeSegment *atomic.Int64
+	total                  *atomic.Int64
+	maxBaseSegment         *atomic.Int64
+	maxLoadStateLock       *atomic.Int64
+	maxDynamicPoolWait     *atomic.Int64
+	maxCreateCSegment      *atomic.Int64
+	maxLocalStruct         *atomic.Int64
+	maxInitializeSegment   *atomic.Int64
+	maxTotal               *atomic.Int64
+	lastLogUnixNano        *atomic.Int64
+}
+
+func newNewSegmentTimingStats() *newSegmentTimingStats {
+	return &newSegmentTimingStats{
+		count:                  atomic.NewInt64(0),
+		totalBaseSegment:       atomic.NewInt64(0),
+		totalLoadStateLock:     atomic.NewInt64(0),
+		totalDynamicPoolWait:   atomic.NewInt64(0),
+		totalCreateCSegment:    atomic.NewInt64(0),
+		totalLocalStruct:       atomic.NewInt64(0),
+		totalInitializeSegment: atomic.NewInt64(0),
+		total:                  atomic.NewInt64(0),
+		maxBaseSegment:         atomic.NewInt64(0),
+		maxLoadStateLock:       atomic.NewInt64(0),
+		maxDynamicPoolWait:     atomic.NewInt64(0),
+		maxCreateCSegment:      atomic.NewInt64(0),
+		maxLocalStruct:         atomic.NewInt64(0),
+		maxInitializeSegment:   atomic.NewInt64(0),
+		maxTotal:               atomic.NewInt64(0),
+		lastLogUnixNano:        atomic.NewInt64(time.Now().UnixNano()),
+	}
+}
+
+var newSegmentTiming = newNewSegmentTimingStats()
+
+func (s *newSegmentTimingStats) record(timing newSegmentTimingPhase) {
+	s.count.Inc()
+	s.totalBaseSegment.Add(int64(timing.baseSegmentDur))
+	s.totalLoadStateLock.Add(int64(timing.loadStateLockDur))
+	s.totalDynamicPoolWait.Add(int64(timing.dynamicPoolWaitDur))
+	s.totalCreateCSegment.Add(int64(timing.createCSegmentDur))
+	s.totalLocalStruct.Add(int64(timing.localStructDur))
+	s.totalInitializeSegment.Add(int64(timing.initializeSegmentDur))
+	s.total.Add(int64(timing.totalDur))
+	updateMaxDuration(s.maxBaseSegment, timing.baseSegmentDur)
+	updateMaxDuration(s.maxLoadStateLock, timing.loadStateLockDur)
+	updateMaxDuration(s.maxDynamicPoolWait, timing.dynamicPoolWaitDur)
+	updateMaxDuration(s.maxCreateCSegment, timing.createCSegmentDur)
+	updateMaxDuration(s.maxLocalStruct, timing.localStructDur)
+	updateMaxDuration(s.maxInitializeSegment, timing.initializeSegmentDur)
+	updateMaxDuration(s.maxTotal, timing.totalDur)
+
+	now := time.Now()
+	last := s.lastLogUnixNano.Load()
+	if now.UnixNano()-last < int64(requestResourceTimingLogInterval) {
+		return
+	}
+	if !s.lastLogUnixNano.CompareAndSwap(last, now.UnixNano()) {
+		return
+	}
+
+	count := s.count.Swap(0)
+	totalBaseSegment := s.totalBaseSegment.Swap(0)
+	totalLoadStateLock := s.totalLoadStateLock.Swap(0)
+	totalDynamicPoolWait := s.totalDynamicPoolWait.Swap(0)
+	totalCreateCSegment := s.totalCreateCSegment.Swap(0)
+	totalLocalStruct := s.totalLocalStruct.Swap(0)
+	totalInitializeSegment := s.totalInitializeSegment.Swap(0)
+	total := s.total.Swap(0)
+	maxBaseSegment := s.maxBaseSegment.Swap(0)
+	maxLoadStateLock := s.maxLoadStateLock.Swap(0)
+	maxDynamicPoolWait := s.maxDynamicPoolWait.Swap(0)
+	maxCreateCSegment := s.maxCreateCSegment.Swap(0)
+	maxLocalStruct := s.maxLocalStruct.Swap(0)
+	maxInitializeSegment := s.maxInitializeSegment.Swap(0)
+	maxTotal := s.maxTotal.Swap(0)
+	if count == 0 {
+		return
+	}
+
+	pool := GetDynamicPool()
+	log.Warn("new segment timing stats",
+		zap.Int64("requestCount", count),
+		zap.Duration("avgBaseSegmentDur", avgDuration(totalBaseSegment, count)),
+		zap.Duration("avgLoadStateLockDur", avgDuration(totalLoadStateLock, count)),
+		zap.Duration("avgDynamicPoolWaitDur", avgDuration(totalDynamicPoolWait, count)),
+		zap.Duration("avgCreateCSegmentDur", avgDuration(totalCreateCSegment, count)),
+		zap.Duration("avgLocalStructDur", avgDuration(totalLocalStruct, count)),
+		zap.Duration("avgInitializeSegmentDur", avgDuration(totalInitializeSegment, count)),
+		zap.Duration("avgTotalDur", avgDuration(total, count)),
+		zap.Duration("maxBaseSegmentDur", time.Duration(maxBaseSegment)),
+		zap.Duration("maxLoadStateLockDur", time.Duration(maxLoadStateLock)),
+		zap.Duration("maxDynamicPoolWaitDur", time.Duration(maxDynamicPoolWait)),
+		zap.Duration("maxCreateCSegmentDur", time.Duration(maxCreateCSegment)),
+		zap.Duration("maxLocalStructDur", time.Duration(maxLocalStruct)),
+		zap.Duration("maxInitializeSegmentDur", time.Duration(maxInitializeSegment)),
+		zap.Duration("maxTotalDur", time.Duration(maxTotal)),
+		zap.Int("dynamicPoolCap", pool.Cap()),
+		zap.Int("dynamicPoolRunning", pool.Running()),
+		zap.Int("dynamicPoolWaiting", pool.Waiting()),
+	)
+}
+
 func NewSegment(ctx context.Context,
 	collection *Collection,
 	manager SegmentManager,
@@ -369,11 +489,21 @@ func NewSegment(ctx context.Context,
 		return NewL0Segment(collection, segmentType, version, loadInfo)
 	}
 
+	newSegmentStart := time.Now()
+	timing := newSegmentTimingPhase{}
+	defer func() {
+		timing.totalDur = time.Since(newSegmentStart)
+		newSegmentTiming.record(timing)
+	}()
+
+	stageStart := time.Now()
 	base, err := newBaseSegment(collection, segmentType, version, loadInfo)
+	timing.baseSegmentDur = time.Since(stageStart)
 	if err != nil {
 		return nil, err
 	}
 
+	stageStart = time.Now()
 	var locker *state.LoadStateLock
 	switch segmentType {
 	case SegmentTypeSealed:
@@ -383,6 +513,7 @@ func NewSegment(ctx context.Context,
 	default:
 		return nil, fmt.Errorf("illegal segment type %d when create segment %d", segmentType, loadInfo.GetSegmentID())
 	}
+	timing.loadStateLockDur = time.Since(stageStart)
 
 	logger := log.With(
 		zap.Int64("collectionID", loadInfo.GetCollectionID()),
@@ -393,8 +524,11 @@ func NewSegment(ctx context.Context,
 	)
 
 	var csegment segcore.CSegment
+	submitStart := time.Now()
 	if _, err := GetDynamicPool().Submit(func() (any, error) {
+		timing.dynamicPoolWaitDur = time.Since(submitStart)
 		var err error
+		stageStart := time.Now()
 		csegment, err = segcore.CreateCSegment(&segcore.CreateCSegmentRequest{
 			Collection:  collection.ccollection,
 			SegmentID:   loadInfo.GetSegmentID(),
@@ -402,6 +536,7 @@ func NewSegment(ctx context.Context,
 			IsSorted:    loadInfo.GetIsSorted(),
 			LoadInfo:    loadInfo,
 		})
+		timing.createCSegmentDur = time.Since(stageStart)
 		return nil, err
 	}).Await(); err != nil {
 		logger.Warn("create segment failed", zap.Error(err))
@@ -409,6 +544,7 @@ func NewSegment(ctx context.Context,
 	}
 	logger.Debug("create segment done")
 
+	stageStart = time.Now()
 	segment := &LocalSegment{
 		baseSegment:        base,
 		manager:            manager,
@@ -425,11 +561,15 @@ func NewSegment(ctx context.Context,
 		rowNum:      atomic.NewInt64(-1),
 		insertCount: atomic.NewInt64(0),
 	}
+	timing.localStructDur = time.Since(stageStart)
 
+	stageStart = time.Now()
 	if err := segment.initializeSegment(); err != nil {
+		timing.initializeSegmentDur = time.Since(stageStart)
 		csegment.Release()
 		return nil, err
 	}
+	timing.initializeSegmentDur = time.Since(stageStart)
 	return segment, nil
 }
 
