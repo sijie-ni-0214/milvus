@@ -356,25 +356,28 @@ type LocalSegment struct {
 type newSegmentTimingPhase struct {
 	baseSegmentDur       time.Duration
 	loadStateLockDur     time.Duration
-	dynamicPoolWaitDur   time.Duration
+	cgoPoolWaitDur       time.Duration
 	createCSegmentDur    time.Duration
 	localStructDur       time.Duration
 	initializeSegmentDur time.Duration
 	totalDur             time.Duration
+	useLoadPool          bool
 }
 
 type newSegmentTimingStats struct {
 	count                  *atomic.Int64
+	loadPoolCount          *atomic.Int64
+	dynamicPoolCount       *atomic.Int64
 	totalBaseSegment       *atomic.Int64
 	totalLoadStateLock     *atomic.Int64
-	totalDynamicPoolWait   *atomic.Int64
+	totalCGOPoolWait       *atomic.Int64
 	totalCreateCSegment    *atomic.Int64
 	totalLocalStruct       *atomic.Int64
 	totalInitializeSegment *atomic.Int64
 	total                  *atomic.Int64
 	maxBaseSegment         *atomic.Int64
 	maxLoadStateLock       *atomic.Int64
-	maxDynamicPoolWait     *atomic.Int64
+	maxCGOPoolWait         *atomic.Int64
 	maxCreateCSegment      *atomic.Int64
 	maxLocalStruct         *atomic.Int64
 	maxInitializeSegment   *atomic.Int64
@@ -385,16 +388,18 @@ type newSegmentTimingStats struct {
 func newNewSegmentTimingStats() *newSegmentTimingStats {
 	return &newSegmentTimingStats{
 		count:                  atomic.NewInt64(0),
+		loadPoolCount:          atomic.NewInt64(0),
+		dynamicPoolCount:       atomic.NewInt64(0),
 		totalBaseSegment:       atomic.NewInt64(0),
 		totalLoadStateLock:     atomic.NewInt64(0),
-		totalDynamicPoolWait:   atomic.NewInt64(0),
+		totalCGOPoolWait:       atomic.NewInt64(0),
 		totalCreateCSegment:    atomic.NewInt64(0),
 		totalLocalStruct:       atomic.NewInt64(0),
 		totalInitializeSegment: atomic.NewInt64(0),
 		total:                  atomic.NewInt64(0),
 		maxBaseSegment:         atomic.NewInt64(0),
 		maxLoadStateLock:       atomic.NewInt64(0),
-		maxDynamicPoolWait:     atomic.NewInt64(0),
+		maxCGOPoolWait:         atomic.NewInt64(0),
 		maxCreateCSegment:      atomic.NewInt64(0),
 		maxLocalStruct:         atomic.NewInt64(0),
 		maxInitializeSegment:   atomic.NewInt64(0),
@@ -407,16 +412,21 @@ var newSegmentTiming = newNewSegmentTimingStats()
 
 func (s *newSegmentTimingStats) record(timing newSegmentTimingPhase) {
 	s.count.Inc()
+	if timing.useLoadPool {
+		s.loadPoolCount.Inc()
+	} else {
+		s.dynamicPoolCount.Inc()
+	}
 	s.totalBaseSegment.Add(int64(timing.baseSegmentDur))
 	s.totalLoadStateLock.Add(int64(timing.loadStateLockDur))
-	s.totalDynamicPoolWait.Add(int64(timing.dynamicPoolWaitDur))
+	s.totalCGOPoolWait.Add(int64(timing.cgoPoolWaitDur))
 	s.totalCreateCSegment.Add(int64(timing.createCSegmentDur))
 	s.totalLocalStruct.Add(int64(timing.localStructDur))
 	s.totalInitializeSegment.Add(int64(timing.initializeSegmentDur))
 	s.total.Add(int64(timing.totalDur))
 	updateMaxDuration(s.maxBaseSegment, timing.baseSegmentDur)
 	updateMaxDuration(s.maxLoadStateLock, timing.loadStateLockDur)
-	updateMaxDuration(s.maxDynamicPoolWait, timing.dynamicPoolWaitDur)
+	updateMaxDuration(s.maxCGOPoolWait, timing.cgoPoolWaitDur)
 	updateMaxDuration(s.maxCreateCSegment, timing.createCSegmentDur)
 	updateMaxDuration(s.maxLocalStruct, timing.localStructDur)
 	updateMaxDuration(s.maxInitializeSegment, timing.initializeSegmentDur)
@@ -432,16 +442,18 @@ func (s *newSegmentTimingStats) record(timing newSegmentTimingPhase) {
 	}
 
 	count := s.count.Swap(0)
+	loadPoolCount := s.loadPoolCount.Swap(0)
+	dynamicPoolCount := s.dynamicPoolCount.Swap(0)
 	totalBaseSegment := s.totalBaseSegment.Swap(0)
 	totalLoadStateLock := s.totalLoadStateLock.Swap(0)
-	totalDynamicPoolWait := s.totalDynamicPoolWait.Swap(0)
+	totalCGOPoolWait := s.totalCGOPoolWait.Swap(0)
 	totalCreateCSegment := s.totalCreateCSegment.Swap(0)
 	totalLocalStruct := s.totalLocalStruct.Swap(0)
 	totalInitializeSegment := s.totalInitializeSegment.Swap(0)
 	total := s.total.Swap(0)
 	maxBaseSegment := s.maxBaseSegment.Swap(0)
 	maxLoadStateLock := s.maxLoadStateLock.Swap(0)
-	maxDynamicPoolWait := s.maxDynamicPoolWait.Swap(0)
+	maxCGOPoolWait := s.maxCGOPoolWait.Swap(0)
 	maxCreateCSegment := s.maxCreateCSegment.Swap(0)
 	maxLocalStruct := s.maxLocalStruct.Swap(0)
 	maxInitializeSegment := s.maxInitializeSegment.Swap(0)
@@ -450,26 +462,32 @@ func (s *newSegmentTimingStats) record(timing newSegmentTimingPhase) {
 		return
 	}
 
-	pool := GetDynamicPool()
+	dynamicPool := GetDynamicPool()
+	loadPool := GetLoadPool()
 	log.Warn("new segment timing stats",
 		zap.Int64("requestCount", count),
+		zap.Int64("loadPoolCount", loadPoolCount),
+		zap.Int64("dynamicPoolCount", dynamicPoolCount),
 		zap.Duration("avgBaseSegmentDur", avgDuration(totalBaseSegment, count)),
 		zap.Duration("avgLoadStateLockDur", avgDuration(totalLoadStateLock, count)),
-		zap.Duration("avgDynamicPoolWaitDur", avgDuration(totalDynamicPoolWait, count)),
+		zap.Duration("avgCGOPoolWaitDur", avgDuration(totalCGOPoolWait, count)),
 		zap.Duration("avgCreateCSegmentDur", avgDuration(totalCreateCSegment, count)),
 		zap.Duration("avgLocalStructDur", avgDuration(totalLocalStruct, count)),
 		zap.Duration("avgInitializeSegmentDur", avgDuration(totalInitializeSegment, count)),
 		zap.Duration("avgTotalDur", avgDuration(total, count)),
 		zap.Duration("maxBaseSegmentDur", time.Duration(maxBaseSegment)),
 		zap.Duration("maxLoadStateLockDur", time.Duration(maxLoadStateLock)),
-		zap.Duration("maxDynamicPoolWaitDur", time.Duration(maxDynamicPoolWait)),
+		zap.Duration("maxCGOPoolWaitDur", time.Duration(maxCGOPoolWait)),
 		zap.Duration("maxCreateCSegmentDur", time.Duration(maxCreateCSegment)),
 		zap.Duration("maxLocalStructDur", time.Duration(maxLocalStruct)),
 		zap.Duration("maxInitializeSegmentDur", time.Duration(maxInitializeSegment)),
 		zap.Duration("maxTotalDur", time.Duration(maxTotal)),
-		zap.Int("dynamicPoolCap", pool.Cap()),
-		zap.Int("dynamicPoolRunning", pool.Running()),
-		zap.Int("dynamicPoolWaiting", pool.Waiting()),
+		zap.Int("dynamicPoolCap", dynamicPool.Cap()),
+		zap.Int("dynamicPoolRunning", dynamicPool.Running()),
+		zap.Int("dynamicPoolWaiting", dynamicPool.Waiting()),
+		zap.Int("loadPoolCap", loadPool.Cap()),
+		zap.Int("loadPoolRunning", loadPool.Running()),
+		zap.Int("loadPoolWaiting", loadPool.Waiting()),
 	)
 }
 
@@ -524,9 +542,14 @@ func NewSegment(ctx context.Context,
 	)
 
 	var csegment segcore.CSegment
+	pool := GetDynamicPool()
+	if segmentType == SegmentTypeSealed {
+		pool = GetLoadPool()
+		timing.useLoadPool = true
+	}
 	submitStart := time.Now()
-	if _, err := GetDynamicPool().Submit(func() (any, error) {
-		timing.dynamicPoolWaitDur = time.Since(submitStart)
+	if _, err := pool.Submit(func() (any, error) {
+		timing.cgoPoolWaitDur = time.Since(submitStart)
 		var err error
 		stageStart := time.Now()
 		csegment, err = segcore.CreateCSegment(&segcore.CreateCSegmentRequest{
