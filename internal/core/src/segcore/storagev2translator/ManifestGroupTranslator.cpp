@@ -17,6 +17,8 @@
 #include "segcore/storagev2translator/ManifestGroupTranslator.h"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <exception>
@@ -52,9 +54,180 @@
 #include "segcore/storagev2translator/GroupCTMeta.h"
 #include "storage/Util.h"
 
-#include <atomic>
-
 namespace milvus::segcore::storagev2translator {
+namespace {
+
+constexpr int64_t kTimingLogIntervalNs = 5LL * 1000 * 1000 * 1000;
+
+int64_t
+NowNs() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
+int64_t
+DurationNs(std::chrono::steady_clock::time_point start) {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::steady_clock::now() - start)
+        .count();
+}
+
+double
+AvgMs(int64_t total_ns, int64_t count) {
+    if (count == 0) {
+        return 0.0;
+    }
+    return static_cast<double>(total_ns) / static_cast<double>(count) /
+           1000000.0;
+}
+
+double
+NsToMs(int64_t ns) {
+    return static_cast<double>(ns) / 1000000.0;
+}
+
+void
+UpdateMax(std::atomic<int64_t>& target, int64_t value) {
+    auto current = target.load(std::memory_order_relaxed);
+    while (value > current &&
+           !target.compare_exchange_weak(current,
+                                         value,
+                                         std::memory_order_relaxed,
+                                         std::memory_order_relaxed)) {
+    }
+}
+
+struct ManifestGroupGetCellsTiming {
+    int64_t validate_ns = 0;
+    int64_t build_specs_ns = 0;
+    int64_t factory_ns = 0;
+    int64_t submit_ns = 0;
+    int64_t pop_convert_ns = 0;
+    int64_t wait_ns = 0;
+    int64_t assemble_ns = 0;
+    int64_t total_ns = 0;
+    int64_t cid_count = 0;
+    int64_t future_count = 0;
+    int64_t completed_count = 0;
+    bool use_mmap = false;
+};
+
+class ManifestGroupGetCellsTimingStats {
+ public:
+    void
+    Record(const ManifestGroupGetCellsTiming& timing) {
+        count_.fetch_add(1, std::memory_order_relaxed);
+        total_validate_ns_.fetch_add(timing.validate_ns,
+                                     std::memory_order_relaxed);
+        total_build_specs_ns_.fetch_add(timing.build_specs_ns,
+                                        std::memory_order_relaxed);
+        total_factory_ns_.fetch_add(timing.factory_ns,
+                                    std::memory_order_relaxed);
+        total_submit_ns_.fetch_add(timing.submit_ns, std::memory_order_relaxed);
+        total_pop_convert_ns_.fetch_add(timing.pop_convert_ns,
+                                        std::memory_order_relaxed);
+        total_wait_ns_.fetch_add(timing.wait_ns, std::memory_order_relaxed);
+        total_assemble_ns_.fetch_add(timing.assemble_ns,
+                                     std::memory_order_relaxed);
+        total_ns_.fetch_add(timing.total_ns, std::memory_order_relaxed);
+        total_cid_count_.fetch_add(timing.cid_count, std::memory_order_relaxed);
+        total_future_count_.fetch_add(timing.future_count,
+                                      std::memory_order_relaxed);
+        total_completed_count_.fetch_add(timing.completed_count,
+                                         std::memory_order_relaxed);
+        mmap_count_.fetch_add(timing.use_mmap ? 1 : 0,
+                              std::memory_order_relaxed);
+        UpdateMax(max_total_ns_, timing.total_ns);
+        MaybeLog();
+    }
+
+ private:
+    void
+    MaybeLog() {
+        auto now = NowNs();
+        auto last = last_log_ns_.load(std::memory_order_relaxed);
+        if (last != 0 && now - last < kTimingLogIntervalNs) {
+            return;
+        }
+        if (!last_log_ns_.compare_exchange_strong(last,
+                                                  now,
+                                                  std::memory_order_relaxed,
+                                                  std::memory_order_relaxed)) {
+            return;
+        }
+        auto count = count_.exchange(0, std::memory_order_relaxed);
+        if (count == 0) {
+            return;
+        }
+        auto validate_ns =
+            total_validate_ns_.exchange(0, std::memory_order_relaxed);
+        auto build_specs_ns =
+            total_build_specs_ns_.exchange(0, std::memory_order_relaxed);
+        auto factory_ns =
+            total_factory_ns_.exchange(0, std::memory_order_relaxed);
+        auto submit_ns =
+            total_submit_ns_.exchange(0, std::memory_order_relaxed);
+        auto pop_convert_ns =
+            total_pop_convert_ns_.exchange(0, std::memory_order_relaxed);
+        auto wait_ns = total_wait_ns_.exchange(0, std::memory_order_relaxed);
+        auto assemble_ns =
+            total_assemble_ns_.exchange(0, std::memory_order_relaxed);
+        auto total_ns = total_ns_.exchange(0, std::memory_order_relaxed);
+        auto cid_count =
+            total_cid_count_.exchange(0, std::memory_order_relaxed);
+        auto future_count =
+            total_future_count_.exchange(0, std::memory_order_relaxed);
+        auto completed_count =
+            total_completed_count_.exchange(0, std::memory_order_relaxed);
+        auto mmap_count = mmap_count_.exchange(0, std::memory_order_relaxed);
+        auto max_total_ns =
+            max_total_ns_.exchange(0, std::memory_order_relaxed);
+
+        LOG_WARN(
+            "segcore manifest group get cells timing stats count={} "
+            "avgValidateMs={:.3f} avgBuildSpecsMs={:.3f} "
+            "avgFactoryMs={:.3f} avgSubmitMs={:.3f} "
+            "avgPopConvertMs={:.3f} avgWaitMs={:.3f} "
+            "avgAssembleMs={:.3f} avgTotalMs={:.3f} maxTotalMs={:.3f} "
+            "avgCidCount={:.2f} avgFutureCount={:.2f} "
+            "avgCompletedCount={:.2f} mmapRatio={:.2f}",
+            count,
+            AvgMs(validate_ns, count),
+            AvgMs(build_specs_ns, count),
+            AvgMs(factory_ns, count),
+            AvgMs(submit_ns, count),
+            AvgMs(pop_convert_ns, count),
+            AvgMs(wait_ns, count),
+            AvgMs(assemble_ns, count),
+            AvgMs(total_ns, count),
+            NsToMs(max_total_ns),
+            static_cast<double>(cid_count) / count,
+            static_cast<double>(future_count) / count,
+            static_cast<double>(completed_count) / count,
+            static_cast<double>(mmap_count) / count);
+    }
+
+    std::atomic<int64_t> count_{0};
+    std::atomic<int64_t> total_validate_ns_{0};
+    std::atomic<int64_t> total_build_specs_ns_{0};
+    std::atomic<int64_t> total_factory_ns_{0};
+    std::atomic<int64_t> total_submit_ns_{0};
+    std::atomic<int64_t> total_pop_convert_ns_{0};
+    std::atomic<int64_t> total_wait_ns_{0};
+    std::atomic<int64_t> total_assemble_ns_{0};
+    std::atomic<int64_t> total_ns_{0};
+    std::atomic<int64_t> total_cid_count_{0};
+    std::atomic<int64_t> total_future_count_{0};
+    std::atomic<int64_t> total_completed_count_{0};
+    std::atomic<int64_t> mmap_count_{0};
+    std::atomic<int64_t> max_total_ns_{0};
+    std::atomic<int64_t> last_log_ns_{0};
+};
+
+static ManifestGroupGetCellsTimingStats manifest_group_get_cells_timing_stats;
+
+}  // namespace
 
 // See GroupChunkTranslator.cpp for explanation of g_mmap_path_generation.
 static std::atomic<uint64_t> g_mmap_path_generation{0};
@@ -270,6 +443,12 @@ std::vector<
 ManifestGroupTranslator::get_cells(
     milvus::OpContext* ctx,
     const std::vector<milvus::cachinglayer::cid_t>& cids) {
+    auto total_start = std::chrono::steady_clock::now();
+    auto stage_start = std::chrono::steady_clock::now();
+    ManifestGroupGetCellsTiming timing;
+    timing.cid_count = cids.size();
+    timing.use_mmap = use_mmap_;
+
     // Check for cancellation before loading group chunks
     CheckCancellation(ctx, segment_id_, "ManifestGroupTranslator::get_cells()");
 
@@ -287,8 +466,10 @@ ManifestGroupTranslator::get_cells(
             max_cid,
             meta_.chunk_memory_size_.size());
     }
+    timing.validate_ns = DurationNs(stage_start);
 
     // Build CellSpec for each requested cid
+    stage_start = std::chrono::steady_clock::now();
     std::vector<milvus::segcore::CellSpec> cell_specs;
     cell_specs.reserve(cids.size());
     for (auto cid : cids) {
@@ -299,8 +480,10 @@ ManifestGroupTranslator::get_cells(
                               static_cast<int64_t>(end - start),
                               meta_.chunk_memory_size_[cid]});
     }
+    timing.build_specs_ns = DurationNs(stage_start);
 
     // Create factory using ChunkReader — reads a batch of row groups at once
+    stage_start = std::chrono::steady_clock::now();
     auto factory = milvus::segcore::MakeChunkReaderFactory(chunk_reader_);
 
     // Submit cell-batch loading tasks
@@ -309,7 +492,9 @@ ManifestGroupTranslator::get_cells(
     auto channel = std::make_shared<milvus::segcore::CellReaderChannel>(
         static_cast<size_t>(pool.GetMaxThreadNum() *
                             milvus::segcore::kChannelCapacityMultiplier));
+    timing.factory_ns = DurationNs(stage_start);
 
+    stage_start = std::chrono::steady_clock::now();
     auto load_futures =
         milvus::segcore::LoadCellBatchAsync(ctx,
                                             std::move(cell_specs),
@@ -317,6 +502,8 @@ ManifestGroupTranslator::get_cells(
                                             channel,
                                             DEFAULT_FIELD_MAX_MEMORY_LIMIT,
                                             load_priority_);
+    timing.submit_ns = DurationNs(stage_start);
+    timing.future_count = load_futures.size();
 
     LOG_INFO(
         "[StorageV2] translator {} submits {} batch tasks for manifest "
@@ -332,6 +519,7 @@ ManifestGroupTranslator::get_cells(
     completed_cells.reserve(cids.size());
 
     try {
+        stage_start = std::chrono::steady_clock::now();
         std::shared_ptr<milvus::segcore::CellLoadResult> cell_data;
         while (channel->pop(cell_data)) {
             CheckCancellation(
@@ -339,6 +527,8 @@ ManifestGroupTranslator::get_cells(
             completed_cells[cell_data->cid] =
                 load_group_chunk(cell_data->tables, cell_data->cid);
         }
+        timing.pop_convert_ns = DurationNs(stage_start);
+        timing.completed_count = completed_cells.size();
     } catch (...) {
         // Drain the channel to unblock producers that may be stuck on push()
         // to a full bounded channel. Without draining, producers block forever
@@ -367,8 +557,11 @@ ManifestGroupTranslator::get_cells(
         throw;
     }
 
+    stage_start = std::chrono::steady_clock::now();
     storage::WaitAllFutures(load_futures);
+    timing.wait_ns = DurationNs(stage_start);
 
+    stage_start = std::chrono::steady_clock::now();
     for (auto cid : cids) {
         auto it = completed_cells.find(cid);
         AssertInfo(
@@ -377,6 +570,9 @@ ManifestGroupTranslator::get_cells(
                 "[StorageV2] translator {} cell {} not loaded", key_, cid));
         cells.emplace_back(cid, std::move(it->second));
     }
+    timing.assemble_ns = DurationNs(stage_start);
+    timing.total_ns = DurationNs(total_start);
+    manifest_group_get_cells_timing_stats.Record(timing);
 
     return cells;
 }
