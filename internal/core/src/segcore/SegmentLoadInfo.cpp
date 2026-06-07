@@ -10,6 +10,7 @@
 // or implied. See the License for the specific language governing permissions and limitations under the License
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cctype>
 #include <chrono>
@@ -42,7 +43,7 @@ namespace {
 
 constexpr int64_t kSegmentLoadInfoTimingLogIntervalNs =
     5LL * 1000 * 1000 * 1000;
-
+constexpr int kBuildCacheSourceCount = 6;
 int64_t
 NowNs() {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -89,6 +90,7 @@ struct BuildCacheTiming {
     int64_t binlog_group_count = 0;
     int64_t index_count = 0;
     int64_t raw_data_index_count = 0;
+    int source = 0;
 };
 
 class BuildCacheTimingStats {
@@ -109,6 +111,14 @@ class BuildCacheTimingStats {
                                      std::memory_order_relaxed);
         total_raw_data_index_count_.fetch_add(timing.raw_data_index_count,
                                               std::memory_order_relaxed);
+        if (timing.source >= 0 && timing.source < kBuildCacheSourceCount) {
+            source_count_[timing.source].fetch_add(1,
+                                                   std::memory_order_relaxed);
+            source_total_ns_[timing.source].fetch_add(
+                timing.total_ns, std::memory_order_relaxed);
+            source_raw_data_ns_[timing.source].fetch_add(
+                timing.index_raw_data_ns, std::memory_order_relaxed);
+        }
         UpdateMax(max_total_ns_, timing.total_ns);
         MaybeLog();
     }
@@ -146,6 +156,17 @@ class BuildCacheTimingStats {
             total_raw_data_index_count_.exchange(0, std::memory_order_relaxed);
         auto max_total_ns =
             max_total_ns_.exchange(0, std::memory_order_relaxed);
+        std::array<int64_t, kBuildCacheSourceCount> source_count{};
+        std::array<int64_t, kBuildCacheSourceCount> source_total_ns{};
+        std::array<int64_t, kBuildCacheSourceCount> source_raw_data_ns{};
+        for (int i = 0; i < kBuildCacheSourceCount; ++i) {
+            source_count[i] =
+                source_count_[i].exchange(0, std::memory_order_relaxed);
+            source_total_ns[i] =
+                source_total_ns_[i].exchange(0, std::memory_order_relaxed);
+            source_raw_data_ns[i] =
+                source_raw_data_ns_[i].exchange(0, std::memory_order_relaxed);
+        }
 
         LOG_WARN(
             "segment load info build cache timing stats count={} "
@@ -162,6 +183,18 @@ class BuildCacheTimingStats {
             static_cast<double>(binlog_group_count) / count,
             static_cast<double>(index_count) / count,
             static_cast<double>(raw_data_index_count) / count);
+        for (int i = 0; i < kBuildCacheSourceCount; ++i) {
+            if (source_count[i] == 0) {
+                continue;
+            }
+            LOG_WARN(
+                "segment load info build cache source timing stats source={} "
+                "count={} avgTotalMs={:.3f} avgRawDataMs={:.3f}",
+                i,
+                source_count[i],
+                AvgMs(source_total_ns[i], source_count[i]),
+                AvgMs(source_raw_data_ns[i], source_count[i]));
+        }
     }
 
     std::atomic<int64_t> count_{0};
@@ -174,6 +207,10 @@ class BuildCacheTimingStats {
     std::atomic<int64_t> total_raw_data_index_count_{0};
     std::atomic<int64_t> max_total_ns_{0};
     std::atomic<int64_t> last_log_ns_{0};
+    std::array<std::atomic<int64_t>, kBuildCacheSourceCount> source_count_{};
+    std::array<std::atomic<int64_t>, kBuildCacheSourceCount> source_total_ns_{};
+    std::array<std::atomic<int64_t>, kBuildCacheSourceCount>
+        source_raw_data_ns_{};
 };
 
 static BuildCacheTimingStats build_cache_timing_stats;
@@ -305,8 +342,14 @@ SegmentLoadInfo::RebuildFieldBinlogCache() {
 
 void
 SegmentLoadInfo::BuildCache() {
+    BuildCacheWithSource(kBuildCacheSourceUnknown);
+}
+
+void
+SegmentLoadInfo::BuildCacheWithSource(int source) {
     auto total_start = std::chrono::steady_clock::now();
     BuildCacheTiming timing;
+    timing.source = source;
 
     auto stage_start = std::chrono::steady_clock::now();
     RebuildFieldBinlogCache();

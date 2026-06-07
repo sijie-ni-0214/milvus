@@ -400,7 +400,7 @@ class SegmentLoadInfo {
      */
     explicit SegmentLoadInfo(const ProtoType& info, SchemaPtr schema)
         : info_(info), schema_(std::move(schema)) {
-        BuildCache();
+        BuildCacheWithSource(kBuildCacheSourceProtoCopyCtor);
     }
 
     /**
@@ -409,7 +409,7 @@ class SegmentLoadInfo {
      */
     explicit SegmentLoadInfo(ProtoType&& info, SchemaPtr schema)
         : info_(std::move(info)), schema_(std::move(schema)) {
-        BuildCache();
+        BuildCacheWithSource(kBuildCacheSourceProtoMoveCtor);
     }
 
     /**
@@ -494,7 +494,7 @@ class SegmentLoadInfo {
     Set(const ProtoType& info, SchemaPtr schema) {
         info_ = info;
         schema_ = std::move(schema);
-        BuildCache();
+        BuildCacheWithSource(kBuildCacheSourceSetCopy);
     }
 
     /**
@@ -504,7 +504,7 @@ class SegmentLoadInfo {
     Set(ProtoType&& info, SchemaPtr schema) {
         info_ = std::move(info);
         schema_ = std::move(schema);
-        BuildCache();
+        BuildCacheWithSource(kBuildCacheSourceSetMove);
     }
 
     // ==================== Basic Accessors ====================
@@ -1016,7 +1016,7 @@ class SegmentLoadInfo {
      */
     void
     RebuildCache() {
-        BuildCache();
+        BuildCacheWithSource(kBuildCacheSourceRebuildCache);
     }
 
     /**
@@ -1077,11 +1077,21 @@ class SegmentLoadInfo {
         FieldId field_id) const;
 
  private:
+    static constexpr int kBuildCacheSourceUnknown = 0;
+    static constexpr int kBuildCacheSourceProtoCopyCtor = 1;
+    static constexpr int kBuildCacheSourceProtoMoveCtor = 2;
+    static constexpr int kBuildCacheSourceSetCopy = 3;
+    static constexpr int kBuildCacheSourceSetMove = 4;
+    static constexpr int kBuildCacheSourceRebuildCache = 5;
+
     void
     RebuildFieldBinlogCache();
 
     void
     BuildCache();
+
+    void
+    BuildCacheWithSource(int source);
 
     void
     ComputeDiffIndexes(LoadDiff& diff, SegmentLoadInfo& new_info);
