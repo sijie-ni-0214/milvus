@@ -567,11 +567,86 @@ func (d *distribution) removeSnapshotSegmentLocked(nodeSegments map[int64][]Segm
 	delete(d.snapshotSegments, segmentID)
 }
 
+func (d *distribution) isSnapshotAppendOnlyDeltaLocked(delta snapshotDelta) bool {
+	if len(delta.sealedUpserts) == 0 ||
+		len(delta.sealedDeletes) > 0 ||
+		len(delta.growingUpserts) > 0 ||
+		len(delta.growingDeletes) > 0 {
+		return false
+	}
+
+	for segmentID := range delta.sealedUpserts {
+		if _, ok := d.snapshotSegments[segmentID]; ok {
+			return false
+		}
+	}
+	return true
+}
+
+func (d *distribution) buildSnapshotDistWithReplacedNodes(last *snapshot, replacedNodes map[int64][]SegmentEntry) []SnapshotItem {
+	dist := make([]SnapshotItem, 0, len(last.dist)+len(replacedNodes))
+	seenNodes := make(map[int64]struct{}, len(replacedNodes))
+	for _, item := range last.dist {
+		segments, ok := replacedNodes[item.NodeID]
+		if !ok {
+			dist = append(dist, item)
+			continue
+		}
+		seenNodes[item.NodeID] = struct{}{}
+		if len(segments) > 0 {
+			dist = append(dist, SnapshotItem{NodeID: item.NodeID, Segments: segments})
+		}
+	}
+	for nodeID, segments := range replacedNodes {
+		if _, ok := seenNodes[nodeID]; ok || len(segments) == 0 {
+			continue
+		}
+		dist = append(dist, SnapshotItem{NodeID: nodeID, Segments: segments})
+	}
+	return dist
+}
+
+func (d *distribution) applySnapshotAppendOnlyDeltaLocked(last *snapshot, delta snapshotDelta) (map[UniqueID]struct{}, map[UniqueID]SegmentEntry) {
+	changedSegments := make(map[UniqueID]struct{}, len(delta.sealedUpserts))
+	replacedNodes := make(map[int64][]SegmentEntry)
+
+	for segmentID, entry := range delta.sealedUpserts {
+		changedSegments[segmentID] = struct{}{}
+		entry = d.snapshotEntryForQueryView(entry)
+		segments, ok := replacedNodes[entry.NodeID]
+		if !ok {
+			segments = d.snapshotNodeSegments[entry.NodeID]
+		}
+		d.snapshotSegmentPosition[entry.SegmentID] = snapshotSegmentPosition{
+			nodeID: entry.NodeID,
+			index:  len(segments),
+		}
+		segments = append(segments, entry)
+		replacedNodes[entry.NodeID] = segments
+		d.snapshotNodeSegments[entry.NodeID] = segments
+		d.snapshotSegments[entry.SegmentID] = entry
+	}
+
+	dist := d.buildSnapshotDistWithReplacedNodes(last, replacedNodes)
+	d.snapshotVersion++
+	newSnapshot := NewSnapshot(dist, last.growing, last, d.snapshotVersion, d.queryView.GetVersion())
+	newSnapshot.partitions = d.queryView.partitions
+	d.current.Store(newSnapshot)
+	d.snapshots.GetOrInsert(d.snapshotVersion, newSnapshot)
+	last.Expire(d.getCleanup(last.version))
+
+	return changedSegments, nil
+}
+
 func (d *distribution) applySnapshotDeltaLocked(delta snapshotDelta) (map[UniqueID]struct{}, map[UniqueID]SegmentEntry) {
 	last := d.current.Load()
 	if last == nil {
 		d.genSnapshot()
 		return nil, nil
+	}
+
+	if d.isSnapshotAppendOnlyDeltaLocked(delta) {
+		return d.applySnapshotAppendOnlyDeltaLocked(last, delta)
 	}
 
 	changedSegments := make(map[UniqueID]struct{}, len(delta.sealedUpserts)+len(delta.sealedDeletes))
@@ -618,25 +693,7 @@ func (d *distribution) applySnapshotDeltaLocked(delta snapshotDelta) (map[Unique
 		replacedNodes[nodeID] = segments
 	}
 
-	dist := make([]SnapshotItem, 0, len(last.dist)+len(replacedNodes))
-	seenNodes := make(map[int64]struct{}, len(replacedNodes))
-	for _, item := range last.dist {
-		segments, ok := replacedNodes[item.NodeID]
-		if !ok {
-			dist = append(dist, item)
-			continue
-		}
-		seenNodes[item.NodeID] = struct{}{}
-		if len(segments) > 0 {
-			dist = append(dist, SnapshotItem{NodeID: item.NodeID, Segments: segments})
-		}
-	}
-	for nodeID, segments := range replacedNodes {
-		if _, ok := seenNodes[nodeID]; ok || len(segments) == 0 {
-			continue
-		}
-		dist = append(dist, SnapshotItem{NodeID: nodeID, Segments: segments})
-	}
+	dist := d.buildSnapshotDistWithReplacedNodes(last, replacedNodes)
 
 	growing := last.growing
 	if len(delta.growingDeletes) > 0 || len(delta.growingUpserts) > 0 {

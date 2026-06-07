@@ -23,6 +23,7 @@ import (
 	"github.com/bytedance/mockey"
 	"github.com/samber/lo"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
 
 	"github.com/milvus-io/milvus-proto/go-api/v3/commonpb"
@@ -2012,7 +2013,7 @@ func TestDistribution_ApplySnapshotDeltaAdd(t *testing.T) {
 
 	dist.SyncTargetVersion(&querypb.SyncAction{
 		TargetVersion:         100,
-		SealedSegmentRowCount: map[int64]int64{100: 10, 200: 20},
+		SealedSegmentRowCount: map[int64]int64{100: 10, 200: 10},
 	}, []int64{1})
 
 	dist.mut.Lock()
@@ -2028,6 +2029,95 @@ func TestDistribution_ApplySnapshotDeltaAdd(t *testing.T) {
 	requireSnapshotSegments(t, sealed, map[int64][]int64{10: {100}})
 	assert.Equal(t, 0.5, dist.queryView.GetLoadedRatio())
 	assert.Contains(t, dist.queryView.unloadedSealedSegments, int64(200))
+}
+
+func TestDistribution_ApplySnapshotAppendOnlyKeepsOldSnapshot(t *testing.T) {
+	dist := NewDistribution("test-channel", NewChannelQueryView(nil, nil, []int64{1}, initialTargetVersion))
+	defer dist.Close()
+
+	dist.SyncTargetVersion(&querypb.SyncAction{
+		TargetVersion:         100,
+		SealedSegmentRowCount: map[int64]int64{100: 10, 200: 20},
+	}, []int64{1})
+
+	dist.mut.Lock()
+	first := SegmentEntry{NodeID: 10, SegmentID: 100, PartitionID: 1, Version: 1, TargetVersion: 100}
+	dist.sealedSegments[first.SegmentID] = first
+	dist.recordSealedSnapshotUpsertLocked(first)
+	delta := dist.takeSnapshotDeltaLocked()
+	changedSegments, oldSegments := dist.applySnapshotDeltaLocked(delta)
+	dist.updateServiceableByChangedSegments("test", changedSegments, oldSegments)
+	dist.mut.Unlock()
+
+	oldSnapshot := dist.current.Load()
+	assert.NotNil(t, oldSnapshot)
+	require.Len(t, oldSnapshot.dist, 1)
+	segments := make([]SegmentEntry, len(oldSnapshot.dist[0].Segments), 4)
+	copy(segments, oldSnapshot.dist[0].Segments)
+	oldSnapshot.dist[0].Segments = segments
+	dist.snapshotNodeSegments[10] = segments
+	require.Greater(t, cap(dist.snapshotNodeSegments[10]), len(dist.snapshotNodeSegments[10]))
+
+	dist.mut.Lock()
+	second := SegmentEntry{NodeID: 10, SegmentID: 200, PartitionID: 1, Version: 1, TargetVersion: 100}
+	dist.sealedSegments[second.SegmentID] = second
+	dist.recordSealedSnapshotUpsertLocked(second)
+	delta = dist.takeSnapshotDeltaLocked()
+	assert.True(t, dist.isSnapshotAppendOnlyDeltaLocked(delta))
+	changedSegments, oldSegments = dist.applySnapshotDeltaLocked(delta)
+	dist.updateServiceableByChangedSegments("test", changedSegments, oldSegments)
+	dist.mut.Unlock()
+
+	oldSealed, _ := oldSnapshot.Peek(1)
+	requireSnapshotSegments(t, oldSealed, map[int64][]int64{10: {100}})
+
+	sealed, _ := dist.PeekSegments(false)
+	requireSnapshotSegments(t, sealed, map[int64][]int64{10: {100, 200}})
+	assert.Equal(t, 1.0, dist.queryView.GetLoadedRatio())
+}
+
+func TestDistribution_ApplySnapshotAppendOnlyThenRemove(t *testing.T) {
+	dist := NewDistribution("test-channel", NewChannelQueryView(nil, nil, []int64{1}, initialTargetVersion))
+	defer dist.Close()
+
+	dist.SyncTargetVersion(&querypb.SyncAction{
+		TargetVersion:         100,
+		SealedSegmentRowCount: map[int64]int64{100: 10, 200: 20},
+	}, []int64{1})
+
+	dist.mut.Lock()
+	for _, segment := range []SegmentEntry{
+		{NodeID: 10, SegmentID: 100, PartitionID: 1, Version: 1, TargetVersion: 100},
+		{NodeID: 10, SegmentID: 200, PartitionID: 1, Version: 1, TargetVersion: 100},
+	} {
+		dist.sealedSegments[segment.SegmentID] = segment
+		dist.recordSealedSnapshotUpsertLocked(segment)
+	}
+	delta := dist.takeSnapshotDeltaLocked()
+	assert.True(t, dist.isSnapshotAppendOnlyDeltaLocked(delta))
+	changedSegments, oldSegments := dist.applySnapshotDeltaLocked(delta)
+	dist.updateServiceableByChangedSegments("test", changedSegments, oldSegments)
+	dist.mut.Unlock()
+
+	firstPosition := dist.snapshotSegmentPosition[100]
+	secondPosition := dist.snapshotSegmentPosition[200]
+	assert.Equal(t, int64(10), firstPosition.nodeID)
+	assert.Equal(t, int64(10), secondPosition.nodeID)
+	assert.NotEqual(t, firstPosition.index, secondPosition.index)
+
+	dist.mut.Lock()
+	delete(dist.sealedSegments, int64(100))
+	dist.recordSealedSnapshotDeleteLocked(100)
+	delta = dist.takeSnapshotDeltaLocked()
+	assert.False(t, dist.isSnapshotAppendOnlyDeltaLocked(delta))
+	changedSegments, oldSegments = dist.applySnapshotDeltaLocked(delta)
+	dist.updateServiceableByChangedSegments("test", changedSegments, oldSegments)
+	dist.mut.Unlock()
+
+	sealed, _ := dist.PeekSegments(false)
+	requireSnapshotSegments(t, sealed, map[int64][]int64{10: {200}})
+	assert.Equal(t, snapshotSegmentPosition{nodeID: 10, index: 0}, dist.snapshotSegmentPosition[200])
+	assert.InDelta(t, float64(20)/float64(30), dist.queryView.GetLoadedRatio(), 0.0001)
 }
 
 func TestDistribution_ApplySnapshotDeltaRemoveKeepsPinnedSnapshot(t *testing.T) {
