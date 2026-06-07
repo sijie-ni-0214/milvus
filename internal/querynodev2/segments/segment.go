@@ -361,12 +361,12 @@ type newSegmentTimingPhase struct {
 	localStructDur       time.Duration
 	initializeSegmentDur time.Duration
 	totalDur             time.Duration
-	useLoadPool          bool
+	useSegmentCreatePool bool
 }
 
 type newSegmentTimingStats struct {
 	count                  *atomic.Int64
-	loadPoolCount          *atomic.Int64
+	segmentCreatePoolCount *atomic.Int64
 	dynamicPoolCount       *atomic.Int64
 	totalBaseSegment       *atomic.Int64
 	totalLoadStateLock     *atomic.Int64
@@ -388,7 +388,7 @@ type newSegmentTimingStats struct {
 func newNewSegmentTimingStats() *newSegmentTimingStats {
 	return &newSegmentTimingStats{
 		count:                  atomic.NewInt64(0),
-		loadPoolCount:          atomic.NewInt64(0),
+		segmentCreatePoolCount: atomic.NewInt64(0),
 		dynamicPoolCount:       atomic.NewInt64(0),
 		totalBaseSegment:       atomic.NewInt64(0),
 		totalLoadStateLock:     atomic.NewInt64(0),
@@ -412,8 +412,8 @@ var newSegmentTiming = newNewSegmentTimingStats()
 
 func (s *newSegmentTimingStats) record(timing newSegmentTimingPhase) {
 	s.count.Inc()
-	if timing.useLoadPool {
-		s.loadPoolCount.Inc()
+	if timing.useSegmentCreatePool {
+		s.segmentCreatePoolCount.Inc()
 	} else {
 		s.dynamicPoolCount.Inc()
 	}
@@ -442,7 +442,7 @@ func (s *newSegmentTimingStats) record(timing newSegmentTimingPhase) {
 	}
 
 	count := s.count.Swap(0)
-	loadPoolCount := s.loadPoolCount.Swap(0)
+	segmentCreatePoolCount := s.segmentCreatePoolCount.Swap(0)
 	dynamicPoolCount := s.dynamicPoolCount.Swap(0)
 	totalBaseSegment := s.totalBaseSegment.Swap(0)
 	totalLoadStateLock := s.totalLoadStateLock.Swap(0)
@@ -464,9 +464,10 @@ func (s *newSegmentTimingStats) record(timing newSegmentTimingPhase) {
 
 	dynamicPool := GetDynamicPool()
 	loadPool := GetLoadPool()
+	segmentCreatePool := GetSegmentCreatePool()
 	log.Warn("new segment timing stats",
 		zap.Int64("requestCount", count),
-		zap.Int64("loadPoolCount", loadPoolCount),
+		zap.Int64("segmentCreatePoolCount", segmentCreatePoolCount),
 		zap.Int64("dynamicPoolCount", dynamicPoolCount),
 		zap.Duration("avgBaseSegmentDur", avgDuration(totalBaseSegment, count)),
 		zap.Duration("avgLoadStateLockDur", avgDuration(totalLoadStateLock, count)),
@@ -488,6 +489,9 @@ func (s *newSegmentTimingStats) record(timing newSegmentTimingPhase) {
 		zap.Int("loadPoolCap", loadPool.Cap()),
 		zap.Int("loadPoolRunning", loadPool.Running()),
 		zap.Int("loadPoolWaiting", loadPool.Waiting()),
+		zap.Int("segmentCreatePoolCap", segmentCreatePool.Cap()),
+		zap.Int("segmentCreatePoolRunning", segmentCreatePool.Running()),
+		zap.Int("segmentCreatePoolWaiting", segmentCreatePool.Waiting()),
 	)
 }
 
@@ -544,8 +548,8 @@ func NewSegment(ctx context.Context,
 	var csegment segcore.CSegment
 	pool := GetDynamicPool()
 	if segmentType == SegmentTypeSealed {
-		pool = GetLoadPool()
-		timing.useLoadPool = true
+		pool = GetSegmentCreatePool()
+		timing.useSegmentCreatePool = true
 	}
 	submitStart := time.Now()
 	if _, err := pool.Submit(func() (any, error) {
