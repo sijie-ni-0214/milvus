@@ -385,11 +385,15 @@ IndexFactory::VecIndexHasRawData(
     IndexVersion index_version,
     const std::map<std::string, std::string>& index_params,
     bool mmap_enable) {
-    auto config = milvus::index::ParseConfigFromIndexParams(index_params);
-
     auto index_type_it = index_params.find("index_type");
     AssertInfo(index_type_it != index_params.end(), "index type is empty");
     const std::string& index_type = index_type_it->second;
+
+    if (index_type == knowhere::IndexEnum::INDEX_HNSW) {
+        return true;
+    }
+
+    auto config = milvus::index::ParseConfigFromIndexParams(index_params);
 
     if (mmap_enable &&
         knowhere::KnowhereCheck::SupportMmapIndexTypeCheck(index_type)) {
