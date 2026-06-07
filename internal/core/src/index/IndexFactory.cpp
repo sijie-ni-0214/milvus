@@ -389,10 +389,6 @@ IndexFactory::VecIndexHasRawData(
     AssertInfo(index_type_it != index_params.end(), "index type is empty");
     const std::string& index_type = index_type_it->second;
 
-    if (index_type == knowhere::IndexEnum::INDEX_HNSW) {
-        return true;
-    }
-
     auto config = milvus::index::ParseConfigFromIndexParams(index_params);
 
     if (mmap_enable &&
