@@ -57,6 +57,13 @@ class IndexFactory {
                       int64_t num_rows,
                       int64_t dim);
 
+    bool
+    IndexHasRawData(DataType field_type,
+                    DataType element_type,
+                    IndexVersion index_version,
+                    const std::map<std::string, std::string>& index_params,
+                    bool mmap_enable);
+
     LoadResourceRequest
     VecIndexLoadResource(DataType field_type,
                          DataType element_type,
@@ -67,11 +74,25 @@ class IndexFactory {
                          int64_t num_rows,
                          int64_t dim);
 
+    bool
+    VecIndexHasRawData(DataType field_type,
+                       DataType element_type,
+                       IndexVersion index_version,
+                       const std::map<std::string, std::string>& index_params,
+                       bool mmap_enable);
+
     LoadResourceRequest
     ScalarIndexLoadResource(
         DataType field_type,
         IndexVersion index_version,
         uint64_t index_size_in_bytes,
+        const std::map<std::string, std::string>& index_params,
+        bool mmap_enable);
+
+    bool
+    ScalarIndexHasRawData(
+        DataType field_type,
+        IndexVersion index_version,
         const std::map<std::string, std::string>& index_params,
         bool mmap_enable);
 

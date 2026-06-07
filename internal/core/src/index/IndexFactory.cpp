@@ -156,6 +156,22 @@ IndexFactory::IndexLoadResource(
     }
 }
 
+bool
+IndexFactory::IndexHasRawData(
+    DataType field_type,
+    DataType element_type,
+    IndexVersion index_version,
+    const std::map<std::string, std::string>& index_params,
+    bool mmap_enable) {
+    if (milvus::IsVectorDataType(field_type)) {
+        return VecIndexHasRawData(
+            field_type, element_type, index_version, index_params, mmap_enable);
+    }
+
+    return ScalarIndexHasRawData(
+        field_type, index_version, index_params, mmap_enable);
+}
+
 LoadResourceRequest
 IndexFactory::VecIndexLoadResource(
     DataType field_type,
@@ -362,6 +378,90 @@ IndexFactory::VecIndexLoadResource(
     return request;
 }
 
+bool
+IndexFactory::VecIndexHasRawData(
+    DataType field_type,
+    DataType element_type,
+    IndexVersion index_version,
+    const std::map<std::string, std::string>& index_params,
+    bool mmap_enable) {
+    auto config = milvus::index::ParseConfigFromIndexParams(index_params);
+
+    auto index_type_it = index_params.find("index_type");
+    AssertInfo(index_type_it != index_params.end(), "index type is empty");
+    const std::string& index_type = index_type_it->second;
+
+    if (mmap_enable &&
+        knowhere::KnowhereCheck::SupportMmapIndexTypeCheck(index_type)) {
+        config["enable_mmap"] = true;
+    }
+
+    switch (field_type) {
+        case milvus::DataType::VECTOR_BINARY:
+            return knowhere::IndexStaticFaced<knowhere::bin1>::HasRawData(
+                index_type, index_version, config);
+        case milvus::DataType::VECTOR_FLOAT:
+            return knowhere::IndexStaticFaced<knowhere::fp32>::HasRawData(
+                index_type, index_version, config);
+        case milvus::DataType::VECTOR_FLOAT16:
+            return knowhere::IndexStaticFaced<knowhere::fp16>::HasRawData(
+                index_type, index_version, config);
+        case milvus::DataType::VECTOR_BFLOAT16:
+            return knowhere::IndexStaticFaced<knowhere::bf16>::HasRawData(
+                index_type, index_version, config);
+        case milvus::DataType::VECTOR_SPARSE_U32_F32:
+            return knowhere::IndexStaticFaced<knowhere::fp32>::HasRawData(
+                index_type, index_version, config);
+        case milvus::DataType::VECTOR_INT8:
+            return knowhere::IndexStaticFaced<knowhere::int8>::HasRawData(
+                index_type, index_version, config);
+        case milvus::DataType::VECTOR_ARRAY: {
+            auto metric_type = milvus::index::GetMetricTypeFromConfig(config);
+            if (!knowhere::get_el_metric_type(metric_type).has_value()) {
+                return false;
+            }
+            switch (element_type) {
+                case milvus::DataType::VECTOR_FLOAT:
+                    return knowhere::IndexStaticFaced<
+                        knowhere::fp32>::HasRawData(index_type,
+                                                    index_version,
+                                                    config);
+                case milvus::DataType::VECTOR_FLOAT16:
+                    return knowhere::IndexStaticFaced<
+                        knowhere::fp16>::HasRawData(index_type,
+                                                    index_version,
+                                                    config);
+                case milvus::DataType::VECTOR_BFLOAT16:
+                    return knowhere::IndexStaticFaced<
+                        knowhere::bf16>::HasRawData(index_type,
+                                                    index_version,
+                                                    config);
+                case milvus::DataType::VECTOR_BINARY:
+                    return knowhere::IndexStaticFaced<
+                        knowhere::bin1>::HasRawData(index_type,
+                                                    index_version,
+                                                    config);
+                case milvus::DataType::VECTOR_INT8:
+                    return knowhere::IndexStaticFaced<
+                        knowhere::int8>::HasRawData(index_type,
+                                                    index_version,
+                                                    config);
+                default:
+                    LOG_ERROR(
+                        "invalid data type to check index raw data: "
+                        "field_type {}, element_type {}",
+                        field_type,
+                        element_type);
+                    return true;
+            }
+        }
+        default:
+            LOG_ERROR("invalid data type to check index raw data: {}",
+                      field_type);
+            return true;
+    }
+}
+
 LoadResourceRequest
 IndexFactory::ScalarIndexLoadResource(
     DataType field_type,
@@ -436,6 +536,40 @@ IndexFactory::ScalarIndexLoadResource(
         return LoadResourceRequest{0, 0, 0, 0, false};
     }
     return request;
+}
+
+bool
+IndexFactory::ScalarIndexHasRawData(
+    DataType field_type,
+    IndexVersion index_version,
+    const std::map<std::string, std::string>& index_params,
+    bool mmap_enable) {
+    (void)field_type;
+    (void)index_version;
+    (void)mmap_enable;
+
+    auto index_type_it = index_params.find("index_type");
+    AssertInfo(index_type_it != index_params.end(), "index type is empty");
+    const std::string& index_type = index_type_it->second;
+
+    if (index_type == milvus::index::ASCENDING_SORT) {
+        return true;
+    }
+    if (index_type == milvus::index::MARISA_TRIE ||
+        index_type == milvus::index::MARISA_TRIE_UPPER) {
+        return true;
+    }
+    if (index_type == milvus::index::INVERTED_INDEX_TYPE ||
+        index_type == milvus::index::NGRAM_INDEX_TYPE ||
+        index_type == milvus::index::RTREE_INDEX_TYPE ||
+        index_type == milvus::index::BITMAP_INDEX_TYPE ||
+        index_type == milvus::index::HYBRID_INDEX_TYPE) {
+        return false;
+    }
+
+    LOG_ERROR("invalid index type to check scalar index raw data: {}",
+              index_type);
+    return false;
 }
 
 IndexBasePtr
