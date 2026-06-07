@@ -1063,26 +1063,30 @@ func (sd *shardDelegator) LoadSegments(ctx context.Context, req *querypb.LoadSeg
 	}
 
 	postLoadStart := time.Now()
+	var infos []*querypb.SegmentLoadInfo
+	var candidates []*pkoracle.BloomFilterSet
+	var entries []SegmentEntry
 	postLoadWaitDur, err = sd.withPostLoadLimit(ctx, func() error {
-		infos := lo.Filter(req.GetInfos(), func(info *querypb.SegmentLoadInfo, _ int) bool {
+		infos = lo.Filter(req.GetInfos(), func(info *querypb.SegmentLoadInfo, _ int) bool {
 			return !sd.distribution.SealedSegmentExistsOnNode(info.GetSegmentID(), targetNodeID)
 		})
 
 		stageStart := time.Now()
-		candidates, err := sd.loader.LoadBloomFilterSet(ctx, req.GetCollectionID(), infos...)
+		var loadErr error
+		candidates, loadErr = sd.loader.LoadBloomFilterSet(ctx, req.GetCollectionID(), infos...)
 		bloomFilterDur = time.Since(stageStart)
-		if err != nil {
-			log.Warn("failed to load bloom filter set for segment", zap.Error(err))
-			return err
+		if loadErr != nil {
+			log.Warn("failed to load bloom filter set for segment", zap.Error(loadErr))
+			return loadErr
 		}
 
 		// Load BM25 stats BEFORE loadStreamDelete so stats are ready before segment becomes visible
 		stageStart = time.Now()
-		err = sd.loadBM25Stats(ctx, infos, req)
+		loadErr = sd.loadBM25Stats(ctx, infos, req)
 		bm25StatsDur = time.Since(stageStart)
-		if err != nil {
-			log.Warn("failed to load BM25 stats", zap.Error(err))
-			return err
+		if loadErr != nil {
+			log.Warn("failed to load BM25 stats", zap.Error(loadErr))
+			return loadErr
 		}
 
 		// Build a map from segmentID to BloomFilterSet
@@ -1095,7 +1099,7 @@ func (sd *shardDelegator) LoadSegments(ctx context.Context, req *querypb.LoadSeg
 		}
 
 		// Build entries with Candidate before loadStreamDelete, which will atomically add them to distribution
-		entries := make([]SegmentEntry, 0, len(infos))
+		entries = make([]SegmentEntry, 0, len(infos))
 		for _, info := range infos {
 			entries = append(entries, SegmentEntry{
 				SegmentID:   info.GetSegmentID(),
@@ -1107,9 +1111,12 @@ func (sd *shardDelegator) LoadSegments(ctx context.Context, req *querypb.LoadSeg
 			})
 		}
 
+		return nil
+	})
+	if err == nil {
 		log.Debug("load delete...")
 		// loadStreamDelete now handles distribution add atomically in Phase 3
-		stageStart = time.Now()
+		stageStart := time.Now()
 		err = sd.loadStreamDelete(ctx, candidates, infos, req, targetNodeID, worker,
 			entries, req.GetLoadMeta().GetSchemaVersion())
 		streamDeleteDur = time.Since(stageStart)
@@ -1120,9 +1127,7 @@ func (sd *shardDelegator) LoadSegments(ctx context.Context, req *querypb.LoadSeg
 			return err
 		}
 		log.Debug("load stream delete done")
-
-		return nil
-	})
+	}
 	postLoadDur = time.Since(postLoadStart)
 	return err
 }
