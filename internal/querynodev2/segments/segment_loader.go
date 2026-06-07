@@ -1142,6 +1142,15 @@ func (loader *segmentLoader) requestResource(ctx context.Context, infos ...*quer
 		log.Warn("no sufficient physical resource to load segments", zap.Error(err))
 		return requestResourceResult{}, err
 	}
+	if loadingUsage.MemorySize == 0 &&
+		loadingUsage.DiskSize == 0 &&
+		!paramtable.Get().QueryNodeCfg.TieredEvictionEnabled.GetAsBool() {
+		result := requestResourceResult{
+			ConcurrencyLevel: funcutil.Min(hardware.GetCPUNum(), len(infos)),
+		}
+		requestResourceTiming.record(estimateDur, 0, 0, time.Since(requestStart))
+		return result, nil
+	}
 
 	lockWaitStart := time.Now()
 	loader.mut.Lock()
@@ -1258,6 +1267,10 @@ func (loader *segmentLoader) requestResource(ctx context.Context, infos ...*quer
 
 // freeRequestResource returns request memory & storage usage request.
 func (loader *segmentLoader) freeRequestResource(requestResourceResult requestResourceResult) {
+	if requestResourceResult.Resource.IsZero() && requestResourceResult.LogicalResource.IsZero() {
+		return
+	}
+
 	loader.mut.Lock()
 	defer loader.mut.Unlock()
 
