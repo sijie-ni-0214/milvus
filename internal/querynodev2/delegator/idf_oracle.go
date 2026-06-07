@@ -51,6 +51,142 @@ import (
 
 const memoryHeadroom = 4 * 1024 * 1024 // 4MB headroom for Insert path, ~50K unique tokens
 
+var bm25StatsStreamTiming = newBM25StatsStreamTimingStats()
+
+type bm25StatsFileTiming struct {
+	readerDur time.Duration
+	createDur time.Duration
+	copyDur   time.Duration
+	syncDur   time.Duration
+	statDur   time.Duration
+	totalDur  time.Duration
+}
+
+type bm25StatsStreamTimingPhase struct {
+	fileCount int64
+	byteCount int64
+	parsed    bool
+	readerDur time.Duration
+	createDur time.Duration
+	copyDur   time.Duration
+	syncDur   time.Duration
+	statDur   time.Duration
+	totalDur  time.Duration
+}
+
+type bm25StatsStreamTimingStats struct {
+	count           *atomic.Int64
+	parsedCount     *atomic.Int64
+	fileCount       *atomic.Int64
+	byteCount       *atomic.Int64
+	totalReader     *atomic.Int64
+	totalCreate     *atomic.Int64
+	totalCopy       *atomic.Int64
+	totalSync       *atomic.Int64
+	totalStat       *atomic.Int64
+	total           *atomic.Int64
+	maxReader       *atomic.Int64
+	maxCreate       *atomic.Int64
+	maxCopy         *atomic.Int64
+	maxSync         *atomic.Int64
+	maxStat         *atomic.Int64
+	maxTotal        *atomic.Int64
+	lastLogUnixNano *atomic.Int64
+}
+
+func newBM25StatsStreamTimingStats() *bm25StatsStreamTimingStats {
+	return &bm25StatsStreamTimingStats{
+		count:           atomic.NewInt64(0),
+		parsedCount:     atomic.NewInt64(0),
+		fileCount:       atomic.NewInt64(0),
+		byteCount:       atomic.NewInt64(0),
+		totalReader:     atomic.NewInt64(0),
+		totalCreate:     atomic.NewInt64(0),
+		totalCopy:       atomic.NewInt64(0),
+		totalSync:       atomic.NewInt64(0),
+		totalStat:       atomic.NewInt64(0),
+		total:           atomic.NewInt64(0),
+		maxReader:       atomic.NewInt64(0),
+		maxCreate:       atomic.NewInt64(0),
+		maxCopy:         atomic.NewInt64(0),
+		maxSync:         atomic.NewInt64(0),
+		maxStat:         atomic.NewInt64(0),
+		maxTotal:        atomic.NewInt64(0),
+		lastLogUnixNano: atomic.NewInt64(time.Now().UnixNano()),
+	}
+}
+
+func (s *bm25StatsStreamTimingStats) record(timing bm25StatsStreamTimingPhase) {
+	s.count.Inc()
+	if timing.parsed {
+		s.parsedCount.Inc()
+	}
+	s.fileCount.Add(timing.fileCount)
+	s.byteCount.Add(timing.byteCount)
+	s.totalReader.Add(int64(timing.readerDur))
+	s.totalCreate.Add(int64(timing.createDur))
+	s.totalCopy.Add(int64(timing.copyDur))
+	s.totalSync.Add(int64(timing.syncDur))
+	s.totalStat.Add(int64(timing.statDur))
+	s.total.Add(int64(timing.totalDur))
+	updateMaxDuration(s.maxReader, timing.readerDur)
+	updateMaxDuration(s.maxCreate, timing.createDur)
+	updateMaxDuration(s.maxCopy, timing.copyDur)
+	updateMaxDuration(s.maxSync, timing.syncDur)
+	updateMaxDuration(s.maxStat, timing.statDur)
+	updateMaxDuration(s.maxTotal, timing.totalDur)
+
+	now := time.Now()
+	last := s.lastLogUnixNano.Load()
+	if now.UnixNano()-last < int64(delegatorLoadTimingLogInterval) {
+		return
+	}
+	if !s.lastLogUnixNano.CompareAndSwap(last, now.UnixNano()) {
+		return
+	}
+
+	count := s.count.Swap(0)
+	parsedCount := s.parsedCount.Swap(0)
+	fileCount := s.fileCount.Swap(0)
+	byteCount := s.byteCount.Swap(0)
+	totalReader := s.totalReader.Swap(0)
+	totalCreate := s.totalCreate.Swap(0)
+	totalCopy := s.totalCopy.Swap(0)
+	totalSync := s.totalSync.Swap(0)
+	totalStat := s.totalStat.Swap(0)
+	total := s.total.Swap(0)
+	maxReader := s.maxReader.Swap(0)
+	maxCreate := s.maxCreate.Swap(0)
+	maxCopy := s.maxCopy.Swap(0)
+	maxSync := s.maxSync.Swap(0)
+	maxStat := s.maxStat.Swap(0)
+	maxTotal := s.maxTotal.Swap(0)
+	if count == 0 {
+		return
+	}
+
+	log.Warn("bm25 stats stream timing stats",
+		zap.Int64("requestCount", count),
+		zap.Int64("parsedCount", parsedCount),
+		zap.Int64("fileCount", fileCount),
+		zap.Int64("byteCount", byteCount),
+		zap.Float64("avgFileCount", float64(fileCount)/float64(count)),
+		zap.Float64("avgByteCount", float64(byteCount)/float64(count)),
+		zap.Duration("avgReaderDur", avgDuration(totalReader, count)),
+		zap.Duration("avgCreateDur", avgDuration(totalCreate, count)),
+		zap.Duration("avgCopyDur", avgDuration(totalCopy, count)),
+		zap.Duration("avgSyncDur", avgDuration(totalSync, count)),
+		zap.Duration("avgStatDur", avgDuration(totalStat, count)),
+		zap.Duration("avgTotalDur", avgDuration(total, count)),
+		zap.Duration("maxReaderDur", time.Duration(maxReader)),
+		zap.Duration("maxCreateDur", time.Duration(maxCreate)),
+		zap.Duration("maxCopyDur", time.Duration(maxCopy)),
+		zap.Duration("maxSyncDur", time.Duration(maxSync)),
+		zap.Duration("maxStatDur", time.Duration(maxStat)),
+		zap.Duration("maxTotalDur", time.Duration(maxTotal)),
+	)
+}
+
 type IDFOracle interface {
 	SetNext(snapshot *snapshot)
 	TargetVersion() int64
@@ -347,6 +483,9 @@ type streamLoadResult struct {
 func (o *idfOracle) streamLoad(ctx context.Context, segmentID int64, binlogPaths map[int64][]string, cm storage.ChunkManager, needParse bool) (streamLoadResult, error) {
 	log := log.Ctx(ctx).With(zap.Int64("segmentID", segmentID))
 	startTs := time.Now()
+	timing := bm25StatsStreamTimingPhase{
+		parsed: needParse,
+	}
 
 	segDir := path.Join(o.dirPath, fmt.Sprintf("%d", segmentID))
 	var totalDiskSize int64
@@ -371,11 +510,18 @@ func (o *idfOracle) streamLoad(ctx context.Context, segmentID int64, binlogPaths
 
 		for i, remotePath := range paths {
 			localFile := path.Join(fieldDir, fmt.Sprintf("%d.data", i))
-			written, err := streamOneFile(ctx, cm, remotePath, localFile, fieldStats)
+			written, fileTiming, err := streamOneFile(ctx, cm, remotePath, localFile, fieldStats)
 			if err != nil {
 				return streamLoadResult{}, errors.Wrapf(err, "stream bm25 stats file %s", remotePath)
 			}
 			totalDiskSize += written
+			timing.fileCount++
+			timing.byteCount += written
+			timing.readerDur += fileTiming.readerDur
+			timing.createDur += fileTiming.createDur
+			timing.copyDur += fileTiming.copyDur
+			timing.syncDur += fileTiming.syncDur
+			timing.statDur += fileTiming.statDur
 		}
 
 		if needParse {
@@ -385,6 +531,8 @@ func (o *idfOracle) streamLoad(ctx context.Context, segmentID int64, binlogPaths
 	}
 
 	log.Info("stream load bm25 stats done", zap.Duration("time", time.Since(startTs)), zap.Int64("diskSize", totalDiskSize), zap.Bool("parsed", needParse))
+	timing.totalDur = time.Since(startTs)
+	bm25StatsStreamTiming.record(timing)
 
 	return streamLoadResult{
 		localDir:  segDir,
@@ -396,16 +544,25 @@ func (o *idfOracle) streamLoad(ctx context.Context, segmentID int64, binlogPaths
 
 // streamOneFile streams a single remote file to a local file.
 // If parseInto is non-nil, uses TeeReader to simultaneously parse stats.
-func streamOneFile(ctx context.Context, cm storage.ChunkManager, remotePath, localPath string, parseInto *storage.BM25Stats) (int64, error) {
+func streamOneFile(ctx context.Context, cm storage.ChunkManager, remotePath, localPath string, parseInto *storage.BM25Stats) (int64, bm25StatsFileTiming, error) {
+	totalStart := time.Now()
+	timing := bm25StatsFileTiming{}
+
+	stageStart := time.Now()
 	reader, err := cm.Reader(ctx, remotePath)
+	timing.readerDur = time.Since(stageStart)
 	if err != nil {
-		return 0, err
+		timing.totalDur = time.Since(totalStart)
+		return 0, timing, err
 	}
 	defer reader.Close()
 
+	stageStart = time.Now()
 	f, err := os.Create(localPath)
+	timing.createDur = time.Since(stageStart)
 	if err != nil {
-		return 0, err
+		timing.totalDur = time.Since(totalStart)
+		return 0, timing, err
 	}
 	defer f.Close()
 
@@ -413,31 +570,51 @@ func streamOneFile(ctx context.Context, cm storage.ChunkManager, remotePath, loc
 		br := bufio.NewReaderSize(reader, paramtable.Get().QueryNodeCfg.IDFReadBufferSize.GetAsInt())
 		bw := bufio.NewWriter(f)
 		tee := io.TeeReader(br, bw)
+		stageStart = time.Now()
 		err = parseInto.DeserializeFromReader(tee)
+		timing.copyDur = time.Since(stageStart)
 		if err != nil {
-			return 0, err
+			timing.totalDur = time.Since(totalStart)
+			return 0, timing, err
 		}
 		if err := bw.Flush(); err != nil {
-			return 0, err
+			timing.totalDur = time.Since(totalStart)
+			return 0, timing, err
 		}
+		stageStart = time.Now()
 		if err := f.Sync(); err != nil {
-			return 0, err
+			timing.syncDur = time.Since(stageStart)
+			timing.totalDur = time.Since(totalStart)
+			return 0, timing, err
 		}
+		timing.syncDur = time.Since(stageStart)
+		stageStart = time.Now()
 		info, err := f.Stat()
+		timing.statDur = time.Since(stageStart)
 		if err != nil {
-			return 0, err
+			timing.totalDur = time.Since(totalStart)
+			return 0, timing, err
 		}
-		return info.Size(), nil
+		timing.totalDur = time.Since(totalStart)
+		return info.Size(), timing, nil
 	}
 
+	stageStart = time.Now()
 	written, err := io.Copy(f, reader)
+	timing.copyDur = time.Since(stageStart)
 	if err != nil {
-		return 0, err
+		timing.totalDur = time.Since(totalStart)
+		return 0, timing, err
 	}
+	stageStart = time.Now()
 	if err := f.Sync(); err != nil {
-		return 0, err
+		timing.syncDur = time.Since(stageStart)
+		timing.totalDur = time.Since(totalStart)
+		return 0, timing, err
 	}
-	return written, nil
+	timing.syncDur = time.Since(stageStart)
+	timing.totalDur = time.Since(totalStart)
+	return written, timing, nil
 }
 
 func (o *idfOracle) UpdateGrowing(segmentID int64, stats bm25Stats) {
