@@ -294,17 +294,22 @@ SegmentLoadInfo::CheckIndexHasRawData(const LoadIndexInfo& load_index_info) {
 }
 
 void
-SegmentLoadInfo::BuildCache() {
-    auto total_start = std::chrono::steady_clock::now();
-    BuildCacheTiming timing;
-
-    auto stage_start = std::chrono::steady_clock::now();
+SegmentLoadInfo::RebuildFieldBinlogCache() {
     field_binlog_cache_.clear();
     for (int i = 0; i < info_.binlog_paths_size(); i++) {
         const auto& binlog = info_.binlog_paths(i);
         auto field_id = FieldId(binlog.fieldid());
         field_binlog_cache_[field_id] = &binlog;
     }
+}
+
+void
+SegmentLoadInfo::BuildCache() {
+    auto total_start = std::chrono::steady_clock::now();
+    BuildCacheTiming timing;
+
+    auto stage_start = std::chrono::steady_clock::now();
+    RebuildFieldBinlogCache();
     timing.binlog_group_count = info_.binlog_paths_size();
     timing.binlog_cache_ns = DurationNs(stage_start);
 
