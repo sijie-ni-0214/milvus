@@ -54,8 +54,6 @@ var (
 	dynOnce    sync.Once
 	loadPool   atomic.Pointer[conc.Pool[any]]
 	loadOnce   sync.Once
-	createPool atomic.Pointer[conc.Pool[any]]
-	createOnce sync.Once
 	warmupPool atomic.Pointer[conc.Pool[any]]
 	warmupOnce sync.Once
 
@@ -71,7 +69,6 @@ var (
 	// intentionally leaked CGO tag names
 	cgoTagSQ      = C.CString("CGO_SQ")
 	cgoTagLoad    = C.CString("CGO_LOAD")
-	cgoTagCreate  = C.CString("CGO_CREATE")
 	cgoTagDynamic = C.CString("CGO_DYN")
 	cgoTagWarmup  = C.CString("CGO_WARMUP")
 )
@@ -134,27 +131,6 @@ func initLoadPool() {
 
 		pt.Watch(pt.CommonCfg.MiddlePriorityThreadCoreCoefficient.Key, config.NewHandler("qn.loadpool.middlepriority", ResizeLoadPool))
 		log.Info("init loadPool done", zap.Int("size", poolSize))
-	})
-}
-
-func initSegmentCreatePool() {
-	createOnce.Do(func() {
-		pt := paramtable.Get()
-		poolSize := hardware.GetCPUNum() * pt.CommonCfg.MiddlePriorityThreadCoreCoefficient.GetAsInt()
-		pool := conc.NewPool[any](
-			poolSize,
-			conc.WithPreAlloc(false),
-			conc.WithDisablePurge(false),
-			conc.WithPreHandler(func() {
-				runtime.LockOSThread()
-				C.SetThreadName(cgoTagCreate)
-			}),
-		)
-
-		createPool.Store(pool)
-
-		pt.Watch(pt.CommonCfg.MiddlePriorityThreadCoreCoefficient.Key, config.NewHandler("qn.segmentcreatepool.middlepriority", ResizeSegmentCreatePool))
-		log.Info("init segmentCreatePool done", zap.Int("size", poolSize))
 	})
 }
 
@@ -227,11 +203,6 @@ func GetLoadPool() *conc.Pool[any] {
 	return loadPool.Load()
 }
 
-func GetSegmentCreatePool() *conc.Pool[any] {
-	initSegmentCreatePool()
-	return createPool.Load()
-}
-
 func GetWarmupPool() *conc.Pool[any] {
 	initWarmupPool()
 	return warmupPool.Load()
@@ -267,14 +238,6 @@ func ResizeLoadPool(evt *config.Event) {
 		pt := paramtable.Get()
 		newSize := hardware.GetCPUNum() * pt.CommonCfg.MiddlePriorityThreadCoreCoefficient.GetAsInt()
 		resizePool(GetLoadPool(), newSize, "LoadPool")
-	}
-}
-
-func ResizeSegmentCreatePool(evt *config.Event) {
-	if evt.HasUpdated {
-		pt := paramtable.Get()
-		newSize := hardware.GetCPUNum() * pt.CommonCfg.MiddlePriorityThreadCoreCoefficient.GetAsInt()
-		resizePool(GetSegmentCreatePool(), newSize, "SegmentCreatePool")
 	}
 }
 
@@ -318,7 +281,6 @@ func CollectPoolStats() []metrics.PoolStats {
 		{"SQPool", GetSQPool()},
 		{"DynamicPool", GetDynamicPool()},
 		{"LoadPool", GetLoadPool()},
-		{"SegmentCreatePool", GetSegmentCreatePool()},
 		{"WarmupPool", GetWarmupPool()},
 		{"BFApplyPool", GetBFApplyPool()},
 		{"BM25LoadPool", GetBM25LoadPool()},

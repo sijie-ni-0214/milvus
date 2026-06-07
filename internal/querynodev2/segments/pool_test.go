@@ -83,28 +83,6 @@ func TestResizePools(t *testing.T) {
 		assert.Equal(t, expectedCap, GetLoadPool().Cap())
 	})
 
-	t.Run("SegmentCreatePool", func(t *testing.T) {
-		pt.Reset(pt.CommonCfg.MiddlePriorityThreadCoreCoefficient.Key)
-		expectedCap := hardware.GetCPUNum() * pt.CommonCfg.MiddlePriorityThreadCoreCoefficient.GetAsInt()
-
-		ResizeSegmentCreatePool(&config.Event{
-			HasUpdated: true,
-		})
-		assert.Equal(t, expectedCap, GetSegmentCreatePool().Cap())
-
-		pt.Save(pt.CommonCfg.MiddlePriorityThreadCoreCoefficient.Key, strconv.FormatFloat(pt.CommonCfg.MiddlePriorityThreadCoreCoefficient.GetAsFloat()*2, 'f', 10, 64))
-		ResizeSegmentCreatePool(&config.Event{
-			HasUpdated: true,
-		})
-		assert.Equal(t, expectedCap, GetSegmentCreatePool().Cap())
-
-		pt.Save(pt.CommonCfg.MiddlePriorityThreadCoreCoefficient.Key, "0")
-		ResizeSegmentCreatePool(&config.Event{
-			HasUpdated: true,
-		})
-		assert.Equal(t, expectedCap, GetSegmentCreatePool().Cap())
-	})
-
 	t.Run("WarmupPool", func(t *testing.T) {
 		expectedCap := hardware.GetCPUNum() * pt.CommonCfg.LowPriorityThreadCoreCoefficient.GetAsInt()
 
