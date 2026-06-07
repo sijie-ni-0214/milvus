@@ -582,13 +582,6 @@ func streamOneFile(ctx context.Context, cm storage.ChunkManager, remotePath, loc
 			return 0, timing, err
 		}
 		stageStart = time.Now()
-		if err := f.Sync(); err != nil {
-			timing.syncDur = time.Since(stageStart)
-			timing.totalDur = time.Since(totalStart)
-			return 0, timing, err
-		}
-		timing.syncDur = time.Since(stageStart)
-		stageStart = time.Now()
 		info, err := f.Stat()
 		timing.statDur = time.Since(stageStart)
 		if err != nil {
@@ -606,13 +599,6 @@ func streamOneFile(ctx context.Context, cm storage.ChunkManager, remotePath, loc
 		timing.totalDur = time.Since(totalStart)
 		return 0, timing, err
 	}
-	stageStart = time.Now()
-	if err := f.Sync(); err != nil {
-		timing.syncDur = time.Since(stageStart)
-		timing.totalDur = time.Since(totalStart)
-		return 0, timing, err
-	}
-	timing.syncDur = time.Since(stageStart)
 	timing.totalDur = time.Since(totalStart)
 	return written, timing, nil
 }
