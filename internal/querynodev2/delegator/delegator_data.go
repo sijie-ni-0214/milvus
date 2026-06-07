@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"runtime"
+	"sync"
 	"time"
 
 	"github.com/cockroachdb/errors"
@@ -59,12 +60,95 @@ import (
 
 // delegator data related part
 
-const delegatorLoadTimingLogInterval = 5 * time.Second
+const (
+	delegatorLoadTimingLogInterval = 5 * time.Second
+	distributionAddBatchSize       = 64
+	distributionAddBatchDelay      = time.Millisecond
+)
 
 var (
 	delegatorLoadTiming         = newDelegatorLoadTimingStats()
 	delegatorStreamDeleteTiming = newDelegatorStreamDeleteTimingStats()
 )
+
+type distributionAddRequest struct {
+	entries []SegmentEntry
+	done    chan error
+}
+
+type distributionAddBatcher struct {
+	mut     sync.Mutex
+	pending []*distributionAddRequest
+	running bool
+}
+
+func newDistributionAddBatcher() *distributionAddBatcher {
+	return &distributionAddBatcher{
+		pending: make([]*distributionAddRequest, 0, distributionAddBatchSize),
+	}
+}
+
+func (b *distributionAddBatcher) add(entries []SegmentEntry, addFunc func(...SegmentEntry) error) error {
+	req := &distributionAddRequest{
+		entries: entries,
+		done:    make(chan error, 1),
+	}
+
+	b.mut.Lock()
+	b.pending = append(b.pending, req)
+	if !b.running {
+		b.running = true
+		go b.flush(addFunc)
+	}
+	b.mut.Unlock()
+
+	return <-req.done
+}
+
+func (b *distributionAddBatcher) flush(addFunc func(...SegmentEntry) error) {
+	timer := time.NewTimer(distributionAddBatchDelay)
+	defer timer.Stop()
+
+	for {
+		<-timer.C
+
+		b.mut.Lock()
+		if len(b.pending) == 0 {
+			b.running = false
+			b.mut.Unlock()
+			return
+		}
+
+		batchSize := len(b.pending)
+		if batchSize > distributionAddBatchSize {
+			batchSize = distributionAddBatchSize
+		}
+		batch := make([]*distributionAddRequest, batchSize)
+		copy(batch, b.pending[:batchSize])
+		copy(b.pending, b.pending[batchSize:])
+		for i := len(b.pending) - batchSize; i < len(b.pending); i++ {
+			b.pending[i] = nil
+		}
+		b.pending = b.pending[:len(b.pending)-batchSize]
+		b.mut.Unlock()
+
+		entryCount := 0
+		for _, req := range batch {
+			entryCount += len(req.entries)
+		}
+		entries := make([]SegmentEntry, 0, entryCount)
+		for _, req := range batch {
+			entries = append(entries, req.entries...)
+		}
+
+		err := addFunc(entries...)
+		for _, req := range batch {
+			req.done <- err
+		}
+
+		timer.Reset(distributionAddBatchDelay)
+	}
+}
 
 type delegatorLoadTimingStats struct {
 	active            *atomic.Int64
@@ -1070,9 +1154,14 @@ func (sd *shardDelegator) addDistributionIfVersionOK(version uint64, entries ...
 		return merr.WrapErrServiceInternal("schema version changed")
 	}
 
-	// alter distribution
-	sd.distribution.AddDistributions(entries...)
-	return nil
+	if sd.distributionAddBatcher == nil {
+		sd.distribution.AddDistributions(entries...)
+		return nil
+	}
+	return sd.distributionAddBatcher.add(entries, func(entries ...SegmentEntry) error {
+		sd.distribution.AddDistributions(entries...)
+		return nil
+	})
 }
 
 // LoadGrowing load growing segments locally.

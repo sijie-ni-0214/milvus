@@ -173,8 +173,9 @@ type shardDelegator struct {
 	schemaVersion     uint64
 
 	// limits delegator-side post-load work after worker LoadSegments returns.
-	postLoadSem           *syncutil.Semaphore
-	postLoadConfigHandler config.EventHandler
+	postLoadSem            *syncutil.Semaphore
+	postLoadConfigHandler  config.EventHandler
+	distributionAddBatcher *distributionAddBatcher
 
 	// streaming data catch-up state
 	catchingUpStreamingData *atomic.Bool
@@ -1393,6 +1394,7 @@ func NewShardDelegator(ctx context.Context, collectionID UniqueID, replicaID Uni
 		l0ForwardPolicy:            policy,
 		postLoadSem:                postLoadSem,
 		postLoadConfigHandler:      postLoadConfigHandler,
+		distributionAddBatcher:     newDistributionAddBatcher(),
 		catchingUpStreamingData:    atomic.NewBool(true),
 		latestRequiredMVCCTimeTick: atomic.NewUint64(0),
 	}
