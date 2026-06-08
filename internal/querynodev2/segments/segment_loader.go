@@ -78,12 +78,13 @@ var errRetryTimerNotified = errors.New("retry timer notified")
 const requestResourceTimingLogInterval = 5 * time.Second
 
 var (
-	requestResourceTiming   = newRequestResourceTimingStats()
-	indexEstimateTiming     = newIndexResourceEstimateTimingStats()
-	segmentLoaderLoadTiming = newSegmentLoaderLoadTimingStats()
-	segmentLoadTiming       = newSegmentLoadTimingStats()
-	sealedLoadTiming        = newSealedLoadTimingStats()
-	bloomFilterLoadTiming   = newBloomFilterLoadTimingStats()
+	requestResourceTiming     = newRequestResourceTimingStats()
+	freeRequestResourceTiming = newFreeRequestResourceTimingStats()
+	indexEstimateTiming       = newIndexResourceEstimateTimingStats()
+	segmentLoaderLoadTiming   = newSegmentLoaderLoadTimingStats()
+	segmentLoadTiming         = newSegmentLoadTimingStats()
+	sealedLoadTiming          = newSealedLoadTimingStats()
+	bloomFilterLoadTiming     = newBloomFilterLoadTimingStats()
 )
 
 type requestResourceTimingStats struct {
@@ -106,6 +107,17 @@ type indexResourceEstimateTimingStats struct {
 	lastLogUnixNano *atomic.Int64
 }
 
+type freeRequestResourceTimingStats struct {
+	count             *atomic.Int64
+	totalLockWaitNano *atomic.Int64
+	totalLockHoldNano *atomic.Int64
+	totalNano         *atomic.Int64
+	maxLockWaitNano   *atomic.Int64
+	maxLockHoldNano   *atomic.Int64
+	maxTotalNano      *atomic.Int64
+	lastLogUnixNano   *atomic.Int64
+}
+
 func newRequestResourceTimingStats() *requestResourceTimingStats {
 	return &requestResourceTimingStats{
 		count:           atomic.NewInt64(0),
@@ -118,6 +130,19 @@ func newRequestResourceTimingStats() *requestResourceTimingStats {
 		maxLockHold:     atomic.NewInt64(0),
 		maxRequest:      atomic.NewInt64(0),
 		lastLogUnixNano: atomic.NewInt64(time.Now().UnixNano()),
+	}
+}
+
+func newFreeRequestResourceTimingStats() *freeRequestResourceTimingStats {
+	return &freeRequestResourceTimingStats{
+		count:             atomic.NewInt64(0),
+		totalLockWaitNano: atomic.NewInt64(0),
+		totalLockHoldNano: atomic.NewInt64(0),
+		totalNano:         atomic.NewInt64(0),
+		maxLockWaitNano:   atomic.NewInt64(0),
+		maxLockHoldNano:   atomic.NewInt64(0),
+		maxTotalNano:      atomic.NewInt64(0),
+		lastLogUnixNano:   atomic.NewInt64(time.Now().UnixNano()),
 	}
 }
 
@@ -693,6 +718,46 @@ func (s *indexResourceEstimateTimingStats) maybeLog() {
 		zap.Int64("scalarFastPath", scalarFastPath),
 		zap.Int64("cgoCacheHit", cgoCacheHit),
 		zap.Int64("cgoCacheMiss", cgoCacheMiss),
+	)
+}
+
+func (s *freeRequestResourceTimingStats) record(lockWaitDur, lockHoldDur, totalDur time.Duration) {
+	s.count.Inc()
+	s.totalLockWaitNano.Add(int64(lockWaitDur))
+	s.totalLockHoldNano.Add(int64(lockHoldDur))
+	s.totalNano.Add(int64(totalDur))
+	updateMaxDuration(s.maxLockWaitNano, lockWaitDur)
+	updateMaxDuration(s.maxLockHoldNano, lockHoldDur)
+	updateMaxDuration(s.maxTotalNano, totalDur)
+
+	now := time.Now()
+	last := s.lastLogUnixNano.Load()
+	if now.UnixNano()-last < int64(requestResourceTimingLogInterval) {
+		return
+	}
+	if !s.lastLogUnixNano.CompareAndSwap(last, now.UnixNano()) {
+		return
+	}
+
+	count := s.count.Swap(0)
+	if count == 0 {
+		return
+	}
+	totalLockWait := time.Duration(s.totalLockWaitNano.Swap(0))
+	totalLockHold := time.Duration(s.totalLockHoldNano.Swap(0))
+	total := time.Duration(s.totalNano.Swap(0))
+	maxLockWait := time.Duration(s.maxLockWaitNano.Swap(0))
+	maxLockHold := time.Duration(s.maxLockHoldNano.Swap(0))
+	maxTotal := time.Duration(s.maxTotalNano.Swap(0))
+
+	log.Warn("free request resource timing stats",
+		zap.Int64("count", count),
+		zap.Duration("avgLockWaitDur", totalLockWait/time.Duration(count)),
+		zap.Duration("avgLockHoldDur", totalLockHold/time.Duration(count)),
+		zap.Duration("avgTotalDur", total/time.Duration(count)),
+		zap.Duration("maxLockWaitDur", maxLockWait),
+		zap.Duration("maxLockHoldDur", maxLockHold),
+		zap.Duration("maxTotalDur", maxTotal),
 	)
 }
 
@@ -1323,12 +1388,20 @@ func (loader *segmentLoader) requestResource(ctx context.Context, infos ...*quer
 
 // freeRequestResource returns request memory & storage usage request.
 func (loader *segmentLoader) freeRequestResource(requestResourceResult requestResourceResult) {
+	freeStart := time.Now()
 	if requestResourceResult.Resource.IsZero() && requestResourceResult.LogicalResource.IsZero() {
 		return
 	}
 
+	lockWaitStart := time.Now()
 	loader.mut.Lock()
-	defer loader.mut.Unlock()
+	lockWaitDur := time.Since(lockWaitStart)
+	lockHoldStart := time.Now()
+	defer func() {
+		lockHoldDur := time.Since(lockHoldStart)
+		loader.mut.Unlock()
+		freeRequestResourceTiming.record(lockWaitDur, lockHoldDur, time.Since(freeStart))
+	}()
 
 	resource := requestResourceResult.Resource
 	// logicalResource := requestResourceResult.LogicalResource
