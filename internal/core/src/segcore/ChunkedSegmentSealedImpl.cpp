@@ -5759,12 +5759,7 @@ ChunkedSegmentSealedImpl::Load(milvus::tracer::TraceContext& trace_ctx,
 
     stage_start = std::chrono::steady_clock::now();
     auto snapshot = std::atomic_load(&segment_load_info_);
-    auto num_rows = snapshot->GetNumOfRows();
     snapshot_ns = DurationSinceNs(stage_start);
-
-    stage_start = std::chrono::steady_clock::now();
-    LOG_INFO("Loading segment {} with {} rows", id_, num_rows);
-    start_log_ns = DurationSinceNs(stage_start);
 
     // reopen_mutex_ synchronizes this read with all schema_ writers.
     stage_start = std::chrono::steady_clock::now();
@@ -5781,16 +5776,9 @@ ChunkedSegmentSealedImpl::Load(milvus::tracer::TraceContext& trace_ctx,
     diff_ns = DurationSinceNs(stage_start);
 
     stage_start = std::chrono::steady_clock::now();
-    LOG_WARN("Load segment {} with diff {}", id_, diff.ToString());
-    diff_log_ns = DurationSinceNs(stage_start);
-
-    stage_start = std::chrono::steady_clock::now();
     ApplyLoadDiff(op_ctx, mutable_copy, diff);
     apply_ns = DurationSinceNs(stage_start);
 
-    stage_start = std::chrono::steady_clock::now();
-    LOG_INFO("Successfully loaded segment {} with {} rows", id_, num_rows);
-    success_log_ns = DurationSinceNs(stage_start);
 }
 
 void
