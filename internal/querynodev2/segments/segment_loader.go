@@ -1671,17 +1671,18 @@ func (loader *segmentLoader) loadSealedSegment(ctx context.Context, loadInfo *qu
 		stateLockGuard.Done(err)
 	}()
 
-	collection := segment.GetCollection()
-	indexedFieldInfos, _, textIndexes, unindexedTextFields, jsonKeyStats, _, _ := separateLoadInfoV2(loadInfo, collection.Schema())
-
 	log := log.Ctx(ctx).With(zap.Int64("segmentID", segment.ID()))
 	tr := timerecord.NewTimeRecorder("segmentLoader.loadSealedSegment")
-	log.Info("Start loading fields...",
-		zap.Int("indexedFields count", len(indexedFieldInfos)),
-		zap.Int64s("indexed text fields", lo.Keys(textIndexes)),
-		zap.Int64s("unindexed text fields", lo.Keys(unindexedTextFields)),
-		zap.Int64s("indexed json key fields", lo.Keys(jsonKeyStats)),
-	)
+	if log.Core().Enabled(zap.InfoLevel) {
+		collection := segment.GetCollection()
+		indexedFieldInfos, _, textIndexes, unindexedTextFields, jsonKeyStats, _, _ := separateLoadInfoV2(loadInfo, collection.Schema())
+		log.Info("Start loading fields...",
+			zap.Int("indexedFields count", len(indexedFieldInfos)),
+			zap.Int64s("indexed text fields", lo.Keys(textIndexes)),
+			zap.Int64s("unindexed text fields", lo.Keys(unindexedTextFields)),
+			zap.Int64s("indexed json key fields", lo.Keys(jsonKeyStats)),
+		)
+	}
 	submitStart := time.Now()
 	_, err = GetLoadPool().Submit(func() (any, error) {
 		poolWaitDur = time.Since(submitStart)

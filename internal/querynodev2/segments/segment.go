@@ -1456,6 +1456,13 @@ func (s *LocalSegment) syncFieldJSONStatsFromLoadInfo(ctx context.Context, loadI
 		return
 	}
 
+	if !s.hasJSONKeyStatsField() {
+		s.fieldJSONStatsMu.Lock()
+		s.fieldJSONStats = jsonStatsInfo
+		s.fieldJSONStatsMu.Unlock()
+		return
+	}
+
 	statsResult := packed.NewStatsResolverFromLoadInfo(loadInfo).TextAndJSONIndexStatsWithBasePaths()
 	jsonKeyStats := statsResult.JSONKeyStats
 	if statsResult.Err() != nil {
@@ -1491,6 +1498,15 @@ func (s *LocalSegment) syncFieldJSONStatsFromLoadInfo(ctx context.Context, loadI
 	s.fieldJSONStatsMu.Lock()
 	s.fieldJSONStats = jsonStatsInfo
 	s.fieldJSONStatsMu.Unlock()
+}
+
+func (s *LocalSegment) hasJSONKeyStatsField() bool {
+	for _, field := range s.collection.Schema().GetFields() {
+		if typeutil.CreateFieldSchemaHelper(field).EnableJSONKeyStatsIndex() {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *LocalSegment) Load(ctx context.Context) error {
