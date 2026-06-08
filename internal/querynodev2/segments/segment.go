@@ -21,6 +21,7 @@ package segments
 
 #include "futures/future_c.h"
 #include "segcore/collection_c.h"
+#include "segcore/load_index_c.h"
 #include "segcore/plan_c.h"
 #include "segcore/reduce_c.h"
 #include "segcore/segment_c.h"
@@ -1041,6 +1042,134 @@ func GetCLoadInfoWithFunc(ctx context.Context,
 	return getCLoadInfoWithFunc(ctx, fieldSchema, loadInfo, indexInfo, f, nil)
 }
 
+func getLoadIndexInfoProto(ctx context.Context,
+	fieldSchema *schemapb.FieldSchema,
+	loadInfo *querypb.SegmentLoadInfo,
+	indexInfo *querypb.FieldIndexInfo,
+) (*cgopb.LoadIndexInfo, error) {
+	indexParams := funcutil.KeyValuePair2Map(indexInfo.IndexParams)
+	// as Knowhere reports error if encounter an unknown param, we need to delete it
+	delete(indexParams, common.MmapEnabledKey)
+
+	// some build params also exist in indexParams, which are useless during loading process
+	if vecindexmgr.GetVecIndexMgrInstance().IsDiskANN(indexParams["index_type"]) {
+		if err := indexparams.SetDiskIndexLoadParams(paramtable.Get(), indexParams, indexInfo.GetNumRows()); err != nil {
+			return nil, err
+		}
+	}
+
+	// set whether enable offset cache for bitmap index
+	if indexParams["index_type"] == indexparamcheck.IndexBitmap {
+		indexparams.SetBitmapIndexLoadParams(paramtable.Get(), indexParams)
+	}
+
+	if err := indexparams.AppendPrepareLoadParams(paramtable.Get(), indexParams); err != nil {
+		return nil, err
+	}
+
+	enableMmap := isIndexMmapEnable(fieldSchema, indexInfo)
+	// Add warmup policy to index_params if not already present
+	// C++ will pass it to Knowhere for index loading
+	if existingWarmup, exists := indexParams[common.WarmupKey]; exists {
+		log.Ctx(ctx).Info("warmup policy already in index params (from QueryCoord)",
+			zap.Int64("segmentID", loadInfo.GetSegmentID()),
+			zap.Int64("fieldID", indexInfo.GetFieldID()),
+			zap.String("warmup", existingWarmup))
+	} else {
+		warmupPolicy := getIndexWarmupPolicy(fieldSchema, indexInfo)
+		log.Ctx(ctx).Info("warmup policy from getIndexWarmupPolicy",
+			zap.Int64("segmentID", loadInfo.GetSegmentID()),
+			zap.Int64("fieldID", indexInfo.GetFieldID()),
+			zap.String("warmup", warmupPolicy))
+		if warmupPolicy != "" {
+			indexParams[common.WarmupKey] = warmupPolicy
+		}
+	}
+	// Pass DataCoord-built index file paths through; QueryNode should not
+	// attach v0/v1 path layout semantics to the read path.
+	return &cgopb.LoadIndexInfo{
+		CollectionID:              loadInfo.GetCollectionID(),
+		PartitionID:               loadInfo.GetPartitionID(),
+		SegmentID:                 loadInfo.GetSegmentID(),
+		Field:                     fieldSchema,
+		EnableMmap:                enableMmap,
+		IndexID:                   indexInfo.GetIndexID(),
+		IndexBuildID:              indexInfo.GetBuildID(),
+		IndexVersion:              indexInfo.GetIndexVersion(),
+		IndexParams:               indexParams,
+		IndexFiles:                indexInfo.GetIndexFilePaths(),
+		IndexEngineVersion:        indexInfo.GetCurrentIndexVersion(),
+		IndexFileSize:             indexInfo.GetIndexSize(),
+		NumRows:                   indexInfo.GetNumRows(),
+		CurrentScalarIndexVersion: indexInfo.GetCurrentScalarIndexVersion(),
+	}, nil
+}
+
+func estimateLoadIndexResourceWithTiming(ctx context.Context,
+	fieldSchema *schemapb.FieldSchema,
+	loadInfo *querypb.SegmentLoadInfo,
+	indexInfo *querypb.FieldIndexInfo,
+	timing *cLoadInfoTiming,
+) (ResourceEstimate, time.Duration, error) {
+	indexInfoProto, err := getLoadIndexInfoProto(ctx, fieldSchema, loadInfo, indexInfo)
+	if err != nil {
+		return ResourceEstimate{}, 0, err
+	}
+	marshaled, err := proto.Marshal(indexInfoProto)
+	if err != nil {
+		return ResourceEstimate{}, 0, err
+	}
+
+	var status C.CStatus
+	var cLoadIndexInfo C.CLoadIndexInfo
+	var request C.LoadResourceRequest
+	var estimateDur time.Duration
+	statusStage := ""
+	_, _ = GetDynamicPool().Submit(func() (any, error) {
+		statusStage = "NewLoadIndexInfo failed"
+		newInfoStart := time.Now()
+		status = C.NewLoadIndexInfo(&cLoadIndexInfo)
+		if timing != nil {
+			timing.newInfoDur += time.Since(newInfoStart)
+		}
+		if status.error_code != 0 {
+			return nil, nil
+		}
+		defer func() {
+			deleteInfoStart := time.Now()
+			C.DeleteLoadIndexInfo(cLoadIndexInfo)
+			if timing != nil {
+				timing.deleteInfoDur += time.Since(deleteInfoStart)
+			}
+		}()
+
+		statusStage = "FinishLoadIndexInfo failed"
+		appendInfoStart := time.Now()
+		status = C.FinishLoadIndexInfo(cLoadIndexInfo, (*C.uint8_t)(unsafe.Pointer(&marshaled[0])), (C.uint64_t)(len(marshaled)))
+		if timing != nil {
+			timing.appendInfoDur += time.Since(appendInfoStart)
+		}
+		if status.error_code != 0 {
+			return nil, nil
+		}
+
+		statusStage = ""
+		callbackStart := time.Now()
+		estimateStart := time.Now()
+		request = C.EstimateLoadIndexResource(cLoadIndexInfo)
+		estimateDur = time.Since(estimateStart)
+		if timing != nil {
+			timing.callbackDur += time.Since(callbackStart)
+		}
+		return nil, nil
+	}).Await()
+
+	if statusStage != "" {
+		return ResourceEstimate{}, estimateDur, HandleCStatus(ctx, &status, statusStage)
+	}
+	return GetResourceEstimate(&request), estimateDur, nil
+}
+
 func getCLoadInfoWithFunc(ctx context.Context,
 	fieldSchema *schemapb.FieldSchema,
 	loadInfo *querypb.SegmentLoadInfo,
@@ -1065,61 +1194,9 @@ func getCLoadInfoWithFunc(ctx context.Context,
 		}
 	}()
 
-	indexParams := funcutil.KeyValuePair2Map(indexInfo.IndexParams)
-	// as Knowhere reports error if encounter an unknown param, we need to delete it
-	delete(indexParams, common.MmapEnabledKey)
-
-	// some build params also exist in indexParams, which are useless during loading process
-	if vecindexmgr.GetVecIndexMgrInstance().IsDiskANN(indexParams["index_type"]) {
-		if err := indexparams.SetDiskIndexLoadParams(paramtable.Get(), indexParams, indexInfo.GetNumRows()); err != nil {
-			return err
-		}
-	}
-
-	// set whether enable offset cache for bitmap index
-	if indexParams["index_type"] == indexparamcheck.IndexBitmap {
-		indexparams.SetBitmapIndexLoadParams(paramtable.Get(), indexParams)
-	}
-
-	if err := indexparams.AppendPrepareLoadParams(paramtable.Get(), indexParams); err != nil {
+	indexInfoProto, err := getLoadIndexInfoProto(ctx, fieldSchema, loadInfo, indexInfo)
+	if err != nil {
 		return err
-	}
-
-	enableMmap := isIndexMmapEnable(fieldSchema, indexInfo)
-	// Add warmup policy to index_params if not already present
-	// C++ will pass it to Knowhere for index loading
-	if existingWarmup, exists := indexParams[common.WarmupKey]; exists {
-		log.Ctx(ctx).Info("warmup policy already in index params (from QueryCoord)",
-			zap.Int64("segmentID", loadInfo.GetSegmentID()),
-			zap.Int64("fieldID", indexInfo.GetFieldID()),
-			zap.String("warmup", existingWarmup))
-	} else {
-		warmupPolicy := getIndexWarmupPolicy(fieldSchema, indexInfo)
-		log.Ctx(ctx).Info("warmup policy from getIndexWarmupPolicy",
-			zap.Int64("segmentID", loadInfo.GetSegmentID()),
-			zap.Int64("fieldID", indexInfo.GetFieldID()),
-			zap.String("warmup", warmupPolicy))
-		if warmupPolicy != "" {
-			indexParams[common.WarmupKey] = warmupPolicy
-		}
-	}
-	// Pass DataCoord-built index file paths through; QueryNode should not
-	// attach v0/v1 path layout semantics to the read path.
-	indexInfoProto := &cgopb.LoadIndexInfo{
-		CollectionID:              loadInfo.GetCollectionID(),
-		PartitionID:               loadInfo.GetPartitionID(),
-		SegmentID:                 loadInfo.GetSegmentID(),
-		Field:                     fieldSchema,
-		EnableMmap:                enableMmap,
-		IndexID:                   indexInfo.GetIndexID(),
-		IndexBuildID:              indexInfo.GetBuildID(),
-		IndexVersion:              indexInfo.GetIndexVersion(),
-		IndexParams:               indexParams,
-		IndexFiles:                indexInfo.GetIndexFilePaths(),
-		IndexEngineVersion:        indexInfo.GetCurrentIndexVersion(),
-		IndexFileSize:             indexInfo.GetIndexSize(),
-		NumRows:                   indexInfo.GetNumRows(),
-		CurrentScalarIndexVersion: indexInfo.GetCurrentScalarIndexVersion(),
 	}
 
 	// 2.

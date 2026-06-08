@@ -2686,18 +2686,9 @@ func estimateLoadingResourceUsageOfSegment(schema *schemapb.CollectionSchema, lo
 			var estimateResult ResourceEstimate
 			cLoadInfoStart := time.Now()
 			var timing cLoadInfoTiming
-			err = getCLoadInfoWithFunc(ctx, fieldSchema, loadInfo, fieldIndexInfo, func(c *LoadIndexInfo) error {
-				var estimateDur time.Duration
-				GetDynamicPool().Submit(func() (any, error) {
-					estimateStart := time.Now()
-					loadResourceRequest := C.EstimateLoadIndexResource(c.cLoadIndexInfo)
-					estimateDur = time.Since(estimateStart)
-					estimateResult = GetResourceEstimate(&loadResourceRequest)
-					return nil, nil
-				}).Await()
-				cEstimateDur += estimateDur
-				return nil
-			}, &timing)
+			var estimateDur time.Duration
+			estimateResult, estimateDur, err = estimateLoadIndexResourceWithTiming(ctx, fieldSchema, loadInfo, fieldIndexInfo, &timing)
+			cEstimateDur += estimateDur
 			cLoadInfoDur += time.Since(cLoadInfoStart)
 			cNewInfoDur += timing.newInfoDur
 			cAppendDur += timing.appendInfoDur
