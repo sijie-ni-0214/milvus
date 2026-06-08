@@ -408,6 +408,8 @@ func streamOneFile(ctx context.Context, cm storage.ChunkManager, remotePath, loc
 		return 0, err
 	}
 	defer f.Close()
+	// BM25 stats files are rebuildable local runtime cache; avoid forcing
+	// every small segment file to stable storage during recovery.
 
 	if parseInto != nil {
 		br := bufio.NewReaderSize(reader, paramtable.Get().QueryNodeCfg.IDFReadBufferSize.GetAsInt())
@@ -420,9 +422,6 @@ func streamOneFile(ctx context.Context, cm storage.ChunkManager, remotePath, loc
 		if err := bw.Flush(); err != nil {
 			return 0, err
 		}
-		if err := f.Sync(); err != nil {
-			return 0, err
-		}
 		info, err := f.Stat()
 		if err != nil {
 			return 0, err
@@ -432,9 +431,6 @@ func streamOneFile(ctx context.Context, cm storage.ChunkManager, remotePath, loc
 
 	written, err := io.Copy(f, reader)
 	if err != nil {
-		return 0, err
-	}
-	if err := f.Sync(); err != nil {
 		return 0, err
 	}
 	return written, nil
