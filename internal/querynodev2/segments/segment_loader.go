@@ -79,6 +79,7 @@ const requestResourceTimingLogInterval = 5 * time.Second
 
 var (
 	requestResourceTiming   = newRequestResourceTimingStats()
+	indexEstimateTiming     = newIndexResourceEstimateTimingStats()
 	segmentLoaderLoadTiming = newSegmentLoaderLoadTimingStats()
 	segmentLoadTiming       = newSegmentLoadTimingStats()
 	sealedLoadTiming        = newSealedLoadTimingStats()
@@ -98,6 +99,13 @@ type requestResourceTimingStats struct {
 	lastLogUnixNano *atomic.Int64
 }
 
+type indexResourceEstimateTimingStats struct {
+	scalarFastPath  *atomic.Int64
+	cgoCacheHit     *atomic.Int64
+	cgoCacheMiss    *atomic.Int64
+	lastLogUnixNano *atomic.Int64
+}
+
 func newRequestResourceTimingStats() *requestResourceTimingStats {
 	return &requestResourceTimingStats{
 		count:           atomic.NewInt64(0),
@@ -109,6 +117,15 @@ func newRequestResourceTimingStats() *requestResourceTimingStats {
 		maxLockWait:     atomic.NewInt64(0),
 		maxLockHold:     atomic.NewInt64(0),
 		maxRequest:      atomic.NewInt64(0),
+		lastLogUnixNano: atomic.NewInt64(time.Now().UnixNano()),
+	}
+}
+
+func newIndexResourceEstimateTimingStats() *indexResourceEstimateTimingStats {
+	return &indexResourceEstimateTimingStats{
+		scalarFastPath:  atomic.NewInt64(0),
+		cgoCacheHit:     atomic.NewInt64(0),
+		cgoCacheMiss:    atomic.NewInt64(0),
 		lastLogUnixNano: atomic.NewInt64(time.Now().UnixNano()),
 	}
 }
@@ -638,6 +655,47 @@ func (s *requestResourceTimingStats) record(estimateDur, lockWaitDur, lockHoldDu
 	)
 }
 
+func (s *indexResourceEstimateTimingStats) recordScalarFastPath() {
+	s.scalarFastPath.Inc()
+	s.maybeLog()
+}
+
+func (s *indexResourceEstimateTimingStats) recordCgoCacheHit() {
+	s.cgoCacheHit.Inc()
+	s.maybeLog()
+}
+
+func (s *indexResourceEstimateTimingStats) recordCgoCacheMiss() {
+	s.cgoCacheMiss.Inc()
+	s.maybeLog()
+}
+
+func (s *indexResourceEstimateTimingStats) maybeLog() {
+	now := time.Now()
+	last := s.lastLogUnixNano.Load()
+	if now.UnixNano()-last < int64(requestResourceTimingLogInterval) {
+		return
+	}
+	if !s.lastLogUnixNano.CompareAndSwap(last, now.UnixNano()) {
+		return
+	}
+
+	scalarFastPath := s.scalarFastPath.Swap(0)
+	cgoCacheHit := s.cgoCacheHit.Swap(0)
+	cgoCacheMiss := s.cgoCacheMiss.Swap(0)
+	total := scalarFastPath + cgoCacheHit + cgoCacheMiss
+	if total == 0 {
+		return
+	}
+
+	log.Warn("index resource estimate stats",
+		zap.Int64("total", total),
+		zap.Int64("scalarFastPath", scalarFastPath),
+		zap.Int64("cgoCacheHit", cgoCacheHit),
+		zap.Int64("cgoCacheMiss", cgoCacheMiss),
+	)
+}
+
 type Loader interface {
 	// Load loads binlogs, and spawn segments,
 	// NOTE: make sure the ref count of the corresponding collection will never go down to 0 during this
@@ -1134,9 +1192,7 @@ func (loader *segmentLoader) requestResource(ctx context.Context, infos ...*quer
 	diskCap := paramtable.Get().QueryNodeCfg.DiskCapacityLimit.GetAsUint64()
 
 	estimateStart := time.Now()
-	// Recovery profiling experiment: bypass the expensive per-index resource
-	// estimate so the next recovery run exposes the downstream load bottleneck.
-	loadingUsage, maxSegmentSize, err := &ResourceUsage{}, uint64(0), error(nil)
+	loadingUsage, maxSegmentSize, err := loader.estimateSegmentLoadingResourceUsage(ctx, infos...)
 	estimateDur := time.Since(estimateStart)
 	if err != nil {
 		log.Warn("no sufficient physical resource to load segments", zap.Error(err))
@@ -2440,6 +2496,81 @@ func (loader *segmentLoader) estimateSegmentLoadingResourceUsage(ctx context.Con
 	return loadingUsage, maxSegmentSize, nil
 }
 
+func estimateIndexLoadResource(ctx context.Context, fieldSchema *schemapb.FieldSchema, loadInfo *querypb.SegmentLoadInfo, fieldIndexInfo *querypb.FieldIndexInfo) (ResourceEstimate, error) {
+	if estimateResult, ok, err := estimateScalarIndexLoadResource(fieldSchema, fieldIndexInfo); ok || err != nil {
+		if ok && err == nil {
+			indexEstimateTiming.recordScalarFastPath()
+		}
+		return estimateResult, err
+	}
+	return getIndexAttrCache().GetCIndexResourceEstimate(ctx, fieldSchema, loadInfo, fieldIndexInfo)
+}
+
+func estimateScalarIndexLoadResource(fieldSchema *schemapb.FieldSchema, indexInfo *querypb.FieldIndexInfo) (ResourceEstimate, bool, error) {
+	if typeutil.IsVectorType(fieldSchema.GetDataType()) {
+		return ResourceEstimate{}, false, nil
+	}
+
+	indexType, err := funcutil.GetAttrByKeyFromRepeatedKV(common.IndexTypeKey, indexInfo.GetIndexParams())
+	if err != nil {
+		return ResourceEstimate{}, true, errors.New("index type not exist in index params")
+	}
+
+	indexSize := uint64(indexInfo.GetIndexSize())
+	enableMmap := isIndexMmapEnable(fieldSchema, indexInfo)
+
+	switch indexType {
+	case indexparamcheck.IndexSTLSORT:
+		return ResourceEstimate{
+			MaxMemoryCost:   2 * indexSize,
+			FinalMemoryCost: indexSize,
+			HasRawData:      true,
+		}, true, nil
+	case indexparamcheck.IndexTRIE, indexparamcheck.IndexTrie:
+		if enableMmap {
+			return ResourceEstimate{
+				MaxMemoryCost: indexSize,
+				MaxDiskCost:   indexSize,
+				FinalDiskCost: indexSize,
+				HasRawData:    true,
+			}, true, nil
+		}
+		return ResourceEstimate{
+			MaxMemoryCost:   2 * indexSize,
+			MaxDiskCost:     indexSize,
+			FinalMemoryCost: indexSize,
+			HasRawData:      true,
+		}, true, nil
+	case indexparamcheck.IndexINVERTED, indexparamcheck.IndexNGRAM, indexparamcheck.IndexRTREE:
+		return ResourceEstimate{
+			MaxMemoryCost: indexSize,
+			MaxDiskCost:   indexSize,
+			FinalDiskCost: indexSize,
+		}, true, nil
+	case indexparamcheck.IndexBitmap:
+		if enableMmap {
+			return ResourceEstimate{
+				MaxMemoryCost: indexSize,
+				MaxDiskCost:   indexSize,
+				FinalDiskCost: indexSize,
+			}, true, nil
+		}
+		return ResourceEstimate{
+			MaxMemoryCost:   2 * indexSize,
+			FinalMemoryCost: indexSize,
+		}, true, nil
+	case indexparamcheck.IndexHybrid:
+		return ResourceEstimate{
+			MaxMemoryCost:   2 * indexSize,
+			MaxDiskCost:     indexSize,
+			FinalMemoryCost: indexSize,
+			FinalDiskCost:   indexSize,
+		}, true, nil
+	default:
+		return ResourceEstimate{}, false, nil
+	}
+}
+
 // checkSegmentSize checks whether the memory & disk is sufficient to load the segments
 // returns the memory & disk usage while loading if possible to load,
 // otherwise, returns error
@@ -2556,15 +2687,7 @@ func estimateLogicalResourceUsageOfSegment(schema *schemapb.CollectionSchema, lo
 			}
 			isVectorType := typeutil.IsVectorType(fieldSchema.GetDataType())
 
-			var estimateResult ResourceEstimate
-			err = GetCLoadInfoWithFunc(ctx, fieldSchema, loadInfo, fieldIndexInfo, func(c *LoadIndexInfo) error {
-				GetDynamicPool().Submit(func() (any, error) {
-					loadResourceRequest := C.EstimateLoadIndexResource(c.cLoadIndexInfo)
-					estimateResult = GetResourceEstimate(&loadResourceRequest)
-					return nil, nil
-				}).Await()
-				return nil
-			})
+			estimateResult, err := estimateIndexLoadResource(ctx, fieldSchema, loadInfo, fieldIndexInfo)
 			if err != nil {
 				return nil, errors.Wrapf(err, "failed to estimate logical resource usage of index, collection %d, segment %d, indexBuildID %d",
 					loadInfo.GetCollectionID(),
@@ -2755,15 +2878,7 @@ func estimateLoadingResourceUsageOfSegment(schema *schemapb.CollectionSchema, lo
 
 			isVectorType := typeutil.IsVectorType(fieldSchema.GetDataType())
 
-			var estimateResult ResourceEstimate
-			err = GetCLoadInfoWithFunc(ctx, fieldSchema, loadInfo, fieldIndexInfo, func(c *LoadIndexInfo) error {
-				GetDynamicPool().Submit(func() (any, error) {
-					loadResourceRequest := C.EstimateLoadIndexResource(c.cLoadIndexInfo)
-					estimateResult = GetResourceEstimate(&loadResourceRequest)
-					return nil, nil
-				}).Await()
-				return nil
-			})
+			estimateResult, err := estimateIndexLoadResource(ctx, fieldSchema, loadInfo, fieldIndexInfo)
 			if err != nil {
 				return nil, errors.Wrapf(err, "failed to estimate loading resource usage of index, collection %d, segment %d, indexBuildID %d",
 					loadInfo.GetCollectionID(),

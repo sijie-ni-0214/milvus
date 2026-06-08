@@ -24,11 +24,15 @@ package segments
 import "C"
 
 import (
+	"context"
 	"fmt"
+	"sort"
+	"strings"
 	"unsafe"
 
 	"github.com/cockroachdb/errors"
 
+	"github.com/milvus-io/milvus-proto/go-api/v3/schemapb"
 	"github.com/milvus-io/milvus/internal/util/indexparamcheck"
 	"github.com/milvus-io/milvus/internal/util/vecindexmgr"
 	"github.com/milvus-io/milvus/pkg/v3/common"
@@ -36,6 +40,8 @@ import (
 	"github.com/milvus-io/milvus/pkg/v3/proto/querypb"
 	"github.com/milvus-io/milvus/pkg/v3/util/conc"
 	"github.com/milvus-io/milvus/pkg/v3/util/funcutil"
+	"github.com/milvus-io/milvus/pkg/v3/util/indexparams"
+	"github.com/milvus-io/milvus/pkg/v3/util/paramtable"
 	"github.com/milvus-io/milvus/pkg/v3/util/typeutil"
 )
 
@@ -48,13 +54,16 @@ func getIndexAttrCache() *IndexAttrCache {
 
 // IndexAttrCache index meta cache stores calculated attribute.
 type IndexAttrCache struct {
-	loadWithDisk *typeutil.ConcurrentMap[typeutil.Pair[string, int32], bool]
-	sf           conc.Singleflight[bool]
+	loadWithDisk  *typeutil.ConcurrentMap[typeutil.Pair[string, int32], bool]
+	indexResource *typeutil.ConcurrentMap[string, ResourceEstimate]
+	sf            conc.Singleflight[bool]
+	resourceSF    conc.Singleflight[ResourceEstimate]
 }
 
 func NewIndexAttrCache() *IndexAttrCache {
 	return &IndexAttrCache{
-		loadWithDisk: typeutil.NewConcurrentMap[typeutil.Pair[string, int32], bool](),
+		loadWithDisk:  typeutil.NewConcurrentMap[typeutil.Pair[string, int32], bool](),
+		indexResource: typeutil.NewConcurrentMap[string, ResourceEstimate](),
 	}
 }
 
@@ -106,4 +115,107 @@ func (c *IndexAttrCache) GetIndexResourceUsage(indexInfo *querypb.FieldIndexInfo
 	}
 
 	return uint64(float64(indexInfo.IndexSize) * factor), diskUsage, nil
+}
+
+func (c *IndexAttrCache) GetCIndexResourceEstimate(ctx context.Context, fieldSchema *schemapb.FieldSchema, loadInfo *querypb.SegmentLoadInfo, indexInfo *querypb.FieldIndexInfo) (ResourceEstimate, error) {
+	key, err := indexResourceEstimateCacheKey(fieldSchema, indexInfo)
+	if err != nil {
+		return ResourceEstimate{}, err
+	}
+	if estimate, ok := c.indexResource.Get(key); ok {
+		indexEstimateTiming.recordCgoCacheHit()
+		return estimate, nil
+	}
+
+	estimate, err, _ := c.resourceSF.Do(key, func() (ResourceEstimate, error) {
+		if estimate, ok := c.indexResource.Get(key); ok {
+			indexEstimateTiming.recordCgoCacheHit()
+			return estimate, nil
+		}
+
+		indexEstimateTiming.recordCgoCacheMiss()
+		var estimateResult ResourceEstimate
+		err := GetCLoadInfoWithFunc(ctx, fieldSchema, loadInfo, indexInfo, func(c *LoadIndexInfo) error {
+			GetDynamicPool().Submit(func() (any, error) {
+				loadResourceRequest := C.EstimateLoadIndexResource(c.cLoadIndexInfo)
+				estimateResult = GetResourceEstimate(&loadResourceRequest)
+				return nil, nil
+			}).Await()
+			return nil
+		})
+		if err != nil {
+			return ResourceEstimate{}, err
+		}
+
+		c.indexResource.Insert(key, estimateResult)
+		return estimateResult, nil
+	})
+	return estimate, err
+}
+
+func indexResourceEstimateCacheKey(fieldSchema *schemapb.FieldSchema, indexInfo *querypb.FieldIndexInfo) (string, error) {
+	indexParams, err := prepareIndexLoadParamsForEstimate(fieldSchema, indexInfo)
+	if err != nil {
+		return "", err
+	}
+
+	dim := int64(1)
+	if typeutil.IsVectorType(fieldSchema.GetDataType()) &&
+		fieldSchema.GetDataType() != schemapb.DataType_SparseFloatVector {
+		dim, err = typeutil.GetDim(fieldSchema)
+		if err != nil {
+			return "", err
+		}
+	}
+
+	keys := make([]string, 0, len(indexParams))
+	for key := range indexParams {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+
+	var builder strings.Builder
+	_, _ = fmt.Fprintf(&builder, "%d|%d|%d|%d|%d|%d|%t",
+		fieldSchema.GetDataType(),
+		fieldSchema.GetElementType(),
+		indexInfo.GetCurrentIndexVersion(),
+		indexInfo.GetIndexSize(),
+		indexInfo.GetNumRows(),
+		dim,
+		isIndexMmapEnable(fieldSchema, indexInfo),
+	)
+	for _, key := range keys {
+		builder.WriteByte('|')
+		builder.WriteString(key)
+		builder.WriteByte('=')
+		builder.WriteString(indexParams[key])
+	}
+	return builder.String(), nil
+}
+
+func prepareIndexLoadParamsForEstimate(fieldSchema *schemapb.FieldSchema, indexInfo *querypb.FieldIndexInfo) (map[string]string, error) {
+	indexParams := funcutil.KeyValuePair2Map(indexInfo.GetIndexParams())
+	delete(indexParams, common.MmapEnabledKey)
+
+	indexType := indexParams[common.IndexTypeKey]
+	if vecindexmgr.GetVecIndexMgrInstance().IsDiskANN(indexType) {
+		if err := indexparams.SetDiskIndexLoadParams(paramtable.Get(), indexParams, indexInfo.GetNumRows()); err != nil {
+			return nil, err
+		}
+	}
+
+	if indexType == indexparamcheck.IndexBitmap {
+		indexparams.SetBitmapIndexLoadParams(paramtable.Get(), indexParams)
+	}
+
+	if err := indexparams.AppendPrepareLoadParams(paramtable.Get(), indexParams); err != nil {
+		return nil, err
+	}
+
+	if _, exists := indexParams[common.WarmupKey]; !exists {
+		if warmupPolicy := getIndexWarmupPolicy(fieldSchema, indexInfo); warmupPolicy != "" {
+			indexParams[common.WarmupKey] = warmupPolicy
+		}
+	}
+	return indexParams, nil
 }

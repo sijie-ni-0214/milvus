@@ -1213,6 +1213,68 @@ func (suite *SegmentLoaderDetailSuite) TestRequestResource() {
 	})
 }
 
+func TestEstimateScalarIndexLoadResourceFastPath(t *testing.T) {
+	paramtable.Init()
+	field := &schemapb.FieldSchema{FieldID: 101, Name: "age", DataType: schemapb.DataType_Int64}
+
+	t.Run("stl_sort", func(t *testing.T) {
+		indexInfo := &querypb.FieldIndexInfo{
+			IndexSize: 100,
+			IndexParams: []*commonpb.KeyValuePair{
+				{Key: common.IndexTypeKey, Value: indexparamcheck.IndexSTLSORT},
+			},
+		}
+
+		estimate, ok, err := estimateScalarIndexLoadResource(field, indexInfo)
+		assert.NoError(t, err)
+		assert.True(t, ok)
+		assert.EqualValues(t, 200, estimate.MaxMemoryCost)
+		assert.EqualValues(t, 0, estimate.MaxDiskCost)
+		assert.EqualValues(t, 100, estimate.FinalMemoryCost)
+		assert.EqualValues(t, 0, estimate.FinalDiskCost)
+		assert.True(t, estimate.HasRawData)
+	})
+
+	t.Run("inverted", func(t *testing.T) {
+		indexInfo := &querypb.FieldIndexInfo{
+			IndexSize: 100,
+			IndexParams: []*commonpb.KeyValuePair{
+				{Key: common.IndexTypeKey, Value: indexparamcheck.IndexINVERTED},
+			},
+		}
+
+		estimate, ok, err := estimateScalarIndexLoadResource(field, indexInfo)
+		assert.NoError(t, err)
+		assert.True(t, ok)
+		assert.EqualValues(t, 100, estimate.MaxMemoryCost)
+		assert.EqualValues(t, 100, estimate.MaxDiskCost)
+		assert.EqualValues(t, 0, estimate.FinalMemoryCost)
+		assert.EqualValues(t, 100, estimate.FinalDiskCost)
+		assert.False(t, estimate.HasRawData)
+	})
+
+	t.Run("vector_fallback", func(t *testing.T) {
+		vectorField := &schemapb.FieldSchema{
+			FieldID:  102,
+			Name:     "vector",
+			DataType: schemapb.DataType_FloatVector,
+			TypeParams: []*commonpb.KeyValuePair{
+				{Key: common.DimKey, Value: "128"},
+			},
+		}
+		indexInfo := &querypb.FieldIndexInfo{
+			IndexSize: 100,
+			IndexParams: []*commonpb.KeyValuePair{
+				{Key: common.IndexTypeKey, Value: "HNSW"},
+			},
+		}
+
+		_, ok, err := estimateScalarIndexLoadResource(vectorField, indexInfo)
+		assert.NoError(t, err)
+		assert.False(t, ok)
+	})
+}
+
 func (suite *SegmentLoaderDetailSuite) TestCheckSegmentSizeWithDiskLimit() {
 	ctx := context.Background()
 
