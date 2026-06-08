@@ -486,24 +486,25 @@ SegmentLoadInfo::ComputeDiffColumnGroups(LoadDiff& diff,
                 field_id < START_USER_FIELDID ||
                 (new_info.schema_->ShouldLoadField(fid) &&
                  (prefer_field_data || !index_has_raw_data));
+            bool skip_lazy_column = index_has_raw_data && !prefer_field_data;
             if (is_new_field) {
                 // Field not in current and not default-filled → new load
                 if (should_eager_load) {
                     fields.emplace_back(field_id);
-                } else {
+                } else if (!skip_lazy_column) {
                     lazy_fields.emplace_back(field_id);
                 }
             } else if (is_replace_field) {
                 // Field was default-filled or moved between groups → replace
                 if (should_eager_load) {
                     replace_fields.emplace_back(field_id);
-                } else {
+                } else if (!skip_lazy_column) {
                     lazy_replace_fields.emplace_back(field_id);
                 }
             } else {
                 // Field at same position — check if needs lazification
                 // (transitioning from no-raw-data-index to raw-data-index)
-                if (!prefer_field_data &&
+                if (!skip_lazy_column && !prefer_field_data &&
                     new_info.field_index_has_raw_data_.count(
                         FieldId(field_id)) > 0 &&
                     field_index_has_raw_data_.count(FieldId(field_id)) == 0) {
