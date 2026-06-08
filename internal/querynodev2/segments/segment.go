@@ -21,6 +21,7 @@ package segments
 
 #include "futures/future_c.h"
 #include "segcore/collection_c.h"
+#include "segcore/load_index_c.h"
 #include "segcore/plan_c.h"
 #include "segcore/segment_c.h"
 #include "common/init_c.h"
@@ -1114,6 +1115,24 @@ func GetCLoadInfoWithFunc(ctx context.Context,
 	}
 	defer deleteLoadIndexInfo(loadIndexInfo)
 
+	indexInfoProto, err := getLoadIndexInfoProto(ctx, fieldSchema, loadInfo, indexInfo)
+	if err != nil {
+		return err
+	}
+
+	// 2.
+	if err := loadIndexInfo.appendLoadIndexInfo(ctx, indexInfoProto); err != nil {
+		mlog.Warn(ctx, "fail to append load index info", mlog.Err(err))
+		return err
+	}
+	return f(loadIndexInfo)
+}
+
+func getLoadIndexInfoProto(ctx context.Context,
+	fieldSchema *schemapb.FieldSchema,
+	loadInfo *querypb.SegmentLoadInfo,
+	indexInfo *querypb.FieldIndexInfo,
+) (*cgopb.LoadIndexInfo, error) {
 	indexParams := funcutil.KeyValuePair2Map(indexInfo.IndexParams)
 	// as Knowhere reports error if encounter an unknown param, we need to delete it
 	delete(indexParams, common.MmapEnabledKey)
@@ -1121,7 +1140,7 @@ func GetCLoadInfoWithFunc(ctx context.Context,
 	// some build params also exist in indexParams, which are useless during loading process
 	if vecindexmgr.GetVecIndexMgrInstance().IsDiskANN(indexParams["index_type"]) {
 		if err := indexparams.SetDiskIndexLoadParams(paramtable.Get(), indexParams, indexInfo.GetNumRows()); err != nil {
-			return err
+			return nil, err
 		}
 	}
 
@@ -1131,7 +1150,7 @@ func GetCLoadInfoWithFunc(ctx context.Context,
 	}
 
 	if err := indexparams.AppendPrepareLoadParams(paramtable.Get(), indexParams); err != nil {
-		return err
+		return nil, err
 	}
 
 	enableMmap := isIndexMmapEnable(fieldSchema, indexInfo)
@@ -1154,7 +1173,7 @@ func GetCLoadInfoWithFunc(ctx context.Context,
 	}
 	// Pass DataCoord-built index file paths through; QueryNode should not
 	// attach v0/v1 path layout semantics to the read path.
-	indexInfoProto := &cgopb.LoadIndexInfo{
+	return &cgopb.LoadIndexInfo{
 		CollectionID:              loadInfo.GetCollectionID(),
 		PartitionID:               loadInfo.GetPartitionID(),
 		SegmentID:                 loadInfo.GetSegmentID(),
@@ -1170,14 +1189,50 @@ func GetCLoadInfoWithFunc(ctx context.Context,
 		NumRows:                   indexInfo.GetNumRows(),
 		CurrentScalarIndexVersion: indexInfo.GetCurrentScalarIndexVersion(),
 		IndexStorePathVersion:     indexInfo.GetIndexStorePathVersion(),
+	}, nil
+}
+
+func estimateLoadIndexResource(ctx context.Context,
+	fieldSchema *schemapb.FieldSchema,
+	loadInfo *querypb.SegmentLoadInfo,
+	indexInfo *querypb.FieldIndexInfo,
+) (ResourceEstimate, error) {
+	indexInfoProto, err := getLoadIndexInfoProto(ctx, fieldSchema, loadInfo, indexInfo)
+	if err != nil {
+		return ResourceEstimate{}, err
+	}
+	marshaled, err := proto.Marshal(indexInfoProto)
+	if err != nil {
+		return ResourceEstimate{}, err
 	}
 
-	// 2.
-	if err := loadIndexInfo.appendLoadIndexInfo(ctx, indexInfoProto); err != nil {
-		mlog.Warn(ctx, "fail to append load index info", mlog.Err(err))
-		return err
+	var status C.CStatus
+	var cLoadIndexInfo C.CLoadIndexInfo
+	var request C.LoadResourceRequest
+	statusStage := ""
+	_, _ = GetDynamicPool().Submit(func() (any, error) {
+		statusStage = "NewLoadIndexInfo failed"
+		status = C.NewLoadIndexInfo(&cLoadIndexInfo)
+		if status.error_code != 0 {
+			return nil, nil
+		}
+		defer C.DeleteLoadIndexInfo(cLoadIndexInfo)
+
+		statusStage = "FinishLoadIndexInfo failed"
+		status = C.FinishLoadIndexInfo(cLoadIndexInfo, (*C.uint8_t)(unsafe.Pointer(&marshaled[0])), (C.uint64_t)(len(marshaled)))
+		if status.error_code != 0 {
+			return nil, nil
+		}
+
+		statusStage = ""
+		request = C.EstimateLoadIndexResource(cLoadIndexInfo)
+		return nil, nil
+	}).Await()
+
+	if statusStage != "" {
+		return ResourceEstimate{}, HandleCStatus(ctx, &status, statusStage)
 	}
-	return f(loadIndexInfo)
+	return GetResourceEstimate(&request), nil
 }
 
 func (s *LocalSegment) LoadIndex(ctx context.Context, indexInfo *querypb.FieldIndexInfo, fieldType schemapb.DataType) error {

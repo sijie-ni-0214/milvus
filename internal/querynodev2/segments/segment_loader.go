@@ -2215,14 +2215,7 @@ func estimateLoadingResourceUsageOfSegment(schema *schemapb.CollectionSchema, lo
 			isVectorType := typeutil.IsVectorType(fieldSchema.GetDataType())
 
 			var estimateResult ResourceEstimate
-			err = GetCLoadInfoWithFunc(ctx, fieldSchema, loadInfo, fieldIndexInfo, func(c *LoadIndexInfo) error {
-				GetDynamicPool().Submit(func() (any, error) {
-					loadResourceRequest := C.EstimateLoadIndexResource(c.cLoadIndexInfo)
-					estimateResult = GetResourceEstimate(&loadResourceRequest)
-					return nil, nil
-				}).Await()
-				return nil
-			})
+			estimateResult, err = estimateLoadIndexResource(ctx, fieldSchema, loadInfo, fieldIndexInfo)
 			if err != nil {
 				return nil, merr.Wrapf(err, "failed to estimate loading resource usage of index, collection %d, segment %d, indexBuildID %d",
 					loadInfo.GetCollectionID(),
