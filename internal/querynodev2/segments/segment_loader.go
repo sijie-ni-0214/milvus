@@ -1099,16 +1099,7 @@ func (loader *segmentLoader) loadSealedSegment(ctx context.Context, loadInfo *qu
 		stateLockGuard.Done(err)
 	}()
 
-	collection := segment.GetCollection()
-	indexedFieldInfos, _, textIndexes, unindexedTextFields, jsonKeyStats, _, _ := separateLoadInfoV2(loadInfo, collection.Schema())
-
 	tr := timerecord.NewTimeRecorder("segmentLoader.loadSealedSegment")
-	mlog.Info(context.TODO(), "Start loading fields...",
-		mlog.Int("indexedFields count", len(indexedFieldInfos)),
-		mlog.Int64s("indexed text fields", lo.Keys(textIndexes)),
-		mlog.Int64s("unindexed text fields", lo.Keys(unindexedTextFields)),
-		mlog.Int64s("indexed json key fields", lo.Keys(jsonKeyStats)),
-	)
 	_, err = GetLoadPool().Submit(func() (any, error) {
 		if err = segment.Load(ctx); err != nil {
 			return struct{}{}, merr.Wrap(err, "At Load")
