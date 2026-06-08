@@ -19,51 +19,16 @@ import (
 	"path"
 	"strconv"
 	"strings"
-	"sync/atomic"
-	"time"
 
-	"github.com/hashicorp/golang-lru/v2/expirable"
-	"go.uber.org/zap"
-
-	"github.com/milvus-io/milvus/pkg/v3/log"
 	"github.com/milvus-io/milvus/pkg/v3/proto/datapb"
 	"github.com/milvus-io/milvus/pkg/v3/proto/indexpb"
 	"github.com/milvus-io/milvus/pkg/v3/proto/querypb"
-	"github.com/milvus-io/milvus/pkg/v3/util/conc"
 )
 
 // compoundStatsLogIdx is the log index that identifies compound stats format.
 // This mirrors storage.CompoundStatsType.LogIdx() == "1" but avoids
 // importing internal/storage (which already imports this package).
 const compoundStatsLogIdx = "1"
-
-const (
-	manifestStatsCacheCapacity    = 32768
-	manifestStatsCacheTTL         = 3 * time.Minute
-	manifestStatsCacheLogInterval = 10 * time.Second
-)
-
-type manifestStatsCacheValue struct {
-	stats map[string]ManifestStat
-}
-
-var (
-	manifestStatsCache = expirable.NewLRU[string, manifestStatsCacheValue](
-		manifestStatsCacheCapacity,
-		nil,
-		manifestStatsCacheTTL,
-	)
-	manifestStatsLoader conc.Singleflight[manifestStatsCacheValue]
-
-	manifestStatsCacheHits        atomic.Int64
-	manifestStatsCacheMisses      atomic.Int64
-	manifestStatsCacheSharedLoads atomic.Int64
-	manifestStatsCacheLoads       atomic.Int64
-	manifestStatsCacheErrors      atomic.Int64
-	manifestStatsLoadDurNs        atomic.Int64
-	manifestStatsMaxLoadDurNs     atomic.Int64
-	manifestStatsCacheLastLogNs   atomic.Int64
-)
 
 // StatsResolver resolves stat file paths from either a LOON manifest (V3)
 // or legacy FieldBinlog arrays (V2). It caches the manifest FFI call
@@ -397,109 +362,13 @@ func (r *StatsResolver) loadManifest() error {
 	}
 	r.manifestLoaded = true
 
-	stats, err := r.cachedManifestStats()
+	stats, err := GetManifestStats(r.manifestPath, r.storageConfig)
 	if err != nil {
 		r.manifestErr = fmt.Errorf("failed to get manifest stats: %w", err)
 		return r.manifestErr
 	}
 	r.manifestStats = stats
 	return nil
-}
-
-func (r *StatsResolver) cachedManifestStats() (map[string]ManifestStat, error) {
-	key := manifestStatsCacheKey(r.manifestPath, r.storageConfig)
-	if value, ok := manifestStatsCache.Get(key); ok {
-		manifestStatsCacheHits.Add(1)
-		maybeLogManifestStatsCache()
-		return value.stats, nil
-	}
-
-	manifestStatsCacheMisses.Add(1)
-	value, err, shared := manifestStatsLoader.Do(key, func() (manifestStatsCacheValue, error) {
-		if value, ok := manifestStatsCache.Get(key); ok {
-			manifestStatsCacheHits.Add(1)
-			return value, nil
-		}
-
-		start := time.Now()
-		stats, err := GetManifestStats(r.manifestPath, r.storageConfig)
-		loadDur := time.Since(start)
-		manifestStatsLoadDurNs.Add(loadDur.Nanoseconds())
-		updateManifestStatsMaxLoadDur(loadDur.Nanoseconds())
-		if err != nil {
-			manifestStatsCacheErrors.Add(1)
-			return manifestStatsCacheValue{}, err
-		}
-
-		value := manifestStatsCacheValue{stats: stats}
-		manifestStatsCache.Add(key, value)
-		manifestStatsCacheLoads.Add(1)
-		return value, nil
-	})
-	if shared {
-		manifestStatsCacheSharedLoads.Add(1)
-	}
-	maybeLogManifestStatsCache()
-	if err != nil {
-		return nil, err
-	}
-	return value.stats, nil
-}
-
-func manifestStatsCacheKey(manifestPath string, storageConfig *indexpb.StorageConfig) string {
-	if storageConfig == nil {
-		return manifestPath
-	}
-
-	return strings.Join([]string{
-		manifestPath,
-		storageConfig.GetAddress(),
-		storageConfig.GetBucketName(),
-		storageConfig.GetRootPath(),
-		storageConfig.GetStorageType(),
-		storageConfig.GetCloudProvider(),
-		storageConfig.GetRegion(),
-		strconv.FormatBool(storageConfig.GetUseSSL()),
-		strconv.FormatBool(storageConfig.GetUseIAM()),
-		strconv.FormatBool(storageConfig.GetUseVirtualHost()),
-	}, "\x00")
-}
-
-func updateManifestStatsMaxLoadDur(value int64) {
-	for {
-		current := manifestStatsMaxLoadDurNs.Load()
-		if value <= current || manifestStatsMaxLoadDurNs.CompareAndSwap(current, value) {
-			return
-		}
-	}
-}
-
-func maybeLogManifestStatsCache() {
-	now := time.Now().UnixNano()
-	last := manifestStatsCacheLastLogNs.Load()
-	if now-last < int64(manifestStatsCacheLogInterval) {
-		return
-	}
-	if !manifestStatsCacheLastLogNs.CompareAndSwap(last, now) {
-		return
-	}
-
-	loads := manifestStatsCacheLoads.Load()
-	avgLoadDur := time.Duration(0)
-	if loads > 0 {
-		avgLoadDur = time.Duration(manifestStatsLoadDurNs.Load() / loads)
-	}
-
-	log.Warn("manifest stats cache timing stats",
-		zap.Int64("hits", manifestStatsCacheHits.Load()),
-		zap.Int64("misses", manifestStatsCacheMisses.Load()),
-		zap.Int64("sharedLoads", manifestStatsCacheSharedLoads.Load()),
-		zap.Int64("loads", loads),
-		zap.Int64("errors", manifestStatsCacheErrors.Load()),
-		zap.Int("cacheLen", manifestStatsCache.Len()),
-		zap.Duration("avgLoadDur", avgLoadDur),
-		zap.Duration("maxLoadDur", time.Duration(manifestStatsMaxLoadDurNs.Load())),
-	)
 }
 
 // resolveStatPaths returns stat file paths from the manifest.
