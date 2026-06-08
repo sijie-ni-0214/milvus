@@ -1271,7 +1271,8 @@ class ChunkedSegmentSealedImpl : public SegmentSealed {
         const std::vector<FieldId>& milvus_field_ids,
         bool eager_load,
         milvus::OpContext* op_ctx = nullptr,
-        bool is_replace = false);
+        bool is_replace = false,
+        int64_t queue_ns = 0);
 
     // Synthesize system fields (virtual PK, timestamps, PK index, row count)
     // for external collections. External collections don't have real PK or

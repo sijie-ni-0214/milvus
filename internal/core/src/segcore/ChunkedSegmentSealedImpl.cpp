@@ -218,6 +218,7 @@ struct IndexTaskTimingStats {
 struct ColumnGroupTaskTimingStats {
     std::atomic<int64_t> count{0};
     std::atomic<int64_t> total_ns{0};
+    std::atomic<int64_t> queue_ns{0};
     std::atomic<int64_t> prepare_ns{0};
     std::atomic<int64_t> reader_ns{0};
     std::atomic<int64_t> translator_ns{0};
@@ -562,6 +563,7 @@ RecordColumnGroupTaskTiming(bool has_pk,
                             bool has_varchar,
                             bool has_text,
                             int64_t total_ns,
+                            int64_t queue_ns,
                             int64_t prepare_ns,
                             int64_t reader_ns,
                             int64_t translator_ns,
@@ -571,6 +573,7 @@ RecordColumnGroupTaskTiming(bool has_pk,
     auto& stats = g_column_group_task_timing;
     stats.count.fetch_add(1, std::memory_order_relaxed);
     stats.total_ns.fetch_add(total_ns, std::memory_order_relaxed);
+    stats.queue_ns.fetch_add(queue_ns, std::memory_order_relaxed);
     stats.prepare_ns.fetch_add(prepare_ns, std::memory_order_relaxed);
     stats.reader_ns.fetch_add(reader_ns, std::memory_order_relaxed);
     stats.translator_ns.fetch_add(translator_ns, std::memory_order_relaxed);
@@ -614,6 +617,7 @@ RecordColumnGroupTaskTiming(bool has_pk,
         return;
     }
     auto total = stats.total_ns.exchange(0, std::memory_order_relaxed);
+    auto queue = stats.queue_ns.exchange(0, std::memory_order_relaxed);
     auto prepare = stats.prepare_ns.exchange(0, std::memory_order_relaxed);
     auto reader = stats.reader_ns.exchange(0, std::memory_order_relaxed);
     auto translator = stats.translator_ns.exchange(0, std::memory_order_relaxed);
@@ -634,7 +638,8 @@ RecordColumnGroupTaskTiming(bool has_pk,
 
     LOG_WARN(
         "[SN recovery] column group task timing stats count={} "
-        "avgTotalMs={:.3f} avgPrepareMs={:.3f} avgReaderMs={:.3f} "
+        "avgTotalMs={:.3f} avgQueueMs={:.3f} avgPrepareMs={:.3f} "
+        "avgReaderMs={:.3f} "
         "avgTranslatorMs={:.3f} avgCacheSlotMs={:.3f} avgAttachMs={:.3f} "
         "avgPkAttachMs={:.3f} pkCount={} avgPkGroupMs={:.3f} "
         "vectorCount={} avgVectorGroupMs={:.3f} scalarCount={} "
@@ -642,6 +647,7 @@ RecordColumnGroupTaskTiming(bool has_pk,
         "textCount={} avgTextGroupMs={:.3f} maxTotalMs={:.3f}",
         count,
         AvgMs(total, count),
+        AvgMs(queue, count),
         AvgMs(prepare, count),
         AvgMs(reader, count),
         AvgMs(translator, count),
@@ -5528,6 +5534,7 @@ ChunkedSegmentSealedImpl::LoadColumnGroups(
     auto& pool = ThreadPools::GetThreadPool(milvus::ThreadPoolPriority::MIDDLE);
     std::vector<std::future<void>> load_group_futures;
     for (const auto& pair : cg_field_ids) {
+        auto submit_time = std::chrono::steady_clock::now();
         auto cg_index = pair.first;
         const auto& field_ids = pair.second;
         auto future = pool.Submit([this,
@@ -5536,8 +5543,10 @@ ChunkedSegmentSealedImpl::LoadColumnGroups(
                                    cg_index,
                                    field_ids,
                                    eager_load,
+                                   submit_time,
                                    op_ctx,
                                    is_replace]() {
+            auto queue_ns = DurationSinceNs(submit_time);
             // Early exit if cancelled while queued
             CheckCancellation(op_ctx,
                               id_,
@@ -5549,7 +5558,8 @@ ChunkedSegmentSealedImpl::LoadColumnGroups(
                             field_ids,
                             eager_load,
                             op_ctx,
-                            is_replace);
+                            is_replace,
+                            queue_ns);
         });
         load_group_futures.emplace_back(std::move(future));
     }
@@ -5565,7 +5575,8 @@ ChunkedSegmentSealedImpl::LoadColumnGroup(
     const std::vector<FieldId>& milvus_field_ids,
     bool eager_load,
     milvus::OpContext* op_ctx,
-    bool is_replace) {
+    bool is_replace,
+    int64_t queue_ns) {
     auto total_start = std::chrono::steady_clock::now();
     int64_t prepare_ns = 0;
     int64_t reader_ns = 0;
@@ -5761,6 +5772,7 @@ ChunkedSegmentSealedImpl::LoadColumnGroup(
                                 has_varchar,
                                 has_text,
                                 DurationSinceNs(total_start),
+                                queue_ns,
                                 prepare_ns,
                                 reader_ns,
                                 translator_ns,
