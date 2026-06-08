@@ -179,7 +179,19 @@ struct ApplyLoadDiffTimingStats {
     std::atomic<int64_t> last_log_ns{0};
 };
 
+struct SegmentLoadTimingStats {
+    std::atomic<int64_t> count{0};
+    std::atomic<int64_t> total_ns{0};
+    std::atomic<int64_t> snapshot_ns{0};
+    std::atomic<int64_t> prepare_info_ns{0};
+    std::atomic<int64_t> diff_ns{0};
+    std::atomic<int64_t> apply_ns{0};
+    std::atomic<int64_t> max_total_ns{0};
+    std::atomic<int64_t> last_log_ns{0};
+};
+
 ApplyLoadDiffTimingStats g_apply_load_diff_timing;
+SegmentLoadTimingStats g_segment_load_timing;
 
 int64_t
 SteadyNowNs() {
@@ -334,6 +346,58 @@ RecordApplyLoadDiffTiming(int64_t total_ns,
         static_cast<double>(binlogs) / static_cast<double>(count),
         static_cast<double>(text_indexes) / static_cast<double>(count),
         static_cast<double>(json_stats_entries) / static_cast<double>(count),
+        static_cast<double>(max_total) / 1e6);
+}
+
+void
+RecordSegmentLoadTiming(int64_t total_ns,
+                        int64_t snapshot_ns,
+                        int64_t prepare_info_ns,
+                        int64_t diff_ns,
+                        int64_t apply_ns) {
+    auto& stats = g_segment_load_timing;
+    stats.count.fetch_add(1, std::memory_order_relaxed);
+    stats.total_ns.fetch_add(total_ns, std::memory_order_relaxed);
+    stats.snapshot_ns.fetch_add(snapshot_ns, std::memory_order_relaxed);
+    stats.prepare_info_ns.fetch_add(prepare_info_ns,
+                                    std::memory_order_relaxed);
+    stats.diff_ns.fetch_add(diff_ns, std::memory_order_relaxed);
+    stats.apply_ns.fetch_add(apply_ns, std::memory_order_relaxed);
+    UpdateMax(stats.max_total_ns, total_ns);
+
+    auto now_ns = SteadyNowNs();
+    auto last_ns = stats.last_log_ns.load(std::memory_order_relaxed);
+    if (now_ns - last_ns < kApplyLoadDiffTimingLogIntervalNs) {
+        return;
+    }
+    if (!stats.last_log_ns.compare_exchange_strong(
+            last_ns, now_ns, std::memory_order_relaxed)) {
+        return;
+    }
+
+    auto count = stats.count.exchange(0, std::memory_order_relaxed);
+    if (count == 0) {
+        return;
+    }
+    auto total = stats.total_ns.exchange(0, std::memory_order_relaxed);
+    auto snapshot = stats.snapshot_ns.exchange(0, std::memory_order_relaxed);
+    auto prepare_info =
+        stats.prepare_info_ns.exchange(0, std::memory_order_relaxed);
+    auto diff = stats.diff_ns.exchange(0, std::memory_order_relaxed);
+    auto apply = stats.apply_ns.exchange(0, std::memory_order_relaxed);
+    auto max_total = stats.max_total_ns.exchange(0, std::memory_order_relaxed);
+
+    LOG_WARN(
+        "[SN recovery] segment load timing stats count={} avgTotalMs={:.3f} "
+        "avgSnapshotMs={:.3f} avgPrepareInfoMs={:.3f} avgDiffMs={:.3f} "
+        "avgApplyLoadDiffMs={:.3f} avgOutsideApplyMs={:.3f} maxTotalMs={:.3f}",
+        count,
+        AvgMs(total, count),
+        AvgMs(snapshot, count),
+        AvgMs(prepare_info, count),
+        AvgMs(diff, count),
+        AvgMs(apply, count),
+        AvgMs(total - apply, count),
         static_cast<double>(max_total) / 1e6);
 }
 
@@ -5643,25 +5707,47 @@ ChunkedSegmentSealedImpl::LoadBatchFieldData(
 void
 ChunkedSegmentSealedImpl::Load(milvus::tracer::TraceContext& trace_ctx,
                                milvus::OpContext* op_ctx) {
+    auto total_start = std::chrono::steady_clock::now();
+    int64_t snapshot_ns = 0;
+    int64_t prepare_info_ns = 0;
+    int64_t diff_ns = 0;
+    int64_t apply_ns = 0;
+    auto timing_guard = folly::makeGuard([&]() {
+        RecordSegmentLoadTiming(DurationSinceNs(total_start),
+                                snapshot_ns,
+                                prepare_info_ns,
+                                diff_ns,
+                                apply_ns);
+    });
+
     // Serialize with Reopen(pb)/SetLoadInfo. Runtime-only updates produced by
     // ApplyLoadDiff are committed through COW helpers after the data is loaded.
     std::lock_guard<std::mutex> reopen_guard(reopen_mutex_);
 
+    auto stage_start = std::chrono::steady_clock::now();
     auto snapshot = std::atomic_load(&segment_load_info_);
     auto num_rows = snapshot->GetNumOfRows();
+    snapshot_ns = DurationSinceNs(stage_start);
     LOG_INFO("Loading segment {} with {} rows", id_, num_rows);
 
     // reopen_mutex_ synchronizes this read with all schema_ writers.
+    stage_start = std::chrono::steady_clock::now();
     SegmentLoadInfo mutable_copy(snapshot->GetProto(), schema_);
     mutable_copy.SetFieldsFilledWithDefault(
         snapshot->GetFieldsFilledWithDefault());
     for (auto fid : snapshot->GetCreatedTextIndexes()) {
         mutable_copy.SetTextIndexCreated(fid);
     }
+    prepare_info_ns = DurationSinceNs(stage_start);
+
+    stage_start = std::chrono::steady_clock::now();
     auto diff = mutable_copy.GetLoadDiff();
+    diff_ns = DurationSinceNs(stage_start);
     LOG_WARN("Load segment {} with diff {}", id_, diff.ToString());
 
+    stage_start = std::chrono::steady_clock::now();
     ApplyLoadDiff(op_ctx, mutable_copy, diff);
+    apply_ns = DurationSinceNs(stage_start);
 
     LOG_INFO("Successfully loaded segment {} with {} rows", id_, num_rows);
 }
