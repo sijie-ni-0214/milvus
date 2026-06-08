@@ -242,6 +242,10 @@ func (r *StatsResolver) TextAndJSONIndexStatsWithBasePaths() *StatsResultWithErr
 		}
 	}
 
+	if r.hasPreResolvedTextOrJSONStats() {
+		return r.textAndJSONIndexStatsFromPreResolved()
+	}
+
 	if err := r.loadManifest(); err != nil {
 		return &StatsResultWithErr{err: err}
 	}
@@ -325,6 +329,96 @@ func (r *StatsResolver) TextAndJSONIndexStatsWithBasePaths() *StatsResultWithErr
 			TextBasePaths:  textBasePaths,
 			JSONBasePaths:  jsonBasePaths,
 		},
+	}
+}
+
+func (r *StatsResolver) hasPreResolvedTextOrJSONStats() bool {
+	return len(r.textStatsLogs) > 0 || len(r.jsonKeyStats) > 0
+}
+
+func (r *StatsResolver) textAndJSONIndexStatsFromPreResolved() *StatsResultWithErr {
+	basePath, _, err := UnmarshalManifestPath(r.manifestPath)
+	if err != nil {
+		return &StatsResultWithErr{err: err}
+	}
+
+	textIndexedInfo := make(map[int64]*datapb.TextIndexStats, len(r.textStatsLogs))
+	jsonKeyIndexInfo := make(map[int64]*datapb.JsonKeyStats, len(r.jsonKeyStats))
+	textBasePaths := make(map[int64]string, len(r.textStatsLogs))
+	jsonBasePaths := make(map[int64]string, len(r.jsonKeyStats))
+
+	for fieldID, stats := range r.textStatsLogs {
+		if stats == nil {
+			continue
+		}
+		statBasePath := basePath + "/_stats/" + fmt.Sprintf("text_index.%d", fieldID)
+		textIndexedInfo[fieldID] = cloneTextIndexStatsWithFiles(stats,
+			normalizePreResolvedStatFiles(stats.GetFiles(), statBasePath))
+		textBasePaths[fieldID] = statBasePath
+	}
+
+	for fieldID, stats := range r.jsonKeyStats {
+		if stats == nil {
+			continue
+		}
+		statBasePath := basePath + "/_stats/" + fmt.Sprintf("json_stats.%d", fieldID)
+		jsonKeyIndexInfo[fieldID] = cloneJSONKeyStatsWithFiles(stats,
+			normalizePreResolvedStatFiles(stats.GetFiles(), statBasePath))
+		jsonBasePaths[fieldID] = statBasePath
+	}
+
+	return &StatsResultWithErr{
+		StatsResult: StatsResult{
+			TextIndexStats: textIndexedInfo,
+			JSONKeyStats:   jsonKeyIndexInfo,
+			TextBasePaths:  textBasePaths,
+			JSONBasePaths:  jsonBasePaths,
+		},
+	}
+}
+
+func normalizePreResolvedStatFiles(files []string, basePath string) []string {
+	if files == nil {
+		return nil
+	}
+
+	prefix := strings.TrimSuffix(basePath, "/") + "/"
+	result := make([]string, 0, len(files))
+	for _, file := range files {
+		if strings.HasPrefix(file, prefix) {
+			result = append(result, strings.TrimPrefix(file, prefix))
+			continue
+		}
+		if strings.Contains(file, "/") {
+			result = append(result, path.Base(file))
+			continue
+		}
+		result = append(result, file)
+	}
+	return result
+}
+
+func cloneTextIndexStatsWithFiles(stats *datapb.TextIndexStats, files []string) *datapb.TextIndexStats {
+	return &datapb.TextIndexStats{
+		FieldID:                   stats.GetFieldID(),
+		Version:                   stats.GetVersion(),
+		Files:                     files,
+		LogSize:                   stats.GetLogSize(),
+		MemorySize:                stats.GetMemorySize(),
+		BuildID:                   stats.GetBuildID(),
+		CurrentScalarIndexVersion: stats.GetCurrentScalarIndexVersion(),
+	}
+}
+
+func cloneJSONKeyStatsWithFiles(stats *datapb.JsonKeyStats, files []string) *datapb.JsonKeyStats {
+	return &datapb.JsonKeyStats{
+		FieldID:                stats.GetFieldID(),
+		Version:                stats.GetVersion(),
+		Files:                  files,
+		LogSize:                stats.GetLogSize(),
+		MemorySize:             stats.GetMemorySize(),
+		BuildID:                stats.GetBuildID(),
+		JsonKeyStatsDataFormat: stats.GetJsonKeyStatsDataFormat(),
 	}
 }
 

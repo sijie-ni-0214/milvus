@@ -241,6 +241,52 @@ func TestStatsResolverLegacy(t *testing.T) {
 	})
 }
 
+func TestStatsResolverManifestPreResolvedStats(t *testing.T) {
+	manifestBase := "files/insert_log/1/2/3"
+	manifestPath := MarshalManifestPath(manifestBase, 4)
+	textBase := manifestBase + "/_stats/text_index.101"
+	jsonBase := manifestBase + "/_stats/json_stats.102"
+
+	textStats := map[int64]*datapb.TextIndexStats{
+		101: {
+			FieldID:                   101,
+			Version:                   7,
+			BuildID:                   1001,
+			Files:                     []string{textBase + "/idx1", "files/text_log/1001/7/1/2/3/101/legacy.idx", "plain.idx"},
+			LogSize:                   10,
+			MemorySize:                20,
+			CurrentScalarIndexVersion: 3,
+		},
+	}
+	jsonStats := map[int64]*datapb.JsonKeyStats{
+		102: {
+			FieldID:                102,
+			Version:                8,
+			BuildID:                1002,
+			Files:                  []string{jsonBase + "/json.idx", "relative-json.idx"},
+			LogSize:                30,
+			MemorySize:             40,
+			JsonKeyStatsDataFormat: 2,
+		},
+	}
+
+	resolver := NewStatsResolver(manifestPath, nil).
+		WithTextStatsLogs(textStats).
+		WithJSONKeyStats(jsonStats)
+	result := resolver.TextAndJSONIndexStatsWithBasePaths()
+
+	require.NoError(t, result.Err())
+	assert.Equal(t, textBase, result.TextBasePaths[101])
+	assert.Equal(t, jsonBase, result.JSONBasePaths[102])
+	assert.Equal(t, []string{"idx1", "legacy.idx", "plain.idx"}, result.TextIndexStats[101].GetFiles())
+	assert.Equal(t, []string{"json.idx", "relative-json.idx"}, result.JSONKeyStats[102].GetFiles())
+	assert.Equal(t, int64(7), result.TextIndexStats[101].GetVersion())
+	assert.Equal(t, int64(8), result.JSONKeyStats[102].GetVersion())
+
+	assert.Equal(t, textBase+"/idx1", textStats[101].GetFiles()[0])
+	assert.Equal(t, jsonBase+"/json.idx", jsonStats[102].GetFiles()[0])
+}
+
 // TestStatsResolverManifest exercises the V3 manifest-based code path
 // end-to-end: write stats to a manifest via AddStatsToManifest, then
 // read them back through StatsResolver and verify exact paths.
