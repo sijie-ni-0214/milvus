@@ -194,8 +194,54 @@ struct SegmentLoadTimingStats {
     std::atomic<int64_t> last_log_ns{0};
 };
 
+
+struct IndexTaskTimingStats {
+    std::atomic<int64_t> count{0};
+    std::atomic<int64_t> total_ns{0};
+    std::atomic<int64_t> queue_ns{0};
+    std::atomic<int64_t> load_data_ns{0};
+    std::atomic<int64_t> load_index_ns{0};
+    std::atomic<int64_t> vector_count{0};
+    std::atomic<int64_t> vector_total_ns{0};
+    std::atomic<int64_t> int64_count{0};
+    std::atomic<int64_t> int64_total_ns{0};
+    std::atomic<int64_t> varchar_count{0};
+    std::atomic<int64_t> varchar_total_ns{0};
+    std::atomic<int64_t> text_count{0};
+    std::atomic<int64_t> text_total_ns{0};
+    std::atomic<int64_t> other_count{0};
+    std::atomic<int64_t> other_total_ns{0};
+    std::atomic<int64_t> max_total_ns{0};
+    std::atomic<int64_t> last_log_ns{0};
+};
+
+struct ColumnGroupTaskTimingStats {
+    std::atomic<int64_t> count{0};
+    std::atomic<int64_t> total_ns{0};
+    std::atomic<int64_t> prepare_ns{0};
+    std::atomic<int64_t> reader_ns{0};
+    std::atomic<int64_t> translator_ns{0};
+    std::atomic<int64_t> cache_slot_ns{0};
+    std::atomic<int64_t> attach_ns{0};
+    std::atomic<int64_t> pk_attach_ns{0};
+    std::atomic<int64_t> pk_count{0};
+    std::atomic<int64_t> pk_total_ns{0};
+    std::atomic<int64_t> vector_count{0};
+    std::atomic<int64_t> vector_total_ns{0};
+    std::atomic<int64_t> scalar_count{0};
+    std::atomic<int64_t> scalar_total_ns{0};
+    std::atomic<int64_t> varchar_count{0};
+    std::atomic<int64_t> varchar_total_ns{0};
+    std::atomic<int64_t> text_count{0};
+    std::atomic<int64_t> text_total_ns{0};
+    std::atomic<int64_t> max_total_ns{0};
+    std::atomic<int64_t> last_log_ns{0};
+};
+
 ApplyLoadDiffTimingStats g_apply_load_diff_timing;
 SegmentLoadTimingStats g_segment_load_timing;
+IndexTaskTimingStats g_index_task_timing;
+ColumnGroupTaskTimingStats g_column_group_task_timing;
 
 int64_t
 SteadyNowNs() {
@@ -421,6 +467,197 @@ RecordSegmentLoadTiming(int64_t total_ns,
         AvgMs(apply, count),
         AvgMs(success_log, count),
         AvgMs(total - apply, count),
+        static_cast<double>(max_total) / 1e6);
+}
+
+
+void
+RecordIndexTaskTiming(DataType data_type,
+                      int64_t total_ns,
+                      int64_t queue_ns,
+                      int64_t load_data_ns,
+                      int64_t load_index_ns) {
+    auto& stats = g_index_task_timing;
+    stats.count.fetch_add(1, std::memory_order_relaxed);
+    stats.total_ns.fetch_add(total_ns, std::memory_order_relaxed);
+    stats.queue_ns.fetch_add(queue_ns, std::memory_order_relaxed);
+    stats.load_data_ns.fetch_add(load_data_ns, std::memory_order_relaxed);
+    stats.load_index_ns.fetch_add(load_index_ns, std::memory_order_relaxed);
+    UpdateMax(stats.max_total_ns, total_ns);
+
+    if (IsVectorDataType(data_type)) {
+        stats.vector_count.fetch_add(1, std::memory_order_relaxed);
+        stats.vector_total_ns.fetch_add(total_ns, std::memory_order_relaxed);
+    } else if (data_type == DataType::INT64) {
+        stats.int64_count.fetch_add(1, std::memory_order_relaxed);
+        stats.int64_total_ns.fetch_add(total_ns, std::memory_order_relaxed);
+    } else if (data_type == DataType::VARCHAR) {
+        stats.varchar_count.fetch_add(1, std::memory_order_relaxed);
+        stats.varchar_total_ns.fetch_add(total_ns, std::memory_order_relaxed);
+    } else if (data_type == DataType::TEXT) {
+        stats.text_count.fetch_add(1, std::memory_order_relaxed);
+        stats.text_total_ns.fetch_add(total_ns, std::memory_order_relaxed);
+    } else {
+        stats.other_count.fetch_add(1, std::memory_order_relaxed);
+        stats.other_total_ns.fetch_add(total_ns, std::memory_order_relaxed);
+    }
+
+    auto now_ns = SteadyNowNs();
+    auto last_ns = stats.last_log_ns.load(std::memory_order_relaxed);
+    if (now_ns - last_ns < kApplyLoadDiffTimingLogIntervalNs) {
+        return;
+    }
+    if (!stats.last_log_ns.compare_exchange_strong(
+            last_ns, now_ns, std::memory_order_relaxed)) {
+        return;
+    }
+
+    auto count = stats.count.exchange(0, std::memory_order_relaxed);
+    if (count == 0) {
+        return;
+    }
+    auto total = stats.total_ns.exchange(0, std::memory_order_relaxed);
+    auto queue = stats.queue_ns.exchange(0, std::memory_order_relaxed);
+    auto load_data = stats.load_data_ns.exchange(0, std::memory_order_relaxed);
+    auto load_index = stats.load_index_ns.exchange(0, std::memory_order_relaxed);
+    auto vector_count = stats.vector_count.exchange(0, std::memory_order_relaxed);
+    auto vector_total = stats.vector_total_ns.exchange(0, std::memory_order_relaxed);
+    auto int64_count = stats.int64_count.exchange(0, std::memory_order_relaxed);
+    auto int64_total = stats.int64_total_ns.exchange(0, std::memory_order_relaxed);
+    auto varchar_count = stats.varchar_count.exchange(0, std::memory_order_relaxed);
+    auto varchar_total = stats.varchar_total_ns.exchange(0, std::memory_order_relaxed);
+    auto text_count = stats.text_count.exchange(0, std::memory_order_relaxed);
+    auto text_total = stats.text_total_ns.exchange(0, std::memory_order_relaxed);
+    auto other_count = stats.other_count.exchange(0, std::memory_order_relaxed);
+    auto other_total = stats.other_total_ns.exchange(0, std::memory_order_relaxed);
+    auto max_total = stats.max_total_ns.exchange(0, std::memory_order_relaxed);
+
+    LOG_WARN(
+        "[SN recovery] index task timing stats count={} avgTotalMs={:.3f} "
+        "avgQueueMs={:.3f} avgLoadDataMs={:.3f} avgLoadIndexMs={:.3f} "
+        "vectorCount={} avgVectorMs={:.3f} int64Count={} avgInt64Ms={:.3f} "
+        "varcharCount={} avgVarcharMs={:.3f} textCount={} avgTextMs={:.3f} "
+        "otherCount={} avgOtherMs={:.3f} maxTotalMs={:.3f}",
+        count,
+        AvgMs(total, count),
+        AvgMs(queue, count),
+        AvgMs(load_data, count),
+        AvgMs(load_index, count),
+        vector_count,
+        AvgMs(vector_total, vector_count),
+        int64_count,
+        AvgMs(int64_total, int64_count),
+        varchar_count,
+        AvgMs(varchar_total, varchar_count),
+        text_count,
+        AvgMs(text_total, text_count),
+        other_count,
+        AvgMs(other_total, other_count),
+        static_cast<double>(max_total) / 1e6);
+}
+
+void
+RecordColumnGroupTaskTiming(bool has_pk,
+                            bool has_vector,
+                            bool has_varchar,
+                            bool has_text,
+                            int64_t total_ns,
+                            int64_t prepare_ns,
+                            int64_t reader_ns,
+                            int64_t translator_ns,
+                            int64_t cache_slot_ns,
+                            int64_t attach_ns,
+                            int64_t pk_attach_ns) {
+    auto& stats = g_column_group_task_timing;
+    stats.count.fetch_add(1, std::memory_order_relaxed);
+    stats.total_ns.fetch_add(total_ns, std::memory_order_relaxed);
+    stats.prepare_ns.fetch_add(prepare_ns, std::memory_order_relaxed);
+    stats.reader_ns.fetch_add(reader_ns, std::memory_order_relaxed);
+    stats.translator_ns.fetch_add(translator_ns, std::memory_order_relaxed);
+    stats.cache_slot_ns.fetch_add(cache_slot_ns, std::memory_order_relaxed);
+    stats.attach_ns.fetch_add(attach_ns, std::memory_order_relaxed);
+    stats.pk_attach_ns.fetch_add(pk_attach_ns, std::memory_order_relaxed);
+    UpdateMax(stats.max_total_ns, total_ns);
+
+    if (has_pk) {
+        stats.pk_count.fetch_add(1, std::memory_order_relaxed);
+        stats.pk_total_ns.fetch_add(total_ns, std::memory_order_relaxed);
+    }
+    if (has_vector) {
+        stats.vector_count.fetch_add(1, std::memory_order_relaxed);
+        stats.vector_total_ns.fetch_add(total_ns, std::memory_order_relaxed);
+    } else {
+        stats.scalar_count.fetch_add(1, std::memory_order_relaxed);
+        stats.scalar_total_ns.fetch_add(total_ns, std::memory_order_relaxed);
+    }
+    if (has_varchar) {
+        stats.varchar_count.fetch_add(1, std::memory_order_relaxed);
+        stats.varchar_total_ns.fetch_add(total_ns, std::memory_order_relaxed);
+    }
+    if (has_text) {
+        stats.text_count.fetch_add(1, std::memory_order_relaxed);
+        stats.text_total_ns.fetch_add(total_ns, std::memory_order_relaxed);
+    }
+
+    auto now_ns = SteadyNowNs();
+    auto last_ns = stats.last_log_ns.load(std::memory_order_relaxed);
+    if (now_ns - last_ns < kApplyLoadDiffTimingLogIntervalNs) {
+        return;
+    }
+    if (!stats.last_log_ns.compare_exchange_strong(
+            last_ns, now_ns, std::memory_order_relaxed)) {
+        return;
+    }
+
+    auto count = stats.count.exchange(0, std::memory_order_relaxed);
+    if (count == 0) {
+        return;
+    }
+    auto total = stats.total_ns.exchange(0, std::memory_order_relaxed);
+    auto prepare = stats.prepare_ns.exchange(0, std::memory_order_relaxed);
+    auto reader = stats.reader_ns.exchange(0, std::memory_order_relaxed);
+    auto translator = stats.translator_ns.exchange(0, std::memory_order_relaxed);
+    auto cache_slot = stats.cache_slot_ns.exchange(0, std::memory_order_relaxed);
+    auto attach = stats.attach_ns.exchange(0, std::memory_order_relaxed);
+    auto pk_attach = stats.pk_attach_ns.exchange(0, std::memory_order_relaxed);
+    auto pk_count = stats.pk_count.exchange(0, std::memory_order_relaxed);
+    auto pk_total = stats.pk_total_ns.exchange(0, std::memory_order_relaxed);
+    auto vector_count = stats.vector_count.exchange(0, std::memory_order_relaxed);
+    auto vector_total = stats.vector_total_ns.exchange(0, std::memory_order_relaxed);
+    auto scalar_count = stats.scalar_count.exchange(0, std::memory_order_relaxed);
+    auto scalar_total = stats.scalar_total_ns.exchange(0, std::memory_order_relaxed);
+    auto varchar_count = stats.varchar_count.exchange(0, std::memory_order_relaxed);
+    auto varchar_total = stats.varchar_total_ns.exchange(0, std::memory_order_relaxed);
+    auto text_count = stats.text_count.exchange(0, std::memory_order_relaxed);
+    auto text_total = stats.text_total_ns.exchange(0, std::memory_order_relaxed);
+    auto max_total = stats.max_total_ns.exchange(0, std::memory_order_relaxed);
+
+    LOG_WARN(
+        "[SN recovery] column group task timing stats count={} "
+        "avgTotalMs={:.3f} avgPrepareMs={:.3f} avgReaderMs={:.3f} "
+        "avgTranslatorMs={:.3f} avgCacheSlotMs={:.3f} avgAttachMs={:.3f} "
+        "avgPkAttachMs={:.3f} pkCount={} avgPkGroupMs={:.3f} "
+        "vectorCount={} avgVectorGroupMs={:.3f} scalarCount={} "
+        "avgScalarGroupMs={:.3f} varcharCount={} avgVarcharGroupMs={:.3f} "
+        "textCount={} avgTextGroupMs={:.3f} maxTotalMs={:.3f}",
+        count,
+        AvgMs(total, count),
+        AvgMs(prepare, count),
+        AvgMs(reader, count),
+        AvgMs(translator, count),
+        AvgMs(cache_slot, count),
+        AvgMs(attach, count),
+        AvgMs(pk_attach, count),
+        pk_count,
+        AvgMs(pk_total, pk_count),
+        vector_count,
+        AvgMs(vector_total, vector_count),
+        scalar_count,
+        AvgMs(scalar_total, scalar_count),
+        varchar_count,
+        AvgMs(varchar_total, varchar_count),
+        text_count,
+        AvgMs(text_total, text_count),
         static_cast<double>(max_total) / 1e6);
 }
 
@@ -5329,6 +5566,14 @@ ChunkedSegmentSealedImpl::LoadColumnGroup(
     bool eager_load,
     milvus::OpContext* op_ctx,
     bool is_replace) {
+    auto total_start = std::chrono::steady_clock::now();
+    int64_t prepare_ns = 0;
+    int64_t reader_ns = 0;
+    int64_t translator_ns = 0;
+    int64_t cache_slot_ns = 0;
+    int64_t attach_ns = 0;
+    int64_t pk_attach_ns = 0;
+
     AssertInfo(index < column_groups->size(),
                "load column group index out of range");
     AssertInfo(!milvus_field_ids.empty(),
@@ -5336,6 +5581,7 @@ ChunkedSegmentSealedImpl::LoadColumnGroup(
     auto column_group = column_groups->at(index);
     auto load_info = std::atomic_load(&segment_load_info_);
 
+    auto stage_start = std::chrono::steady_clock::now();
     for (const auto& field_id : milvus_field_ids) {
         AssertInfo(field_exists_in_schema(schema_, field_id),
                    "field {} not found in schema when loading column group",
@@ -5402,6 +5648,9 @@ ChunkedSegmentSealedImpl::LoadColumnGroup(
             needed_columns->push_back(std::to_string(fid.get()));
         }
     }
+    prepare_ns = DurationSinceNs(stage_start);
+
+    stage_start = std::chrono::steady_clock::now();
     auto chunk_reader_result = reader_->get_chunk_reader(index, needed_columns);
     AssertInfo(chunk_reader_result.ok(),
                "get chunk reader failed, segment {}, column group index {}, "
@@ -5411,6 +5660,7 @@ ChunkedSegmentSealedImpl::LoadColumnGroup(
                chunk_reader_result.status().ToString());
 
     auto chunk_reader = std::move(chunk_reader_result).ValueOrDie();
+    reader_ns = DurationSinceNs(stage_start);
 
     LOG_INFO("[StorageV2] segment {} loads manifest cg index {}",
              this->get_segment_id(),
@@ -5434,6 +5684,7 @@ ChunkedSegmentSealedImpl::LoadColumnGroup(
         cache_key_suffix = std::to_string(milvus_field_ids.front().get());
     }
 
+    stage_start = std::chrono::steady_clock::now();
     auto translator =
         std::make_unique<storagev2translator::ManifestGroupTranslator>(
             get_segment_id(),
@@ -5450,15 +5701,21 @@ ChunkedSegmentSealedImpl::LoadColumnGroup(
             warmup_policy,
             cache_key_suffix,
             load_info->GetEstimatedBytesPerRow());
+    translator_ns = DurationSinceNs(stage_start);
+
+    stage_start = std::chrono::steady_clock::now();
     auto chunked_column_group =
         std::make_shared<ChunkedColumnGroup>(std::move(translator));
+    cache_slot_ns = DurationSinceNs(stage_start);
 
     // Create ProxyChunkColumn for each field
+    stage_start = std::chrono::steady_clock::now();
     for (const auto& field_id : milvus_field_ids) {
         const auto& field_meta = field_metas.at(field_id);
         auto column = std::make_shared<ProxyChunkColumn>(
             chunked_column_group, field_id, field_meta);
         auto data_type = field_meta.get_data_type();
+        auto field_attach_start = std::chrono::steady_clock::now();
         load_field_data_common(
             field_id,
             column,
@@ -5470,6 +5727,11 @@ ChunkedSegmentSealedImpl::LoadColumnGroup(
                 nullopt,  // manifest cannot provide parquet skip index directly
             op_ctx,
             is_replace);
+        auto field_attach_ns = DurationSinceNs(field_attach_start);
+        auto primary_field_id = schema_->get_primary_field_id();
+        if (primary_field_id.has_value() && primary_field_id.value() == field_id) {
+            pk_attach_ns += field_attach_ns;
+        }
         if (field_id == TimestampFieldID) {
             int64_t num_rows = load_info->GetNumOfRows();
             if (commit_ts_ != 0) {
@@ -5480,6 +5742,31 @@ ChunkedSegmentSealedImpl::LoadColumnGroup(
             }
         }
     }
+    attach_ns = DurationSinceNs(stage_start);
+
+    bool has_vector = false;
+    bool has_varchar = false;
+    bool has_text = false;
+    bool has_pk = false;
+    auto primary_field_id = schema_->get_primary_field_id();
+    for (const auto& field_id : milvus_field_ids) {
+        const auto& field_meta = field_metas.at(field_id);
+        has_vector = has_vector || IsVectorDataType(field_meta.get_data_type());
+        has_varchar = has_varchar || field_meta.get_data_type() == DataType::VARCHAR;
+        has_text = has_text || field_meta.get_data_type() == DataType::TEXT;
+        has_pk = has_pk || (primary_field_id.has_value() && primary_field_id.value() == field_id);
+    }
+    RecordColumnGroupTaskTiming(has_pk,
+                                has_vector,
+                                has_varchar,
+                                has_text,
+                                DurationSinceNs(total_start),
+                                prepare_ns,
+                                reader_ns,
+                                translator_ns,
+                                cache_slot_ns,
+                                attach_ns,
+                                pk_attach_ns);
 }
 
 void
@@ -5545,15 +5832,21 @@ ChunkedSegmentSealedImpl::LoadBatchIndexes(
         AssertInfo(field_exists_in_schema(schema_, field_id),
                    "field {} not found in schema when loading index",
                    field_id.get());
+        auto data_type = schema_->operator[](field_id).get_data_type();
         auto& index_infos = pair.second;
         for (auto& load_index_info : index_infos) {
             auto* load_index_info_ptr = &load_index_info;
+            auto submit_time = std::chrono::steady_clock::now();
             auto future = pool.Submit([this,
                                        trace_ctx,
                                        field_id,
+                                       data_type,
                                        load_index_info_ptr,
+                                       submit_time,
                                        op_ctx,
                                        is_replace]() mutable -> void {
+                auto task_start = std::chrono::steady_clock::now();
+                auto queue_ns = DurationSinceNs(submit_time);
                 // Early exit if cancelled while queued
                 CheckCancellation(op_ctx, id_, field_id.get(), "LoadIndex");
 
@@ -5563,10 +5856,19 @@ ChunkedSegmentSealedImpl::LoadBatchIndexes(
                          load_index_info_ptr->index_files.size());
 
                 // Download & compose index
+                auto stage_start = std::chrono::steady_clock::now();
                 LoadIndexData(trace_ctx, load_index_info_ptr, op_ctx);
+                auto load_data_ns = DurationSinceNs(stage_start);
 
                 // Load index into segment
+                stage_start = std::chrono::steady_clock::now();
                 LoadIndex(*load_index_info_ptr, is_replace);
+                auto load_index_ns = DurationSinceNs(stage_start);
+                RecordIndexTaskTiming(data_type,
+                                      DurationSinceNs(task_start),
+                                      queue_ns,
+                                      load_data_ns,
+                                      load_index_ns);
             });
 
             load_index_futures.push_back(std::move(future));
