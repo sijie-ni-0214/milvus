@@ -78,10 +78,11 @@ var errRetryTimerNotified = errors.New("retry timer notified")
 const requestResourceTimingLogInterval = 5 * time.Second
 
 var (
-	requestResourceTiming = newRequestResourceTimingStats()
-	segmentLoadTiming     = newSegmentLoadTimingStats()
-	sealedLoadTiming      = newSealedLoadTimingStats()
-	bloomFilterLoadTiming = newBloomFilterLoadTimingStats()
+	requestResourceTiming         = newRequestResourceTimingStats()
+	estimateSegmentResourceTiming = newEstimateSegmentResourceTimingStats()
+	segmentLoadTiming             = newSegmentLoadTimingStats()
+	sealedLoadTiming              = newSealedLoadTimingStats()
+	bloomFilterLoadTiming         = newBloomFilterLoadTimingStats()
 )
 
 type requestResourceTimingStats struct {
@@ -181,6 +182,44 @@ type bloomFilterLoadTimingStats struct {
 	maxCharge            *atomic.Int64
 	maxBloomFilterLoad   *atomic.Int64
 	lastLogUnixNano      *atomic.Int64
+}
+
+type estimateSegmentResourceTimingStats struct {
+	count           *atomic.Int64
+	totalIndex      *atomic.Int64
+	totalBinlog     *atomic.Int64
+	totalSchema     *atomic.Int64
+	totalIndexLoop  *atomic.Int64
+	totalCLoadInfo  *atomic.Int64
+	totalCEstimate  *atomic.Int64
+	totalBinlogLoop *atomic.Int64
+	totalStats      *atomic.Int64
+	totalDelete     *atomic.Int64
+	totalJSONStats  *atomic.Int64
+	totalTextStats  *atomic.Int64
+	totalSegment    *atomic.Int64
+	maxSegment      *atomic.Int64
+	lastLogUnixNano *atomic.Int64
+}
+
+func newEstimateSegmentResourceTimingStats() *estimateSegmentResourceTimingStats {
+	return &estimateSegmentResourceTimingStats{
+		count:           atomic.NewInt64(0),
+		totalIndex:      atomic.NewInt64(0),
+		totalBinlog:     atomic.NewInt64(0),
+		totalSchema:     atomic.NewInt64(0),
+		totalIndexLoop:  atomic.NewInt64(0),
+		totalCLoadInfo:  atomic.NewInt64(0),
+		totalCEstimate:  atomic.NewInt64(0),
+		totalBinlogLoop: atomic.NewInt64(0),
+		totalStats:      atomic.NewInt64(0),
+		totalDelete:     atomic.NewInt64(0),
+		totalJSONStats:  atomic.NewInt64(0),
+		totalTextStats:  atomic.NewInt64(0),
+		totalSegment:    atomic.NewInt64(0),
+		maxSegment:      atomic.NewInt64(0),
+		lastLogUnixNano: atomic.NewInt64(time.Now().UnixNano()),
+	}
 }
 
 func newSealedLoadTimingStats() *sealedLoadTimingStats {
@@ -477,6 +516,67 @@ func (s *requestResourceTimingStats) record(estimateDur, lockWaitDur, lockHoldDu
 		zap.Duration("maxLockWaitDur", time.Duration(maxLockWait)),
 		zap.Duration("maxLockHoldDur", time.Duration(maxLockHold)),
 		zap.Duration("maxTotalDur", time.Duration(maxRequest)),
+	)
+}
+
+func (s *estimateSegmentResourceTimingStats) record(indexCount, binlogCount int, schemaDur, indexLoopDur, cLoadInfoDur, cEstimateDur, binlogLoopDur, statsDur, deleteDur, jsonStatsDur, textStatsDur, totalDur time.Duration) {
+	s.count.Inc()
+	s.totalIndex.Add(int64(indexCount))
+	s.totalBinlog.Add(int64(binlogCount))
+	s.totalSchema.Add(int64(schemaDur))
+	s.totalIndexLoop.Add(int64(indexLoopDur))
+	s.totalCLoadInfo.Add(int64(cLoadInfoDur))
+	s.totalCEstimate.Add(int64(cEstimateDur))
+	s.totalBinlogLoop.Add(int64(binlogLoopDur))
+	s.totalStats.Add(int64(statsDur))
+	s.totalDelete.Add(int64(deleteDur))
+	s.totalJSONStats.Add(int64(jsonStatsDur))
+	s.totalTextStats.Add(int64(textStatsDur))
+	s.totalSegment.Add(int64(totalDur))
+	updateMaxDuration(s.maxSegment, totalDur)
+
+	now := time.Now()
+	last := s.lastLogUnixNano.Load()
+	if now.UnixNano()-last < int64(requestResourceTimingLogInterval) {
+		return
+	}
+	if !s.lastLogUnixNano.CompareAndSwap(last, now.UnixNano()) {
+		return
+	}
+
+	count := s.count.Swap(0)
+	totalIndex := s.totalIndex.Swap(0)
+	totalBinlog := s.totalBinlog.Swap(0)
+	totalSchema := s.totalSchema.Swap(0)
+	totalIndexLoop := s.totalIndexLoop.Swap(0)
+	totalCLoadInfo := s.totalCLoadInfo.Swap(0)
+	totalCEstimate := s.totalCEstimate.Swap(0)
+	totalBinlogLoop := s.totalBinlogLoop.Swap(0)
+	totalStats := s.totalStats.Swap(0)
+	totalDelete := s.totalDelete.Swap(0)
+	totalJSONStats := s.totalJSONStats.Swap(0)
+	totalTextStats := s.totalTextStats.Swap(0)
+	totalSegment := s.totalSegment.Swap(0)
+	maxSegment := s.maxSegment.Swap(0)
+	if count == 0 {
+		return
+	}
+
+	log.Warn("estimate loading resource usage timing stats",
+		zap.Int64("segmentCount", count),
+		zap.Int64("avgIndexCount", totalIndex/count),
+		zap.Int64("avgBinlogCount", totalBinlog/count),
+		zap.Duration("avgSchemaDur", avgDuration(totalSchema, count)),
+		zap.Duration("avgIndexLoopDur", avgDuration(totalIndexLoop, count)),
+		zap.Duration("avgCLoadInfoDur", avgDuration(totalCLoadInfo, count)),
+		zap.Duration("avgCEstimateDur", avgDuration(totalCEstimate, count)),
+		zap.Duration("avgBinlogLoopDur", avgDuration(totalBinlogLoop, count)),
+		zap.Duration("avgStatsDur", avgDuration(totalStats, count)),
+		zap.Duration("avgDeleteDur", avgDuration(totalDelete, count)),
+		zap.Duration("avgJSONStatsDur", avgDuration(totalJSONStats, count)),
+		zap.Duration("avgTextStatsDur", avgDuration(totalTextStats, count)),
+		zap.Duration("avgTotalDur", avgDuration(totalSegment, count)),
+		zap.Duration("maxTotalDur", time.Duration(maxSegment)),
 	)
 }
 
@@ -2515,6 +2615,23 @@ func estimateLoadingResourceUsageOfSegment(schema *schemapb.CollectionSchema, lo
 	var mmapFieldCount int
 	var fieldGpuMemorySize []uint64
 
+	segmentEstimateStart := time.Now()
+	var schemaDur time.Duration
+	var indexLoopDur time.Duration
+	var cLoadInfoDur time.Duration
+	var cEstimateDur time.Duration
+	var binlogLoopDur time.Duration
+	var statsDur time.Duration
+	var deleteDur time.Duration
+	var jsonStatsDur time.Duration
+	var textStatsDur time.Duration
+	var estimatedIndexCount int
+	defer func() {
+		estimateSegmentResourceTiming.record(estimatedIndexCount, len(loadInfo.GetBinlogPaths()), schemaDur, indexLoopDur, cLoadInfoDur, cEstimateDur, binlogLoopDur, statsDur, deleteDur, jsonStatsDur, textStatsDur, time.Since(segmentEstimateStart))
+	}()
+
+	schemaStart := time.Now()
+
 	id2Binlogs := lo.SliceToMap(loadInfo.BinlogPaths, func(fieldBinlog *datapb.FieldBinlog) (int64, *datapb.FieldBinlog) {
 		return fieldBinlog.GetFieldID(), fieldBinlog
 	})
@@ -2525,12 +2642,15 @@ func estimateLoadingResourceUsageOfSegment(schema *schemapb.CollectionSchema, lo
 		return nil, err
 	}
 	indexedFields := make(map[int64]struct{})
+	schemaDur = time.Since(schemaStart)
 	ctx := context.Background()
 
 	// PART 1: calculate size of indexes
+	indexLoopStart := time.Now()
 	for _, fieldIndexInfo := range loadInfo.IndexInfos {
 		fieldID := fieldIndexInfo.GetFieldID()
 		if len(fieldIndexInfo.GetIndexFilePaths()) > 0 {
+			estimatedIndexCount++
 			fieldSchema, err := schemaHelper.GetFieldFromID(fieldID)
 			if err != nil {
 				return nil, err
@@ -2540,14 +2660,20 @@ func estimateLoadingResourceUsageOfSegment(schema *schemapb.CollectionSchema, lo
 			isVectorType := typeutil.IsVectorType(fieldSchema.GetDataType())
 
 			var estimateResult ResourceEstimate
+			cLoadInfoStart := time.Now()
 			err = GetCLoadInfoWithFunc(ctx, fieldSchema, loadInfo, fieldIndexInfo, func(c *LoadIndexInfo) error {
+				var estimateDur time.Duration
 				GetDynamicPool().Submit(func() (any, error) {
+					estimateStart := time.Now()
 					loadResourceRequest := C.EstimateLoadIndexResource(c.cLoadIndexInfo)
+					estimateDur = time.Since(estimateStart)
 					estimateResult = GetResourceEstimate(&loadResourceRequest)
 					return nil, nil
 				}).Await()
+				cEstimateDur += estimateDur
 				return nil
 			})
+			cLoadInfoDur += time.Since(cLoadInfoStart)
 			if err != nil {
 				return nil, errors.Wrapf(err, "failed to estimate loading resource usage of index, collection %d, segment %d, indexBuildID %d",
 					loadInfo.GetCollectionID(),
@@ -2591,6 +2717,8 @@ func estimateLoadingResourceUsageOfSegment(schema *schemapb.CollectionSchema, lo
 			}
 		}
 	}
+	indexLoopDur = time.Since(indexLoopStart)
+	binlogLoopStart := time.Now()
 
 	// PART 2: calculate size of binlogs
 	for fieldID, fieldBinlog := range id2Binlogs {
@@ -2684,6 +2812,7 @@ func estimateLoadingResourceUsageOfSegment(schema *schemapb.CollectionSchema, lo
 			}
 		}
 	}
+	binlogLoopDur = time.Since(binlogLoopStart)
 
 	// PART 2.5: external segment adjustments
 	//
@@ -2722,13 +2851,16 @@ func estimateLoadingResourceUsageOfSegment(schema *schemapb.CollectionSchema, lo
 	// PART 3: calculate size of stats data
 	// stats data isn't managed by the caching layer, so its size should always be included,
 	// regardless of the tiered eviction value
+	statsStart := time.Now()
 	for _, fieldBinlog := range loadInfo.Statslogs {
 		segMemoryLoadingSize += uint64(getBinlogDataMemorySize(fieldBinlog))
 	}
+	statsDur = time.Since(statsStart)
 
 	// PART 4: calculate size of delete data
 	// delete data isn't managed by the caching layer, so its size should always be included,
 	// regardless of the tiered eviction value
+	deleteStart := time.Now()
 	for _, fieldBinlog := range loadInfo.Deltalogs {
 		// MemorySize of filedBinlog is the actual size in memory, but we should also consider
 		// the memcpy from golang to cpp side, so the expansionFactor is set to 2.
@@ -2743,9 +2875,11 @@ func estimateLoadingResourceUsageOfSegment(schema *schemapb.CollectionSchema, lo
 		}
 		segMemoryLoadingSize += uint64(float64(memSize) * expansionFactor)
 	}
+	deleteDur = time.Since(deleteStart)
 
 	// PART 5: calculate size of json key stats data
 	jsonStatsMmapEnable := paramtable.Get().QueryNodeCfg.MmapJSONStats.GetAsBool()
+	jsonStatsStart := time.Now()
 	for _, jsonKeyStats := range loadInfo.GetJsonKeyStatsLogs() {
 		if jsonStatsMmapEnable {
 			if !multiplyFactor.TieredEvictionEnabled {
@@ -2757,6 +2891,7 @@ func estimateLoadingResourceUsageOfSegment(schema *schemapb.CollectionSchema, lo
 			}
 		}
 	}
+	jsonStatsDur = time.Since(jsonStatsStart)
 
 	// per struct memory size, used to keep mapping between row id and element id
 	var structArrayOffsetsSize uint64
@@ -2775,6 +2910,7 @@ func estimateLoadingResourceUsageOfSegment(schema *schemapb.CollectionSchema, lo
 	// memory_size = sum of Tantivy index file sizes (same value as C++ ByteSize() after load),
 	// so 1.0x is the baseline; textIndexExpansionFactor allows tuning if needed.
 	textIndexMmapEnable := paramtable.Get().QueryNodeCfg.MmapScalarField.GetAsBool()
+	textStatsStart := time.Now()
 	for _, textStats := range loadInfo.GetTextStatsLogs() {
 		if textIndexMmapEnable {
 			if !multiplyFactor.TieredEvictionEnabled {
@@ -2786,6 +2922,7 @@ func estimateLoadingResourceUsageOfSegment(schema *schemapb.CollectionSchema, lo
 			}
 		}
 	}
+	textStatsDur = time.Since(textStatsStart)
 
 	return &ResourceUsage{
 		MemorySize:         segMemoryLoadingSize + indexMemorySize + structArrayOffsetsSize,
