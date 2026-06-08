@@ -52,6 +52,8 @@ var (
 	sqOnce     sync.Once
 	dp         atomic.Pointer[conc.Pool[any]]
 	dynOnce    sync.Once
+	ep         atomic.Pointer[conc.Pool[any]]
+	estOnce    sync.Once
 	loadPool   atomic.Pointer[conc.Pool[any]]
 	loadOnce   sync.Once
 	warmupPool atomic.Pointer[conc.Pool[any]]
@@ -67,10 +69,11 @@ var (
 	bm25PoolOnce sync.Once
 
 	// intentionally leaked CGO tag names
-	cgoTagSQ      = C.CString("CGO_SQ")
-	cgoTagLoad    = C.CString("CGO_LOAD")
-	cgoTagDynamic = C.CString("CGO_DYN")
-	cgoTagWarmup  = C.CString("CGO_WARMUP")
+	cgoTagSQ       = C.CString("CGO_SQ")
+	cgoTagLoad     = C.CString("CGO_LOAD")
+	cgoTagDynamic  = C.CString("CGO_DYN")
+	cgoTagEstimate = C.CString("CGO_EST")
+	cgoTagWarmup   = C.CString("CGO_WARMUP")
 )
 
 // initSQPool initialize
@@ -110,6 +113,26 @@ func initDynamicPool() {
 
 		dp.Store(pool)
 		log.Info("init dynamicPool done", zap.Int("size", size))
+	})
+}
+
+func initEstimatePool() {
+	estOnce.Do(func() {
+		pt := paramtable.Get()
+		poolSize := hardware.GetCPUNum() * pt.CommonCfg.MiddlePriorityThreadCoreCoefficient.GetAsInt()
+		pool := conc.NewPool[any](
+			poolSize,
+			conc.WithPreAlloc(false),
+			conc.WithDisablePurge(false),
+			conc.WithPreHandler(func() {
+				runtime.LockOSThread()
+				C.SetThreadName(cgoTagEstimate)
+			}),
+		)
+
+		ep.Store(pool)
+		pt.Watch(pt.CommonCfg.MiddlePriorityThreadCoreCoefficient.Key, config.NewHandler("qn.estimatepool.middlepriority", ResizeEstimatePool))
+		log.Info("init estimatePool done", zap.Int("size", poolSize))
 	})
 }
 
@@ -198,6 +221,11 @@ func GetDynamicPool() *conc.Pool[any] {
 	return dp.Load()
 }
 
+func GetEstimatePool() *conc.Pool[any] {
+	initEstimatePool()
+	return ep.Load()
+}
+
 func GetLoadPool() *conc.Pool[any] {
 	initLoadPool()
 	return loadPool.Load()
@@ -241,6 +269,14 @@ func ResizeLoadPool(evt *config.Event) {
 	}
 }
 
+func ResizeEstimatePool(evt *config.Event) {
+	if evt.HasUpdated {
+		pt := paramtable.Get()
+		newSize := hardware.GetCPUNum() * pt.CommonCfg.MiddlePriorityThreadCoreCoefficient.GetAsInt()
+		resizePool(GetEstimatePool(), newSize, "EstimatePool")
+	}
+}
+
 func ResizeWarmupPool(evt *config.Event) {
 	if evt.HasUpdated {
 		pt := paramtable.Get()
@@ -280,6 +316,7 @@ func CollectPoolStats() []metrics.PoolStats {
 	refs := []poolRef{
 		{"SQPool", GetSQPool()},
 		{"DynamicPool", GetDynamicPool()},
+		{"EstimatePool", GetEstimatePool()},
 		{"LoadPool", GetLoadPool()},
 		{"WarmupPool", GetWarmupPool()},
 		{"BFApplyPool", GetBFApplyPool()},
