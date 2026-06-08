@@ -6077,12 +6077,7 @@ ChunkedSegmentSealedImpl::Load(milvus::tracer::TraceContext& trace_ctx,
 
     // reopen_mutex_ synchronizes this read with all schema_ writers.
     stage_start = std::chrono::steady_clock::now();
-    SegmentLoadInfo mutable_copy(snapshot->GetProto(), schema_);
-    mutable_copy.SetFieldsFilledWithDefault(
-        snapshot->GetFieldsFilledWithDefault());
-    for (auto fid : snapshot->GetCreatedTextIndexes()) {
-        mutable_copy.SetTextIndexCreated(fid);
-    }
+    SegmentLoadInfo mutable_copy(*snapshot);
     prepare_info_ns = DurationSinceNs(stage_start);
 
     stage_start = std::chrono::steady_clock::now();
