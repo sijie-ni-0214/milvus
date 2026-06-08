@@ -286,6 +286,22 @@ func avgDuration(total int64, count int64) time.Duration {
 	return time.Duration(total / count)
 }
 
+func updateMaxInt64(max *atomic.Int64, value int64) {
+	for {
+		old := max.Load()
+		if value <= old || max.CompareAndSwap(old, value) {
+			return
+		}
+	}
+}
+
+func avgInt64(total int64, count int64) float64 {
+	if count == 0 {
+		return 0
+	}
+	return float64(total) / float64(count)
+}
+
 func (s *delegatorStreamDeleteTimingStats) record(segmentNum int, timing streamDeleteTiming) {
 	s.count.Inc()
 	s.segmentCount.Add(int64(segmentNum))

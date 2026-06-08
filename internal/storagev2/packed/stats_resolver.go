@@ -50,6 +50,12 @@ type StatsResolver struct {
 	manifestErr    error
 }
 
+// BM25StatsFile identifies a BM25 stats file and its known remote size.
+type BM25StatsFile struct {
+	Path    string
+	LogSize int64
+}
+
 // NewStatsResolver creates a StatsResolver. Pass a non-empty manifestPath
 // for V3 (manifest-based) segments, or an empty string for V2 (legacy).
 func NewStatsResolver(manifestPath string, storageConfig *indexpb.StorageConfig) *StatsResolver {
@@ -178,15 +184,33 @@ func (r *StatsResolver) BloomFilterMemorySize(pkFieldID int64) (int64, error) {
 
 // BM25StatsPaths returns BM25 stat file paths grouped by field ID.
 func (r *StatsResolver) BM25StatsPaths() (map[int64][]string, error) {
+	files, err := r.BM25StatsFiles()
+	if err != nil {
+		return nil, err
+	}
+
+	result := make(map[int64][]string, len(files))
+	for fieldID, fieldFiles := range files {
+		paths := make([]string, 0, len(fieldFiles))
+		for _, file := range fieldFiles {
+			paths = append(paths, file.Path)
+		}
+		result[fieldID] = paths
+	}
+	return result, nil
+}
+
+// BM25StatsFiles returns BM25 stat files grouped by field ID.
+func (r *StatsResolver) BM25StatsFiles() (map[int64][]BM25StatsFile, error) {
 	if !r.isManifest() {
-		return filterBM25Stats(r.bm25Logs), nil
+		return filterBM25StatsFiles(r.bm25Logs), nil
 	}
 
 	if err := r.loadManifest(); err != nil {
 		return nil, err
 	}
 
-	result := make(map[int64][]string)
+	result := make(map[int64][]BM25StatsFile)
 	for key, stat := range r.manifestStats {
 		prefix, fieldID, ok := ParseStatKey(key)
 		if !ok || prefix != "bm25" || len(stat.Paths) == 0 {
@@ -194,18 +218,27 @@ func (r *StatsResolver) BM25StatsPaths() (map[int64][]string, error) {
 		}
 
 		resolved := r.resolveStatPaths(stat.Paths)
+		logSize, _ := strconv.ParseInt(stat.Metadata["log_size"], 10, 64)
+		fileSize := int64(0)
+		if len(resolved) == 1 {
+			fileSize = logSize
+		}
 
 		found := false
 		for i, p := range stat.Paths {
 			_, logidx := path.Split(p)
 			if logidx == compoundStatsLogIdx {
-				result[fieldID] = []string{resolved[i]}
+				result[fieldID] = []BM25StatsFile{{Path: resolved[i], LogSize: logSize}}
 				found = true
 				break
 			}
 		}
 		if !found {
-			result[fieldID] = resolved
+			files := make([]BM25StatsFile, 0, len(resolved))
+			for _, p := range resolved {
+				files = append(files, BM25StatsFile{Path: p, LogSize: fileSize})
+			}
+			result[fieldID] = files
 		}
 	}
 	return result, nil
@@ -412,18 +445,36 @@ func filterPKStatsBinlogs(fieldBinlogs []*datapb.FieldBinlog, pkFieldID int64) [
 
 // filterBM25Stats filters legacy FieldBinlog arrays into BM25 paths grouped by field ID.
 func filterBM25Stats(fieldBinlogs []*datapb.FieldBinlog) map[int64][]string {
-	result := make(map[int64][]string, 0)
+	files := filterBM25StatsFiles(fieldBinlogs)
+	result := make(map[int64][]string, len(files))
+	for fieldID, fieldFiles := range files {
+		paths := make([]string, 0, len(fieldFiles))
+		for _, file := range fieldFiles {
+			paths = append(paths, file.Path)
+		}
+		result[fieldID] = paths
+	}
+	return result
+}
+
+// filterBM25StatsFiles filters legacy FieldBinlog arrays into BM25 files grouped by field ID.
+func filterBM25StatsFiles(fieldBinlogs []*datapb.FieldBinlog) map[int64][]BM25StatsFile {
+	result := make(map[int64][]BM25StatsFile, 0)
 	for _, fieldBinlog := range fieldBinlogs {
-		logpaths := []string{}
+		files := []BM25StatsFile{}
 		for _, binlog := range fieldBinlog.GetBinlogs() {
 			_, logidx := path.Split(binlog.GetLogPath())
+			file := BM25StatsFile{
+				Path:    binlog.GetLogPath(),
+				LogSize: binlog.GetLogSize(),
+			}
 			if logidx == compoundStatsLogIdx {
-				logpaths = []string{binlog.GetLogPath()}
+				files = []BM25StatsFile{file}
 				break
 			}
-			logpaths = append(logpaths, binlog.GetLogPath())
+			files = append(files, file)
 		}
-		result[fieldBinlog.FieldID] = logpaths
+		result[fieldBinlog.FieldID] = files
 	}
 	return result
 }

@@ -24,10 +24,12 @@ import (
 // For example: FieldBinlogStatEntry("bloom_filter", stats.GetFieldID(), stats)
 func FieldBinlogStatEntry(prefix string, fieldID int64, fb *datapb.FieldBinlog) StatEntry {
 	var memorySize int64
+	var logSize int64
 	paths := make([]string, 0, len(fb.GetBinlogs()))
 	for _, b := range fb.GetBinlogs() {
 		paths = append(paths, b.GetLogPath())
 		memorySize += b.GetMemorySize()
+		logSize += b.GetLogSize()
 	}
 	entry := StatEntry{
 		Key:   fmt.Sprintf("%s.%d", prefix, fieldID),
@@ -35,6 +37,12 @@ func FieldBinlogStatEntry(prefix string, fieldID int64, fb *datapb.FieldBinlog) 
 	}
 	if memorySize > 0 {
 		entry.Metadata = map[string]string{"memory_size": fmt.Sprintf("%d", memorySize)}
+	}
+	if logSize > 0 {
+		if entry.Metadata == nil {
+			entry.Metadata = map[string]string{}
+		}
+		entry.Metadata["log_size"] = fmt.Sprintf("%d", logSize)
 	}
 	return entry
 }

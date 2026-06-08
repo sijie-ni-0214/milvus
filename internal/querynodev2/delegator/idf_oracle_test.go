@@ -34,6 +34,7 @@ import (
 	"github.com/milvus-io/milvus/internal/storage"
 	"github.com/milvus-io/milvus/pkg/v3/proto/datapb"
 	"github.com/milvus-io/milvus/pkg/v3/proto/querypb"
+	"github.com/milvus-io/milvus/pkg/v3/util/paramtable"
 	"github.com/milvus-io/milvus/pkg/v3/util/typeutil"
 )
 
@@ -57,6 +58,7 @@ type IDFOracleSuite struct {
 }
 
 func (suite *IDFOracleSuite) SetupSuite() {
+	paramtable.Init()
 	suite.collectionID = 111
 	suite.channel = "test-channel"
 	suite.collectionSchema = &schemapb.CollectionSchema{
@@ -118,7 +120,7 @@ func (suite *IDFOracleSuite) registerSealed(segID int64, start uint32, end uint3
 
 	bm25Logs := []*datapb.FieldBinlog{{
 		FieldID: 102,
-		Binlogs: []*datapb.Binlog{{LogPath: remotePath}},
+		Binlogs: []*datapb.Binlog{{LogPath: remotePath, LogSize: int64(len(data))}},
 	}}
 
 	diskBefore := suite.idfOracle.sealedDiskSize.Load()
@@ -405,7 +407,7 @@ func (suite *IDFOracleSuite) TestLoadSealedNoParse() {
 
 	bm25Logs := []*datapb.FieldBinlog{{
 		FieldID: 102,
-		Binlogs: []*datapb.Binlog{{LogPath: remotePath}},
+		Binlogs: []*datapb.Binlog{{LogPath: remotePath, LogSize: int64(len(data))}},
 	}}
 
 	err = suite.idfOracle.LoadSealed(context.Background(), 1, &querypb.SegmentLoadInfo{Bm25Logs: bm25Logs}, cm)
@@ -452,6 +454,19 @@ func (suite *IDFOracleSuite) TestLoadSealedFailureCleanup() {
 	segDir := path.Join(suite.idfOracle.dirPath, "1")
 	_, statErr := os.Stat(segDir)
 	suite.True(os.IsNotExist(statErr))
+}
+
+func (suite *IDFOracleSuite) TestBM25StatsReadBufferSize() {
+	pt := paramtable.Get()
+	pt.Save(pt.QueryNodeCfg.IDFReadBufferSize.Key, "4194304")
+	suite.T().Cleanup(func() {
+		pt.Reset(pt.QueryNodeCfg.IDFReadBufferSize.Key)
+	})
+
+	suite.Equal(4096, bm25StatsReadBufferSize(1024))
+	suite.Equal(8192, bm25StatsReadBufferSize(8192))
+	suite.Equal(4194304, bm25StatsReadBufferSize(0))
+	suite.Equal(4194304, bm25StatsReadBufferSize(8*1024*1024))
 }
 
 func TestIDFOracle(t *testing.T) {

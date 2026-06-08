@@ -29,27 +29,41 @@ func TestFieldBinlogStatEntry(t *testing.T) {
 		fb := &datapb.FieldBinlog{
 			FieldID: 100,
 			Binlogs: []*datapb.Binlog{
-				{LogPath: "path/a", MemorySize: 1024},
-				{LogPath: "path/b", MemorySize: 2048},
+				{LogPath: "path/a", MemorySize: 1024, LogSize: 10},
+				{LogPath: "path/b", MemorySize: 2048, LogSize: 20},
 			},
 		}
 		entry := FieldBinlogStatEntry("bloom_filter", 100, fb)
 		assert.Equal(t, "bloom_filter.100", entry.Key)
 		assert.Equal(t, []string{"path/a", "path/b"}, entry.Files)
 		assert.Equal(t, "3072", entry.Metadata["memory_size"])
+		assert.Equal(t, "30", entry.Metadata["log_size"])
 	})
 
 	t.Run("bm25 prefix", func(t *testing.T) {
 		fb := &datapb.FieldBinlog{
 			FieldID: 200,
 			Binlogs: []*datapb.Binlog{
-				{LogPath: "path/c", MemorySize: 500},
+				{LogPath: "path/c", MemorySize: 500, LogSize: 64},
 			},
 		}
 		entry := FieldBinlogStatEntry("bm25", 200, fb)
 		assert.Equal(t, "bm25.200", entry.Key)
 		assert.Equal(t, []string{"path/c"}, entry.Files)
 		assert.Equal(t, "500", entry.Metadata["memory_size"])
+		assert.Equal(t, "64", entry.Metadata["log_size"])
+	})
+
+	t.Run("log size without memory size", func(t *testing.T) {
+		fb := &datapb.FieldBinlog{
+			FieldID: 200,
+			Binlogs: []*datapb.Binlog{
+				{LogPath: "path/c", LogSize: 64},
+			},
+		}
+		entry := FieldBinlogStatEntry("bm25", 200, fb)
+		assert.Equal(t, "64", entry.Metadata["log_size"])
+		assert.NotContains(t, entry.Metadata, "memory_size")
 	})
 
 	t.Run("zero memory size omits metadata", func(t *testing.T) {

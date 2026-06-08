@@ -130,14 +130,14 @@ func TestFilterBM25Stats(t *testing.T) {
 			{
 				FieldID: 10,
 				Binlogs: []*datapb.Binlog{
-					{LogPath: "bm25/10/100"},
-					{LogPath: "bm25/10/200"},
+					{LogPath: "bm25/10/100", LogSize: 100},
+					{LogPath: "bm25/10/200", LogSize: 200},
 				},
 			},
 			{
 				FieldID: 20,
 				Binlogs: []*datapb.Binlog{
-					{LogPath: "bm25/20/100"},
+					{LogPath: "bm25/20/100", LogSize: 300},
 				},
 			},
 		}
@@ -145,6 +145,13 @@ func TestFilterBM25Stats(t *testing.T) {
 		assert.Len(t, result, 2)
 		assert.Equal(t, []string{"bm25/10/100", "bm25/10/200"}, result[10])
 		assert.Equal(t, []string{"bm25/20/100"}, result[20])
+
+		files := filterBM25StatsFiles(binlogs)
+		assert.Equal(t, []BM25StatsFile{
+			{Path: "bm25/10/100", LogSize: 100},
+			{Path: "bm25/10/200", LogSize: 200},
+		}, files[10])
+		assert.Equal(t, []BM25StatsFile{{Path: "bm25/20/100", LogSize: 300}}, files[20])
 	})
 
 	t.Run("CompoundStatsType in BM25", func(t *testing.T) {
@@ -152,14 +159,17 @@ func TestFilterBM25Stats(t *testing.T) {
 			{
 				FieldID: 10,
 				Binlogs: []*datapb.Binlog{
-					{LogPath: "bm25/10/100"},
-					{LogPath: "bm25/10/" + compoundStatsLogIdx},
+					{LogPath: "bm25/10/100", LogSize: 100},
+					{LogPath: "bm25/10/" + compoundStatsLogIdx, LogSize: 200},
 				},
 			},
 		}
 		result := filterBM25Stats(binlogs)
 		assert.Len(t, result[10], 1)
 		assert.Contains(t, result[10][0], compoundStatsLogIdx)
+
+		files := filterBM25StatsFiles(binlogs)
+		assert.Equal(t, []BM25StatsFile{{Path: "bm25/10/" + compoundStatsLogIdx, LogSize: 200}}, files[10])
 	})
 
 	t.Run("empty input", func(t *testing.T) {
@@ -182,7 +192,7 @@ func TestStatsResolverLegacy(t *testing.T) {
 		{
 			FieldID: 50,
 			Binlogs: []*datapb.Binlog{
-				{LogPath: "bm25/50/10"},
+				{LogPath: "bm25/50/10", LogSize: 512},
 			},
 		},
 	}
@@ -233,6 +243,12 @@ func TestStatsResolverLegacy(t *testing.T) {
 		assert.Equal(t, []string{"bm25/50/10"}, paths[50])
 	})
 
+	t.Run("BM25StatsFiles", func(t *testing.T) {
+		files, err := resolver.BM25StatsFiles()
+		assert.NoError(t, err)
+		assert.Equal(t, []BM25StatsFile{{Path: "bm25/50/10", LogSize: 512}}, files[50])
+	})
+
 	t.Run("TextAndJSONIndexStats", func(t *testing.T) {
 		text, json, err := resolver.TextAndJSONIndexStats()
 		assert.NoError(t, err)
@@ -274,8 +290,9 @@ func TestStatsResolverManifest(t *testing.T) {
 			Metadata: map[string]string{"memory_size": "8192"},
 		},
 		{
-			Key:   "bm25.200",
-			Files: []string{bm25Path},
+			Key:      "bm25.200",
+			Files:    []string{bm25Path},
+			Metadata: map[string]string{"log_size": "2048"},
 		},
 		{
 			Key:   "json_stats.300",
@@ -319,6 +336,12 @@ func TestStatsResolverManifest(t *testing.T) {
 		require.NoError(t, err)
 		require.Equal(t, 1, len(paths[200]))
 		assert.Equal(t, bm25Path, paths[200][0])
+	})
+
+	t.Run("BM25StatsFiles returns log size", func(t *testing.T) {
+		files, err := resolver.BM25StatsFiles()
+		require.NoError(t, err)
+		require.Equal(t, []BM25StatsFile{{Path: bm25Path, LogSize: 2048}}, files[200])
 	})
 
 	t.Run("TextAndJSONIndexStatsWithBasePaths returns relative json stats", func(t *testing.T) {
