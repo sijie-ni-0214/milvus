@@ -191,6 +191,10 @@ type estimateSegmentResourceTimingStats struct {
 	totalSchema     *atomic.Int64
 	totalIndexLoop  *atomic.Int64
 	totalCLoadInfo  *atomic.Int64
+	totalCNewInfo   *atomic.Int64
+	totalCAppend    *atomic.Int64
+	totalCCallback  *atomic.Int64
+	totalCDelete    *atomic.Int64
 	totalCEstimate  *atomic.Int64
 	totalBinlogLoop *atomic.Int64
 	totalStats      *atomic.Int64
@@ -210,6 +214,10 @@ func newEstimateSegmentResourceTimingStats() *estimateSegmentResourceTimingStats
 		totalSchema:     atomic.NewInt64(0),
 		totalIndexLoop:  atomic.NewInt64(0),
 		totalCLoadInfo:  atomic.NewInt64(0),
+		totalCNewInfo:   atomic.NewInt64(0),
+		totalCAppend:    atomic.NewInt64(0),
+		totalCCallback:  atomic.NewInt64(0),
+		totalCDelete:    atomic.NewInt64(0),
 		totalCEstimate:  atomic.NewInt64(0),
 		totalBinlogLoop: atomic.NewInt64(0),
 		totalStats:      atomic.NewInt64(0),
@@ -519,13 +527,17 @@ func (s *requestResourceTimingStats) record(estimateDur, lockWaitDur, lockHoldDu
 	)
 }
 
-func (s *estimateSegmentResourceTimingStats) record(indexCount, binlogCount int, schemaDur, indexLoopDur, cLoadInfoDur, cEstimateDur, binlogLoopDur, statsDur, deleteDur, jsonStatsDur, textStatsDur, totalDur time.Duration) {
+func (s *estimateSegmentResourceTimingStats) record(indexCount, binlogCount int, schemaDur, indexLoopDur, cLoadInfoDur, cNewInfoDur, cAppendDur, cCallbackDur, cDeleteInfoDur, cEstimateDur, binlogLoopDur, statsDur, deleteDur, jsonStatsDur, textStatsDur, totalDur time.Duration) {
 	s.count.Inc()
 	s.totalIndex.Add(int64(indexCount))
 	s.totalBinlog.Add(int64(binlogCount))
 	s.totalSchema.Add(int64(schemaDur))
 	s.totalIndexLoop.Add(int64(indexLoopDur))
 	s.totalCLoadInfo.Add(int64(cLoadInfoDur))
+	s.totalCNewInfo.Add(int64(cNewInfoDur))
+	s.totalCAppend.Add(int64(cAppendDur))
+	s.totalCCallback.Add(int64(cCallbackDur))
+	s.totalCDelete.Add(int64(cDeleteInfoDur))
 	s.totalCEstimate.Add(int64(cEstimateDur))
 	s.totalBinlogLoop.Add(int64(binlogLoopDur))
 	s.totalStats.Add(int64(statsDur))
@@ -550,6 +562,10 @@ func (s *estimateSegmentResourceTimingStats) record(indexCount, binlogCount int,
 	totalSchema := s.totalSchema.Swap(0)
 	totalIndexLoop := s.totalIndexLoop.Swap(0)
 	totalCLoadInfo := s.totalCLoadInfo.Swap(0)
+	totalCNewInfo := s.totalCNewInfo.Swap(0)
+	totalCAppend := s.totalCAppend.Swap(0)
+	totalCCallback := s.totalCCallback.Swap(0)
+	totalCDelete := s.totalCDelete.Swap(0)
 	totalCEstimate := s.totalCEstimate.Swap(0)
 	totalBinlogLoop := s.totalBinlogLoop.Swap(0)
 	totalStats := s.totalStats.Swap(0)
@@ -569,6 +585,10 @@ func (s *estimateSegmentResourceTimingStats) record(indexCount, binlogCount int,
 		zap.Duration("avgSchemaDur", avgDuration(totalSchema, count)),
 		zap.Duration("avgIndexLoopDur", avgDuration(totalIndexLoop, count)),
 		zap.Duration("avgCLoadInfoDur", avgDuration(totalCLoadInfo, count)),
+		zap.Duration("avgCNewInfoDur", avgDuration(totalCNewInfo, count)),
+		zap.Duration("avgCAppendDur", avgDuration(totalCAppend, count)),
+		zap.Duration("avgCCallbackDur", avgDuration(totalCCallback, count)),
+		zap.Duration("avgCDeleteDur", avgDuration(totalCDelete, count)),
 		zap.Duration("avgCEstimateDur", avgDuration(totalCEstimate, count)),
 		zap.Duration("avgBinlogLoopDur", avgDuration(totalBinlogLoop, count)),
 		zap.Duration("avgStatsDur", avgDuration(totalStats, count)),
@@ -2619,6 +2639,10 @@ func estimateLoadingResourceUsageOfSegment(schema *schemapb.CollectionSchema, lo
 	var schemaDur time.Duration
 	var indexLoopDur time.Duration
 	var cLoadInfoDur time.Duration
+	var cNewInfoDur time.Duration
+	var cAppendDur time.Duration
+	var cCallbackDur time.Duration
+	var cDeleteInfoDur time.Duration
 	var cEstimateDur time.Duration
 	var binlogLoopDur time.Duration
 	var statsDur time.Duration
@@ -2627,7 +2651,7 @@ func estimateLoadingResourceUsageOfSegment(schema *schemapb.CollectionSchema, lo
 	var textStatsDur time.Duration
 	var estimatedIndexCount int
 	defer func() {
-		estimateSegmentResourceTiming.record(estimatedIndexCount, len(loadInfo.GetBinlogPaths()), schemaDur, indexLoopDur, cLoadInfoDur, cEstimateDur, binlogLoopDur, statsDur, deleteDur, jsonStatsDur, textStatsDur, time.Since(segmentEstimateStart))
+		estimateSegmentResourceTiming.record(estimatedIndexCount, len(loadInfo.GetBinlogPaths()), schemaDur, indexLoopDur, cLoadInfoDur, cNewInfoDur, cAppendDur, cCallbackDur, cDeleteInfoDur, cEstimateDur, binlogLoopDur, statsDur, deleteDur, jsonStatsDur, textStatsDur, time.Since(segmentEstimateStart))
 	}()
 
 	schemaStart := time.Now()
@@ -2661,7 +2685,8 @@ func estimateLoadingResourceUsageOfSegment(schema *schemapb.CollectionSchema, lo
 
 			var estimateResult ResourceEstimate
 			cLoadInfoStart := time.Now()
-			err = GetCLoadInfoWithFunc(ctx, fieldSchema, loadInfo, fieldIndexInfo, func(c *LoadIndexInfo) error {
+			var timing cLoadInfoTiming
+			err = getCLoadInfoWithFunc(ctx, fieldSchema, loadInfo, fieldIndexInfo, func(c *LoadIndexInfo) error {
 				var estimateDur time.Duration
 				GetDynamicPool().Submit(func() (any, error) {
 					estimateStart := time.Now()
@@ -2672,8 +2697,12 @@ func estimateLoadingResourceUsageOfSegment(schema *schemapb.CollectionSchema, lo
 				}).Await()
 				cEstimateDur += estimateDur
 				return nil
-			})
+			}, &timing)
 			cLoadInfoDur += time.Since(cLoadInfoStart)
+			cNewInfoDur += timing.newInfoDur
+			cAppendDur += timing.appendInfoDur
+			cCallbackDur += timing.callbackDur
+			cDeleteInfoDur += timing.deleteInfoDur
 			if err != nil {
 				return nil, errors.Wrapf(err, "failed to estimate loading resource usage of index, collection %d, segment %d, indexBuildID %d",
 					loadInfo.GetCollectionID(),

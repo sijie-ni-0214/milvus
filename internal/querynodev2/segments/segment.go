@@ -1025,18 +1025,45 @@ func (s *LocalSegment) LoadDeltaData(ctx context.Context, deltaData *storage.Del
 	return nil
 }
 
+type cLoadInfoTiming struct {
+	newInfoDur    time.Duration
+	appendInfoDur time.Duration
+	callbackDur   time.Duration
+	deleteInfoDur time.Duration
+}
+
 func GetCLoadInfoWithFunc(ctx context.Context,
 	fieldSchema *schemapb.FieldSchema,
 	loadInfo *querypb.SegmentLoadInfo,
 	indexInfo *querypb.FieldIndexInfo,
 	f func(c *LoadIndexInfo) error,
 ) error {
+	return getCLoadInfoWithFunc(ctx, fieldSchema, loadInfo, indexInfo, f, nil)
+}
+
+func getCLoadInfoWithFunc(ctx context.Context,
+	fieldSchema *schemapb.FieldSchema,
+	loadInfo *querypb.SegmentLoadInfo,
+	indexInfo *querypb.FieldIndexInfo,
+	f func(c *LoadIndexInfo) error,
+	timing *cLoadInfoTiming,
+) error {
 	// 1.
+	newInfoStart := time.Now()
 	loadIndexInfo, err := newLoadIndexInfo(ctx)
+	if timing != nil {
+		timing.newInfoDur += time.Since(newInfoStart)
+	}
 	if err != nil {
 		return err
 	}
-	defer deleteLoadIndexInfo(loadIndexInfo)
+	defer func() {
+		deleteInfoStart := time.Now()
+		deleteLoadIndexInfo(loadIndexInfo)
+		if timing != nil {
+			timing.deleteInfoDur += time.Since(deleteInfoStart)
+		}
+	}()
 
 	indexParams := funcutil.KeyValuePair2Map(indexInfo.IndexParams)
 	// as Knowhere reports error if encounter an unknown param, we need to delete it
@@ -1096,11 +1123,21 @@ func GetCLoadInfoWithFunc(ctx context.Context,
 	}
 
 	// 2.
-	if err := loadIndexInfo.appendLoadIndexInfo(ctx, indexInfoProto); err != nil {
+	appendInfoStart := time.Now()
+	err = loadIndexInfo.appendLoadIndexInfo(ctx, indexInfoProto)
+	if timing != nil {
+		timing.appendInfoDur += time.Since(appendInfoStart)
+	}
+	if err != nil {
 		log.Warn("fail to append load index info", zap.Error(err))
 		return err
 	}
-	return f(loadIndexInfo)
+	callbackStart := time.Now()
+	err = f(loadIndexInfo)
+	if timing != nil {
+		timing.callbackDur += time.Since(callbackStart)
+	}
+	return err
 }
 
 func (s *LocalSegment) LoadIndex(ctx context.Context, indexInfo *querypb.FieldIndexInfo, fieldType schemapb.DataType) error {
