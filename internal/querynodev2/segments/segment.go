@@ -1125,7 +1125,7 @@ func estimateLoadIndexResourceWithTiming(ctx context.Context,
 	var request C.LoadResourceRequest
 	var estimateDur time.Duration
 	statusStage := ""
-	_, _ = GetEstimatePool().Submit(func() (any, error) {
+	_, _ = GetDynamicPool().Submit(func() (any, error) {
 		statusStage = "NewLoadIndexInfo failed"
 		newInfoStart := time.Now()
 		status = C.NewLoadIndexInfo(&cLoadIndexInfo)
