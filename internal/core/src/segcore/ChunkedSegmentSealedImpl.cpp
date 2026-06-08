@@ -18,6 +18,7 @@
 #include <folly/Try.h>
 #include <simdjson.h>
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <ctime>
@@ -148,6 +149,195 @@
 
 namespace milvus::segcore {
 using namespace milvus::cachinglayer;
+
+namespace {
+
+constexpr int64_t kApplyLoadDiffTimingLogIntervalNs = 5LL * 1000 * 1000 * 1000;
+
+struct ApplyLoadDiffTimingStats {
+    std::atomic<int64_t> count{0};
+    std::atomic<int64_t> total_ns{0};
+    std::atomic<int64_t> index_load_ns{0};
+    std::atomic<int64_t> index_replace_ns{0};
+    std::atomic<int64_t> reload_field_ns{0};
+    std::atomic<int64_t> column_group_ns{0};
+    std::atomic<int64_t> init_text_lob_ns{0};
+    std::atomic<int64_t> binlog_load_ns{0};
+    std::atomic<int64_t> binlog_replace_ns{0};
+    std::atomic<int64_t> drop_index_ns{0};
+    std::atomic<int64_t> text_index_ns{0};
+    std::atomic<int64_t> json_stats_ns{0};
+    std::atomic<int64_t> default_fill_ns{0};
+    std::atomic<int64_t> create_text_index_ns{0};
+    std::atomic<int64_t> drop_field_data_ns{0};
+    std::atomic<int64_t> index_count{0};
+    std::atomic<int64_t> column_group_count{0};
+    std::atomic<int64_t> binlog_count{0};
+    std::atomic<int64_t> text_index_count{0};
+    std::atomic<int64_t> json_stats_count{0};
+    std::atomic<int64_t> max_total_ns{0};
+    std::atomic<int64_t> last_log_ns{0};
+};
+
+ApplyLoadDiffTimingStats g_apply_load_diff_timing;
+
+int64_t
+SteadyNowNs() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
+int64_t
+DurationSinceNs(std::chrono::steady_clock::time_point start) {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::steady_clock::now() - start)
+        .count();
+}
+
+void
+UpdateMax(std::atomic<int64_t>& target, int64_t value) {
+    auto old = target.load(std::memory_order_relaxed);
+    while (value > old &&
+           !target.compare_exchange_weak(old, value, std::memory_order_relaxed)) {
+    }
+}
+
+double
+AvgMs(int64_t total_ns, int64_t count) {
+    if (count == 0) {
+        return 0.0;
+    }
+    return static_cast<double>(total_ns) / static_cast<double>(count) / 1e6;
+}
+
+void
+RecordApplyLoadDiffTiming(int64_t total_ns,
+                          int64_t index_load_ns,
+                          int64_t index_replace_ns,
+                          int64_t reload_field_ns,
+                          int64_t column_group_ns,
+                          int64_t init_text_lob_ns,
+                          int64_t binlog_load_ns,
+                          int64_t binlog_replace_ns,
+                          int64_t drop_index_ns,
+                          int64_t text_index_ns,
+                          int64_t json_stats_ns,
+                          int64_t default_fill_ns,
+                          int64_t create_text_index_ns,
+                          int64_t drop_field_data_ns,
+                          int64_t index_count,
+                          int64_t column_group_count,
+                          int64_t binlog_count,
+                          int64_t text_index_count,
+                          int64_t json_stats_count) {
+    auto& stats = g_apply_load_diff_timing;
+    stats.count.fetch_add(1, std::memory_order_relaxed);
+    stats.total_ns.fetch_add(total_ns, std::memory_order_relaxed);
+    stats.index_load_ns.fetch_add(index_load_ns, std::memory_order_relaxed);
+    stats.index_replace_ns.fetch_add(index_replace_ns, std::memory_order_relaxed);
+    stats.reload_field_ns.fetch_add(reload_field_ns, std::memory_order_relaxed);
+    stats.column_group_ns.fetch_add(column_group_ns, std::memory_order_relaxed);
+    stats.init_text_lob_ns.fetch_add(init_text_lob_ns, std::memory_order_relaxed);
+    stats.binlog_load_ns.fetch_add(binlog_load_ns, std::memory_order_relaxed);
+    stats.binlog_replace_ns.fetch_add(binlog_replace_ns, std::memory_order_relaxed);
+    stats.drop_index_ns.fetch_add(drop_index_ns, std::memory_order_relaxed);
+    stats.text_index_ns.fetch_add(text_index_ns, std::memory_order_relaxed);
+    stats.json_stats_ns.fetch_add(json_stats_ns, std::memory_order_relaxed);
+    stats.default_fill_ns.fetch_add(default_fill_ns, std::memory_order_relaxed);
+    stats.create_text_index_ns.fetch_add(create_text_index_ns,
+                                         std::memory_order_relaxed);
+    stats.drop_field_data_ns.fetch_add(drop_field_data_ns,
+                                       std::memory_order_relaxed);
+    stats.index_count.fetch_add(index_count, std::memory_order_relaxed);
+    stats.column_group_count.fetch_add(column_group_count,
+                                       std::memory_order_relaxed);
+    stats.binlog_count.fetch_add(binlog_count, std::memory_order_relaxed);
+    stats.text_index_count.fetch_add(text_index_count, std::memory_order_relaxed);
+    stats.json_stats_count.fetch_add(json_stats_count, std::memory_order_relaxed);
+    UpdateMax(stats.max_total_ns, total_ns);
+
+    auto now_ns = SteadyNowNs();
+    auto last_ns = stats.last_log_ns.load(std::memory_order_relaxed);
+    if (now_ns - last_ns < kApplyLoadDiffTimingLogIntervalNs) {
+        return;
+    }
+    if (!stats.last_log_ns.compare_exchange_strong(
+            last_ns, now_ns, std::memory_order_relaxed)) {
+        return;
+    }
+
+    auto count = stats.count.exchange(0, std::memory_order_relaxed);
+    if (count == 0) {
+        return;
+    }
+    auto total = stats.total_ns.exchange(0, std::memory_order_relaxed);
+    auto index_load = stats.index_load_ns.exchange(0, std::memory_order_relaxed);
+    auto index_replace =
+        stats.index_replace_ns.exchange(0, std::memory_order_relaxed);
+    auto reload_field =
+        stats.reload_field_ns.exchange(0, std::memory_order_relaxed);
+    auto column_group =
+        stats.column_group_ns.exchange(0, std::memory_order_relaxed);
+    auto init_text_lob =
+        stats.init_text_lob_ns.exchange(0, std::memory_order_relaxed);
+    auto binlog_load = stats.binlog_load_ns.exchange(0, std::memory_order_relaxed);
+    auto binlog_replace =
+        stats.binlog_replace_ns.exchange(0, std::memory_order_relaxed);
+    auto drop_index = stats.drop_index_ns.exchange(0, std::memory_order_relaxed);
+    auto text_index = stats.text_index_ns.exchange(0, std::memory_order_relaxed);
+    auto json_stats = stats.json_stats_ns.exchange(0, std::memory_order_relaxed);
+    auto default_fill =
+        stats.default_fill_ns.exchange(0, std::memory_order_relaxed);
+    auto create_text_index =
+        stats.create_text_index_ns.exchange(0, std::memory_order_relaxed);
+    auto drop_field_data =
+        stats.drop_field_data_ns.exchange(0, std::memory_order_relaxed);
+    auto indexes = stats.index_count.exchange(0, std::memory_order_relaxed);
+    auto column_groups =
+        stats.column_group_count.exchange(0, std::memory_order_relaxed);
+    auto binlogs = stats.binlog_count.exchange(0, std::memory_order_relaxed);
+    auto text_indexes =
+        stats.text_index_count.exchange(0, std::memory_order_relaxed);
+    auto json_stats_entries =
+        stats.json_stats_count.exchange(0, std::memory_order_relaxed);
+    auto max_total = stats.max_total_ns.exchange(0, std::memory_order_relaxed);
+
+    LOG_WARN(
+        "[SN recovery] apply load diff timing stats count={} avgTotalMs={:.3f} "
+        "avgIndexLoadMs={:.3f} avgIndexReplaceMs={:.3f} "
+        "avgReloadFieldMs={:.3f} avgColumnGroupMs={:.3f} "
+        "avgInitTextLobMs={:.3f} avgBinlogLoadMs={:.3f} "
+        "avgBinlogReplaceMs={:.3f} avgDropIndexMs={:.3f} "
+        "avgTextIndexMs={:.3f} avgJsonStatsMs={:.3f} "
+        "avgDefaultFillMs={:.3f} avgCreateTextIndexMs={:.3f} "
+        "avgDropFieldDataMs={:.3f} avgIndexCount={:.3f} "
+        "avgColumnGroupCount={:.3f} avgBinlogCount={:.3f} "
+        "avgTextIndexCount={:.3f} avgJsonStatsCount={:.3f} maxTotalMs={:.3f}",
+        count,
+        AvgMs(total, count),
+        AvgMs(index_load, count),
+        AvgMs(index_replace, count),
+        AvgMs(reload_field, count),
+        AvgMs(column_group, count),
+        AvgMs(init_text_lob, count),
+        AvgMs(binlog_load, count),
+        AvgMs(binlog_replace, count),
+        AvgMs(drop_index, count),
+        AvgMs(text_index, count),
+        AvgMs(json_stats, count),
+        AvgMs(default_fill, count),
+        AvgMs(create_text_index, count),
+        AvgMs(drop_field_data, count),
+        static_cast<double>(indexes) / static_cast<double>(count),
+        static_cast<double>(column_groups) / static_cast<double>(count),
+        static_cast<double>(binlogs) / static_cast<double>(count),
+        static_cast<double>(text_indexes) / static_cast<double>(count),
+        static_cast<double>(json_stats_entries) / static_cast<double>(count),
+        static_cast<double>(max_total) / 1e6);
+}
+
+}  // namespace
 
 static inline void
 set_bit(BitsetType& bitset, FieldId field_id, bool flag = true) {
@@ -4489,26 +4679,84 @@ ChunkedSegmentSealedImpl::ApplyLoadDiff(milvus::OpContext* op_ctx,
                                         LoadDiff& diff) {
     // TODO: pass trace_ctx separately when needed
     milvus::tracer::TraceContext trace_ctx;
+    auto total_start = std::chrono::steady_clock::now();
+    int64_t index_load_ns = 0;
+    int64_t index_replace_ns = 0;
+    int64_t reload_field_ns = 0;
+    int64_t column_group_ns = 0;
+    int64_t init_text_lob_ns = 0;
+    int64_t binlog_load_ns = 0;
+    int64_t binlog_replace_ns = 0;
+    int64_t drop_index_ns = 0;
+    int64_t text_index_ns = 0;
+    int64_t json_stats_ns = 0;
+    int64_t default_fill_ns = 0;
+    int64_t create_text_index_ns = 0;
+    int64_t drop_field_data_ns = 0;
+    auto count_index_infos =
+        [](const std::unordered_map<FieldId, std::vector<LoadIndexInfo>>&
+               field_indexes) -> int64_t {
+        int64_t total = 0;
+        for (const auto& [_, indexes] : field_indexes) {
+            total += static_cast<int64_t>(indexes.size());
+        }
+        return total;
+    };
+    auto timing_guard = folly::makeGuard([&]() {
+        RecordApplyLoadDiffTiming(
+            DurationSinceNs(total_start),
+            index_load_ns,
+            index_replace_ns,
+            reload_field_ns,
+            column_group_ns,
+            init_text_lob_ns,
+            binlog_load_ns,
+            binlog_replace_ns,
+            drop_index_ns,
+            text_index_ns,
+            json_stats_ns,
+            default_fill_ns,
+            create_text_index_ns,
+            drop_field_data_ns,
+            count_index_infos(diff.indexes_to_load) +
+                count_index_infos(diff.indexes_to_replace),
+            static_cast<int64_t>(diff.column_groups_to_load.size() +
+                                 diff.column_groups_to_replace.size() +
+                                 diff.column_groups_to_lazyload.size() +
+                                 diff.column_groups_to_lazyreplace.size()),
+            static_cast<int64_t>(diff.binlogs_to_load.size() +
+                                 diff.binlogs_to_replace.size()),
+            static_cast<int64_t>(diff.text_indexes_to_load.size() +
+                                 diff.text_indexes_to_create.size()),
+            static_cast<int64_t>(diff.json_stats_to_load.size() +
+                                 diff.json_stats_to_replace.size()));
+    });
 
     CheckCancellation(op_ctx, id_, "ChunkedSegmentSealedImpl::ApplyLoadDiff()");
 
     // Load new indexes (fields without existing index)
+    auto stage_start = std::chrono::steady_clock::now();
     if (!diff.indexes_to_load.empty()) {
         LoadBatchIndexes(trace_ctx, diff.indexes_to_load, op_ctx);
     }
+    index_load_ns = DurationSinceNs(stage_start);
     CheckCancellation(op_ctx, id_, "ChunkedSegmentSealedImpl::ApplyLoadDiff()");
 
     // Replace indexes (fields that already have an index loaded)
+    stage_start = std::chrono::steady_clock::now();
     if (!diff.indexes_to_replace.empty()) {
         LoadBatchIndexes(trace_ctx, diff.indexes_to_replace, op_ctx, true);
     }
+    index_replace_ns = DurationSinceNs(stage_start);
 
     CheckCancellation(op_ctx, id_, "ChunkedSegmentSealedImpl::ApplyLoadDiff()");
 
     // reload fields (warmup for fields already in memory)
+    stage_start = std::chrono::steady_clock::now();
     if (!diff.fields_to_reload.empty()) {
         ReloadColumns(diff.fields_to_reload, op_ctx);
     }
+    reload_field_ns = DurationSinceNs(stage_start);
 
     // Load field data from storage BEFORE dropping indexes, so that queries
     // always have a data source available during the transition.
@@ -4516,6 +4764,7 @@ ChunkedSegmentSealedImpl::ApplyLoadDiff(milvus::OpContext* op_ctx,
     CheckCancellation(op_ctx, id_, "ChunkedSegmentSealedImpl::ApplyLoadDiff()");
 
     // load column groups
+    stage_start = std::chrono::steady_clock::now();
     if (diff.load_external_manifest) {
         // External collections: load via manifest path
         LoadColumnGroups(segment_load_info.GetManifestPath(), op_ctx);
@@ -4578,31 +4827,39 @@ ChunkedSegmentSealedImpl::ApplyLoadDiff(milvus::OpContext* op_ctx,
             }
         }
     }
+    column_group_ns = DurationSinceNs(stage_start);
 
     CheckCancellation(op_ctx, id_, "ChunkedSegmentSealedImpl::ApplyLoadDiff()");
 
     // Initialize LOB paths for TEXT fields after any column group loading
+    stage_start = std::chrono::steady_clock::now();
     if (segment_load_info.HasManifestPath()) {
         InitTextLobPaths(segment_load_info.GetManifestPath());
     }
+    init_text_lob_ns = DurationSinceNs(stage_start);
 
     CheckCancellation(op_ctx, id_, "ChunkedSegmentSealedImpl::ApplyLoadDiff()");
 
     // Load new field binlogs
+    stage_start = std::chrono::steady_clock::now();
     if (!diff.binlogs_to_load.empty()) {
         LoadBatchFieldData(trace_ctx, diff.binlogs_to_load, op_ctx);
     }
+    binlog_load_ns = DurationSinceNs(stage_start);
     CheckCancellation(op_ctx, id_, "ChunkedSegmentSealedImpl::ApplyLoadDiff()");
 
     // Replace field binlogs
+    stage_start = std::chrono::steady_clock::now();
     if (!diff.binlogs_to_replace.empty()) {
         LoadBatchFieldData(trace_ctx, diff.binlogs_to_replace, op_ctx, true);
     }
+    binlog_replace_ns = DurationSinceNs(stage_start);
 
     CheckCancellation(op_ctx, id_, "ChunkedSegmentSealedImpl::ApplyLoadDiff()");
 
     // drop index — field data is already loaded/restored above, so queries
     // can fall back to raw data after the index is dropped.
+    stage_start = std::chrono::steady_clock::now();
     if (!diff.indexes_to_drop.empty()) {
         for (auto field_id : diff.indexes_to_drop) {
             // Skip drop if this field already has a replacement or new index loaded
@@ -4613,16 +4870,20 @@ ChunkedSegmentSealedImpl::ApplyLoadDiff(milvus::OpContext* op_ctx,
             DropIndex(field_id);
         }
     }
+    drop_index_ns = DurationSinceNs(stage_start);
 
     CheckCancellation(op_ctx, id_, "ChunkedSegmentSealedImpl::ApplyLoadDiff()");
 
     // load pre-built text indexes
+    stage_start = std::chrono::steady_clock::now();
     if (!diff.text_indexes_to_load.empty()) {
         LoadBatchTextIndexes(op_ctx, diff.text_indexes_to_load);
     }
+    text_index_ns = DurationSinceNs(stage_start);
 
     CheckCancellation(op_ctx, id_, "ChunkedSegmentSealedImpl::ApplyLoadDiff()");
 
+    stage_start = std::chrono::steady_clock::now();
     if (!diff.json_stats_to_load.empty()) {
         LoadBatchJsonKeyIndexes(op_ctx, diff.json_stats_to_load);
     }
@@ -4646,33 +4907,40 @@ ChunkedSegmentSealedImpl::ApplyLoadDiff(milvus::OpContext* op_ctx,
             RemoveJsonStats(field_id);
         }
     }
+    json_stats_ns = DurationSinceNs(stage_start);
 
     CheckCancellation(op_ctx, id_, "ChunkedSegmentSealedImpl::ApplyLoadDiff()");
 
     // fill default values for fields without data sources (schema evolution)
+    stage_start = std::chrono::steady_clock::now();
     if (!diff.fields_to_fill_default.empty()) {
         FillDefaultValueFields(diff.fields_to_fill_default);
         RecordDefaultFieldsFilled(diff.fields_to_fill_default);
     }
+    default_fill_ns = DurationSinceNs(stage_start);
 
     CheckCancellation(op_ctx, id_, "ChunkedSegmentSealedImpl::ApplyLoadDiff()");
 
     // create text indexes from raw data
+    stage_start = std::chrono::steady_clock::now();
     if (!diff.text_indexes_to_create.empty()) {
         for (const auto& field_id : diff.text_indexes_to_create) {
             CreateTextIndex(field_id, op_ctx);
         }
     }
+    create_text_index_ns = DurationSinceNs(stage_start);
 
     CheckCancellation(op_ctx, id_, "ChunkedSegmentSealedImpl::ApplyLoadDiff()");
 
     // Drop field data — only for schema evolution scenarios where
     // the field has been removed from the data source (binlogs/column_groups).
+    stage_start = std::chrono::steady_clock::now();
     if (!diff.field_data_to_drop.empty()) {
         for (auto field_id : diff.field_data_to_drop) {
             DropFieldData(field_id);
         }
     }
+    drop_field_data_ns = DurationSinceNs(stage_start);
 }
 
 void
