@@ -69,8 +69,9 @@ import (
 )
 
 const (
-	UsedDiskMemoryRatio      = 4
-	UsedDiskMemoryRatioAisaq = 64
+	UsedDiskMemoryRatio       = 4
+	UsedDiskMemoryRatioAisaq  = 64
+	defaultFieldMaxMemorySize = 128 << 20
 )
 
 var errRetryTimerNotified = errors.New("retry timer notified")
@@ -2168,6 +2169,114 @@ func estimateLogicalResourceUsageOfSegment(schema *schemapb.CollectionSchema, lo
 	}, nil
 }
 
+func estimateIndexResourceFast(fieldSchema *schemapb.FieldSchema, indexInfo *querypb.FieldIndexInfo) (ResourceEstimate, bool) {
+	if typeutil.IsVectorType(fieldSchema.GetDataType()) {
+		return estimateKnowhereVectorIndexResourceFast(fieldSchema, indexInfo)
+	}
+	return estimateScalarIndexResourceFast(fieldSchema, indexInfo)
+}
+
+func estimateKnowhereVectorIndexResourceFast(fieldSchema *schemapb.FieldSchema, indexInfo *querypb.FieldIndexInfo) (ResourceEstimate, bool) {
+	indexSize := uint64(0)
+	if indexInfo.GetIndexSize() > 0 {
+		indexSize = uint64(indexInfo.GetIndexSize())
+	}
+
+	indexType := common.GetIndexType(indexInfo.GetIndexParams())
+	var hasRawData bool
+	switch indexType {
+	case "HNSW":
+		hasRawData = true
+	case "SPARSE_INVERTED_INDEX", "SPARSE_WAND":
+	default:
+		return ResourceEstimate{}, false
+	}
+
+	mmapEnable := isIndexMmapEnable(fieldSchema, indexInfo)
+	if mmapEnable {
+		downloadBufferSize := indexSize
+		if downloadBufferSize > defaultFieldMaxMemorySize {
+			downloadBufferSize = defaultFieldMaxMemorySize
+		}
+		return ResourceEstimate{
+			MaxMemoryCost: downloadBufferSize,
+			MaxDiskCost:   indexSize,
+			FinalDiskCost: indexSize,
+			HasRawData:    hasRawData,
+		}, true
+	}
+
+	return ResourceEstimate{
+		MaxMemoryCost:   2 * indexSize,
+		FinalMemoryCost: indexSize,
+		HasRawData:      hasRawData,
+	}, true
+}
+
+func estimateScalarIndexResourceFast(fieldSchema *schemapb.FieldSchema, indexInfo *querypb.FieldIndexInfo) (ResourceEstimate, bool) {
+	if typeutil.IsVectorType(fieldSchema.GetDataType()) {
+		return ResourceEstimate{}, false
+	}
+
+	indexSize := uint64(0)
+	if indexInfo.GetIndexSize() > 0 {
+		indexSize = uint64(indexInfo.GetIndexSize())
+	}
+	indexType := common.GetIndexType(indexInfo.GetIndexParams())
+	mmapEnable := isIndexMmapEnable(fieldSchema, indexInfo)
+
+	switch indexType {
+	case indexparamcheck.IndexSTLSORT:
+		return ResourceEstimate{
+			MaxMemoryCost:   2 * indexSize,
+			FinalMemoryCost: indexSize,
+			HasRawData:      true,
+		}, true
+	case indexparamcheck.IndexTRIE, indexparamcheck.IndexTrie:
+		if mmapEnable {
+			return ResourceEstimate{
+				MaxMemoryCost: indexSize,
+				MaxDiskCost:   indexSize,
+				FinalDiskCost: indexSize,
+				HasRawData:    true,
+			}, true
+		}
+		return ResourceEstimate{
+			MaxMemoryCost:   2 * indexSize,
+			MaxDiskCost:     indexSize,
+			FinalMemoryCost: indexSize,
+			HasRawData:      true,
+		}, true
+	case indexparamcheck.IndexINVERTED, indexparamcheck.IndexNGRAM, indexparamcheck.IndexRTREE:
+		return ResourceEstimate{
+			MaxMemoryCost: indexSize,
+			MaxDiskCost:   indexSize,
+			FinalDiskCost: indexSize,
+		}, true
+	case indexparamcheck.IndexBitmap:
+		if mmapEnable {
+			return ResourceEstimate{
+				MaxMemoryCost: indexSize,
+				MaxDiskCost:   indexSize,
+				FinalDiskCost: indexSize,
+			}, true
+		}
+		return ResourceEstimate{
+			MaxMemoryCost:   2 * indexSize,
+			FinalMemoryCost: indexSize,
+		}, true
+	case indexparamcheck.IndexHybrid:
+		return ResourceEstimate{
+			MaxMemoryCost:   2 * indexSize,
+			MaxDiskCost:     indexSize,
+			FinalMemoryCost: indexSize,
+			FinalDiskCost:   indexSize,
+		}, true
+	default:
+		return ResourceEstimate{}, false
+	}
+}
+
 // estimateLoadingResourceUsageOfSegment estimates the resource usage of the segment when loading,
 // it will return two different results, depending on the value of tiered eviction parameter:
 //   - when tiered eviction is enabled, the result is the max resource usage of the segment that cannot be managed by caching layer,
@@ -2206,12 +2315,16 @@ func estimateLoadingResourceUsageOfSegment(schema *schemapb.CollectionSchema, lo
 			isVectorType := typeutil.IsVectorType(fieldSchema.GetDataType())
 
 			var estimateResult ResourceEstimate
-			estimateResult, err = estimateLoadIndexResource(ctx, fieldSchema, loadInfo, fieldIndexInfo)
-			if err != nil {
-				return nil, merr.Wrapf(err, "failed to estimate loading resource usage of index, collection %d, segment %d, indexBuildID %d",
-					loadInfo.GetCollectionID(),
-					loadInfo.GetSegmentID(),
-					fieldIndexInfo.GetBuildID())
+			if fastEstimate, ok := estimateIndexResourceFast(fieldSchema, fieldIndexInfo); ok {
+				estimateResult = fastEstimate
+			} else {
+				estimateResult, err = estimateLoadIndexResource(ctx, fieldSchema, loadInfo, fieldIndexInfo)
+				if err != nil {
+					return nil, merr.Wrapf(err, "failed to estimate loading resource usage of index, collection %d, segment %d, indexBuildID %d",
+						loadInfo.GetCollectionID(),
+						loadInfo.GetSegmentID(),
+						fieldIndexInfo.GetBuildID())
+				}
 			}
 
 			if !multiplyFactor.TieredEvictionEnabled {
