@@ -69,8 +69,9 @@ import (
 )
 
 const (
-	UsedDiskMemoryRatio      = 4
-	UsedDiskMemoryRatioAisaq = 64
+	UsedDiskMemoryRatio       = 4
+	UsedDiskMemoryRatioAisaq  = 64
+	defaultFieldMaxMemorySize = 128 << 20
 )
 
 var errRetryTimerNotified = errors.New("retry timer notified")
@@ -187,6 +188,7 @@ type bloomFilterLoadTimingStats struct {
 type estimateSegmentResourceTimingStats struct {
 	count           *atomic.Int64
 	totalIndex      *atomic.Int64
+	totalFastIndex  *atomic.Int64
 	totalBinlog     *atomic.Int64
 	totalSchema     *atomic.Int64
 	totalIndexLoop  *atomic.Int64
@@ -210,6 +212,7 @@ func newEstimateSegmentResourceTimingStats() *estimateSegmentResourceTimingStats
 	return &estimateSegmentResourceTimingStats{
 		count:           atomic.NewInt64(0),
 		totalIndex:      atomic.NewInt64(0),
+		totalFastIndex:  atomic.NewInt64(0),
 		totalBinlog:     atomic.NewInt64(0),
 		totalSchema:     atomic.NewInt64(0),
 		totalIndexLoop:  atomic.NewInt64(0),
@@ -527,9 +530,10 @@ func (s *requestResourceTimingStats) record(estimateDur, lockWaitDur, lockHoldDu
 	)
 }
 
-func (s *estimateSegmentResourceTimingStats) record(indexCount, binlogCount int, schemaDur, indexLoopDur, cLoadInfoDur, cNewInfoDur, cAppendDur, cCallbackDur, cDeleteInfoDur, cEstimateDur, binlogLoopDur, statsDur, deleteDur, jsonStatsDur, textStatsDur, totalDur time.Duration) {
+func (s *estimateSegmentResourceTimingStats) record(indexCount, fastIndexCount, binlogCount int, schemaDur, indexLoopDur, cLoadInfoDur, cNewInfoDur, cAppendDur, cCallbackDur, cDeleteInfoDur, cEstimateDur, binlogLoopDur, statsDur, deleteDur, jsonStatsDur, textStatsDur, totalDur time.Duration) {
 	s.count.Inc()
 	s.totalIndex.Add(int64(indexCount))
+	s.totalFastIndex.Add(int64(fastIndexCount))
 	s.totalBinlog.Add(int64(binlogCount))
 	s.totalSchema.Add(int64(schemaDur))
 	s.totalIndexLoop.Add(int64(indexLoopDur))
@@ -558,6 +562,7 @@ func (s *estimateSegmentResourceTimingStats) record(indexCount, binlogCount int,
 
 	count := s.count.Swap(0)
 	totalIndex := s.totalIndex.Swap(0)
+	totalFastIndex := s.totalFastIndex.Swap(0)
 	totalBinlog := s.totalBinlog.Swap(0)
 	totalSchema := s.totalSchema.Swap(0)
 	totalIndexLoop := s.totalIndexLoop.Swap(0)
@@ -581,6 +586,7 @@ func (s *estimateSegmentResourceTimingStats) record(indexCount, binlogCount int,
 	log.Warn("estimate loading resource usage timing stats",
 		zap.Int64("segmentCount", count),
 		zap.Int64("avgIndexCount", totalIndex/count),
+		zap.Int64("avgFastEstimateCount", totalFastIndex/count),
 		zap.Int64("avgBinlogCount", totalBinlog/count),
 		zap.Duration("avgSchemaDur", avgDuration(totalSchema, count)),
 		zap.Duration("avgIndexLoopDur", avgDuration(totalIndexLoop, count)),
@@ -2625,6 +2631,114 @@ func estimateLogicalResourceUsageOfSegment(schema *schemapb.CollectionSchema, lo
 	}, nil
 }
 
+func estimateIndexResourceFast(fieldSchema *schemapb.FieldSchema, indexInfo *querypb.FieldIndexInfo) (ResourceEstimate, bool) {
+	if typeutil.IsVectorType(fieldSchema.GetDataType()) {
+		return estimateKnowhereVectorIndexResourceFast(fieldSchema, indexInfo)
+	}
+	return estimateScalarIndexResourceFast(fieldSchema, indexInfo)
+}
+
+func estimateKnowhereVectorIndexResourceFast(fieldSchema *schemapb.FieldSchema, indexInfo *querypb.FieldIndexInfo) (ResourceEstimate, bool) {
+	indexSize := uint64(0)
+	if indexInfo.GetIndexSize() > 0 {
+		indexSize = uint64(indexInfo.GetIndexSize())
+	}
+
+	indexType := common.GetIndexType(indexInfo.GetIndexParams())
+	var hasRawData bool
+	switch indexType {
+	case "HNSW":
+		hasRawData = true
+	case "SPARSE_INVERTED_INDEX", "SPARSE_WAND":
+	default:
+		return ResourceEstimate{}, false
+	}
+
+	mmapEnable := isIndexMmapEnable(fieldSchema, indexInfo)
+	if mmapEnable {
+		downloadBufferSize := indexSize
+		if downloadBufferSize > defaultFieldMaxMemorySize {
+			downloadBufferSize = defaultFieldMaxMemorySize
+		}
+		return ResourceEstimate{
+			MaxMemoryCost: downloadBufferSize,
+			MaxDiskCost:   indexSize,
+			FinalDiskCost: indexSize,
+			HasRawData:    hasRawData,
+		}, true
+	}
+
+	return ResourceEstimate{
+		MaxMemoryCost:   2 * indexSize,
+		FinalMemoryCost: indexSize,
+		HasRawData:      hasRawData,
+	}, true
+}
+
+func estimateScalarIndexResourceFast(fieldSchema *schemapb.FieldSchema, indexInfo *querypb.FieldIndexInfo) (ResourceEstimate, bool) {
+	if typeutil.IsVectorType(fieldSchema.GetDataType()) {
+		return ResourceEstimate{}, false
+	}
+
+	indexSize := uint64(0)
+	if indexInfo.GetIndexSize() > 0 {
+		indexSize = uint64(indexInfo.GetIndexSize())
+	}
+	indexType := common.GetIndexType(indexInfo.GetIndexParams())
+	mmapEnable := isIndexMmapEnable(fieldSchema, indexInfo)
+
+	switch indexType {
+	case indexparamcheck.IndexSTLSORT:
+		return ResourceEstimate{
+			MaxMemoryCost:   2 * indexSize,
+			FinalMemoryCost: indexSize,
+			HasRawData:      true,
+		}, true
+	case indexparamcheck.IndexTRIE, indexparamcheck.IndexTrie:
+		if mmapEnable {
+			return ResourceEstimate{
+				MaxMemoryCost: indexSize,
+				MaxDiskCost:   indexSize,
+				FinalDiskCost: indexSize,
+				HasRawData:    true,
+			}, true
+		}
+		return ResourceEstimate{
+			MaxMemoryCost:   2 * indexSize,
+			MaxDiskCost:     indexSize,
+			FinalMemoryCost: indexSize,
+			HasRawData:      true,
+		}, true
+	case indexparamcheck.IndexINVERTED, indexparamcheck.IndexNGRAM, indexparamcheck.IndexRTREE:
+		return ResourceEstimate{
+			MaxMemoryCost: indexSize,
+			MaxDiskCost:   indexSize,
+			FinalDiskCost: indexSize,
+		}, true
+	case indexparamcheck.IndexBitmap:
+		if mmapEnable {
+			return ResourceEstimate{
+				MaxMemoryCost: indexSize,
+				MaxDiskCost:   indexSize,
+				FinalDiskCost: indexSize,
+			}, true
+		}
+		return ResourceEstimate{
+			MaxMemoryCost:   2 * indexSize,
+			FinalMemoryCost: indexSize,
+		}, true
+	case indexparamcheck.IndexHybrid:
+		return ResourceEstimate{
+			MaxMemoryCost:   2 * indexSize,
+			MaxDiskCost:     indexSize,
+			FinalMemoryCost: indexSize,
+			FinalDiskCost:   indexSize,
+		}, true
+	default:
+		return ResourceEstimate{}, false
+	}
+}
+
 // estimateLoadingResourceUsageOfSegment estimates the resource usage of the segment when loading,
 // it will return two different results, depending on the value of tiered eviction parameter:
 //   - when tiered eviction is enabled, the result is the max resource usage of the segment that cannot be managed by caching layer,
@@ -2651,8 +2765,9 @@ func estimateLoadingResourceUsageOfSegment(schema *schemapb.CollectionSchema, lo
 	var jsonStatsDur time.Duration
 	var textStatsDur time.Duration
 	var estimatedIndexCount int
+	var fastEstimateCount int
 	defer func() {
-		estimateSegmentResourceTiming.record(estimatedIndexCount, len(loadInfo.GetBinlogPaths()), schemaDur, indexLoopDur, cLoadInfoDur, cNewInfoDur, cAppendDur, cCallbackDur, cDeleteInfoDur, cEstimateDur, binlogLoopDur, statsDur, deleteDur, jsonStatsDur, textStatsDur, time.Since(segmentEstimateStart))
+		estimateSegmentResourceTiming.record(estimatedIndexCount, fastEstimateCount, len(loadInfo.GetBinlogPaths()), schemaDur, indexLoopDur, cLoadInfoDur, cNewInfoDur, cAppendDur, cCallbackDur, cDeleteInfoDur, cEstimateDur, binlogLoopDur, statsDur, deleteDur, jsonStatsDur, textStatsDur, time.Since(segmentEstimateStart))
 	}()
 
 	schemaStart := time.Now()
@@ -2685,21 +2800,26 @@ func estimateLoadingResourceUsageOfSegment(schema *schemapb.CollectionSchema, lo
 			isVectorType := typeutil.IsVectorType(fieldSchema.GetDataType())
 
 			var estimateResult ResourceEstimate
-			cLoadInfoStart := time.Now()
-			var timing cLoadInfoTiming
-			var estimateDur time.Duration
-			estimateResult, estimateDur, err = estimateLoadIndexResourceWithTiming(ctx, fieldSchema, loadInfo, fieldIndexInfo, &timing)
-			cEstimateDur += estimateDur
-			cLoadInfoDur += time.Since(cLoadInfoStart)
-			cNewInfoDur += timing.newInfoDur
-			cAppendDur += timing.appendInfoDur
-			cCallbackDur += timing.callbackDur
-			cDeleteInfoDur += timing.deleteInfoDur
-			if err != nil {
-				return nil, errors.Wrapf(err, "failed to estimate loading resource usage of index, collection %d, segment %d, indexBuildID %d",
-					loadInfo.GetCollectionID(),
-					loadInfo.GetSegmentID(),
-					fieldIndexInfo.GetBuildID())
+			if fastEstimate, ok := estimateIndexResourceFast(fieldSchema, fieldIndexInfo); ok {
+				estimateResult = fastEstimate
+				fastEstimateCount++
+			} else {
+				cLoadInfoStart := time.Now()
+				var timing cLoadInfoTiming
+				var estimateDur time.Duration
+				estimateResult, estimateDur, err = estimateLoadIndexResourceWithTiming(ctx, fieldSchema, loadInfo, fieldIndexInfo, &timing)
+				cEstimateDur += estimateDur
+				cLoadInfoDur += time.Since(cLoadInfoStart)
+				cNewInfoDur += timing.newInfoDur
+				cAppendDur += timing.appendInfoDur
+				cCallbackDur += timing.callbackDur
+				cDeleteInfoDur += timing.deleteInfoDur
+				if err != nil {
+					return nil, errors.Wrapf(err, "failed to estimate loading resource usage of index, collection %d, segment %d, indexBuildID %d",
+						loadInfo.GetCollectionID(),
+						loadInfo.GetSegmentID(),
+						fieldIndexInfo.GetBuildID())
+				}
 			}
 
 			if !multiplyFactor.TieredEvictionEnabled {
