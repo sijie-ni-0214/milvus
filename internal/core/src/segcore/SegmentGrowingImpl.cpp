@@ -2305,7 +2305,7 @@ SegmentGrowingImpl::LoadColumnGroup(
     AssertInfo(index < column_groups->size(),
                "load column group index out of range");
     auto column_group = column_groups->at(index);
-    LOG_INFO("Loading segment {} column group {}", id_, index);
+    LOG_DEBUG("Loading segment {} column group {}", id_, index);
 
     auto chunk_reader_result = reader_->get_chunk_reader(index);
     AssertInfo(chunk_reader_result.ok(),
@@ -2375,7 +2375,7 @@ SegmentGrowingImpl::LoadColumnGroup(
         }
     }
 
-    LOG_INFO("Finished loading segment {} column group {}", id_, index);
+    LOG_DEBUG("Finished loading segment {} column group {}", id_, index);
     return field_data_map;
 }
 

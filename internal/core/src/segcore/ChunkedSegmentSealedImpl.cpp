@@ -329,6 +329,7 @@ RecordApplyLoadDiffTiming(int64_t total_ns,
             last_ns, now_ns, std::memory_order_relaxed)) {
         return;
     }
+    auto window_ns = last_ns == 0 ? 0 : now_ns - last_ns;
 
     auto count = stats.count.exchange(0, std::memory_order_relaxed);
     if (count == 0) {
@@ -367,7 +368,8 @@ RecordApplyLoadDiffTiming(int64_t total_ns,
     auto max_total = stats.max_total_ns.exchange(0, std::memory_order_relaxed);
 
     LOG_WARN(
-        "[SN recovery] apply load diff timing stats count={} avgTotalMs={:.3f} "
+        "[SN recovery] load timing stats phase=segcore.apply_load_diff "
+        "count={} windowMs={:.3f} avgTotalMs={:.3f} "
         "avgIndexLoadMs={:.3f} avgIndexReplaceMs={:.3f} "
         "avgReloadFieldMs={:.3f} avgColumnGroupMs={:.3f} "
         "avgInitTextLobMs={:.3f} avgBinlogLoadMs={:.3f} "
@@ -378,6 +380,7 @@ RecordApplyLoadDiffTiming(int64_t total_ns,
         "avgColumnGroupCount={:.3f} avgBinlogCount={:.3f} "
         "avgTextIndexCount={:.3f} avgJsonStatsCount={:.3f} maxTotalMs={:.3f}",
         count,
+        static_cast<double>(window_ns) / 1e6,
         AvgMs(total, count),
         AvgMs(index_load, count),
         AvgMs(index_replace, count),
@@ -433,6 +436,7 @@ RecordSegmentLoadTiming(int64_t total_ns,
             last_ns, now_ns, std::memory_order_relaxed)) {
         return;
     }
+    auto window_ns = last_ns == 0 ? 0 : now_ns - last_ns;
 
     auto count = stats.count.exchange(0, std::memory_order_relaxed);
     if (count == 0) {
@@ -452,12 +456,14 @@ RecordSegmentLoadTiming(int64_t total_ns,
     auto max_total = stats.max_total_ns.exchange(0, std::memory_order_relaxed);
 
     LOG_WARN(
-        "[SN recovery] segment load timing stats count={} avgTotalMs={:.3f} "
+        "[SN recovery] load timing stats phase=segcore.segment_load "
+        "count={} windowMs={:.3f} avgTotalMs={:.3f} "
         "avgLockWaitMs={:.3f} avgSnapshotMs={:.3f} avgStartLogMs={:.3f} "
         "avgPrepareInfoMs={:.3f} avgDiffMs={:.3f} avgDiffLogMs={:.3f} "
         "avgApplyLoadDiffMs={:.3f} avgSuccessLogMs={:.3f} "
         "avgOutsideApplyMs={:.3f} maxTotalMs={:.3f}",
         count,
+        static_cast<double>(window_ns) / 1e6,
         AvgMs(total, count),
         AvgMs(lock_wait, count),
         AvgMs(snapshot, count),
@@ -512,6 +518,7 @@ RecordIndexTaskTiming(DataType data_type,
             last_ns, now_ns, std::memory_order_relaxed)) {
         return;
     }
+    auto window_ns = last_ns == 0 ? 0 : now_ns - last_ns;
 
     auto count = stats.count.exchange(0, std::memory_order_relaxed);
     if (count == 0) {
@@ -534,12 +541,14 @@ RecordIndexTaskTiming(DataType data_type,
     auto max_total = stats.max_total_ns.exchange(0, std::memory_order_relaxed);
 
     LOG_WARN(
-        "[SN recovery] index task timing stats count={} avgTotalMs={:.3f} "
+        "[SN recovery] load timing stats phase=segcore.index_task "
+        "count={} windowMs={:.3f} avgTotalMs={:.3f} "
         "avgQueueMs={:.3f} avgLoadDataMs={:.3f} avgLoadIndexMs={:.3f} "
         "vectorCount={} avgVectorMs={:.3f} int64Count={} avgInt64Ms={:.3f} "
         "varcharCount={} avgVarcharMs={:.3f} textCount={} avgTextMs={:.3f} "
         "otherCount={} avgOtherMs={:.3f} maxTotalMs={:.3f}",
         count,
+        static_cast<double>(window_ns) / 1e6,
         AvgMs(total, count),
         AvgMs(queue, count),
         AvgMs(load_data, count),
@@ -611,6 +620,7 @@ RecordColumnGroupTaskTiming(bool has_pk,
             last_ns, now_ns, std::memory_order_relaxed)) {
         return;
     }
+    auto window_ns = last_ns == 0 ? 0 : now_ns - last_ns;
 
     auto count = stats.count.exchange(0, std::memory_order_relaxed);
     if (count == 0) {
@@ -637,8 +647,9 @@ RecordColumnGroupTaskTiming(bool has_pk,
     auto max_total = stats.max_total_ns.exchange(0, std::memory_order_relaxed);
 
     LOG_WARN(
-        "[SN recovery] column group task timing stats count={} "
-        "avgTotalMs={:.3f} avgQueueMs={:.3f} avgPrepareMs={:.3f} "
+        "[SN recovery] load timing stats phase=segcore.column_group_task "
+        "count={} windowMs={:.3f} avgTotalMs={:.3f} "
+        "avgQueueMs={:.3f} avgPrepareMs={:.3f} "
         "avgReaderMs={:.3f} "
         "avgTranslatorMs={:.3f} avgCacheSlotMs={:.3f} avgAttachMs={:.3f} "
         "avgPkAttachMs={:.3f} pkCount={} avgPkGroupMs={:.3f} "
@@ -646,6 +657,7 @@ RecordColumnGroupTaskTiming(bool has_pk,
         "avgScalarGroupMs={:.3f} varcharCount={} avgVarcharGroupMs={:.3f} "
         "textCount={} avgTextGroupMs={:.3f} maxTotalMs={:.3f}",
         count,
+        static_cast<double>(window_ns) / 1e6,
         AvgMs(total, count),
         AvgMs(queue, count),
         AvgMs(prepare, count),
@@ -4910,7 +4922,7 @@ ChunkedSegmentSealedImpl::Reopen(milvus::OpContext* op_ctx, SchemaPtr sch) {
     auto diff = current_mutable.ComputeDiff(new_local);
     new_local.SetFieldsFilledWithDefault(
         current_mutable.GetDefaultFilledFieldsForNewInfo(new_local));
-    LOG_INFO(
+    LOG_DEBUG(
         "Schema-only reopen segment {} with diff {}", id_, diff.ToString());
 
     auto published = std::make_shared<const SegmentLoadInfo>(new_local);
@@ -4921,7 +4933,7 @@ ChunkedSegmentSealedImpl::Reopen(milvus::OpContext* op_ctx, SchemaPtr sch) {
     ApplySchemaForReopen(sch);
     ApplyLoadDiff(op_ctx, new_local, diff);
 
-    LOG_INFO("Schema-only reopen segment {} done", id_);
+    LOG_DEBUG("Schema-only reopen segment {} done", id_);
 }
 
 void
@@ -4970,7 +4982,7 @@ ChunkedSegmentSealedImpl::Reopen(
     auto diff = current_mutable.ComputeDiff(new_local);
     new_local.SetFieldsFilledWithDefault(
         current_mutable.GetDefaultFilledFieldsForNewInfo(new_local));
-    LOG_INFO("Reopen segment {} with diff {}", id_, diff.ToString());
+    LOG_DEBUG("Reopen segment {} with diff {}", id_, diff.ToString());
 
     auto published = std::make_shared<const SegmentLoadInfo>(new_local);
     std::atomic_store(&segment_load_info_, published);
@@ -4980,7 +4992,7 @@ ChunkedSegmentSealedImpl::Reopen(
     ApplySchemaForReopen(target_schema);
     ApplyLoadDiff(op_ctx, new_local, diff);
 
-    LOG_INFO("Reopen segment {} done", id_);
+    LOG_DEBUG("Reopen segment {} done", id_);
 }
 
 void
@@ -5653,9 +5665,9 @@ ChunkedSegmentSealedImpl::LoadColumnGroup(
     auto chunk_reader = std::move(chunk_reader_result).ValueOrDie();
     reader_ns = DurationSinceNs(stage_start);
 
-    LOG_INFO("[StorageV2] segment {} loads manifest cg index {}",
-             this->get_segment_id(),
-             index);
+    LOG_DEBUG("[StorageV2] segment {} loads manifest cg index {}",
+              this->get_segment_id(),
+              index);
     auto mmap_dir_path =
         milvus::storage::LocalChunkManagerSingleton::GetInstance()
             .GetChunkManager()
@@ -5842,10 +5854,10 @@ ChunkedSegmentSealedImpl::LoadBatchIndexes(
                 // Early exit if cancelled while queued
                 CheckCancellation(op_ctx, id_, field_id.get(), "LoadIndex");
 
-                LOG_INFO("Loading index for segment {} field {} with {} files",
-                         id_,
-                         field_id.get(),
-                         load_index_info_ptr->index_files.size());
+                LOG_DEBUG("Loading index for segment {} field {} with {} files",
+                          id_,
+                          field_id.get(),
+                          load_index_info_ptr->index_files.size());
 
                 // Download & compose index
                 auto stage_start = std::chrono::steady_clock::now();

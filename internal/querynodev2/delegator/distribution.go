@@ -132,6 +132,7 @@ func (s *distributionAddTimingStats) record(entryNum int, lockWaitDur, lockHoldD
 	if !s.lastLogUnixNano.CompareAndSwap(last, now.UnixNano()) {
 		return
 	}
+	windowDur := time.Duration(now.UnixNano() - last)
 
 	count := s.count.Swap(0)
 	entryCount := s.entryCount.Swap(0)
@@ -149,7 +150,9 @@ func (s *distributionAddTimingStats) record(entryNum int, lockWaitDur, lockHoldD
 		return
 	}
 
-	log.Warn("delegator distribution add timing stats",
+	log.Warn("[SN recovery] load timing stats",
+		zap.String("phase", "delegator.distribution_add"),
+		zap.Duration("windowDur", windowDur),
 		zap.Int64("requestCount", count),
 		zap.Int64("entryCount", entryCount),
 		zap.Duration("avgLockWaitDur", avgDuration(totalLockWait, count)),
@@ -188,6 +191,7 @@ func (s *distributionSnapshotTimingStats) record(sealedNum int, growingNum int, 
 	if !s.lastLogUnixNano.CompareAndSwap(last, now.UnixNano()) {
 		return
 	}
+	windowDur := time.Duration(now.UnixNano() - last)
 
 	count := s.count.Swap(0)
 	sealedCount := s.sealedCount.Swap(0)
@@ -206,7 +210,9 @@ func (s *distributionSnapshotTimingStats) record(sealedNum int, growingNum int, 
 		return
 	}
 
-	log.Warn("delegator distribution snapshot timing stats",
+	log.Warn("[SN recovery] load timing stats",
+		zap.String("phase", "delegator.distribution_snapshot"),
+		zap.Duration("windowDur", windowDur),
 		zap.Int64("snapshotCount", count),
 		zap.Int64("avgSealedSegmentNum", sealedCount/count),
 		zap.Int64("avgGrowingSegmentNum", growingCount/count),

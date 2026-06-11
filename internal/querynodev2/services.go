@@ -222,6 +222,7 @@ func (s *queryNodeLoadSegmentsTimingStats) record(loadScope querypb.LoadScope, n
 	if !s.lastLogUnixNano.CompareAndSwap(last, now.UnixNano()) {
 		return
 	}
+	windowDur := time.Duration(now.UnixNano() - last)
 
 	count := s.count.Swap(0)
 	segmentCount := s.segmentCount.Swap(0)
@@ -257,7 +258,9 @@ func (s *queryNodeLoadSegmentsTimingStats) record(loadScope querypb.LoadScope, n
 		return
 	}
 
-	log.Warn("querynode load segments timing stats",
+	log.Warn("[SN recovery] load timing stats",
+		zap.String("phase", "querynode.load_segments"),
+		zap.Duration("windowDur", windowDur),
 		zap.Int64("requestCount", count),
 		zap.Int64("segmentCount", segmentCount),
 		zap.Int64("transferCount", transferCount),

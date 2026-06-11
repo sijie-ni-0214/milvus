@@ -78,6 +78,215 @@ const (
 	SegmentTypeSealed  = commonpb.SegmentState_Sealed
 )
 
+var (
+	newSegmentTiming        = newNewSegmentTimingStats()
+	initializeSegmentTiming = newInitializeSegmentTimingStats()
+)
+
+type newSegmentTimingStats struct {
+	count             *atomic.Int64
+	totalBase         *atomic.Int64
+	totalCreateSubmit *atomic.Int64
+	totalCreateCgo    *atomic.Int64
+	totalStruct       *atomic.Int64
+	totalInitialize   *atomic.Int64
+	totalSegment      *atomic.Int64
+	maxBase           *atomic.Int64
+	maxCreateSubmit   *atomic.Int64
+	maxCreateCgo      *atomic.Int64
+	maxStruct         *atomic.Int64
+	maxInitialize     *atomic.Int64
+	maxSegment        *atomic.Int64
+	lastLogUnixNano   *atomic.Int64
+}
+
+func newNewSegmentTimingStats() *newSegmentTimingStats {
+	return &newSegmentTimingStats{
+		count:             atomic.NewInt64(0),
+		totalBase:         atomic.NewInt64(0),
+		totalCreateSubmit: atomic.NewInt64(0),
+		totalCreateCgo:    atomic.NewInt64(0),
+		totalStruct:       atomic.NewInt64(0),
+		totalInitialize:   atomic.NewInt64(0),
+		totalSegment:      atomic.NewInt64(0),
+		maxBase:           atomic.NewInt64(0),
+		maxCreateSubmit:   atomic.NewInt64(0),
+		maxCreateCgo:      atomic.NewInt64(0),
+		maxStruct:         atomic.NewInt64(0),
+		maxInitialize:     atomic.NewInt64(0),
+		maxSegment:        atomic.NewInt64(0),
+		lastLogUnixNano:   atomic.NewInt64(time.Now().UnixNano()),
+	}
+}
+
+func (s *newSegmentTimingStats) record(baseDur, createSubmitDur, createCgoDur, structDur, initializeDur, totalDur time.Duration) {
+	s.count.Inc()
+	s.totalBase.Add(int64(baseDur))
+	s.totalCreateSubmit.Add(int64(createSubmitDur))
+	s.totalCreateCgo.Add(int64(createCgoDur))
+	s.totalStruct.Add(int64(structDur))
+	s.totalInitialize.Add(int64(initializeDur))
+	s.totalSegment.Add(int64(totalDur))
+	updateMaxDuration(s.maxBase, baseDur)
+	updateMaxDuration(s.maxCreateSubmit, createSubmitDur)
+	updateMaxDuration(s.maxCreateCgo, createCgoDur)
+	updateMaxDuration(s.maxStruct, structDur)
+	updateMaxDuration(s.maxInitialize, initializeDur)
+	updateMaxDuration(s.maxSegment, totalDur)
+
+	now := time.Now()
+	last := s.lastLogUnixNano.Load()
+	if now.UnixNano()-last < int64(requestResourceTimingLogInterval) {
+		return
+	}
+	if !s.lastLogUnixNano.CompareAndSwap(last, now.UnixNano()) {
+		return
+	}
+	windowDur := time.Duration(now.UnixNano() - last)
+
+	count := s.count.Swap(0)
+	totalBase := s.totalBase.Swap(0)
+	totalCreateSubmit := s.totalCreateSubmit.Swap(0)
+	totalCreateCgo := s.totalCreateCgo.Swap(0)
+	totalStruct := s.totalStruct.Swap(0)
+	totalInitialize := s.totalInitialize.Swap(0)
+	totalSegment := s.totalSegment.Swap(0)
+	maxBase := s.maxBase.Swap(0)
+	maxCreateSubmit := s.maxCreateSubmit.Swap(0)
+	maxCreateCgo := s.maxCreateCgo.Swap(0)
+	maxStruct := s.maxStruct.Swap(0)
+	maxInitialize := s.maxInitialize.Swap(0)
+	maxSegment := s.maxSegment.Swap(0)
+	if count == 0 {
+		return
+	}
+
+	totalAccounted := totalBase + totalCreateSubmit + totalStruct + totalInitialize
+	log.Warn("[SN recovery] load timing stats",
+		zap.String("phase", "segment.new_segment"),
+		zap.Duration("windowDur", windowDur),
+		zap.Int64("count", count),
+		zap.Duration("avgBaseDur", avgDuration(totalBase, count)),
+		zap.Duration("avgCreateSubmitDur", avgDuration(totalCreateSubmit, count)),
+		zap.Duration("avgCreateCgoDur", avgDuration(totalCreateCgo, count)),
+		zap.Duration("avgCreateQueueDur", avgDuration(totalCreateSubmit-totalCreateCgo, count)),
+		zap.Duration("avgStructDur", avgDuration(totalStruct, count)),
+		zap.Duration("avgInitializeDur", avgDuration(totalInitialize, count)),
+		zap.Duration("avgOtherDur", avgDuration(totalSegment-totalAccounted, count)),
+		zap.Duration("avgTotalDur", avgDuration(totalSegment, count)),
+		zap.Duration("maxBaseDur", time.Duration(maxBase)),
+		zap.Duration("maxCreateSubmitDur", time.Duration(maxCreateSubmit)),
+		zap.Duration("maxCreateCgoDur", time.Duration(maxCreateCgo)),
+		zap.Duration("maxStructDur", time.Duration(maxStruct)),
+		zap.Duration("maxInitializeDur", time.Duration(maxInitialize)),
+		zap.Duration("maxTotalDur", time.Duration(maxSegment)),
+	)
+}
+
+type initializeSegmentTimingStats struct {
+	count                *atomic.Int64
+	totalIndexInfo       *atomic.Int64
+	totalFieldBinlog     *atomic.Int64
+	totalSeparate        *atomic.Int64
+	totalSchemaHelper    *atomic.Int64
+	totalIndexLoop       *atomic.Int64
+	totalSchemaGet       *atomic.Int64
+	totalInsertIndex     *atomic.Int64
+	totalHasRawData      *atomic.Int64
+	totalInsertField     *atomic.Int64
+	totalFieldBinlogLoop *atomic.Int64
+	totalStoreInsert     *atomic.Int64
+	totalInitialize      *atomic.Int64
+	maxInitialize        *atomic.Int64
+	lastLogUnixNano      *atomic.Int64
+}
+
+func newInitializeSegmentTimingStats() *initializeSegmentTimingStats {
+	return &initializeSegmentTimingStats{
+		count:                atomic.NewInt64(0),
+		totalIndexInfo:       atomic.NewInt64(0),
+		totalFieldBinlog:     atomic.NewInt64(0),
+		totalSeparate:        atomic.NewInt64(0),
+		totalSchemaHelper:    atomic.NewInt64(0),
+		totalIndexLoop:       atomic.NewInt64(0),
+		totalSchemaGet:       atomic.NewInt64(0),
+		totalInsertIndex:     atomic.NewInt64(0),
+		totalHasRawData:      atomic.NewInt64(0),
+		totalInsertField:     atomic.NewInt64(0),
+		totalFieldBinlogLoop: atomic.NewInt64(0),
+		totalStoreInsert:     atomic.NewInt64(0),
+		totalInitialize:      atomic.NewInt64(0),
+		maxInitialize:        atomic.NewInt64(0),
+		lastLogUnixNano:      atomic.NewInt64(time.Now().UnixNano()),
+	}
+}
+
+func (s *initializeSegmentTimingStats) record(indexInfoCount, fieldBinlogCount int, separateDur, schemaHelperDur, indexLoopDur, schemaGetDur, insertIndexDur, hasRawDataDur, insertFieldDur, fieldBinlogLoopDur, storeInsertDur, totalDur time.Duration) {
+	s.count.Inc()
+	s.totalIndexInfo.Add(int64(indexInfoCount))
+	s.totalFieldBinlog.Add(int64(fieldBinlogCount))
+	s.totalSeparate.Add(int64(separateDur))
+	s.totalSchemaHelper.Add(int64(schemaHelperDur))
+	s.totalIndexLoop.Add(int64(indexLoopDur))
+	s.totalSchemaGet.Add(int64(schemaGetDur))
+	s.totalInsertIndex.Add(int64(insertIndexDur))
+	s.totalHasRawData.Add(int64(hasRawDataDur))
+	s.totalInsertField.Add(int64(insertFieldDur))
+	s.totalFieldBinlogLoop.Add(int64(fieldBinlogLoopDur))
+	s.totalStoreInsert.Add(int64(storeInsertDur))
+	s.totalInitialize.Add(int64(totalDur))
+	updateMaxDuration(s.maxInitialize, totalDur)
+
+	now := time.Now()
+	last := s.lastLogUnixNano.Load()
+	if now.UnixNano()-last < int64(requestResourceTimingLogInterval) {
+		return
+	}
+	if !s.lastLogUnixNano.CompareAndSwap(last, now.UnixNano()) {
+		return
+	}
+	windowDur := time.Duration(now.UnixNano() - last)
+
+	count := s.count.Swap(0)
+	totalIndexInfo := s.totalIndexInfo.Swap(0)
+	totalFieldBinlog := s.totalFieldBinlog.Swap(0)
+	totalSeparate := s.totalSeparate.Swap(0)
+	totalSchemaHelper := s.totalSchemaHelper.Swap(0)
+	totalIndexLoop := s.totalIndexLoop.Swap(0)
+	totalSchemaGet := s.totalSchemaGet.Swap(0)
+	totalInsertIndex := s.totalInsertIndex.Swap(0)
+	totalHasRawData := s.totalHasRawData.Swap(0)
+	totalInsertField := s.totalInsertField.Swap(0)
+	totalFieldBinlogLoop := s.totalFieldBinlogLoop.Swap(0)
+	totalStoreInsert := s.totalStoreInsert.Swap(0)
+	totalInitialize := s.totalInitialize.Swap(0)
+	maxInitialize := s.maxInitialize.Swap(0)
+	if count == 0 {
+		return
+	}
+
+	totalAccounted := totalSeparate + totalSchemaHelper + totalIndexLoop + totalFieldBinlogLoop + totalStoreInsert
+	log.Warn("[SN recovery] load timing stats",
+		zap.String("phase", "segment.initialize"),
+		zap.Duration("windowDur", windowDur),
+		zap.Int64("count", count),
+		zap.Int64("avgIndexInfoCount", totalIndexInfo/count),
+		zap.Int64("avgFieldBinlogCount", totalFieldBinlog/count),
+		zap.Duration("avgSeparateDur", avgDuration(totalSeparate, count)),
+		zap.Duration("avgSchemaHelperDur", avgDuration(totalSchemaHelper, count)),
+		zap.Duration("avgIndexLoopDur", avgDuration(totalIndexLoop, count)),
+		zap.Duration("avgSchemaGetDur", avgDuration(totalSchemaGet, count)),
+		zap.Duration("avgInsertIndexDur", avgDuration(totalInsertIndex, count)),
+		zap.Duration("avgHasRawDataDur", avgDuration(totalHasRawData, count)),
+		zap.Duration("avgInsertFieldDur", avgDuration(totalInsertField, count)),
+		zap.Duration("avgFieldBinlogLoopDur", avgDuration(totalFieldBinlogLoop, count)),
+		zap.Duration("avgStoreInsertDur", avgDuration(totalStoreInsert, count)),
+		zap.Duration("avgOtherDur", avgDuration(totalInitialize-totalAccounted, count)),
+		zap.Duration("avgTotalDur", avgDuration(totalInitialize, count)),
+		zap.Duration("maxTotalDur", time.Duration(maxInitialize)),
+	)
+}
+
 var ErrSegmentUnhealthy = errors.New("segment unhealthy")
 
 // IndexedFieldInfo contains binlog info of vector field
@@ -362,6 +571,15 @@ func NewSegment(ctx context.Context,
 	loadInfo *querypb.SegmentLoadInfo,
 ) (Segment, error) {
 	log := log.Ctx(ctx)
+	segmentStart := time.Now()
+	var baseDur time.Duration
+	var createSubmitDur time.Duration
+	var createCgoDur time.Duration
+	var structDur time.Duration
+	var initializeDur time.Duration
+	defer func() {
+		newSegmentTiming.record(baseDur, createSubmitDur, createCgoDur, structDur, initializeDur, time.Since(segmentStart))
+	}()
 	/*
 		CStatus
 		NewSegment(CCollection collection, uint64_t segment_id, SegmentType seg_type, CSegmentInterface* newSegment);
@@ -370,7 +588,9 @@ func NewSegment(ctx context.Context,
 		return NewL0Segment(collection, segmentType, version, loadInfo)
 	}
 
+	stageStart := time.Now()
 	base, err := newBaseSegment(collection, segmentType, version, loadInfo)
+	baseDur = time.Since(stageStart)
 	if err != nil {
 		return nil, err
 	}
@@ -394,8 +614,10 @@ func NewSegment(ctx context.Context,
 	)
 
 	var csegment segcore.CSegment
+	stageStart = time.Now()
 	if _, err := GetDynamicPool().Submit(func() (any, error) {
 		var err error
+		cgoStart := time.Now()
 		csegment, err = segcore.CreateCSegment(&segcore.CreateCSegmentRequest{
 			Collection:  collection.ccollection,
 			SegmentID:   loadInfo.GetSegmentID(),
@@ -403,13 +625,17 @@ func NewSegment(ctx context.Context,
 			IsSorted:    loadInfo.GetIsSorted(),
 			LoadInfo:    loadInfo,
 		})
+		createCgoDur = time.Since(cgoStart)
 		return nil, err
 	}).Await(); err != nil {
+		createSubmitDur = time.Since(stageStart)
 		logger.Warn("create segment failed", zap.Error(err))
 		return nil, err
 	}
+	createSubmitDur = time.Since(stageStart)
 	logger.Info("create segment done")
 
+	stageStart = time.Now()
 	segment := &LocalSegment{
 		baseSegment:        base,
 		manager:            manager,
@@ -426,26 +652,48 @@ func NewSegment(ctx context.Context,
 		rowNum:      atomic.NewInt64(-1),
 		insertCount: atomic.NewInt64(0),
 	}
+	structDur = time.Since(stageStart)
 
+	stageStart = time.Now()
 	if err := segment.initializeSegment(); err != nil {
+		initializeDur = time.Since(stageStart)
 		csegment.Release()
 		return nil, err
 	}
+	initializeDur = time.Since(stageStart)
 	return segment, nil
 }
 
 func (s *LocalSegment) initializeSegment() error {
+	initializeStart := time.Now()
+	var separateDur time.Duration
+	var schemaHelperDur time.Duration
+	var indexLoopDur time.Duration
+	var schemaGetDur time.Duration
+	var insertIndexDur time.Duration
+	var hasRawDataDur time.Duration
+	var insertFieldDur time.Duration
+	var fieldBinlogLoopDur time.Duration
+	var storeInsertDur time.Duration
 	loadInfo := s.loadInfo.Load()
+	stageStart := time.Now()
 	indexedFieldInfos, fieldBinlogs := separateIndexAndBinlog(loadInfo)
+	separateDur = time.Since(stageStart)
+	stageStart = time.Now()
 	schemaHelper, _ := typeutil.CreateSchemaHelper(s.collection.Schema())
+	schemaHelperDur = time.Since(stageStart)
 
+	indexLoopStart := time.Now()
 	for _, info := range indexedFieldInfos {
 		fieldID := info.IndexInfo.FieldID
+		stageStart = time.Now()
 		field, err := schemaHelper.GetFieldFromID(fieldID)
+		schemaGetDur += time.Since(stageStart)
 		if err != nil {
 			return err
 		}
 		indexInfo := info.IndexInfo
+		stageStart = time.Now()
 		s.fieldIndexes.Insert(indexInfo.GetIndexID(), &IndexedFieldInfo{
 			FieldBinlog: &datapb.FieldBinlog{
 				FieldID: indexInfo.GetFieldID(),
@@ -453,23 +701,38 @@ func (s *LocalSegment) initializeSegment() error {
 			IndexInfo: indexInfo,
 			IsLoaded:  false,
 		})
-		if !typeutil.IsVectorType(field.GetDataType()) && !s.HasRawData(fieldID) {
+		insertIndexDur += time.Since(stageStart)
+		hasRawData := false
+		if !typeutil.IsVectorType(field.GetDataType()) {
+			stageStart = time.Now()
+			hasRawData = s.HasRawData(fieldID)
+			hasRawDataDur += time.Since(stageStart)
+		}
+		if !typeutil.IsVectorType(field.GetDataType()) && !hasRawData {
+			stageStart = time.Now()
 			s.fields.Insert(fieldID, &FieldInfo{
 				FieldBinlog: info.FieldBinlog,
 				RowCount:    loadInfo.GetNumOfRows(),
 			})
+			insertFieldDur += time.Since(stageStart)
 		}
 	}
+	indexLoopDur = time.Since(indexLoopStart)
 
+	stageStart = time.Now()
 	for _, binlogs := range fieldBinlogs {
 		s.fields.Insert(binlogs.FieldID, &FieldInfo{
 			FieldBinlog: binlogs,
 			RowCount:    loadInfo.GetNumOfRows(),
 		})
 	}
+	fieldBinlogLoopDur = time.Since(stageStart)
 
 	// Update the insert count when initialize the segment and update the metrics.
+	stageStart = time.Now()
 	s.insertCount.Store(loadInfo.GetNumOfRows())
+	storeInsertDur = time.Since(stageStart)
+	initializeSegmentTiming.record(len(indexedFieldInfos), len(fieldBinlogs), separateDur, schemaHelperDur, indexLoopDur, schemaGetDur, insertIndexDur, hasRawDataDur, insertFieldDur, fieldBinlogLoopDur, storeInsertDur, time.Since(initializeStart))
 	return nil
 }
 

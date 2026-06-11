@@ -234,6 +234,7 @@ func (s *delegatorStreamDeleteTimingStats) record(segmentNum int, timing streamD
 	if !s.lastLogUnixNano.CompareAndSwap(last, now.UnixNano()) {
 		return
 	}
+	windowDur := time.Duration(now.UnixNano() - last)
 
 	count := s.count.Swap(0)
 	segmentCount := s.segmentCount.Swap(0)
@@ -261,7 +262,9 @@ func (s *delegatorStreamDeleteTimingStats) record(segmentNum int, timing streamD
 		return
 	}
 
-	log.Warn("delegator stream delete timing stats",
+	log.Warn("[SN recovery] load timing stats",
+		zap.String("phase", "delegator.stream_delete"),
+		zap.Duration("windowDur", windowDur),
 		zap.Int64("requestCount", count),
 		zap.Int64("segmentCount", segmentCount),
 		zap.Duration("avgPhase0ForwardL0Dur", avgDuration(totalPhase0ForwardL0, count)),
@@ -325,6 +328,7 @@ func (s *delegatorLoadTimingStats) record(segmentNum int, workerLoadDur, postLoa
 	if !s.lastLogUnixNano.CompareAndSwap(last, now.UnixNano()) {
 		return
 	}
+	windowDur := time.Duration(now.UnixNano() - last)
 
 	count := s.count.Swap(0)
 	segmentCount := s.segmentCount.Swap(0)
@@ -350,7 +354,9 @@ func (s *delegatorLoadTimingStats) record(segmentNum int, workerLoadDur, postLoa
 		return
 	}
 
-	log.Warn("delegator load segments timing stats",
+	log.Warn("[SN recovery] load timing stats",
+		zap.String("phase", "delegator.load_segments"),
+		zap.Duration("windowDur", windowDur),
 		zap.Int64("requestCount", count),
 		zap.Int64("segmentCount", segmentCount),
 		zap.Duration("avgWorkerLoadDur", avgDuration(totalWorkerLoad, count)),
@@ -1004,7 +1010,7 @@ func (sd *shardDelegator) LoadSegments(ctx context.Context, req *querypb.LoadSeg
 		// Build a map from segmentID to BloomFilterSet
 		bfMap := make(map[int64]pkoracle.Candidate)
 		for _, candidate := range candidates {
-			log.Info("loaded bloom filter set for sealed segment",
+			log.Debug("loaded bloom filter set for sealed segment",
 				zap.Int64("segmentID", candidate.ID()),
 			)
 			bfMap[candidate.ID()] = candidate
