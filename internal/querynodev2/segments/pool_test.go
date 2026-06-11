@@ -37,6 +37,7 @@ func TestResizePools(t *testing.T) {
 		pt.Reset(pt.QueryNodeCfg.MaxReadConcurrency.Key)
 		pt.Reset(pt.QueryNodeCfg.CGOPoolSizeRatio.Key)
 		pt.Reset(pt.CommonCfg.MiddlePriorityThreadCoreCoefficient.Key)
+		pt.Reset(pt.CommonCfg.DynamicPoolThreadCoreCoefficient.Key)
 		pt.Reset(pt.QueryNodeCfg.BloomFilterApplyParallelFactor.Key)
 	}()
 
@@ -60,6 +61,28 @@ func TestResizePools(t *testing.T) {
 			HasUpdated: true,
 		})
 		assert.Equal(t, expectedCap, GetSQPool().Cap(), "pool shall not be resized when newSize is 0")
+	})
+
+	t.Run("DynamicPool", func(t *testing.T) {
+		expectedCap := hardware.GetCPUNum() * pt.CommonCfg.DynamicPoolThreadCoreCoefficient.GetAsInt()
+
+		ResizeDynamicPool(&config.Event{
+			HasUpdated: true,
+		})
+		assert.Equal(t, expectedCap, GetDynamicPool().Cap())
+
+		pt.Save(pt.CommonCfg.DynamicPoolThreadCoreCoefficient.Key, strconv.Itoa(pt.CommonCfg.DynamicPoolThreadCoreCoefficient.GetAsInt()*2))
+		expectedCap = hardware.GetCPUNum() * pt.CommonCfg.DynamicPoolThreadCoreCoefficient.GetAsInt()
+		ResizeDynamicPool(&config.Event{
+			HasUpdated: true,
+		})
+		assert.Equal(t, expectedCap, GetDynamicPool().Cap())
+
+		pt.Save(pt.CommonCfg.DynamicPoolThreadCoreCoefficient.Key, "0")
+		ResizeDynamicPool(&config.Event{
+			HasUpdated: true,
+		})
+		assert.Equal(t, expectedCap, GetDynamicPool().Cap())
 	})
 
 	t.Run("LoadPool", func(t *testing.T) {
