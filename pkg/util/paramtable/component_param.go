@@ -49,6 +49,7 @@ const (
 	DefaultHighPriorityThreadCoreCoefficient   = 10
 	DefaultMiddlePriorityThreadCoreCoefficient = 5
 	DefaultLowPriorityThreadCoreCoefficient    = 1
+	DefaultDynamicPoolThreadCoreCoefficient    = 1
 	DefaultBM25LoadThreadCoreCoefficient       = 1
 	DefaultThreadPoolMaxThreadsSize            = 16
 
@@ -236,6 +237,7 @@ type commonConfig struct {
 	HighPriorityThreadCoreCoefficient   ParamItem `refreshable:"true"`
 	MiddlePriorityThreadCoreCoefficient ParamItem `refreshable:"true"`
 	LowPriorityThreadCoreCoefficient    ParamItem `refreshable:"true"`
+	DynamicPoolThreadCoreCoefficient    ParamItem `refreshable:"true"`
 	BM25LoadThreadCoreCoefficient       ParamItem `refreshable:"true"`
 	ThreadPoolMaxThreadsSize            ParamItem `refreshable:"true"`
 	ArrowIOThreadPoolCoefficient        ParamItem `refreshable:"true"`
@@ -718,6 +720,16 @@ This configuration is only used by querynode and indexnode, it selects CPU instr
 		Export: true,
 	}
 	p.LowPriorityThreadCoreCoefficient.Init(base.mgr)
+
+	p.DynamicPoolThreadCoreCoefficient = ParamItem{
+		Key:          "common.threadCoreCoefficient.dynamicPool",
+		Version:      "2.6.13",
+		DefaultValue: strconv.Itoa(DefaultDynamicPoolThreadCoreCoefficient),
+		Doc: "This parameter specify how many times the number of threads " +
+			"is the number of cores in dynamic cgo pool",
+		Export: true,
+	}
+	p.DynamicPoolThreadCoreCoefficient.Init(base.mgr)
 
 	p.BM25LoadThreadCoreCoefficient = ParamItem{
 		Key:          "common.threadCoreCoefficient.bm25Load",

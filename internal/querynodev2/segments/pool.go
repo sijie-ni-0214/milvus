@@ -96,7 +96,8 @@ func initSQPool() {
 
 func initDynamicPool() {
 	dynOnce.Do(func() {
-		size := hardware.GetCPUNum()
+		pt := paramtable.Get()
+		size := hardware.GetCPUNum() * pt.CommonCfg.DynamicPoolThreadCoreCoefficient.GetAsInt()
 		pool := conc.NewPool[any](
 			size,
 			conc.WithPreAlloc(false),
@@ -108,6 +109,7 @@ func initDynamicPool() {
 		)
 
 		dp.Store(pool)
+		pt.Watch(pt.CommonCfg.DynamicPoolThreadCoreCoefficient.Key, config.NewHandler("qn.dynamicpool.dynamicpoolthreadcorecoefficient", ResizeDynamicPool))
 		mlog.Info(context.TODO(), "init dynamicPool done", mlog.Int("size", size))
 	})
 }
@@ -237,6 +239,14 @@ func ResizeLoadPool(evt *config.Event) {
 		pt := paramtable.Get()
 		newSize := hardware.GetCPUNum() * pt.CommonCfg.MiddlePriorityThreadCoreCoefficient.GetAsInt()
 		resizePool(GetLoadPool(), newSize, "LoadPool")
+	}
+}
+
+func ResizeDynamicPool(evt *config.Event) {
+	if evt.HasUpdated {
+		pt := paramtable.Get()
+		newSize := hardware.GetCPUNum() * pt.CommonCfg.DynamicPoolThreadCoreCoefficient.GetAsInt()
+		resizePool(GetDynamicPool(), newSize, "DynamicPool")
 	}
 }
 
