@@ -2180,12 +2180,10 @@ SegmentGrowingImpl::Load(milvus::tracer::TraceContext& trace_ctx,
         binlog_info.entries_nums.reserve(binlog_count);
         binlog_info.insert_files.reserve(binlog_count);
         binlog_info.memory_sizes.reserve(binlog_count);
-        binlog_info.log_sizes.reserve(binlog_count);
         for (const auto& binlog : field_binlog.binlogs()) {
             binlog_info.entries_nums.push_back(binlog.entries_num());
             binlog_info.insert_files.push_back(binlog.log_path());
             binlog_info.memory_sizes.push_back(binlog.memory_size());
-            binlog_info.log_sizes.push_back(binlog.log_size());
             total_row_count += binlog.entries_num();
         }
         binlog_info.row_count = total_row_count;

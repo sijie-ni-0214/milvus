@@ -35,7 +35,6 @@ struct FieldBinlogInfo {
     std::string warmup_policy;
     std::vector<std::string> insert_files;
     std::vector<int64_t> child_field_ids;
-    std::vector<int64_t> log_sizes;
 };
 
 struct LoadFieldDataInfo {

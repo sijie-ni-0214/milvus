@@ -274,220 +274,6 @@ AvgMs(int64_t total_ns, int64_t count) {
     return static_cast<double>(total_ns) / static_cast<double>(count) / 1e6;
 }
 
-struct StorageV2FieldDataTiming {
-    int64_t resolve_fields_ns = 0;
-    int64_t schema_meta_ns = 0;
-    int64_t metadata_ns = 0;
-    int64_t metadata_reader_make_ns = 0;
-    int64_t metadata_extract_ns = 0;
-    int64_t metadata_close_ns = 0;
-    int64_t create_translator_ns = 0;
-    int64_t create_chunk_group_ns = 0;
-    int64_t proxy_common_ns = 0;
-    int64_t total_ns = 0;
-    int64_t field_count = 0;
-    int64_t stats_field_count = 0;
-    int64_t metadata_file_count = 0;
-    int64_t metadata_known_log_size_count = 0;
-    int64_t metadata_total_log_size = 0;
-    int64_t metadata_total_read_buffer_size = 0;
-    int64_t metadata_max_read_buffer_size = 0;
-    bool enable_mmap = false;
-    bool has_vector = false;
-};
-
-class StorageV2FieldDataTimingStats {
- public:
-    void
-    Record(const StorageV2FieldDataTiming& timing) {
-        count_.fetch_add(1, std::memory_order_relaxed);
-        total_resolve_fields_ns_.fetch_add(timing.resolve_fields_ns,
-                                           std::memory_order_relaxed);
-        total_schema_meta_ns_.fetch_add(timing.schema_meta_ns,
-                                        std::memory_order_relaxed);
-        total_metadata_ns_.fetch_add(timing.metadata_ns,
-                                     std::memory_order_relaxed);
-        total_metadata_reader_make_ns_.fetch_add(timing.metadata_reader_make_ns,
-                                                 std::memory_order_relaxed);
-        total_metadata_extract_ns_.fetch_add(timing.metadata_extract_ns,
-                                             std::memory_order_relaxed);
-        total_metadata_close_ns_.fetch_add(timing.metadata_close_ns,
-                                           std::memory_order_relaxed);
-        total_create_translator_ns_.fetch_add(timing.create_translator_ns,
-                                              std::memory_order_relaxed);
-        total_create_chunk_group_ns_.fetch_add(timing.create_chunk_group_ns,
-                                               std::memory_order_relaxed);
-        total_proxy_common_ns_.fetch_add(timing.proxy_common_ns,
-                                         std::memory_order_relaxed);
-        total_ns_.fetch_add(timing.total_ns, std::memory_order_relaxed);
-        total_field_count_.fetch_add(timing.field_count,
-                                     std::memory_order_relaxed);
-        total_stats_field_count_.fetch_add(timing.stats_field_count,
-                                           std::memory_order_relaxed);
-        total_metadata_file_count_.fetch_add(timing.metadata_file_count,
-                                             std::memory_order_relaxed);
-        total_metadata_known_log_size_count_.fetch_add(
-            timing.metadata_known_log_size_count, std::memory_order_relaxed);
-        total_metadata_log_size_.fetch_add(timing.metadata_total_log_size,
-                                           std::memory_order_relaxed);
-        total_metadata_read_buffer_size_.fetch_add(
-            timing.metadata_total_read_buffer_size, std::memory_order_relaxed);
-        UpdateMax(max_metadata_read_buffer_size_,
-                  timing.metadata_max_read_buffer_size);
-        mmap_count_.fetch_add(timing.enable_mmap ? 1 : 0,
-                              std::memory_order_relaxed);
-        vector_count_.fetch_add(timing.has_vector ? 1 : 0,
-                                std::memory_order_relaxed);
-        UpdateMax(max_total_ns_, timing.total_ns);
-        MaybeLog();
-    }
-
- private:
-    void
-    MaybeLog() {
-        auto now = SteadyNowNs();
-        auto last = last_log_ns_.load(std::memory_order_relaxed);
-        if (last != 0 && now - last < kApplyLoadDiffTimingLogIntervalNs) {
-            return;
-        }
-        if (!last_log_ns_.compare_exchange_strong(last,
-                                                  now,
-                                                  std::memory_order_relaxed,
-                                                  std::memory_order_relaxed)) {
-            return;
-        }
-        auto count = count_.exchange(0, std::memory_order_relaxed);
-        if (count == 0) {
-            return;
-        }
-        auto resolve_fields_ns =
-            total_resolve_fields_ns_.exchange(0, std::memory_order_relaxed);
-        auto schema_meta_ns =
-            total_schema_meta_ns_.exchange(0, std::memory_order_relaxed);
-        auto metadata_ns =
-            total_metadata_ns_.exchange(0, std::memory_order_relaxed);
-        auto metadata_reader_make_ns = total_metadata_reader_make_ns_.exchange(
-            0, std::memory_order_relaxed);
-        auto metadata_extract_ns =
-            total_metadata_extract_ns_.exchange(0, std::memory_order_relaxed);
-        auto metadata_close_ns =
-            total_metadata_close_ns_.exchange(0, std::memory_order_relaxed);
-        auto create_translator_ns =
-            total_create_translator_ns_.exchange(0, std::memory_order_relaxed);
-        auto create_chunk_group_ns =
-            total_create_chunk_group_ns_.exchange(0, std::memory_order_relaxed);
-        auto proxy_common_ns =
-            total_proxy_common_ns_.exchange(0, std::memory_order_relaxed);
-        auto total_ns = total_ns_.exchange(0, std::memory_order_relaxed);
-        auto field_count =
-            total_field_count_.exchange(0, std::memory_order_relaxed);
-        auto stats_field_count =
-            total_stats_field_count_.exchange(0, std::memory_order_relaxed);
-        auto metadata_file_count =
-            total_metadata_file_count_.exchange(0, std::memory_order_relaxed);
-        auto metadata_known_log_size_count =
-            total_metadata_known_log_size_count_.exchange(
-                0, std::memory_order_relaxed);
-        auto metadata_log_size =
-            total_metadata_log_size_.exchange(0, std::memory_order_relaxed);
-        auto metadata_read_buffer_size =
-            total_metadata_read_buffer_size_.exchange(
-                0, std::memory_order_relaxed);
-        auto max_metadata_read_buffer_size =
-            max_metadata_read_buffer_size_.exchange(0,
-                                                    std::memory_order_relaxed);
-        auto mmap_count = mmap_count_.exchange(0, std::memory_order_relaxed);
-        auto vector_count =
-            vector_count_.exchange(0, std::memory_order_relaxed);
-        auto max_total_ns =
-            max_total_ns_.exchange(0, std::memory_order_relaxed);
-
-        LOG_WARN(
-            "segcore load storage v2 field data timing stats count={} "
-            "avgResolveFieldsMs={:.3f} avgSchemaMetaMs={:.3f} "
-            "avgMetadataMs={:.3f} avgMetadataMakeMs={:.3f} "
-            "avgMetadataExtractMs={:.3f} avgMetadataCloseMs={:.3f} "
-            "avgCreateTranslatorMs={:.3f} "
-            "avgCreateChunkGroupMs={:.3f} avgProxyCommonMs={:.3f} "
-            "avgTotalMs={:.3f} maxTotalMs={:.3f} avgFieldCount={:.2f} "
-            "avgStatsFieldCount={:.2f} avgMetadataFileCount={:.2f} "
-            "avgKnownLogSizeCount={:.2f} avgMetadataLogSize={:.2f} "
-            "avgMetadataReadBufferSize={:.2f} "
-            "maxMetadataReadBufferSize={} mmapRatio={:.2f} "
-            "vectorRatio={:.2f}",
-            count,
-            AvgMs(resolve_fields_ns, count),
-            AvgMs(schema_meta_ns, count),
-            AvgMs(metadata_ns, count),
-            AvgMs(metadata_reader_make_ns, count),
-            AvgMs(metadata_extract_ns, count),
-            AvgMs(metadata_close_ns, count),
-            AvgMs(create_translator_ns, count),
-            AvgMs(create_chunk_group_ns, count),
-            AvgMs(proxy_common_ns, count),
-            AvgMs(total_ns, count),
-            static_cast<double>(max_total_ns) / 1e6,
-            static_cast<double>(field_count) / count,
-            static_cast<double>(stats_field_count) / count,
-            static_cast<double>(metadata_file_count) / count,
-            static_cast<double>(metadata_known_log_size_count) / count,
-            metadata_file_count == 0
-                ? 0
-                : static_cast<double>(metadata_log_size) / metadata_file_count,
-            metadata_file_count == 0
-                ? 0
-                : static_cast<double>(metadata_read_buffer_size) /
-                      metadata_file_count,
-            max_metadata_read_buffer_size,
-            static_cast<double>(mmap_count) / count,
-            static_cast<double>(vector_count) / count);
-    }
-
-    std::atomic<int64_t> count_{0};
-    std::atomic<int64_t> total_resolve_fields_ns_{0};
-    std::atomic<int64_t> total_schema_meta_ns_{0};
-    std::atomic<int64_t> total_metadata_ns_{0};
-    std::atomic<int64_t> total_metadata_reader_make_ns_{0};
-    std::atomic<int64_t> total_metadata_extract_ns_{0};
-    std::atomic<int64_t> total_metadata_close_ns_{0};
-    std::atomic<int64_t> total_create_translator_ns_{0};
-    std::atomic<int64_t> total_create_chunk_group_ns_{0};
-    std::atomic<int64_t> total_proxy_common_ns_{0};
-    std::atomic<int64_t> total_ns_{0};
-    std::atomic<int64_t> total_field_count_{0};
-    std::atomic<int64_t> total_stats_field_count_{0};
-    std::atomic<int64_t> total_metadata_file_count_{0};
-    std::atomic<int64_t> total_metadata_known_log_size_count_{0};
-    std::atomic<int64_t> total_metadata_log_size_{0};
-    std::atomic<int64_t> total_metadata_read_buffer_size_{0};
-    std::atomic<int64_t> max_metadata_read_buffer_size_{0};
-    std::atomic<int64_t> mmap_count_{0};
-    std::atomic<int64_t> vector_count_{0};
-    std::atomic<int64_t> max_total_ns_{0};
-    std::atomic<int64_t> last_log_ns_{0};
-};
-
-StorageV2FieldDataTimingStats storage_v2_field_data_timing_stats;
-
-struct FieldDataCommonTiming {
-    int64_t initial_lock_ns = 0;
-    int64_t nullable_ns = 0;
-    int64_t memory_stats_ns = 0;
-    int64_t skip_index_ns = 0;
-    int64_t pk_index_ns = 0;
-    int64_t interim_index_ns = 0;
-    int64_t final_lock_ns = 0;
-    int64_t array_offsets_ns = 0;
-    int64_t total_ns = 0;
-    bool system = false;
-    bool vector = false;
-    bool variable = false;
-    bool proxy = false;
-    bool mmap = false;
-    bool pk = false;
-    bool nullable = false;
-};
-
 void
 RecordApplyLoadDiffTiming(int64_t total_ns,
                           int64_t index_load_ns,
@@ -1570,22 +1356,7 @@ struct FileMetadataLoadResult {
     // group had no statistics set for this field.
     std::map<int64_t, std::vector<std::shared_ptr<parquet::Statistics>>>
         per_field_row_group_stats;
-    int64_t reader_make_ns = 0;
-    int64_t metadata_extract_ns = 0;
-    int64_t close_ns = 0;
-    int64_t log_size = -1;
-    int64_t read_buffer_size = 0;
 };
-
-int64_t
-StorageV2MetadataReadBufferSize(int64_t log_size) {
-    constexpr int64_t kMinReadBufferSize = 4 * 1024;
-    if (log_size <= 0) {
-        return milvus_storage::DEFAULT_READ_BUFFER_SIZE;
-    }
-    return std::min(milvus_storage::DEFAULT_READ_BUFFER_SIZE,
-                    std::max(log_size, kMinReadBufferSize));
-}
 
 }  // namespace
 
@@ -1593,49 +1364,30 @@ LoadedGroupChunkMetadata
 LoadGroupChunkMetadata(const std::vector<std::string>& insert_files,
                        const std::vector<FieldId>& field_ids_for_stats,
                        const std::string& debug_key) {
-    std::vector<GroupChunkFileInfo> file_infos;
-    file_infos.reserve(insert_files.size());
-    for (const auto& file : insert_files) {
-        file_infos.push_back({file, -1});
-    }
-    return LoadGroupChunkMetadata(file_infos, field_ids_for_stats, debug_key);
-}
-
-LoadedGroupChunkMetadata
-LoadGroupChunkMetadata(const std::vector<GroupChunkFileInfo>& insert_files,
-                       const std::vector<FieldId>& field_ids_for_stats,
-                       const std::string& debug_key) {
     auto fs = milvus::segcore::GetDefaultArrowFileSystem();
     auto& pool = ThreadPools::GetThreadPool(ThreadPoolPriority::HIGH);
 
     std::vector<std::future<FileMetadataLoadResult>> futures;
     futures.reserve(insert_files.size());
-    for (const auto& file_info : insert_files) {
+    for (const auto& file : insert_files) {
         // Futures are always joined below before this function returns, so
         // capturing loader inputs by reference is safe here.
         futures.push_back(pool.Submit([&fs,
-                                       file_info,
+                                       file,
                                        &field_ids_for_stats,
                                        &debug_key]() {
-            FileMetadataLoadResult load_result;
-            load_result.log_size = file_info.log_size;
-            load_result.read_buffer_size =
-                StorageV2MetadataReadBufferSize(file_info.log_size);
-
-            auto stage_start = std::chrono::steady_clock::now();
             auto result = milvus_storage::FileRowGroupReader::Make(
                 fs,
-                file_info.file_path,
-                load_result.read_buffer_size,
+                file,
+                milvus_storage::DEFAULT_READ_BUFFER_SIZE,
                 storage::GetReaderProperties(),
                 storage::GetArrowReaderProperties());
-            load_result.reader_make_ns = DurationSinceNs(stage_start);
             AssertInfo(result.ok(),
                        "[StorageV2] Failed to create file row group reader: " +
                            result.status().ToString());
 
             auto reader = result.ValueOrDie();
-            stage_start = std::chrono::steady_clock::now();
+            FileMetadataLoadResult load_result;
             auto file_metadata = reader->file_metadata();
             load_result.row_group_meta =
                 file_metadata->GetRowGroupMetadataVector();
@@ -1662,16 +1414,13 @@ LoadGroupChunkMetadata(const std::vector<GroupChunkFileInfo>& insert_files,
                     }
                 }
             }
-            load_result.metadata_extract_ns = DurationSinceNs(stage_start);
 
-            stage_start = std::chrono::steady_clock::now();
             auto status = reader->Close();
-            load_result.close_ns = DurationSinceNs(stage_start);
             AssertInfo(status.ok(),
                        "[StorageV2] metadata loader {} failed to close "
                        "file reader for {} with error {}",
                        debug_key,
-                       file_info.file_path,
+                       file,
                        status.ToString());
             return load_result;
         }));
@@ -1693,17 +1442,6 @@ LoadGroupChunkMetadata(const std::vector<GroupChunkFileInfo>& insert_files,
 
     for (auto& future : futures) {
         auto load_result = future.get();
-        metadata.reader_make_ns += load_result.reader_make_ns;
-        metadata.metadata_extract_ns += load_result.metadata_extract_ns;
-        metadata.close_ns += load_result.close_ns;
-        metadata.file_count++;
-        metadata.total_read_buffer_size += load_result.read_buffer_size;
-        metadata.max_read_buffer_size = std::max(metadata.max_read_buffer_size,
-                                                 load_result.read_buffer_size);
-        if (load_result.log_size > 0) {
-            metadata.known_log_size_count++;
-            metadata.total_log_size += load_result.log_size;
-        }
         metadata.row_group_meta_list.push_back(
             std::move(load_result.row_group_meta));
         // Walk files in order and replicate the original single-threaded
@@ -1743,28 +1481,12 @@ ChunkedSegmentSealedImpl::load_column_group_data_internal(
     auto& mmap_config = storage::MmapManager::GetInstance().GetMmapConfig();
 
     for (auto& [id, info] : load_info.field_infos) {
-        auto total_start = std::chrono::steady_clock::now();
-        auto stage_start = total_start;
-        StorageV2FieldDataTiming timing;
-        timing.enable_mmap = info.enable_mmap;
-
         AssertInfo(info.row_count > 0,
                    "[StorageV2] The row count of field data is 0");
 
         auto column_group_id = FieldId(id);
-        std::vector<GroupChunkFileInfo> file_infos;
-        file_infos.reserve(info.insert_files.size());
-        for (size_t i = 0; i < info.insert_files.size(); ++i) {
-            file_infos.push_back(
-                {info.insert_files[i],
-                 i < info.log_sizes.size() ? info.log_sizes[i] : -1});
-        }
-        storage::SortByPath(file_infos);
-        std::vector<std::string> insert_files;
-        insert_files.reserve(file_infos.size());
-        for (const auto& file_info : file_infos) {
-            insert_files.push_back(file_info.file_path);
-        }
+        auto insert_files = info.insert_files;
+        storage::SortByPath(insert_files);
         auto fs = milvus::segcore::GetDefaultArrowFileSystem();
 
         milvus_storage::FieldIDList field_id_list;
@@ -1775,8 +1497,6 @@ ChunkedSegmentSealedImpl::load_column_group_data_internal(
         } else {
             field_id_list = milvus_storage::FieldIDList(info.child_field_ids);
         }
-        timing.resolve_fields_ns = DurationSinceNs(stage_start);
-        stage_start = std::chrono::steady_clock::now();
 
         // if multiple fields share same column group
         // hint for not loading certain field shall not be working for now
@@ -1823,36 +1543,13 @@ ChunkedSegmentSealedImpl::load_column_group_data_internal(
                 }
             }
         }
-        timing.field_count = milvus_field_ids.size();
-        timing.stats_field_count = fields_for_stats.size();
-        for (auto field_id : milvus_field_ids) {
-            const auto& field_meta = field_metas.at(field_id);
-            if (IsVectorDataType(field_meta.get_data_type())) {
-                timing.has_vector = true;
-                break;
-            }
-        }
-        timing.schema_meta_ns = DurationSinceNs(stage_start);
-        stage_start = std::chrono::steady_clock::now();
-
         auto metadata = LoadGroupChunkMetadata(
-            file_infos,
+            insert_files,
             fields_for_stats,
             fmt::format(
                 "seg_{}_cg_{}", get_segment_id(), column_group_id.get()));
         auto parquet_stats_by_field =
             std::move(metadata.parquet_stats_by_field);
-        timing.metadata_ns = DurationSinceNs(stage_start);
-        timing.metadata_reader_make_ns = metadata.reader_make_ns;
-        timing.metadata_extract_ns = metadata.metadata_extract_ns;
-        timing.metadata_close_ns = metadata.close_ns;
-        timing.metadata_file_count = metadata.file_count;
-        timing.metadata_known_log_size_count = metadata.known_log_size_count;
-        timing.metadata_total_log_size = metadata.total_log_size;
-        timing.metadata_total_read_buffer_size =
-            metadata.total_read_buffer_size;
-        timing.metadata_max_read_buffer_size = metadata.max_read_buffer_size;
-        stage_start = std::chrono::steady_clock::now();
 
         auto translator =
             std::make_unique<storagev2translator::GroupChunkTranslator>(
@@ -1867,12 +1564,8 @@ ChunkedSegmentSealedImpl::load_column_group_data_internal(
                 milvus_field_ids.size(),
                 load_info.load_priority,
                 info.warmup_policy);
-        timing.create_translator_ns = DurationSinceNs(stage_start);
-        stage_start = std::chrono::steady_clock::now();
         auto chunked_column_group =
             std::make_shared<ChunkedColumnGroup>(std::move(translator));
-        timing.create_chunk_group_ns = DurationSinceNs(stage_start);
-        stage_start = std::chrono::steady_clock::now();
 
         // Create ProxyChunkColumn for each field in this column group
         for (const auto& field_id : milvus_field_ids) {
@@ -1905,9 +1598,6 @@ ChunkedSegmentSealedImpl::load_column_group_data_internal(
                 }
             }
         }
-        timing.proxy_common_ns = DurationSinceNs(stage_start);
-        timing.total_ns = DurationSinceNs(total_start);
-        storage_v2_field_data_timing_stats.Record(timing);
 
         if (column_group_id.get() == DEFAULT_SHORT_COLUMN_GROUP_ID) {
             stats_.mem_size += chunked_column_group->memory_size();
@@ -6292,12 +5982,10 @@ ChunkedSegmentSealedImpl::LoadBatchFieldData(
         field_binlog_info.insert_files.reserve(binlog_count);
         field_binlog_info.entries_nums.reserve(binlog_count);
         field_binlog_info.memory_sizes.reserve(binlog_count);
-        field_binlog_info.log_sizes.reserve(binlog_count);
         for (const auto& binlog : field_binlog.binlogs()) {
             field_binlog_info.insert_files.push_back(binlog.log_path());
             field_binlog_info.entries_nums.push_back(binlog.entries_num());
             field_binlog_info.memory_sizes.push_back(binlog.memory_size());
-            field_binlog_info.log_sizes.push_back(binlog.log_size());
             total_entries += binlog.entries_num();
         }
         field_binlog_info.row_count = total_entries;
