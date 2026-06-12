@@ -1358,10 +1358,32 @@ struct FileMetadataLoadResult {
         per_field_row_group_stats;
 };
 
+int64_t
+StorageV2MetadataReadBufferSize(int64_t log_size) {
+    constexpr int64_t kMinReadBufferSize = 4 * 1024;
+    if (log_size <= 0) {
+        return milvus_storage::DEFAULT_READ_BUFFER_SIZE;
+    }
+    return std::min(milvus_storage::DEFAULT_READ_BUFFER_SIZE,
+                    std::max(log_size, kMinReadBufferSize));
+}
+
 }  // namespace
 
 LoadedGroupChunkMetadata
 LoadGroupChunkMetadata(const std::vector<std::string>& insert_files,
+                       const std::vector<FieldId>& field_ids_for_stats,
+                       const std::string& debug_key) {
+    std::vector<GroupChunkFileInfo> file_infos;
+    file_infos.reserve(insert_files.size());
+    for (const auto& file : insert_files) {
+        file_infos.push_back({file, -1});
+    }
+    return LoadGroupChunkMetadata(file_infos, field_ids_for_stats, debug_key);
+}
+
+LoadedGroupChunkMetadata
+LoadGroupChunkMetadata(const std::vector<GroupChunkFileInfo>& insert_files,
                        const std::vector<FieldId>& field_ids_for_stats,
                        const std::string& debug_key) {
     auto fs = milvus::segcore::GetDefaultArrowFileSystem();
@@ -1369,17 +1391,19 @@ LoadGroupChunkMetadata(const std::vector<std::string>& insert_files,
 
     std::vector<std::future<FileMetadataLoadResult>> futures;
     futures.reserve(insert_files.size());
-    for (const auto& file : insert_files) {
+    for (const auto& file_info : insert_files) {
         // Futures are always joined below before this function returns, so
         // capturing loader inputs by reference is safe here.
         futures.push_back(pool.Submit([&fs,
-                                       file,
+                                       file_info,
                                        &field_ids_for_stats,
                                        &debug_key]() {
+            auto read_buffer_size =
+                StorageV2MetadataReadBufferSize(file_info.log_size);
             auto result = milvus_storage::FileRowGroupReader::Make(
                 fs,
-                file,
-                milvus_storage::DEFAULT_READ_BUFFER_SIZE,
+                file_info.file_path,
+                read_buffer_size,
                 storage::GetReaderProperties(),
                 storage::GetArrowReaderProperties());
             AssertInfo(result.ok(),
@@ -1420,7 +1444,7 @@ LoadGroupChunkMetadata(const std::vector<std::string>& insert_files,
                        "[StorageV2] metadata loader {} failed to close "
                        "file reader for {} with error {}",
                        debug_key,
-                       file,
+                       file_info.file_path,
                        status.ToString());
             return load_result;
         }));
@@ -1485,8 +1509,19 @@ ChunkedSegmentSealedImpl::load_column_group_data_internal(
                    "[StorageV2] The row count of field data is 0");
 
         auto column_group_id = FieldId(id);
-        auto insert_files = info.insert_files;
-        storage::SortByPath(insert_files);
+        std::vector<GroupChunkFileInfo> file_infos;
+        file_infos.reserve(info.insert_files.size());
+        for (size_t i = 0; i < info.insert_files.size(); ++i) {
+            file_infos.push_back(
+                {info.insert_files[i],
+                 i < info.log_sizes.size() ? info.log_sizes[i] : -1});
+        }
+        storage::SortByPath(file_infos);
+        std::vector<std::string> insert_files;
+        insert_files.reserve(file_infos.size());
+        for (const auto& file_info : file_infos) {
+            insert_files.push_back(file_info.file_path);
+        }
         auto fs = milvus::segcore::GetDefaultArrowFileSystem();
 
         milvus_storage::FieldIDList field_id_list;
@@ -1544,7 +1579,7 @@ ChunkedSegmentSealedImpl::load_column_group_data_internal(
             }
         }
         auto metadata = LoadGroupChunkMetadata(
-            insert_files,
+            file_infos,
             fields_for_stats,
             fmt::format(
                 "seg_{}_cg_{}", get_segment_id(), column_group_id.get()));
@@ -5982,10 +6017,12 @@ ChunkedSegmentSealedImpl::LoadBatchFieldData(
         field_binlog_info.insert_files.reserve(binlog_count);
         field_binlog_info.entries_nums.reserve(binlog_count);
         field_binlog_info.memory_sizes.reserve(binlog_count);
+        field_binlog_info.log_sizes.reserve(binlog_count);
         for (const auto& binlog : field_binlog.binlogs()) {
             field_binlog_info.insert_files.push_back(binlog.log_path());
             field_binlog_info.entries_nums.push_back(binlog.entries_num());
             field_binlog_info.memory_sizes.push_back(binlog.memory_size());
+            field_binlog_info.log_sizes.push_back(binlog.log_size());
             total_entries += binlog.entries_num();
         }
         field_binlog_info.row_count = total_entries;

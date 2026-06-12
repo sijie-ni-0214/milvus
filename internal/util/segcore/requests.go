@@ -76,10 +76,11 @@ func (req *LoadFieldDataRequest) getCLoadFieldDataRequest() (result *cLoadFieldD
 		for _, binlog := range field.Field.Binlogs {
 			cEntriesNum := C.int64_t(binlog.GetEntriesNum())
 			cMemorySize := C.int64_t(binlog.GetMemorySize())
+			cLogSize := C.int64_t(binlog.GetLogSize())
 			cFile := C.CString(binlog.GetLogPath())
 			defer C.free(unsafe.Pointer(cFile))
 
-			status = C.AppendLoadFieldDataPath(cLoadFieldDataInfo, cFieldID, cEntriesNum, cMemorySize, cFile)
+			status = C.AppendLoadFieldDataPath(cLoadFieldDataInfo, cFieldID, cEntriesNum, cMemorySize, cLogSize, cFile)
 			if err := ConsumeCStatusIntoError(&status); err != nil {
 				return nil, errors.Wrapf(err, "AppendLoadFieldDataPath failed at binlog, %d, %s", field.Field.GetFieldID(), binlog.GetLogPath())
 			}

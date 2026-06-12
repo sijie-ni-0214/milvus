@@ -1556,8 +1556,18 @@ struct LoadedGroupChunkMetadata {
     ParquetStatisticsByField parquet_stats_by_field;
 };
 
+struct GroupChunkFileInfo {
+    std::string file_path;
+    int64_t log_size = -1;
+};
+
 LoadedGroupChunkMetadata
 LoadGroupChunkMetadata(const std::vector<std::string>& insert_files,
+                       const std::vector<FieldId>& field_ids_for_stats,
+                       const std::string& debug_key);
+
+LoadedGroupChunkMetadata
+LoadGroupChunkMetadata(const std::vector<GroupChunkFileInfo>& insert_files,
                        const std::vector<FieldId>& field_ids_for_stats,
                        const std::string& debug_key);
 

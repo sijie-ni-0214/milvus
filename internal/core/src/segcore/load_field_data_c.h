@@ -48,6 +48,7 @@ AppendLoadFieldDataPath(CLoadFieldDataInfo c_load_field_data_info,
                         int64_t field_id,
                         int64_t entries_num,
                         int64_t memory_size,
+                        int64_t log_size,
                         const char* file_path);
 
 void
