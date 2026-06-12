@@ -77,6 +77,8 @@ type delegatorLoadTimingStats struct {
 	totalPostOther    *atomic.Int64
 	totalBloomFilter  *atomic.Int64
 	totalBM25Stats    *atomic.Int64
+	totalBM25Queue    *atomic.Int64
+	totalBM25Load     *atomic.Int64
 	totalStreamDelete *atomic.Int64
 	totalLoadSegments *atomic.Int64
 	maxWorkerLoad     *atomic.Int64
@@ -86,6 +88,8 @@ type delegatorLoadTimingStats struct {
 	maxPostOther      *atomic.Int64
 	maxBloomFilter    *atomic.Int64
 	maxBM25Stats      *atomic.Int64
+	maxBM25Queue      *atomic.Int64
+	maxBM25Load       *atomic.Int64
 	maxStreamDelete   *atomic.Int64
 	maxLoadSegments   *atomic.Int64
 	lastLogUnixNano   *atomic.Int64
@@ -142,6 +146,8 @@ func newDelegatorLoadTimingStats() *delegatorLoadTimingStats {
 		totalPostOther:    atomic.NewInt64(0),
 		totalBloomFilter:  atomic.NewInt64(0),
 		totalBM25Stats:    atomic.NewInt64(0),
+		totalBM25Queue:    atomic.NewInt64(0),
+		totalBM25Load:     atomic.NewInt64(0),
 		totalStreamDelete: atomic.NewInt64(0),
 		totalLoadSegments: atomic.NewInt64(0),
 		maxWorkerLoad:     atomic.NewInt64(0),
@@ -151,6 +157,8 @@ func newDelegatorLoadTimingStats() *delegatorLoadTimingStats {
 		maxPostOther:      atomic.NewInt64(0),
 		maxBloomFilter:    atomic.NewInt64(0),
 		maxBM25Stats:      atomic.NewInt64(0),
+		maxBM25Queue:      atomic.NewInt64(0),
+		maxBM25Load:       atomic.NewInt64(0),
 		maxStreamDelete:   atomic.NewInt64(0),
 		maxLoadSegments:   atomic.NewInt64(0),
 		lastLogUnixNano:   atomic.NewInt64(time.Now().UnixNano()),
@@ -290,12 +298,12 @@ func (s *delegatorStreamDeleteTimingStats) record(segmentNum int, timing streamD
 	)
 }
 
-func (s *delegatorLoadTimingStats) record(segmentNum int, workerLoadDur, postLoadDur, postLoadWaitDur, bloomFilterDur, bm25StatsDur, streamDeleteDur, totalDur time.Duration, postLoadCap int, postLoadCurrent int) {
+func (s *delegatorLoadTimingStats) record(segmentNum int, workerLoadDur, postLoadDur, postLoadWaitDur, bloomFilterDur, bm25StatsDur, bm25QueueDur, bm25LoadDur, streamDeleteDur, totalDur time.Duration, postLoadCap int, postLoadCurrent int) {
 	postLoadWorkDur := postLoadDur - postLoadWaitDur
 	if postLoadWorkDur < 0 {
 		postLoadWorkDur = 0
 	}
-	postOtherDur := postLoadWorkDur - bloomFilterDur - bm25StatsDur - streamDeleteDur
+	postOtherDur := postLoadWorkDur - bloomFilterDur - streamDeleteDur
 	if postOtherDur < 0 {
 		postOtherDur = 0
 	}
@@ -308,6 +316,8 @@ func (s *delegatorLoadTimingStats) record(segmentNum int, workerLoadDur, postLoa
 	s.totalPostOther.Add(int64(postOtherDur))
 	s.totalBloomFilter.Add(int64(bloomFilterDur))
 	s.totalBM25Stats.Add(int64(bm25StatsDur))
+	s.totalBM25Queue.Add(int64(bm25QueueDur))
+	s.totalBM25Load.Add(int64(bm25LoadDur))
 	s.totalStreamDelete.Add(int64(streamDeleteDur))
 	s.totalLoadSegments.Add(int64(totalDur))
 	updateMaxDuration(s.maxWorkerLoad, workerLoadDur)
@@ -317,6 +327,8 @@ func (s *delegatorLoadTimingStats) record(segmentNum int, workerLoadDur, postLoa
 	updateMaxDuration(s.maxPostOther, postOtherDur)
 	updateMaxDuration(s.maxBloomFilter, bloomFilterDur)
 	updateMaxDuration(s.maxBM25Stats, bm25StatsDur)
+	updateMaxDuration(s.maxBM25Queue, bm25QueueDur)
+	updateMaxDuration(s.maxBM25Load, bm25LoadDur)
 	updateMaxDuration(s.maxStreamDelete, streamDeleteDur)
 	updateMaxDuration(s.maxLoadSegments, totalDur)
 
@@ -339,6 +351,8 @@ func (s *delegatorLoadTimingStats) record(segmentNum int, workerLoadDur, postLoa
 	totalPostOther := s.totalPostOther.Swap(0)
 	totalBloomFilter := s.totalBloomFilter.Swap(0)
 	totalBM25Stats := s.totalBM25Stats.Swap(0)
+	totalBM25Queue := s.totalBM25Queue.Swap(0)
+	totalBM25Load := s.totalBM25Load.Swap(0)
 	totalStreamDelete := s.totalStreamDelete.Swap(0)
 	totalLoadSegments := s.totalLoadSegments.Swap(0)
 	maxWorkerLoad := s.maxWorkerLoad.Swap(0)
@@ -348,6 +362,8 @@ func (s *delegatorLoadTimingStats) record(segmentNum int, workerLoadDur, postLoa
 	maxPostOther := s.maxPostOther.Swap(0)
 	maxBloomFilter := s.maxBloomFilter.Swap(0)
 	maxBM25Stats := s.maxBM25Stats.Swap(0)
+	maxBM25Queue := s.maxBM25Queue.Swap(0)
+	maxBM25Load := s.maxBM25Load.Swap(0)
 	maxStreamDelete := s.maxStreamDelete.Swap(0)
 	maxLoadSegments := s.maxLoadSegments.Swap(0)
 	if count == 0 {
@@ -366,6 +382,8 @@ func (s *delegatorLoadTimingStats) record(segmentNum int, workerLoadDur, postLoa
 		zap.Duration("avgPostOtherDur", avgDuration(totalPostOther, count)),
 		zap.Duration("avgBloomFilterDur", avgDuration(totalBloomFilter, count)),
 		zap.Duration("avgBM25StatsDur", avgDuration(totalBM25Stats, count)),
+		zap.Duration("avgBM25QueueDur", avgDuration(totalBM25Queue, count)),
+		zap.Duration("avgBM25LoadDur", avgDuration(totalBM25Load, count)),
 		zap.Duration("avgStreamDeleteDur", avgDuration(totalStreamDelete, count)),
 		zap.Duration("avgTotalDur", avgDuration(totalLoadSegments, count)),
 		zap.Duration("maxWorkerLoadDur", time.Duration(maxWorkerLoad)),
@@ -375,6 +393,8 @@ func (s *delegatorLoadTimingStats) record(segmentNum int, workerLoadDur, postLoa
 		zap.Duration("maxPostOtherDur", time.Duration(maxPostOther)),
 		zap.Duration("maxBloomFilterDur", time.Duration(maxBloomFilter)),
 		zap.Duration("maxBM25StatsDur", time.Duration(maxBM25Stats)),
+		zap.Duration("maxBM25QueueDur", time.Duration(maxBM25Queue)),
+		zap.Duration("maxBM25LoadDur", time.Duration(maxBM25Load)),
 		zap.Duration("maxStreamDeleteDur", time.Duration(maxStreamDelete)),
 		zap.Duration("maxTotalDur", time.Duration(maxLoadSegments)),
 		zap.Int64("activeRequests", s.active.Load()),
@@ -840,25 +860,33 @@ func (sd *shardDelegator) LoadGrowing(ctx context.Context, infos []*querypb.Segm
 
 // load bm25 stats for sealed segments.
 // idf oracle owns the full lifecycle: download, disk write, register, cleanup.
-func (sd *shardDelegator) loadBM25Stats(ctx context.Context, infos []*querypb.SegmentLoadInfo, req *querypb.LoadSegmentsRequest) error {
-	if sd.idfOracle == nil {
-		return nil
+func (sd *shardDelegator) loadBM25Stats(ctx context.Context, infos []*querypb.SegmentLoadInfo, req *querypb.LoadSegmentsRequest) (time.Duration, time.Duration, error) {
+	if sd.idfOracle == nil || len(infos) == 0 {
+		return 0, 0, nil
 	}
 
 	pool := segments.GetBM25LoadPool()
 
 	cm := sd.loader.GetChunkManager()
+	totalQueueDur := atomic.NewInt64(0)
+	totalLoadDur := atomic.NewInt64(0)
 	futures := make([]*conc.Future[any], 0, len(infos))
 	for _, info := range infos {
 		info := info
+		submitTime := time.Now()
 		futures = append(futures, pool.Submit(func() (any, error) {
+			queueDur := time.Since(submitTime)
+			totalQueueDur.Add(int64(queueDur))
+			loadStart := time.Now()
 			if err := sd.idfOracle.LoadSealed(ctx, info.GetSegmentID(), info, cm); err != nil {
+				totalLoadDur.Add(int64(time.Since(loadStart)))
 				log.Warn("failed to load bm25 stats for segment",
 					zap.Int64("collectionID", req.GetCollectionID()),
 					zap.Int64("segmentID", info.GetSegmentID()),
 					zap.Error(err))
 				return nil, err
 			}
+			totalLoadDur.Add(int64(time.Since(loadStart)))
 			return nil, nil
 		}))
 	}
@@ -866,9 +894,9 @@ func (sd *shardDelegator) loadBM25Stats(ctx context.Context, infos []*querypb.Se
 	err := conc.BlockOnAll(futures...)
 	if err != nil {
 		log.Warn("failed to load bm25 stats", zap.Error(err))
-		return err
+		return time.Duration(totalQueueDur.Load()), time.Duration(totalLoadDur.Load()), err
 	}
-	return nil
+	return time.Duration(totalQueueDur.Load()), time.Duration(totalLoadDur.Load()), nil
 }
 
 // LoadSegments load segments local or remotely depends on the target node.
@@ -883,6 +911,8 @@ func (sd *shardDelegator) LoadSegments(ctx context.Context, req *querypb.LoadSeg
 	var postLoadWaitDur time.Duration
 	var bloomFilterDur time.Duration
 	var bm25StatsDur time.Duration
+	var bm25QueueDur time.Duration
+	var bm25LoadDur time.Duration
 	var streamDeleteDur time.Duration
 	defer func() {
 		postLoadCap := 0
@@ -898,6 +928,8 @@ func (sd *shardDelegator) LoadSegments(ctx context.Context, req *querypb.LoadSeg
 			postLoadWaitDur,
 			bloomFilterDur,
 			bm25StatsDur,
+			bm25QueueDur,
+			bm25LoadDur,
 			streamDeleteDur,
 			time.Since(loadSegmentsStart),
 			postLoadCap,
@@ -950,6 +982,12 @@ func (sd *shardDelegator) LoadSegments(ctx context.Context, req *querypb.LoadSeg
 		return err
 	}
 
+	filterNewInfos := func() []*querypb.SegmentLoadInfo {
+		return lo.Filter(req.GetInfos(), func(info *querypb.SegmentLoadInfo, _ int) bool {
+			return !sd.distribution.SealedSegmentExistsOnNode(info.GetSegmentID(), targetNodeID)
+		})
+	}
+
 	// separate infos into different load task
 	workerLoadStart := time.Now()
 	if len(req.GetInfos()) > 1 {
@@ -984,26 +1022,22 @@ func (sd *shardDelegator) LoadSegments(ctx context.Context, req *querypb.LoadSeg
 		return nil
 	}
 
+	infos := filterNewInfos()
+	stageStart := time.Now()
+	bm25QueueDur, bm25LoadDur, err = sd.loadBM25Stats(ctx, infos, req)
+	bm25StatsDur = time.Since(stageStart)
+	if err != nil {
+		log.Warn("failed to load BM25 stats", zap.Error(err))
+		return err
+	}
+
 	postLoadStart := time.Now()
 	postLoadWaitDur, err = sd.withPostLoadLimit(ctx, func() error {
-		infos := lo.Filter(req.GetInfos(), func(info *querypb.SegmentLoadInfo, _ int) bool {
-			return !sd.distribution.SealedSegmentExistsOnNode(info.GetSegmentID(), targetNodeID)
-		})
-
 		stageStart := time.Now()
 		candidates, err := sd.loader.LoadBloomFilterSet(ctx, req.GetCollectionID(), infos...)
 		bloomFilterDur = time.Since(stageStart)
 		if err != nil {
 			log.Warn("failed to load bloom filter set for segment", zap.Error(err))
-			return err
-		}
-
-		// Load BM25 stats BEFORE loadStreamDelete so stats are ready before segment becomes visible
-		stageStart = time.Now()
-		err = sd.loadBM25Stats(ctx, infos, req)
-		bm25StatsDur = time.Since(stageStart)
-		if err != nil {
-			log.Warn("failed to load BM25 stats", zap.Error(err))
 			return err
 		}
 
