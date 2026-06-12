@@ -1554,6 +1554,14 @@ using ParquetStatisticsByField =
 struct LoadedGroupChunkMetadata {
     std::vector<milvus_storage::RowGroupMetadataVector> row_group_meta_list;
     ParquetStatisticsByField parquet_stats_by_field;
+    int64_t reader_make_ns = 0;
+    int64_t metadata_extract_ns = 0;
+    int64_t close_ns = 0;
+    int64_t file_count = 0;
+    int64_t known_log_size_count = 0;
+    int64_t total_log_size = 0;
+    int64_t total_read_buffer_size = 0;
+    int64_t max_read_buffer_size = 0;
 };
 
 struct GroupChunkFileInfo {
