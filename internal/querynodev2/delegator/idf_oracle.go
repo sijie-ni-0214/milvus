@@ -51,36 +51,6 @@ import (
 
 const memoryHeadroom = 4 * 1024 * 1024 // 4MB headroom for Insert path, ~50K unique tokens
 
-type emptyBM25StatsReader struct{}
-
-func (emptyBM25StatsReader) Read(_ []byte) (int, error) {
-	return 0, io.EOF
-}
-
-var (
-	bm25StatsReaderPools sync.Map
-	bm25StatsEmptyReader emptyBM25StatsReader
-)
-
-func getBM25StatsReader(reader io.Reader, size int) (*bufio.Reader, func()) {
-	if size <= 0 {
-		size = 4096
-	}
-
-	poolValue, _ := bm25StatsReaderPools.LoadOrStore(size, &sync.Pool{
-		New: func() any {
-			return bufio.NewReaderSize(bm25StatsEmptyReader, size)
-		},
-	})
-	pool := poolValue.(*sync.Pool)
-	br := pool.Get().(*bufio.Reader)
-	br.Reset(reader)
-	return br, func() {
-		br.Reset(bm25StatsEmptyReader)
-		pool.Put(br)
-	}
-}
-
 type IDFOracle interface {
 	SetNext(snapshot *snapshot)
 	TargetVersion() int64
@@ -438,12 +408,9 @@ func streamOneFile(ctx context.Context, cm storage.ChunkManager, remotePath, loc
 		return 0, err
 	}
 	defer f.Close()
-	// BM25 stats files are rebuildable local runtime cache; avoid forcing
-	// every small segment file to stable storage during recovery.
 
 	if parseInto != nil {
-		br, putReader := getBM25StatsReader(reader, paramtable.Get().QueryNodeCfg.IDFReadBufferSize.GetAsInt())
-		defer putReader()
+		br := bufio.NewReaderSize(reader, paramtable.Get().QueryNodeCfg.IDFReadBufferSize.GetAsInt())
 		bw := bufio.NewWriter(f)
 		tee := io.TeeReader(br, bw)
 		err = parseInto.DeserializeFromReader(tee)
@@ -451,6 +418,9 @@ func streamOneFile(ctx context.Context, cm storage.ChunkManager, remotePath, loc
 			return 0, err
 		}
 		if err := bw.Flush(); err != nil {
+			return 0, err
+		}
+		if err := f.Sync(); err != nil {
 			return 0, err
 		}
 		info, err := f.Stat()
@@ -462,6 +432,9 @@ func streamOneFile(ctx context.Context, cm storage.ChunkManager, remotePath, loc
 
 	written, err := io.Copy(f, reader)
 	if err != nil {
+		return 0, err
+	}
+	if err := f.Sync(); err != nil {
 		return 0, err
 	}
 	return written, nil
