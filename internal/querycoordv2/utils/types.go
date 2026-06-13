@@ -93,15 +93,13 @@ func PackSegmentLoadInfo(segment *datapb.SegmentInfo, channelCheckpoint *msgpb.M
 	// Deltalogs are always populated (delta log loading has its own manifest path)
 	loadInfo.Deltalogs = segment.Deltalogs
 
-	loadInfo.TextStatsLogs = segment.GetTextStatsLogs()
-	loadInfo.JsonKeyStatsLogs = segment.GetJsonKeyStats()
-
-	// When manifest_path is set, legacy stats are stored in the manifest.
-	// Keep text/json stats metadata so QueryNode can resolve their V3 base paths
-	// without reopening every segment manifest during recovery.
+	// When manifest_path is set, stats are stored in the manifest.
+	// Skip populating legacy stats fields - the reader will load from manifest.
 	if segment.GetManifestPath() == "" {
 		loadInfo.Statslogs = segment.Statslogs
 		loadInfo.Bm25Logs = segment.Bm25Statslogs
+		loadInfo.TextStatsLogs = segment.GetTextStatsLogs()
+		loadInfo.JsonKeyStatsLogs = segment.GetJsonKeyStats()
 	}
 
 	return loadInfo
