@@ -98,6 +98,9 @@ void
 SegcoreSetPreferFieldDataWhenIndexHasRawData(const bool value);
 
 void
+SegcoreSetLazyManifestReaderEnabled(const bool value);
+
+void
 SegcoreCloseGlog();
 
 int32_t

@@ -22,6 +22,7 @@
 #include <cstdint>
 #include <ctime>
 #include <exception>
+#include <functional>
 #include <future>
 #include <iosfwd>
 #include <limits>
@@ -157,6 +158,380 @@ CheckVectorOutputCellsLoaded(int64_t segment_id,
                              const ChunkedColumnInterface* column,
                              const int64_t* offsets,
                              int64_t count);
+
+namespace {
+
+struct LazyManifestColumnGroupContext {
+    int64_t segment_id;
+    int64_t column_group_index;
+    std::shared_ptr<std::vector<std::string>> needed_columns;
+    std::function<std::shared_ptr<milvus_storage::api::ChunkReader>()>
+        chunk_reader_factory;
+    std::unordered_map<FieldId, FieldMeta> field_metas;
+    bool use_mmap;
+    bool mmap_populate;
+    std::string mmap_dir_path;
+    int64_t num_fields;
+    milvus::proto::common::LoadPriority load_priority;
+    std::string warmup_policy;
+    std::string cache_key_suffix;
+};
+
+class LazyManifestColumnGroup {
+ public:
+    explicit LazyManifestColumnGroup(LazyManifestColumnGroupContext context)
+        : context_(std::move(context)) {
+    }
+
+    std::shared_ptr<ChunkedColumnGroup>
+    Materialize() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (group_ != nullptr) {
+            return group_;
+        }
+
+        auto start = std::chrono::steady_clock::now();
+        auto chunk_reader = context_.chunk_reader_factory();
+
+        auto translator =
+            std::make_unique<storagev2translator::ManifestGroupTranslator>(
+                context_.segment_id,
+                GroupChunkType::DEFAULT,
+                context_.column_group_index,
+                std::move(chunk_reader),
+                context_.field_metas,
+                context_.use_mmap,
+                context_.mmap_populate,
+                context_.mmap_dir_path,
+                context_.num_fields,
+                context_.load_priority,
+                /*eager_load=*/false,
+                context_.warmup_policy,
+                context_.cache_key_suffix);
+        group_ = std::make_shared<ChunkedColumnGroup>(std::move(translator));
+
+        auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                              std::chrono::steady_clock::now() - start)
+                              .count();
+        LOG_INFO(
+            "[StorageV2] lazy manifest column group materialized, segment {}, "
+            "cg {}, column_count {}, elapsed {}ms",
+            context_.segment_id,
+            context_.column_group_index,
+            context_.needed_columns->size(),
+            elapsed_ms);
+        return group_;
+    }
+
+    void
+    ManualEvictCache() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (group_ != nullptr) {
+            group_->ManualEvictCache();
+        }
+    }
+
+    void
+    CancelWarmup() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (group_ != nullptr) {
+            group_->CancelWarmup();
+        }
+    }
+
+    bool
+    IsMaterialized() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return group_ != nullptr;
+    }
+
+    int64_t
+    NumFieldsInGroup() const {
+        return context_.num_fields;
+    }
+
+ private:
+    LazyManifestColumnGroupContext context_;
+    mutable std::mutex mutex_;
+    std::shared_ptr<ChunkedColumnGroup> group_;
+};
+
+class LazyManifestProxyColumn : public ChunkedColumnInterface {
+ public:
+    LazyManifestProxyColumn(std::shared_ptr<LazyManifestColumnGroup> group,
+                            FieldId field_id,
+                            const FieldMeta& field_meta,
+                            size_t num_rows)
+        : group_(std::move(group)),
+          field_id_(field_id),
+          field_meta_(field_meta),
+          num_rows_(num_rows) {
+    }
+
+    ~LazyManifestProxyColumn() override {
+        CancelWarmup();
+    }
+
+    bool
+    IsInMultiFieldColumnGroup() const override {
+        return group_->NumFieldsInGroup() > 1;
+    }
+
+    void
+    ManualEvictCache() const override {
+        if (group_->IsMaterialized()) {
+            group_->ManualEvictCache();
+        }
+    }
+
+    void
+    CancelWarmup() override {
+        if (group_->IsMaterialized()) {
+            group_->CancelWarmup();
+        }
+    }
+
+    cachinglayer::PinWrapper<const char*>
+    DataOfChunk(milvus::OpContext* op_ctx, int chunk_id) const override {
+        return MaterializedColumn()->DataOfChunk(op_ctx, chunk_id);
+    }
+
+    bool
+    IsValid(milvus::OpContext* op_ctx, size_t offset) const override {
+        return MaterializedColumn()->IsValid(op_ctx, offset);
+    }
+
+    void
+    BulkIsValid(milvus::OpContext* ctx,
+                std::function<void(bool, size_t)> fn,
+                const int64_t* offsets,
+                int64_t count) const override {
+        MaterializedColumn()->BulkIsValid(ctx, std::move(fn), offsets, count);
+    }
+
+    bool
+    IsNullable() const override {
+        return field_meta_.is_nullable();
+    }
+
+    size_t
+    NumRows() const override {
+        return num_rows_;
+    }
+
+    int64_t
+    num_chunks() const override {
+        return MaterializedColumn()->num_chunks();
+    }
+
+    size_t
+    DataByteSize() const override {
+        auto column = MaterializedColumnIfReady();
+        if (column != nullptr) {
+            return column->DataByteSize();
+        }
+        return 0;
+    }
+
+    int64_t
+    chunk_row_nums(int64_t chunk_id) const override {
+        return MaterializedColumn()->chunk_row_nums(chunk_id);
+    }
+
+    PinWrapper<SpanBase>
+    Span(milvus::OpContext* op_ctx, int64_t chunk_id) const override {
+        return MaterializedColumn()->Span(op_ctx, chunk_id);
+    }
+
+    void
+    PrefetchChunks(milvus::OpContext* op_ctx,
+                   const std::vector<int64_t>& chunk_ids) const override {
+        MaterializedColumn()->PrefetchChunks(op_ctx, chunk_ids);
+    }
+
+    PinWrapper<std::pair<std::vector<std::string_view>, FixedVector<bool>>>
+    StringViews(milvus::OpContext* op_ctx,
+                int64_t chunk_id,
+                std::optional<std::pair<int64_t, int64_t>> offset_len =
+                    std::nullopt) const override {
+        return MaterializedColumn()->StringViews(op_ctx, chunk_id, offset_len);
+    }
+
+    PinWrapper<std::pair<std::vector<ArrayView>, FixedVector<bool>>>
+    ArrayViews(
+        milvus::OpContext* op_ctx,
+        int64_t chunk_id,
+        std::optional<std::pair<int64_t, int64_t>> offset_len) const override {
+        return MaterializedColumn()->ArrayViews(op_ctx, chunk_id, offset_len);
+    }
+
+    PinWrapper<std::pair<std::vector<VectorArrayView>, FixedVector<bool>>>
+    VectorArrayViews(
+        milvus::OpContext* op_ctx,
+        int64_t chunk_id,
+        std::optional<std::pair<int64_t, int64_t>> offset_len) const override {
+        return MaterializedColumn()->VectorArrayViews(
+            op_ctx, chunk_id, offset_len);
+    }
+
+    PinWrapper<const size_t*>
+    VectorArrayOffsets(milvus::OpContext* op_ctx,
+                       int64_t chunk_id) const override {
+        return MaterializedColumn()->VectorArrayOffsets(op_ctx, chunk_id);
+    }
+
+    PinWrapper<std::pair<std::vector<std::string_view>, FixedVector<bool>>>
+    StringViewsByOffsets(milvus::OpContext* op_ctx,
+                         int64_t chunk_id,
+                         const FixedVector<int32_t>& offsets) const override {
+        return MaterializedColumn()->StringViewsByOffsets(
+            op_ctx, chunk_id, offsets);
+    }
+
+    PinWrapper<std::pair<std::vector<ArrayView>, FixedVector<bool>>>
+    ArrayViewsByOffsets(milvus::OpContext* op_ctx,
+                        int64_t chunk_id,
+                        const FixedVector<int32_t>& offsets) const override {
+        return MaterializedColumn()->ArrayViewsByOffsets(
+            op_ctx, chunk_id, offsets);
+    }
+
+    std::pair<size_t, size_t>
+    GetChunkIDByOffset(int64_t offset) const override {
+        return MaterializedColumn()->GetChunkIDByOffset(offset);
+    }
+
+    std::pair<std::vector<milvus::cachinglayer::cid_t>, std::vector<int64_t>>
+    GetChunkIDsByOffsets(const int64_t* offsets, int64_t count) const override {
+        return MaterializedColumn()->GetChunkIDsByOffsets(offsets, count);
+    }
+
+    PinWrapper<Chunk*>
+    GetChunk(milvus::OpContext* op_ctx, int64_t chunk_id) const override {
+        return MaterializedColumn()->GetChunk(op_ctx, chunk_id);
+    }
+
+    std::vector<PinWrapper<Chunk*>>
+    GetAllChunks(milvus::OpContext* op_ctx) const override {
+        return MaterializedColumn()->GetAllChunks(op_ctx);
+    }
+
+    int64_t
+    GetNumRowsUntilChunk(int64_t chunk_id) const override {
+        return MaterializedColumn()->GetNumRowsUntilChunk(chunk_id);
+    }
+
+    const std::vector<int64_t>&
+    GetNumRowsUntilChunk() const override {
+        return MaterializedColumn()->GetNumRowsUntilChunk();
+    }
+
+    void
+    BuildValidRowIds(milvus::OpContext* op_ctx) override {
+        MaterializedColumn()->BuildValidRowIds(op_ctx);
+    }
+
+    void
+    BulkValueAt(milvus::OpContext* op_ctx,
+                std::function<void(const char*, size_t)> fn,
+                const int64_t* offsets,
+                int64_t count) override {
+        MaterializedColumn()->BulkValueAt(
+            op_ctx, std::move(fn), offsets, count);
+    }
+
+    void
+    BulkPrimitiveValueAt(milvus::OpContext* op_ctx,
+                         void* dst,
+                         const int64_t* offsets,
+                         int64_t count,
+                         bool small_int_raw_type = false) override {
+        MaterializedColumn()->BulkPrimitiveValueAt(
+            op_ctx, dst, offsets, count, small_int_raw_type);
+    }
+
+    void
+    BulkVectorValueAt(milvus::OpContext* op_ctx,
+                      void* dst,
+                      const int64_t* offsets,
+                      int64_t element_sizeof,
+                      int64_t count) override {
+        MaterializedColumn()->BulkVectorValueAt(
+            op_ctx, dst, offsets, element_sizeof, count);
+    }
+
+    void
+    BulkRawStringAt(milvus::OpContext* op_ctx,
+                    std::function<void(std::string_view, size_t, bool)> fn,
+                    const int64_t* offsets = nullptr,
+                    int64_t count = 0) const override {
+        MaterializedColumn()->BulkRawStringAt(
+            op_ctx, std::move(fn), offsets, count);
+    }
+
+    void
+    BulkRawJsonAt(milvus::OpContext* op_ctx,
+                  std::function<void(Json, size_t, bool)> fn,
+                  const int64_t* offsets,
+                  int64_t count) const override {
+        MaterializedColumn()->BulkRawJsonAt(
+            op_ctx, std::move(fn), offsets, count);
+    }
+
+    void
+    BulkRawBsonAt(milvus::OpContext* op_ctx,
+                  std::function<void(BsonView, uint32_t, uint32_t)> fn,
+                  const uint32_t* row_offsets,
+                  const uint32_t* value_offsets,
+                  int64_t count) const override {
+        MaterializedColumn()->BulkRawBsonAt(
+            op_ctx, std::move(fn), row_offsets, value_offsets, count);
+    }
+
+    void
+    BulkArrayAt(milvus::OpContext* op_ctx,
+                std::function<void(const ArrayView&, size_t)> fn,
+                const int64_t* offsets,
+                int64_t count) const override {
+        MaterializedColumn()->BulkArrayAt(
+            op_ctx, std::move(fn), offsets, count);
+    }
+
+    void
+    BulkVectorArrayAt(milvus::OpContext* op_ctx,
+                      std::function<void(VectorFieldProto&&, size_t)> fn,
+                      const int64_t* offsets,
+                      int64_t count) const override {
+        MaterializedColumn()->BulkVectorArrayAt(
+            op_ctx, std::move(fn), offsets, count);
+    }
+
+ private:
+    std::shared_ptr<ChunkedColumnInterface>
+    MaterializedColumn() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (column_ == nullptr) {
+            column_ = std::make_shared<ProxyChunkColumn>(
+                group_->Materialize(), field_id_, field_meta_);
+        }
+        return column_;
+    }
+
+    std::shared_ptr<ChunkedColumnInterface>
+    MaterializedColumnIfReady() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return column_;
+    }
+
+    std::shared_ptr<LazyManifestColumnGroup> group_;
+    FieldId field_id_;
+    FieldMeta field_meta_;
+    size_t num_rows_;
+    mutable std::mutex mutex_;
+    mutable std::shared_ptr<ChunkedColumnInterface> column_;
+};
+
+}  // namespace
 
 static inline void
 set_bit(BitsetType& bitset, FieldId field_id, bool flag = true) {
@@ -672,6 +1047,10 @@ ChunkedSegmentSealedImpl::LoadColumnGroups(const std::string& manifest_path,
              .GetProperties());
     auto load_info = std::atomic_load(&segment_load_info_);
     auto column_groups = load_info->GetColumnGroups();
+    {
+        std::lock_guard<std::mutex> lock(reader_mutex_);
+        reader_.reset();
+    }
 
     // External collections: inject extfs.{collectionID}.* derived from
     // external_source and external_spec only. InjectExternalSpecProperties zero-
@@ -689,39 +1068,21 @@ ChunkedSegmentSealedImpl::LoadColumnGroups(const std::string& manifest_path,
                                      schema_->get_external_spec());
     }
 
-    // Schemaless reader for external collections: pass nullptr schema and
-    // let the Reader derive types from file metadata (Parquet footer).
-    // FillFieldData handles Parquet-native → Milvus type conversion.
-    //
     // This overload is reached only via
     // ApplyLoadDiff when load_external_manifest is set, which in turn is
     // gated on is_external_collection() — see SegmentLoadInfo.cpp where the
     // flag is assigned. The non-external path uses LoadColumnGroups(
-    // column_groups, ...) and never enters here.
-    auto needed_columns = schema_->GetExternalColumnNames();
-    // reader_mutex_ guards reader_ against concurrent use in ExecuteTake.
-    // Reopen reaches this function with mutex_ already released (see Reopen
-    // for the rationale), so without this lock a concurrent ExecuteTake can
-    // observe a mid-assigned shared_ptr or drop the old Reader's refcount
-    // while another thread is still calling take() on it. Initial load is
-    // uncontended (segment not yet ready), so the extra lock is free.
-    {
-        std::lock_guard<std::mutex> lock(reader_mutex_);
-        reader_ = milvus_storage::api::Reader::create(column_groups,
-                                                      /*arrow_schema=*/nullptr,
-                                                      needed_columns,
-                                                      *properties);
-    }
-
-    auto reader_create_ms =
+    // column_groups, ...) and never enters here. Readers are created later
+    // only for eager/fallback materialization or take API access.
+    auto manifest_prepare_ms =
         std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::high_resolution_clock::now() - load_cg_start)
             .count();
     LOG_INFO(
-        "[LoadColumnGroups] segment {} reader created in {}ms, {} column "
+        "[LoadColumnGroups] segment {} manifest prepared in {}ms, {} column "
         "groups",
         id_,
-        reader_create_ms,
+        manifest_prepare_ms,
         column_groups->size());
 
     // Pre-resolve field IDs for each column group, then reuse the
@@ -738,10 +1099,10 @@ ChunkedSegmentSealedImpl::LoadColumnGroups(const std::string& manifest_path,
         cg_field_ids.emplace_back(static_cast<int>(i), std::move(field_ids));
     }
 
-    // Split each column group's fields into eager (warmup=sync/async) and
-    // lazy (warmup=disable) subsets, so that each subset creates its own
-    // ChunkReader with column projection.  This avoids downloading all
-    // columns from S3 when only a subset needs eager warming.
+    // Split each column group's fields by effective warmup policy. True-lazy
+    // fields attach a proxy without creating a reader; warmup-disabled fallback
+    // fields are grouped per column group because they still need load-time
+    // side effects.
     struct FieldGroupTask {
         int cg_index;
         std::vector<FieldId> field_ids;
@@ -752,9 +1113,12 @@ ChunkedSegmentSealedImpl::LoadColumnGroups(const std::string& manifest_path,
     for (const auto& pair : cg_field_ids) {
         auto cg_index = pair.first;
         const auto& all_fields = pair.second;
+        auto lazy_manifest_reader_enabled =
+            segcore_config_.get_lazy_manifest_reader_enabled();
 
         std::vector<FieldId> eager_fields;
-        std::vector<FieldId> lazy_fields;
+        std::vector<FieldId> lazy_manifest_fields;
+        std::vector<FieldId> fallback_fields;
 
         for (const auto& field_id : all_fields) {
             const auto& field_meta = (*schema_)[field_id];
@@ -775,28 +1139,47 @@ ChunkedSegmentSealedImpl::LoadColumnGroups(const std::string& manifest_path,
                                                  /*in_load_list=*/true);
             if (resolved != CacheWarmupPolicy::CacheWarmupPolicy_Disable) {
                 eager_fields.push_back(field_id);
+            } else if (lazy_manifest_reader_enabled &&
+                       CanUseLazyManifestField(field_id, field_meta)) {
+                lazy_manifest_fields.push_back(field_id);
             } else {
-                lazy_fields.push_back(field_id);
+                auto reason = lazy_manifest_reader_enabled
+                                  ? LazyManifestFieldBlockReason(field_id,
+                                                                 field_meta)
+                                  : "lazy manifest reader disabled";
+                LOG_DEBUG(
+                    "[StorageV2] skip lazy manifest field, segment {}, cg {}, "
+                    "field {}, reason {}",
+                    get_segment_id(),
+                    cg_index,
+                    field_id.get(),
+                    reason);
+                fallback_fields.push_back(field_id);
             }
         }
 
+        auto eager_field_count = eager_fields.size();
+        auto lazy_manifest_field_count = lazy_manifest_fields.size();
+        auto fallback_field_count = fallback_fields.size();
         if (!eager_fields.empty()) {
             tasks.push_back({cg_index, std::move(eager_fields), true});
         }
-        // Lazy fields are emitted one-per-field so that each creates its
-        // own single-column projected ChunkReader. Accessing one lazy
-        // field (e.g. caption) will not co-load sibling lazy fields
-        // (e.g. vector), avoiding unnecessary S3 downloads.
-        for (const auto& fid : lazy_fields) {
+        for (const auto& fid : lazy_manifest_fields) {
             tasks.push_back({cg_index, {fid}, false});
         }
-        if (!eager_fields.empty() && !lazy_fields.empty()) {
+        if (!fallback_fields.empty()) {
+            tasks.push_back({cg_index, std::move(fallback_fields), false});
+        }
+        if (eager_field_count > 0 &&
+            (lazy_manifest_field_count > 0 || fallback_field_count > 0)) {
             LOG_INFO(
-                "[LoadColumnGroups] segment {} cg {} split: {} eager, {} lazy",
+                "[LoadColumnGroups] segment {} cg {} split: {} eager, {} lazy "
+                "manifest, {} fallback",
                 get_segment_id(),
                 cg_index,
-                eager_fields.size(),
-                lazy_fields.size());
+                eager_field_count,
+                lazy_manifest_field_count,
+                fallback_field_count);
         }
     }
 
@@ -3157,6 +3540,7 @@ ChunkedSegmentSealedImpl::ClearData() {
         pk_index_slot_.wlock()->reset();
         fields_.wlock()->clear();
         variable_fields_avg_size_.clear();
+        field_data_accounted_bytes_.clear();
         stats_.mem_size = 0;
     }
 }
@@ -4414,48 +4798,14 @@ bool
 ChunkedSegmentSealedImpl::generate_interim_index(const FieldId field_id,
                                                  int64_t num_rows,
                                                  milvus::OpContext* op_ctx) {
-    if (col_index_meta_ == nullptr || !col_index_meta_->HasField(field_id)) {
+    auto& field_meta = schema_->operator[](field_id);
+    if (!MayGenerateInterimIndex(field_id, field_meta)) {
         return false;
     }
-    auto& field_meta = schema_->operator[](field_id);
     auto& field_index_meta = col_index_meta_->GetFieldIndexMeta(field_id);
-    auto& index_params = field_index_meta.GetIndexParams();
 
     bool is_sparse =
         field_meta.get_data_type() == DataType::VECTOR_SPARSE_U32_F32;
-
-    bool enable_growing_mmap = storage::MmapManager::GetInstance()
-                                   .GetMmapConfig()
-                                   .GetEnableGrowingMmap();
-
-    auto enable_binlog_index = [&]() {
-        // check milvus config
-        if (!segcore_config_.get_enable_interim_segment_index() ||
-            enable_growing_mmap) {
-            return false;
-        }
-        // check data type
-        if (field_meta.get_data_type() != DataType::VECTOR_FLOAT &&
-            field_meta.get_data_type() != DataType::VECTOR_FLOAT16 &&
-            field_meta.get_data_type() != DataType::VECTOR_BFLOAT16 &&
-            !is_sparse) {
-            return false;
-        }
-        // check index type
-        if (index_params.find(knowhere::meta::INDEX_TYPE) ==
-                index_params.end() ||
-            field_index_meta.IsFlatIndex()) {
-            return false;
-        }
-        // check index exist
-        if (vector_indexings_.is_ready(field_id)) {
-            return false;
-        }
-        return true;
-    };
-    if (!enable_binlog_index()) {
-        return false;
-    }
     try {
         std::shared_ptr<ChunkedColumnInterface> vec_data = get_column(field_id);
         AssertInfo(
@@ -4489,7 +4839,7 @@ ChunkedSegmentSealedImpl::generate_interim_index(const FieldId field_id,
         build_config[knowhere::meta::NUM_BUILD_THREAD] = std::to_string(1);
         auto index_metric = field_binlog_config->GetMetricType();
 
-        if (enable_binlog_index()) {
+        if (MayGenerateInterimIndex(field_id, field_meta)) {
             std::unique_lock lck(mutex_);
 
             std::unique_ptr<
@@ -4546,6 +4896,98 @@ ChunkedSegmentSealedImpl::generate_interim_index(const FieldId field_id,
         return false;
     }
 }
+
+bool
+ChunkedSegmentSealedImpl::MayGenerateInterimIndex(
+    FieldId field_id,
+    const FieldMeta& field_meta) const {
+    if (col_index_meta_ == nullptr || !col_index_meta_->HasField(field_id)) {
+        return false;
+    }
+
+    auto enable_growing_mmap = storage::MmapManager::GetInstance()
+                                   .GetMmapConfig()
+                                   .GetEnableGrowingMmap();
+    if (!segcore_config_.get_enable_interim_segment_index() ||
+        enable_growing_mmap) {
+        return false;
+    }
+
+    auto data_type = field_meta.get_data_type();
+    bool is_sparse = data_type == DataType::VECTOR_SPARSE_U32_F32;
+    if (data_type != DataType::VECTOR_FLOAT &&
+        data_type != DataType::VECTOR_FLOAT16 &&
+        data_type != DataType::VECTOR_BFLOAT16 && !is_sparse) {
+        return false;
+    }
+
+    auto& field_index_meta = col_index_meta_->GetFieldIndexMeta(field_id);
+    const auto& index_params = field_index_meta.GetIndexParams();
+    if (index_params.find(knowhere::meta::INDEX_TYPE) == index_params.end() ||
+        field_index_meta.IsFlatIndex()) {
+        return false;
+    }
+
+    return !vector_indexings_.is_ready(field_id);
+}
+
+bool
+ChunkedSegmentSealedImpl::CanUseLazyManifestColumnGroup(
+    const std::unordered_map<FieldId, FieldMeta>& field_metas,
+    bool allow_match_field_lazy) const {
+    for (const auto& [field_id, field_meta] : field_metas) {
+        if (!CanUseLazyManifestField(
+                field_id, field_meta, allow_match_field_lazy)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+const char*
+ChunkedSegmentSealedImpl::LazyManifestFieldBlockReason(
+    FieldId field_id,
+    const FieldMeta& field_meta,
+    bool allow_match_field_lazy) const {
+    if (SystemProperty::Instance().IsSystem(field_id)) {
+        return "system field";
+    }
+
+    auto primary_field_id = schema_->get_primary_field_id();
+    if (primary_field_id.has_value() && primary_field_id.value() == field_id) {
+        return "primary key";
+    }
+
+    auto data_type = field_meta.get_data_type();
+    if (field_meta.is_nullable() && IsVectorDataType(data_type)) {
+        return "nullable vector";
+    }
+    if (data_type == DataType::GEOMETRY &&
+        segcore_config_.get_enable_geometry_cache()) {
+        return "geometry cache";
+    }
+    if (GetStructNameForArrayField(field_meta).has_value()) {
+        return "struct array";
+    }
+    if (field_meta.enable_match() && !allow_match_field_lazy) {
+        return "match field";
+    }
+    if (MayGenerateInterimIndex(field_id, field_meta)) {
+        return "interim index";
+    }
+
+    return nullptr;
+}
+
+bool
+ChunkedSegmentSealedImpl::CanUseLazyManifestField(
+    FieldId field_id,
+    const FieldMeta& field_meta,
+    bool allow_match_field_lazy) const {
+    return LazyManifestFieldBlockReason(
+               field_id, field_meta, allow_match_field_lazy) == nullptr;
+}
+
 void
 ChunkedSegmentSealedImpl::RemoveFieldFile(const FieldId field_id) {
 }
@@ -4585,18 +5027,45 @@ ChunkedSegmentSealedImpl::load_field_data_common(
     bool is_proxy_column,
     std::optional<ParquetStatistics> statistics,
     milvus::OpContext* op_ctx,
-    bool is_replace) {
+    bool is_replace,
+    std::optional<size_t> memory_accounting_bytes,
+    std::optional<size_t> avg_size_bytes,
+    bool skip_avg_size_update) {
+    const bool is_system_field = SystemProperty::Instance().IsSystem(field_id);
+    const bool should_account_field_data =
+        !enable_mmap &&
+        (!is_proxy_column ||
+         (is_proxy_column &&
+          field_id.get() != DEFAULT_SHORT_COLUMN_GROUP_ID));
+    size_t accounted_bytes = 0;
+    if (should_account_field_data) {
+        accounted_bytes = memory_accounting_bytes.has_value()
+                              ? memory_accounting_bytes.value()
+                              : column->DataByteSize();
+    }
+
+    std::optional<size_t> field_avg_size_bytes;
+    if (!enable_mmap && IsVariableDataType(data_type) &&
+        !skip_avg_size_update) {
+        if (avg_size_bytes.has_value()) {
+            field_avg_size_bytes = avg_size_bytes.value();
+        } else if (should_account_field_data) {
+            field_avg_size_bytes = accounted_bytes;
+        } else {
+            field_avg_size_bytes = column->DataByteSize();
+        }
+    }
+
     {
         std::unique_lock lck(mutex_);
         if (is_replace) {
-            // Subtract old column memory before replacing
-            auto old_column = get_column(field_id);
-            if (old_column && !enable_mmap) {
-                if (!is_proxy_column ||
-                    (is_proxy_column &&
-                     field_id.get() != DEFAULT_SHORT_COLUMN_GROUP_ID)) {
-                    stats_.mem_size -= old_column->DataByteSize();
-                }
+            // Subtract only bytes previously added to stats_.mem_size. Lazy
+            // manifest columns may materialize later and return a larger
+            // DataByteSize(), which was never accounted during load.
+            auto it = field_data_accounted_bytes_.find(field_id);
+            if (it != field_data_accounted_bytes_.end()) {
+                stats_.mem_size -= it->second;
+                field_data_accounted_bytes_.erase(it);
             }
             fields_.wlock()->insert_or_assign(field_id, column);
             LOG_INFO(
@@ -4620,21 +5089,49 @@ ChunkedSegmentSealedImpl::load_field_data_common(
         }
     }
     // system field only needs to emplace column to fields_ map
-    if (SystemProperty::Instance().IsSystem(field_id)) {
+    if (is_system_field) {
         return;
     }
 
-    if (!enable_mmap) {
-        if (!is_proxy_column ||
-            (is_proxy_column &&
-             field_id.get() != DEFAULT_SHORT_COLUMN_GROUP_ID)) {
-            stats_.mem_size += column->DataByteSize();
+    auto& field_meta = schema_->operator[](field_id);
+    if (field_meta.is_nullable() && IsVectorDataType(data_type)) {
+        bool lazy_inited = false;
+        if (statistics.has_value() && !statistics.value().empty()) {
+            const auto& stats = statistics.value();
+            bool any_null = false;
+            for (const auto& s : stats) {
+                if (s == nullptr) {
+                    any_null = true;
+                    break;
+                }
+            }
+            if (!any_null) {
+                lazy_inited = column->TryInitValidRowIdsFromRowGroups(
+                    stats.size(),
+                    [&](size_t i) {
+                        return stats[i]->num_values() + stats[i]->null_count();
+                    },
+                    [&](size_t i) { return stats[i]->null_count(); });
+            }
         }
-        if (IsVariableDataType(data_type)) {
+        if (!lazy_inited) {
+            column->BuildValidRowIds(op_ctx);
+        }
+    }
+
+    if (!enable_mmap) {
+        if (should_account_field_data) {
+            stats_.mem_size += accounted_bytes;
+        }
+        if (field_avg_size_bytes.has_value()) {
             // update average row data size
             SegmentInternalInterface::set_field_avg_size(
-                field_id, num_rows, column->DataByteSize());
+                field_id, num_rows, field_avg_size_bytes.value());
         }
+    }
+    {
+        std::unique_lock lck(mutex_);
+        field_data_accounted_bytes_[field_id] = accounted_bytes;
     }
     // Skip index construction: for proxy columns (external tables) with no
     // statistics, skip building the skip index during load to avoid triggering
@@ -4905,20 +5402,13 @@ ChunkedSegmentSealedImpl::ApplyLoadDiff(milvus::OpContext* op_ctx,
                 milvus::storage::LoonFFIPropertiesSingleton::GetInstance()
                     .GetProperties();
             auto column_groups = segment_load_info.GetColumnGroups();
-            auto arrow_schema = schema_->ConvertToLoonArrowSchema();
-            auto needed_columns = std::make_shared<std::vector<std::string>>();
-            for (const auto& field_id : schema_->get_field_ids()) {
-                needed_columns->push_back(std::to_string(field_id.get()));
+            std::unordered_set<FieldId> lazy_match_fields;
+            for (const auto& [field_id, _] : diff.text_indexes_to_load) {
+                lazy_match_fields.insert(field_id);
             }
-            // reader_mutex_ guards reader_ against concurrent ExecuteTake.
-            // ApplyLoadDiff is invoked from Reopen AFTER mutex_ has been
-            // released (Reopen:lck.unlock()), so a concurrent take() on the
-            // old reader_ could otherwise observe a half-assigned shared_ptr
-            // or lose its referent mid-call.
             {
                 std::lock_guard<std::mutex> lock(reader_mutex_);
-                reader_ = milvus_storage::api::Reader::create(
-                    column_groups, arrow_schema, needed_columns, *properties);
+                reader_.reset();
             }
             // New column group fields
             if (!diff.column_groups_to_load.empty()) {
@@ -4926,14 +5416,18 @@ ChunkedSegmentSealedImpl::ApplyLoadDiff(milvus::OpContext* op_ctx,
                                  properties,
                                  diff.column_groups_to_load,
                                  true,
-                                 op_ctx);
+                                 op_ctx,
+                                 false,
+                                 &lazy_match_fields);
             }
             if (!diff.column_groups_to_lazyload.empty()) {
                 LoadColumnGroups(column_groups,
                                  properties,
                                  diff.column_groups_to_lazyload,
                                  false,
-                                 op_ctx);
+                                 op_ctx,
+                                 false,
+                                 &lazy_match_fields);
             }
             // Replace column group fields
             if (!diff.column_groups_to_replace.empty()) {
@@ -4942,7 +5436,8 @@ ChunkedSegmentSealedImpl::ApplyLoadDiff(milvus::OpContext* op_ctx,
                                  diff.column_groups_to_replace,
                                  true,
                                  op_ctx,
-                                 true);
+                                 true,
+                                 &lazy_match_fields);
             }
             if (!diff.column_groups_to_lazyreplace.empty()) {
                 LoadColumnGroups(column_groups,
@@ -4950,7 +5445,8 @@ ChunkedSegmentSealedImpl::ApplyLoadDiff(milvus::OpContext* op_ctx,
                                  diff.column_groups_to_lazyreplace,
                                  false,
                                  op_ctx,
-                                 true);
+                                 true,
+                                 &lazy_match_fields);
             }
         }
     }
@@ -5237,10 +5733,10 @@ ChunkedSegmentSealedImpl::LoadManifest(const std::string& manifest_path) {
 
     auto column_groups =
         std::atomic_load(&segment_load_info_)->GetColumnGroups();
-
-    auto arrow_schema = schema_->ConvertToArrowSchema();
-    reader_ = milvus_storage::api::Reader::create(
-        column_groups, arrow_schema, nullptr, *properties);
+    {
+        std::lock_guard<std::mutex> lock(reader_mutex_);
+        reader_.reset();
+    }
 
     std::vector<std::pair<int, std::vector<FieldId>>> cg_field_ids;
     for (int i = 0; i < column_groups->size(); ++i) {
@@ -5305,18 +5801,22 @@ ChunkedSegmentSealedImpl::LoadColumnGroups(
     std::vector<std::pair<int, std::vector<FieldId>>>& cg_field_ids,
     bool eager_load,
     milvus::OpContext* op_ctx,
-    bool is_replace) {
+    bool is_replace,
+    const std::unordered_set<FieldId>* lazy_match_fields) {
     auto& pool = ThreadPools::GetThreadPool(milvus::ThreadPoolPriority::MIDDLE);
     std::vector<std::future<void>> load_group_futures;
-    for (const auto& pair : cg_field_ids) {
-        auto cg_index = pair.first;
-        const auto& field_ids = pair.second;
+
+    auto submit_load_group = [&](int cg_index,
+                                 std::vector<FieldId> field_ids,
+                                 bool task_eager_load,
+                                 bool allow_match_field_lazy) {
         auto future = pool.Submit([this,
                                    column_groups,
                                    properties,
                                    cg_index,
-                                   field_ids,
-                                   eager_load,
+                                   field_ids = std::move(field_ids),
+                                   task_eager_load,
+                                   allow_match_field_lazy,
                                    op_ctx,
                                    is_replace]() {
             // Early exit if cancelled while queued
@@ -5328,11 +5828,107 @@ ChunkedSegmentSealedImpl::LoadColumnGroups(
                             properties,
                             cg_index,
                             field_ids,
-                            eager_load,
+                            task_eager_load,
                             op_ctx,
-                            is_replace);
+                            is_replace,
+                            allow_match_field_lazy);
         });
         load_group_futures.emplace_back(std::move(future));
+    };
+
+    for (const auto& pair : cg_field_ids) {
+        auto cg_index = pair.first;
+        const auto& field_ids = pair.second;
+        auto lazy_manifest_reader_enabled =
+            segcore_config_.get_lazy_manifest_reader_enabled();
+
+        std::vector<FieldId> warmup_fields;
+        std::vector<FieldId> lazy_manifest_fields;
+        std::vector<FieldId> fallback_fields;
+        std::unordered_set<FieldId> lazy_manifest_match_fields;
+        warmup_fields.reserve(field_ids.size());
+        lazy_manifest_fields.reserve(field_ids.size());
+        fallback_fields.reserve(field_ids.size());
+
+        for (const auto& field_id : field_ids) {
+            const auto& field_meta = (*schema_)[field_id];
+            bool field_is_vector = IsVectorDataType(field_meta.get_data_type());
+            bool allow_match_field_lazy =
+                lazy_match_fields != nullptr &&
+                lazy_match_fields->find(field_id) != lazy_match_fields->end();
+            bool warmup_disabled = !eager_load;
+            if (eager_load) {
+                auto [has_warmup, warmup_str] = schema_->WarmupPolicy(
+                    field_id, field_is_vector, /*is_index=*/false);
+                auto resolved =
+                    getCacheWarmupPolicy(has_warmup ? warmup_str : "",
+                                         field_is_vector,
+                                         /*is_index=*/false,
+                                         /*in_load_list=*/true);
+                warmup_disabled =
+                    resolved == CacheWarmupPolicy::CacheWarmupPolicy_Disable;
+            }
+
+            if (!warmup_disabled) {
+                warmup_fields.emplace_back(field_id);
+            } else if (lazy_manifest_reader_enabled &&
+                       CanUseLazyManifestField(
+                           field_id, field_meta, allow_match_field_lazy)) {
+                lazy_manifest_fields.emplace_back(field_id);
+                if (allow_match_field_lazy) {
+                    lazy_manifest_match_fields.emplace(field_id);
+                }
+            } else {
+                auto reason =
+                    lazy_manifest_reader_enabled
+                        ? LazyManifestFieldBlockReason(
+                              field_id, field_meta, allow_match_field_lazy)
+                        : "lazy manifest reader disabled";
+                LOG_DEBUG(
+                    "[StorageV2] skip lazy manifest field, segment {}, cg {}, "
+                    "field {}, reason {}",
+                    get_segment_id(),
+                    cg_index,
+                    field_id.get(),
+                    reason);
+                fallback_fields.emplace_back(field_id);
+            }
+        }
+
+        auto warmup_field_count = warmup_fields.size();
+        auto lazy_manifest_field_count = lazy_manifest_fields.size();
+        auto fallback_field_count = fallback_fields.size();
+        if (!warmup_fields.empty()) {
+            submit_load_group(cg_index,
+                              std::move(warmup_fields),
+                              true,
+                              /*allow_match_field_lazy=*/false);
+        }
+        for (const auto& field_id : lazy_manifest_fields) {
+            submit_load_group(
+                cg_index,
+                std::vector<FieldId>{field_id},
+                false,
+                lazy_manifest_match_fields.find(field_id) !=
+                    lazy_manifest_match_fields.end());
+        }
+        if (!fallback_fields.empty()) {
+            submit_load_group(cg_index,
+                              std::move(fallback_fields),
+                              false,
+                              /*allow_match_field_lazy=*/false);
+        }
+        if (warmup_field_count > 0 &&
+            (lazy_manifest_field_count > 0 || fallback_field_count > 0)) {
+            LOG_INFO(
+                "[StorageV2] segment {} cg {} split by warmup policy: {} "
+                "warmup fields, {} lazy manifest fields, {} fallback fields",
+                get_segment_id(),
+                cg_index,
+                warmup_field_count,
+                lazy_manifest_field_count,
+                fallback_field_count);
+        }
     }
 
     storage::WaitAllFutures(load_group_futures);
@@ -5346,7 +5942,8 @@ ChunkedSegmentSealedImpl::LoadColumnGroup(
     const std::vector<FieldId>& milvus_field_ids,
     bool eager_load,
     milvus::OpContext* op_ctx,
-    bool is_replace) {
+    bool is_replace,
+    bool allow_match_field_lazy) {
     AssertInfo(index < column_groups->size(),
                "load column group index out of range");
     AssertInfo(!milvus_field_ids.empty(),
@@ -5407,27 +6004,17 @@ ChunkedSegmentSealedImpl::LoadColumnGroup(
 
     // The set of columns this entry projects is exactly the field_ids the
     // diff handed us. For lazy entries, SegmentLoadInfo::ComputeDiffColumnGroups
-    // emits one entry per field, so each lazy entry produces a single-column
-    // projected ChunkReader — touching one lazy field will not co-load chunks
-    // for sibling lazy fields in the same column group.
+    // emits one entry per field, so first access materializes only that
+    // single-column projection and does not co-load sibling lazy fields.
     auto needed_columns = std::make_shared<std::vector<std::string>>();
     needed_columns->reserve(milvus_field_ids.size());
     for (const auto& fid : milvus_field_ids) {
         needed_columns->push_back(schema_->GetPhysicalColumnName(fid));
     }
-    auto chunk_reader_result = reader_->get_chunk_reader(index, needed_columns);
-    AssertInfo(chunk_reader_result.ok(),
-               "get chunk reader failed, segment {}, column group index {}, "
-               "status msg: {}",
-               get_segment_id(),
-               index,
-               chunk_reader_result.status().ToString());
 
-    auto chunk_reader = std::move(chunk_reader_result).ValueOrDie();
-
-    LOG_INFO("[StorageV2] segment {} loads manifest cg index {}",
-             this->get_segment_id(),
-             index);
+    LOG_DEBUG("[StorageV2] segment {} loads manifest cg index {}",
+              this->get_segment_id(),
+              index);
     auto mmap_dir_path =
         milvus::storage::LocalChunkManagerSingleton::GetInstance()
             .GetChunkManager()
@@ -5437,16 +6024,96 @@ ChunkedSegmentSealedImpl::LoadColumnGroup(
     // otherwise pass empty string to fall back to global config
     std::string warmup_policy =
         has_warmup_setting ? aggregated_warmup_policy : "";
+    auto effective_warmup_policy =
+        getCacheWarmupPolicy(warmup_policy,
+                             is_vector,
+                             /*is_index=*/false,
+                             /*in_load_list=*/eager_load);
+    auto use_lazy_manifest_column_group =
+        segcore_config_.get_lazy_manifest_reader_enabled() &&
+        effective_warmup_policy ==
+            CacheWarmupPolicy::CacheWarmupPolicy_Disable &&
+        CanUseLazyManifestColumnGroup(field_metas, allow_match_field_lazy);
 
-    // Multiple lazy entries can share the same column-group index (one per
-    // field), so the translator cache key must be disambiguated by the
-    // field-id of this entry. Eager entries are still one-per-cg, so they
-    // keep the unsuffixed key.
+    // Multiple warmup-disabled entries can share the same column-group index
+    // (one per field), so the translator cache key must be disambiguated by
+    // the field-id of this entry. Eager warmup entries are still one-per-cg,
+    // so they keep the unsuffixed key.
     std::string cache_key_suffix;
-    if (!eager_load) {
+    if (!eager_load ||
+        (use_lazy_manifest_column_group && milvus_field_ids.size() == 1)) {
         cache_key_suffix = std::to_string(milvus_field_ids.front().get());
     }
 
+    std::shared_ptr<arrow::Schema> reader_schema;
+    if (!schema_->is_external_collection()) {
+        reader_schema = schema_->ConvertToLoonArrowSchema();
+    }
+
+    if (use_lazy_manifest_column_group) {
+        auto chunk_reader_factory = [this,
+                                     column_groups,
+                                     properties,
+                                     reader_schema,
+                                     index,
+                                     needed_columns]()
+            -> std::shared_ptr<milvus_storage::api::ChunkReader> {
+            return GetManifestChunkReader(column_groups,
+                                          properties,
+                                          reader_schema,
+                                          index,
+                                          needed_columns);
+        };
+        LazyManifestColumnGroupContext context{
+            get_segment_id(),
+            index,
+            needed_columns,
+            std::move(chunk_reader_factory),
+            field_metas,
+            use_mmap,
+            mmap_config.GetMmapPopulate(),
+            mmap_dir_path,
+            static_cast<int64_t>(milvus_field_ids.size()),
+            load_info->GetPriority(),
+            warmup_policy,
+            cache_key_suffix,
+        };
+        auto lazy_column_group =
+            std::make_shared<LazyManifestColumnGroup>(std::move(context));
+
+        for (const auto& field_id : milvus_field_ids) {
+            const auto& field_meta = field_metas.at(field_id);
+            auto column = std::make_shared<LazyManifestProxyColumn>(
+                lazy_column_group,
+                field_id,
+                field_meta,
+                load_info->GetNumOfRows());
+            load_field_data_common(field_id,
+                                   column,
+                                   load_info->GetNumOfRows(),
+                                   field_meta.get_data_type(),
+                                   use_mmap,
+                                   true,
+                                   std::nullopt,
+                                   op_ctx,
+                                   is_replace,
+                                   std::make_optional<size_t>(0),
+                                   std::nullopt,
+                                   true);
+            LOG_INFO(
+                "[StorageV2] attached lazy manifest column, segment {}, cg {}, "
+                "field {}, rows {}, accounted bytes {}",
+                get_segment_id(),
+                index,
+                field_id.get(),
+                load_info->GetNumOfRows(),
+                0);
+        }
+        return;
+    }
+
+    auto chunk_reader = GetManifestChunkReader(
+        column_groups, properties, reader_schema, index, needed_columns);
     auto translator =
         std::make_unique<storagev2translator::ManifestGroupTranslator>(
             get_segment_id(),
@@ -6270,6 +6937,74 @@ ChunkedSegmentSealedImpl::ArrowToDataArray(
     return data_array;
 }
 
+std::shared_ptr<milvus_storage::api::ChunkReader>
+ChunkedSegmentSealedImpl::GetManifestChunkReader(
+    const std::shared_ptr<milvus_storage::api::ColumnGroups>& column_groups,
+    const std::shared_ptr<milvus_storage::api::Properties>& properties,
+    const std::shared_ptr<arrow::Schema>& reader_schema,
+    int64_t column_group_index,
+    const std::shared_ptr<std::vector<std::string>>& needed_columns) const {
+    std::shared_ptr<milvus_storage::api::Reader> reader;
+    {
+        std::lock_guard<std::mutex> lock(reader_mutex_);
+        if (!reader_ || reader_->get_column_groups() != column_groups) {
+            std::shared_ptr<std::vector<std::string>> reader_columns;
+            if (schema_->is_external_collection()) {
+                reader_columns = schema_->GetExternalColumnNames();
+            } else {
+                reader_columns = std::make_shared<std::vector<std::string>>();
+                for (const auto& field_id : schema_->get_field_ids()) {
+                    reader_columns->push_back(std::to_string(field_id.get()));
+                }
+            }
+            reader_ = std::shared_ptr<milvus_storage::api::Reader>(
+                milvus_storage::api::Reader::create(
+                    column_groups, reader_schema, reader_columns, *properties));
+        }
+        reader = reader_;
+    }
+
+    auto chunk_reader_result =
+        reader->get_chunk_reader(column_group_index, needed_columns);
+    AssertInfo(chunk_reader_result.ok(),
+               "get chunk reader failed, segment {}, column group index {}, "
+               "status msg: {}",
+               get_segment_id(),
+               column_group_index,
+               chunk_reader_result.status().ToString());
+    return std::shared_ptr<milvus_storage::api::ChunkReader>(
+        std::move(chunk_reader_result).ValueOrDie());
+}
+
+std::unique_ptr<milvus_storage::api::Reader>
+ChunkedSegmentSealedImpl::CreateManifestReader(
+    const std::shared_ptr<milvus_storage::api::ColumnGroups>& column_groups,
+    const std::shared_ptr<std::vector<std::string>>& needed_columns) const {
+    auto load_info = std::atomic_load(&segment_load_info_);
+    auto properties = std::make_shared<milvus_storage::api::Properties>(
+        *milvus::storage::LoonFFIPropertiesSingleton::GetInstance()
+             .GetProperties());
+    if (schema_->is_external_collection()) {
+        InjectExternalSpecProperties(*properties,
+                                     load_info->GetCollectionID(),
+                                     schema_->get_external_source(),
+                                     schema_->get_external_spec());
+    }
+
+    std::shared_ptr<arrow::Schema> reader_schema;
+    if (!schema_->is_external_collection()) {
+        reader_schema = schema_->ConvertToLoonArrowSchema();
+    }
+
+    auto reader_columns = needed_columns;
+    if (schema_->is_external_collection()) {
+        reader_columns = schema_->GetExternalColumnNames();
+    }
+
+    return milvus_storage::api::Reader::create(
+        column_groups, reader_schema, reader_columns, *properties);
+}
+
 std::shared_ptr<arrow::Table>
 ChunkedSegmentSealedImpl::ExecuteTake(
     const std::vector<int64_t>& unique_offsets,
@@ -6292,8 +7027,18 @@ ChunkedSegmentSealedImpl::ExecuteTake(
     // and the old Reader cannot be destroyed mid-call.
     std::lock_guard<std::mutex> lock(reader_mutex_);
     if (!reader_) {
-        LOG_WARN("[TakeAPI] {} reader is null for segment {}", caller_tag, id_);
-        return nullptr;
+        auto load_info = std::atomic_load(&segment_load_info_);
+        if (load_info == nullptr || !load_info->HasManifestPath()) {
+            LOG_WARN("[TakeAPI] {} reader is null for segment {}",
+                     caller_tag,
+                     id_);
+            return nullptr;
+        }
+        reader_ =
+            CreateManifestReader(load_info->GetColumnGroups(), needed_columns);
+        LOG_INFO("[TakeAPI] {} lazily created reader for segment {}",
+                 caller_tag,
+                 id_);
     }
     auto take_start = std::chrono::high_resolution_clock::now();
     auto result = reader_->take(unique_offsets, 1, needed_columns);

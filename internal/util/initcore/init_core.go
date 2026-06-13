@@ -384,6 +384,7 @@ func InitTieredStorage(params *paramtable.ComponentParam) error {
 	diskMaxBytes := C.int64_t(diskMaxRatio * float64(osDiskBytes))
 
 	storageUsageTrackingEnabled := C.bool(params.QueryNodeCfg.StorageUsageTrackingEnabled.GetAsBool())
+	lazyManifestReaderEnabled := C.bool(params.QueryNodeCfg.TieredLazyManifestReaderEnabled.GetAsBool())
 	evictionEnabled := C.bool(params.QueryNodeCfg.TieredEvictionEnabled.GetAsBool())
 	cacheTouchWindowMs := C.int64_t(params.QueryNodeCfg.TieredCacheTouchWindowMs.GetAsInt64())
 	backgroundEvictionEnabled := C.bool(params.QueryNodeCfg.TieredBackgroundEvictionEnabled.GetAsBool())
@@ -400,6 +401,7 @@ func InitTieredStorage(params *paramtable.ComponentParam) error {
 
 	prefetchPoolThreads := C.uint32_t(hardware.GetCPUNum() * params.CommonCfg.LowPriorityThreadCoreCoefficient.GetAsInt())
 
+	C.SegcoreSetLazyManifestReaderEnabled(lazyManifestReaderEnabled)
 	C.ConfigureTieredStorage(scalarFieldCacheWarmupPolicy,
 		vectorFieldCacheWarmupPolicy,
 		scalarIndexCacheWarmupPolicy,
@@ -455,7 +457,9 @@ func UpdateTieredStorageConfig(params *paramtable.ComponentParam) error {
 	warmupLoadingTimeoutMs := C.int64_t(params.QueryNodeCfg.TieredWarmupLoadingTimeoutMs.GetAsInt64())
 	storageUsageTrackingEnabled := C.bool(params.QueryNodeCfg.StorageUsageTrackingEnabled.GetAsBool())
 	rejectRemoteVectorOutput := C.bool(params.QueryNodeCfg.TieredRejectRemoteVectorOutput.GetAsBool())
+	lazyManifestReaderEnabled := C.bool(params.QueryNodeCfg.TieredLazyManifestReaderEnabled.GetAsBool())
 
+	C.SegcoreSetLazyManifestReaderEnabled(lazyManifestReaderEnabled)
 	C.UpdateTieredStorageConfig(
 		loadingTimeoutMs,
 		warmupLoadingTimeoutMs,
@@ -700,6 +704,7 @@ func SetupCoreConfigChangelCallback() {
 		paramtable.Get().QueryNodeCfg.TieredWarmupVectorField.RegisterCallback(updateTieredStorageConfigCallback)
 		paramtable.Get().QueryNodeCfg.TieredWarmupScalarIndex.RegisterCallback(updateTieredStorageConfigCallback)
 		paramtable.Get().QueryNodeCfg.TieredWarmupVectorIndex.RegisterCallback(updateTieredStorageConfigCallback)
+		paramtable.Get().QueryNodeCfg.TieredLazyManifestReaderEnabled.RegisterCallback(updateTieredStorageConfigCallback)
 	})
 }
 

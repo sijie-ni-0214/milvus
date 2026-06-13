@@ -86,6 +86,13 @@ SegcoreSetPreferFieldDataWhenIndexHasRawData(const bool value) {
 }
 
 extern "C" void
+SegcoreSetLazyManifestReaderEnabled(const bool value) {
+    milvus::segcore::SegcoreConfig& config =
+        milvus::segcore::SegcoreConfig::default_config();
+    config.set_lazy_manifest_reader_enabled(value);
+}
+
+extern "C" void
 SegcoreSetNlist(const int64_t value) {
     milvus::segcore::SegcoreConfig& config =
         milvus::segcore::SegcoreConfig::default_config();

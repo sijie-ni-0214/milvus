@@ -3628,6 +3628,7 @@ type queryNodeConfig struct {
 	TieredWarmupLoadingTimeoutMs    ParamItem `refreshable:"true"`
 	StorageUsageTrackingEnabled     ParamItem `refreshable:"true"`
 	TieredRejectRemoteVectorOutput  ParamItem `refreshable:"true"`
+	TieredLazyManifestReaderEnabled ParamItem `refreshable:"true"`
 
 	KnowhereScoreConsistency ParamItem `refreshable:"false"`
 
@@ -3897,6 +3898,15 @@ Defaults to "sync".`,
 		Export:       true,
 	}
 	p.TieredWarmupVectorIndex.Init(base.mgr)
+
+	p.TieredLazyManifestReaderEnabled = ParamItem{
+		Key:          "queryNode.segcore.tieredStorage.lazyManifestReaderEnabled",
+		Version:      "3.0.0",
+		DefaultValue: "false",
+		Doc:          "When enabled, StorageV2 manifest fields with warmup=disable and no load-time side effects skip reader creation during load and materialize on first access.",
+		Export:       true,
+	}
+	p.TieredLazyManifestReaderEnabled.Init(base.mgr)
 
 	p.TieredEvictionEnabled = ParamItem{
 		Key:          "queryNode.segcore.tieredStorage.evictionEnabled",
