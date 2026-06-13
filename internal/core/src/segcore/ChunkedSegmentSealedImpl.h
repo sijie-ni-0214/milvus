@@ -577,6 +577,19 @@ class ChunkedSegmentSealedImpl : public SegmentSealed {
                 double& elapsed_ms,
                 milvus::OpContext* op_ctx = nullptr) const;
 
+    std::unique_ptr<milvus_storage::api::Reader>
+    CreateManifestReader(
+        const std::shared_ptr<milvus_storage::api::ColumnGroups>& column_groups,
+        const std::shared_ptr<std::vector<std::string>>& needed_columns) const;
+
+    std::shared_ptr<milvus_storage::api::ChunkReader>
+    GetManifestChunkReader(
+        const std::shared_ptr<milvus_storage::api::ColumnGroups>& column_groups,
+        const std::shared_ptr<milvus_storage::api::Properties>& properties,
+        const std::shared_ptr<arrow::Schema>& reader_schema,
+        int64_t column_group_index,
+        const std::shared_ptr<std::vector<std::string>>& needed_columns) const;
+
     void
     check_search(const query::Plan* plan) const override;
 
@@ -1176,6 +1189,25 @@ class ChunkedSegmentSealedImpl : public SegmentSealed {
     bool
     generate_interim_index(const FieldId field_id, int64_t num_rows);
 
+    bool
+    MayGenerateInterimIndex(FieldId field_id,
+                            const FieldMeta& field_meta) const;
+
+    const char*
+    LazyManifestFieldBlockReason(FieldId field_id,
+                                 const FieldMeta& field_meta,
+                                 bool allow_match_field_lazy = false) const;
+
+    bool
+    CanUseLazyManifestField(FieldId field_id,
+                            const FieldMeta& field_meta,
+                            bool allow_match_field_lazy = false) const;
+
+    bool
+    CanUseLazyManifestColumnGroup(
+        const std::unordered_map<FieldId, FieldMeta>& field_metas,
+        bool allow_match_field_lazy = false) const;
+
     void
     fill_empty_field(const FieldMeta& field_meta);
 
@@ -1243,7 +1275,8 @@ class ChunkedSegmentSealedImpl : public SegmentSealed {
         std::vector<std::pair<int, std::vector<FieldId>>>& cg_field_ids,
         bool eager_load,
         milvus::OpContext* op_ctx = nullptr,
-        bool is_replace = false);
+        bool is_replace = false,
+        const std::unordered_set<FieldId>* lazy_match_fields = nullptr);
 
     // Load column groups from a manifest file path (for external collections)
     void
@@ -1272,7 +1305,8 @@ class ChunkedSegmentSealedImpl : public SegmentSealed {
         bool eager_load,
         milvus::OpContext* op_ctx = nullptr,
         bool is_replace = false,
-        int64_t queue_ns = 0);
+        int64_t queue_ns = 0,
+        bool allow_match_field_lazy = false);
 
     // Synthesize system fields (virtual PK, timestamps, PK index, row count)
     // for external collections. External collections don't have real PK or
@@ -1345,7 +1379,10 @@ class ChunkedSegmentSealedImpl : public SegmentSealed {
         bool is_proxy_column,
         std::optional<ParquetStatistics> statistics = {},
         milvus::OpContext* op_ctx = nullptr,
-        bool is_replace = false);
+        bool is_replace = false,
+        std::optional<size_t> memory_accounting_bytes = {},
+        std::optional<size_t> avg_size_bytes = {},
+        bool skip_avg_size_update = false);
 
     std::shared_ptr<ChunkedColumnInterface>
     get_column(FieldId field_id) const {
@@ -1389,7 +1426,8 @@ class ChunkedSegmentSealedImpl : public SegmentSealed {
     // Test-only: inject a mock Reader for unit testing take() paths.
     void
     SetReaderForTesting(std::unique_ptr<milvus_storage::api::Reader> r) {
-        reader_ = std::move(r);
+        reader_ =
+            std::shared_ptr<milvus_storage::api::Reader>(std::move(r));
     }
 
     // Wrappers for protected methods to enable direct unit testing.
@@ -1506,6 +1544,10 @@ class ChunkedSegmentSealedImpl : public SegmentSealed {
         vec_binlog_config_;
 
     SegmentStats stats_{};
+    // Tracks the bytes actually added to stats_.mem_size for each field.  Lazy
+    // manifest fields may report a larger DataByteSize after materialization,
+    // but only this accounted value should be subtracted on replace.
+    std::unordered_map<FieldId, size_t> field_data_accounted_bytes_;
 
     // whether the segment is sorted by the pk
     // 1. will skip index loading for primary key field
@@ -1516,12 +1558,10 @@ class ChunkedSegmentSealedImpl : public SegmentSealed {
     // lock-free on query hot paths.
     std::atomic<bool> use_take_for_output_{false};
 
-    // milvus storage internal api reader instance (NOT thread-safe).
-    // Load-time access (get_chunk_reader, SetReader) is safe: single-threaded,
-    // completes before the segment is visible to queries.
-    // Query-time access (take) must be serialized via reader_mutex_ — concurrent
-    // retrieve/search workers can hit the same segment at the same time.
-    std::unique_ptr<milvus_storage::api::Reader> reader_;
+    // milvus storage internal api reader instance.
+    // reader_mutex_ protects reader_ rebuild/reset and take(); get_chunk_reader()
+    // runs outside the lock using a local shared_ptr snapshot.
+    mutable std::shared_ptr<milvus_storage::api::Reader> reader_;
     mutable std::mutex reader_mutex_;
 
     // ArrayOffsetsSealed for element-level filtering on array fields

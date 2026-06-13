@@ -11,6 +11,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <stdint.h>
 #include <string>
 #include <unordered_set>
@@ -176,6 +177,16 @@ class SegcoreConfig {
         return prefer_field_data_when_index_has_raw_data_;
     }
 
+    void
+    set_lazy_manifest_reader_enabled(bool value) {
+        lazy_manifest_reader_enabled_.store(value, std::memory_order_relaxed);
+    }
+
+    bool
+    get_lazy_manifest_reader_enabled() const {
+        return lazy_manifest_reader_enabled_.load(std::memory_order_relaxed);
+    }
+
     static constexpr int64_t kDefaultMaxGroupByGroups = 100000;
 
     int64_t
@@ -219,6 +230,7 @@ class SegcoreConfig {
     inline static bool enable_geometry_cache_ = false;
     inline static bool visibility_filter_enabled_ = true;
     inline static bool prefer_field_data_when_index_has_raw_data_ = false;
+    inline static std::atomic<bool> lazy_manifest_reader_enabled_ = false;
     inline static float interim_index_mem_expansion_rate_ = 1.15f;
     inline static int64_t max_group_by_groups_ = kDefaultMaxGroupByGroups;
 };
