@@ -1109,10 +1109,9 @@ class SegmentLoadInfo {
             }
             auto load_index_info = ConvertFieldIndexInfoToLoadIndexInfo(
                 &index_info, info_.segmentid());
-            load_index_info.has_raw_data =
-                CheckIndexHasRawData(load_index_info);
             converted_index_infos_.push_back(load_index_info);
-            if (load_index_info.has_raw_data) {
+            // Check if index has raw data before moving
+            if (CheckIndexHasRawData(load_index_info)) {
                 field_index_has_raw_data_.insert(field_id);
             }
             converted_field_index_cache_[field_id].push_back(
