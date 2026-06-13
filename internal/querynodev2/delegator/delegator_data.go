@@ -841,7 +841,7 @@ func (sd *shardDelegator) LoadGrowing(ctx context.Context, infos []*querypb.Segm
 // load bm25 stats for sealed segments.
 // idf oracle owns the full lifecycle: download, disk write, register, cleanup.
 func (sd *shardDelegator) loadBM25Stats(ctx context.Context, infos []*querypb.SegmentLoadInfo, req *querypb.LoadSegmentsRequest) error {
-	if sd.idfOracle == nil {
+	if sd.idfOracle == nil || len(infos) == 0 {
 		return nil
 	}
 
@@ -984,26 +984,26 @@ func (sd *shardDelegator) LoadSegments(ctx context.Context, req *querypb.LoadSeg
 		return nil
 	}
 
+	infos := lo.Filter(req.GetInfos(), func(info *querypb.SegmentLoadInfo, _ int) bool {
+		return !sd.distribution.SealedSegmentExistsOnNode(info.GetSegmentID(), targetNodeID)
+	})
+
+	// Load BM25 stats before post-load limiting so stats are ready before the segment becomes visible.
+	stageStart := time.Now()
+	if err := sd.loadBM25Stats(ctx, infos, req); err != nil {
+		bm25StatsDur = time.Since(stageStart)
+		log.Warn("failed to load BM25 stats", zap.Error(err))
+		return err
+	}
+	bm25StatsDur = time.Since(stageStart)
+
 	postLoadStart := time.Now()
 	postLoadWaitDur, err = sd.withPostLoadLimit(ctx, func() error {
-		infos := lo.Filter(req.GetInfos(), func(info *querypb.SegmentLoadInfo, _ int) bool {
-			return !sd.distribution.SealedSegmentExistsOnNode(info.GetSegmentID(), targetNodeID)
-		})
-
 		stageStart := time.Now()
 		candidates, err := sd.loader.LoadBloomFilterSet(ctx, req.GetCollectionID(), infos...)
 		bloomFilterDur = time.Since(stageStart)
 		if err != nil {
 			log.Warn("failed to load bloom filter set for segment", zap.Error(err))
-			return err
-		}
-
-		// Load BM25 stats BEFORE loadStreamDelete so stats are ready before segment becomes visible
-		stageStart = time.Now()
-		err = sd.loadBM25Stats(ctx, infos, req)
-		bm25StatsDur = time.Since(stageStart)
-		if err != nil {
-			log.Warn("failed to load BM25 stats", zap.Error(err))
 			return err
 		}
 
