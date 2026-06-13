@@ -183,12 +183,15 @@ type sealedBm25Stats struct {
 
 	activate *atomic.Bool
 
-	removed   bool
-	segmentID int64
-	ts        time.Time // Time of segment register
-	localDir  string
-	fieldList []int64 // bm25 field list
-	diskSize  int64   // total disk size of local files
+	removed         bool
+	segmentID       int64
+	ts              time.Time // Time of segment register
+	localDir        string
+	remoteFetchOnly bool
+	remotePaths     map[int64][]string
+	cm              storage.ChunkManager
+	fieldList       []int64 // bm25 field list
+	diskSize        int64   // total disk size of local files
 }
 
 func (s *sealedBm25Stats) HasField(fieldID int64) bool {
@@ -274,7 +277,7 @@ func (s *sealedBm25Stats) Remove() {
 	}
 }
 
-// FetchStats reads stats from local multi-file directory and merges per field.
+// FetchStats reads stats from the configured source and merges per field.
 // Local directory structure: {localDir}/{fieldID}/0.data, 1.data, ...
 func (s *sealedBm25Stats) FetchStats() (map[int64]*storage.BM25Stats, error) {
 	s.RLock()
@@ -284,6 +287,13 @@ func (s *sealedBm25Stats) FetchStats() (map[int64]*storage.BM25Stats, error) {
 		return nil, merr.WrapErrServiceInternalMsg("sealed bm25 stats for segment %d already removed", s.segmentID)
 	}
 
+	if s.remoteFetchOnly {
+		return s.fetchRemoteStats()
+	}
+	return s.fetchLocalStats()
+}
+
+func (s *sealedBm25Stats) fetchLocalStats() (map[int64]*storage.BM25Stats, error) {
 	stats := make(map[int64]*storage.BM25Stats)
 	for _, fieldID := range s.fieldList {
 		fieldDir := path.Join(s.localDir, fmt.Sprintf("%d", fieldID))
@@ -311,6 +321,24 @@ func (s *sealedBm25Stats) FetchStats() (map[int64]*storage.BM25Stats, error) {
 		stats[fieldID] = fieldStats
 	}
 
+	return stats, nil
+}
+
+func (s *sealedBm25Stats) fetchRemoteStats() (map[int64]*storage.BM25Stats, error) {
+	if s.cm == nil {
+		return nil, merr.WrapErrServiceInternalMsg("remote chunk manager is nil for segment %d", s.segmentID)
+	}
+
+	stats := make(map[int64]*storage.BM25Stats, len(s.remotePaths))
+	for _, fieldID := range s.fieldList {
+		fieldStats := storage.NewBM25Stats()
+		for _, remotePath := range s.remotePaths[fieldID] {
+			if err := readRemoteBM25Stats(context.Background(), s.cm, remotePath, fieldStats); err != nil {
+				return nil, merr.Wrapf(err, "read remote bm25 stats %s", remotePath)
+			}
+		}
+		stats[fieldID] = fieldStats
+	}
 	return stats, nil
 }
 
@@ -516,7 +544,8 @@ func (o *idfOracle) LoadSealed(ctx context.Context, segmentID int64, loadInfo *q
 
 		needParse := o.targetVersion.Load() == 0 && paramtable.Get().QueryNodeCfg.IDFPreload.GetAsBool()
 
-		result, err := o.streamLoad(ctx, segmentID, logpaths, cm, needParse)
+		remoteFetchOnly := paramtable.Get().QueryNodeCfg.IDFRemoteFetchOnly.GetAsBool()
+		result, err := o.streamLoad(ctx, segmentID, logpaths, cm, needParse, remoteFetchOnly)
 		if err != nil {
 			// cleanup on failure
 			cleanupPath := path.Join(o.dirPath, fmt.Sprintf("%d", segmentID))
@@ -527,12 +556,15 @@ func (o *idfOracle) LoadSealed(ctx context.Context, segmentID int64, loadInfo *q
 		}
 
 		segStats := &sealedBm25Stats{
-			ts:        time.Now(),
-			activate:  atomic.NewBool(false),
-			segmentID: segmentID,
-			localDir:  result.localDir,
-			fieldList: result.fieldList,
-			diskSize:  result.diskSize,
+			ts:              time.Now(),
+			activate:        atomic.NewBool(false),
+			segmentID:       segmentID,
+			localDir:        result.localDir,
+			remoteFetchOnly: result.remoteFetchOnly,
+			remotePaths:     result.remotePaths,
+			cm:              result.cm,
+			fieldList:       result.fieldList,
+			diskSize:        result.diskSize,
 		}
 
 		if needParse && result.stats != nil {
@@ -601,7 +633,11 @@ func (o *idfOracle) LoadSealedForReopen(ctx context.Context, segmentID int64, lo
 		}
 		defer cleanup()
 
-		result, err := o.streamLoad(ctx, segmentID, missingPaths, cm, true)
+		remoteFetchOnly := paramtable.Get().QueryNodeCfg.IDFRemoteFetchOnly.GetAsBool()
+		if existedBeforeLoad {
+			remoteFetchOnly = segStats.remoteFetchOnly
+		}
+		result, err := o.streamLoad(ctx, segmentID, missingPaths, cm, true, remoteFetchOnly)
 		if err != nil {
 			return nil, err
 		}
@@ -643,6 +679,15 @@ func (o *idfOracle) LoadSealedForReopen(ctx context.Context, segmentID int64, lo
 			}
 
 			segStats.addFieldsLocked(installedFields)
+			if result.remoteFetchOnly {
+				if segStats.remotePaths == nil {
+					segStats.remotePaths = make(map[int64][]string, len(installedFields))
+				}
+				for _, fieldID := range installedFields {
+					segStats.remotePaths[fieldID] = result.remotePaths[fieldID]
+				}
+				segStats.cm = result.cm
+			}
 			segStats.diskSize += result.diskSize
 			switch {
 			case wasActive:
@@ -658,12 +703,15 @@ func (o *idfOracle) LoadSealedForReopen(ctx context.Context, segmentID int64, lo
 			segStats.Unlock()
 		} else {
 			segStats = &sealedBm25Stats{
-				ts:        time.Now(),
-				activate:  atomic.NewBool(false),
-				segmentID: segmentID,
-				localDir:  result.localDir,
-				fieldList: result.fieldList,
-				diskSize:  result.diskSize,
+				ts:              time.Now(),
+				activate:        atomic.NewBool(false),
+				segmentID:       segmentID,
+				localDir:        result.localDir,
+				remoteFetchOnly: result.remoteFetchOnly,
+				remotePaths:     result.remotePaths,
+				cm:              result.cm,
+				fieldList:       result.fieldList,
+				diskSize:        result.diskSize,
 			}
 			if activateIfReadable {
 				o.activateSealedStatsLocked(segStats, result.stats)
@@ -681,10 +729,13 @@ func (o *idfOracle) LoadSealedForReopen(ctx context.Context, segmentID int64, lo
 }
 
 type streamLoadResult struct {
-	localDir  string
-	fieldList []int64
-	stats     bm25Stats // non-nil only when needParse=true
-	diskSize  int64
+	localDir        string
+	remoteFetchOnly bool
+	remotePaths     map[int64][]string
+	cm              storage.ChunkManager
+	fieldList       []int64
+	stats           bm25Stats // non-nil only when needParse=true
+	diskSize        int64
 }
 
 func bm25FieldDirDiskSize(fieldDir string) int64 {
@@ -710,7 +761,7 @@ func bm25FieldDirDiskSize(fieldDir string) int64 {
 
 // streamLoad downloads BM25 stats from remote storage to local disk.
 // When needParse is true, also parses stats using TeeReader.
-func (o *idfOracle) streamLoad(ctx context.Context, segmentID int64, binlogPaths map[int64][]string, cm storage.ChunkManager, needParse bool) (streamLoadResult, error) {
+func (o *idfOracle) streamLoad(ctx context.Context, segmentID int64, binlogPaths map[int64][]string, cm storage.ChunkManager, needParse bool, remoteFetchOnly bool) (streamLoadResult, error) {
 	log := mlog.With(mlog.FieldSegmentID(segmentID))
 	startTs := time.Now()
 
@@ -718,6 +769,36 @@ func (o *idfOracle) streamLoad(ctx context.Context, segmentID int64, binlogPaths
 	var totalDiskSize int64
 	var stats map[int64]*storage.BM25Stats
 	fieldList := make([]int64, 0, len(binlogPaths))
+
+	if remoteFetchOnly {
+		if needParse {
+			stats = make(map[int64]*storage.BM25Stats, len(binlogPaths))
+			for fieldID, paths := range binlogPaths {
+				fieldList = append(fieldList, fieldID)
+				fieldStats := storage.NewBM25Stats()
+				for _, remotePath := range paths {
+					if err := readRemoteBM25Stats(ctx, cm, remotePath, fieldStats); err != nil {
+						return streamLoadResult{}, merr.Wrapf(err, "read remote bm25 stats %s", remotePath)
+					}
+				}
+				stats[fieldID] = fieldStats
+				log.Info(ctx, "loaded remote bm25 stats", mlog.Duration("time", time.Since(startTs)), mlog.Int64("numRow", fieldStats.NumRow()), mlog.FieldFieldID(fieldID))
+			}
+		} else {
+			for fieldID := range binlogPaths {
+				fieldList = append(fieldList, fieldID)
+			}
+		}
+
+		log.Info(ctx, "stream load bm25 stats done", mlog.Duration("time", time.Since(startTs)), mlog.Int64("diskSize", 0), mlog.Bool("parsed", needParse), mlog.Bool("remoteFetchOnly", true))
+		return streamLoadResult{
+			remoteFetchOnly: true,
+			remotePaths:     binlogPaths,
+			cm:              cm,
+			fieldList:       fieldList,
+			stats:           stats,
+		}, nil
+	}
 
 	if needParse {
 		stats = make(map[int64]*storage.BM25Stats, len(binlogPaths))
@@ -758,6 +839,17 @@ func (o *idfOracle) streamLoad(ctx context.Context, segmentID int64, binlogPaths
 		stats:     stats,
 		diskSize:  totalDiskSize,
 	}, nil
+}
+
+func readRemoteBM25Stats(ctx context.Context, cm storage.ChunkManager, remotePath string, parseInto *storage.BM25Stats) error {
+	reader, err := cm.Reader(ctx, remotePath)
+	if err != nil {
+		return err
+	}
+	defer reader.Close()
+
+	br := bufio.NewReaderSize(reader, paramtable.Get().QueryNodeCfg.IDFReadBufferSize.GetAsInt())
+	return parseInto.DeserializeFromReader(br)
 }
 
 // streamOneFile streams a single remote file to a local file.

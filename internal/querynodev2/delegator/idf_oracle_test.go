@@ -37,6 +37,7 @@ import (
 	"github.com/milvus-io/milvus/internal/storage"
 	"github.com/milvus-io/milvus/pkg/v3/proto/datapb"
 	"github.com/milvus-io/milvus/pkg/v3/proto/querypb"
+	"github.com/milvus-io/milvus/pkg/v3/util/paramtable"
 	"github.com/milvus-io/milvus/pkg/v3/util/typeutil"
 )
 
@@ -110,6 +111,15 @@ func genBM25StatsForField(fieldID int64, start uint32, end uint32) map[int64]*st
 		result[fieldID].Append(row)
 	}
 	return result
+}
+
+func (suite *IDFOracleSuite) setIDFRemoteFetchOnly(enabled bool) {
+	item := &paramtable.Get().QueryNodeCfg.IDFRemoteFetchOnly
+	old := item.GetValue()
+	suite.Require().NoError(paramtable.Get().Save(item.Key, fmt.Sprintf("%t", enabled)))
+	suite.T().Cleanup(func() {
+		_ = paramtable.Get().Save(item.Key, old)
+	})
 }
 
 // registerSealed loads BM25 stats via LoadSealed with a mock ChunkManager.
@@ -352,6 +362,18 @@ func (suite *IDFOracleSuite) TestFetchStatsRemoved() {
 	suite.Contains(err.Error(), "already removed")
 }
 
+func (suite *IDFOracleSuite) TestFetchStatsUsesExplicitRemoteFetchOnlyMode() {
+	stats := &sealedBm25Stats{
+		activate:  atomic.NewBool(false),
+		segmentID: 1,
+		fieldList: []int64{102},
+	}
+
+	_, err := stats.FetchStats()
+	suite.Error(err)
+	suite.Contains(err.Error(), "read local dir")
+}
+
 func (suite *IDFOracleSuite) TestDiskSizeTracking() {
 	disk1 := suite.registerSealed(1, 1, 2)
 	disk2 := suite.registerSealed(2, 2, 3)
@@ -470,6 +492,82 @@ func (suite *IDFOracleSuite) TestLoadSealedNoParse() {
 	fetched, err := sealedStats.FetchStats()
 	suite.NoError(err)
 	suite.Equal(int64(4), fetched[102].NumRow())
+}
+
+func (suite *IDFOracleSuite) TestLoadSealedRemoteFetchOnlyPreload() {
+	suite.setIDFRemoteFetchOnly(true)
+
+	stats := suite.genStats(1, 5)
+	data, err := stats[102].Serialize()
+	suite.Require().NoError(err)
+
+	cm := mocks.NewChunkManager(suite.T())
+	remotePath := "bm25stats/seg_1/field_102/0"
+	cm.EXPECT().Reader(mock.Anything, remotePath).RunAndReturn(
+		func(context.Context, string) (storage.FileReader, error) {
+			return &bytesFileReader{bytes.NewReader(data)}, nil
+		},
+	).Once()
+
+	bm25Logs := []*datapb.FieldBinlog{{
+		FieldID: 102,
+		Binlogs: []*datapb.Binlog{{LogPath: remotePath}},
+	}}
+
+	err = suite.idfOracle.LoadSealed(context.Background(), 1, &querypb.SegmentLoadInfo{Bm25Logs: bm25Logs}, cm)
+	suite.NoError(err)
+	suite.Equal(int64(4), suite.idfOracle.current.NumRow())
+	suite.Equal(int64(0), suite.idfOracle.sealedDiskSize.Load())
+
+	sealedStats, ok := suite.idfOracle.sealed.Get(1)
+	suite.True(ok)
+	sealedStats.RLock()
+	suite.Empty(sealedStats.localDir)
+	suite.Equal([]string{remotePath}, sealedStats.remotePaths[102])
+	sealedStats.RUnlock()
+
+	_, statErr := os.Stat(path.Join(suite.idfOracle.dirPath, "1"))
+	suite.True(os.IsNotExist(statErr))
+}
+
+func (suite *IDFOracleSuite) TestLoadSealedRemoteFetchOnlySyncDistribution() {
+	suite.setIDFRemoteFetchOnly(true)
+	suite.targetVersion = 1
+	suite.idfOracle.targetVersion.Store(1)
+
+	stats := suite.genStats(1, 5)
+	data, err := stats[102].Serialize()
+	suite.Require().NoError(err)
+
+	cm := mocks.NewChunkManager(suite.T())
+	remotePath := "bm25stats/seg_1/field_102/0"
+	cm.EXPECT().Reader(mock.Anything, remotePath).RunAndReturn(
+		func(context.Context, string) (storage.FileReader, error) {
+			return &bytesFileReader{bytes.NewReader(data)}, nil
+		},
+	).Twice()
+
+	bm25Logs := []*datapb.FieldBinlog{{
+		FieldID: 102,
+		Binlogs: []*datapb.Binlog{{LogPath: remotePath}},
+	}}
+
+	err = suite.idfOracle.LoadSealed(context.Background(), 1, &querypb.SegmentLoadInfo{Bm25Logs: bm25Logs}, cm)
+	suite.NoError(err)
+	suite.True(suite.idfOracle.sealed.Contain(1))
+	suite.Equal(int64(0), suite.idfOracle.current.NumRow())
+	suite.Equal(int64(0), suite.idfOracle.sealedDiskSize.Load())
+
+	suite.updateSnapshot([]int64{1}, []int64{}, []int64{})
+	suite.idfOracle.SetNext(suite.snapshot)
+	suite.waitTargetVersion(suite.targetVersion)
+	suite.Equal(int64(4), suite.idfOracle.current.NumRow())
+
+	suite.updateSnapshot([]int64{}, []int64{}, []int64{1})
+	suite.idfOracle.SetNext(suite.snapshot)
+	suite.waitTargetVersion(suite.targetVersion)
+	suite.Equal(int64(0), suite.idfOracle.current.NumRow())
+	suite.Equal(int64(0), suite.idfOracle.sealedDiskSize.Load())
 }
 
 func (suite *IDFOracleSuite) TestLoadSealedFailureCleanup() {
