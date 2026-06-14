@@ -128,27 +128,42 @@ class ThreadPool {
         auto task_ptr =
             std::make_shared<std::packaged_task<decltype(f(args...))()>>(func);
 
-        std::function<void()> wrap_func = [task_ptr]() { (*task_ptr)(); };
+        auto submit_time_ns = NowNs();
+        std::function<void()> wrap_func = [this, task_ptr, submit_time_ns]() {
+            RecordTaskStarted(submit_time_ns);
+            try {
+                (*task_ptr)();
+            } catch (...) {
+                RecordTaskFinished();
+                throw;
+            }
+            RecordTaskFinished();
+        };
 
         work_queue_.enqueue(wrap_func);
+        auto queue_depth = work_queue_.size();
+        RecordTaskSubmitted(queue_depth);
         if (metric_submitted_) {
             metric_submitted_->Increment();
         }
         if (metric_queue_depth_) {
-            metric_queue_depth_->Set(work_queue_.size());
+            metric_queue_depth_->Set(queue_depth);
         }
 
-        std::lock_guard<std::mutex> lock(mutex_);
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
 
-        if (idle_threads_size_ > 0) {
-            condition_lock_.notify_one();
-        } else if (current_threads_size_ < max_threads_size_.load()) {
-            // Dynamic increase thread number
-            std::thread t(&ThreadPool::Worker, this);
-            assert(threads_.find(t.get_id()) == threads_.end());
-            threads_[t.get_id()] = std::move(t);
-            current_threads_size_++;
+            if (idle_threads_size_ > 0) {
+                condition_lock_.notify_one();
+            } else if (current_threads_size_ < max_threads_size_.load()) {
+                // Dynamic increase thread number
+                std::thread t(&ThreadPool::Worker, this);
+                assert(threads_.find(t.get_id()) == threads_.end());
+                threads_[t.get_id()] = std::move(t);
+                current_threads_size_++;
+            }
         }
+        LogStatsIfNeeded();
 
         return task_ptr->get_future();
     }
@@ -202,6 +217,21 @@ class ThreadPool {
         }
     }
 
+    void
+    RecordTaskSubmitted(size_t queue_depth);
+
+    void
+    RecordTaskStarted(int64_t submit_time_ns);
+
+    void
+    RecordTaskFinished();
+
+    void
+    LogStatsIfNeeded();
+
+    static int64_t
+    NowNs();
+
  public:
     int min_threads_size_;
     int idle_threads_size_;
@@ -223,6 +253,16 @@ class ThreadPool {
     prometheus::Gauge* metric_queue_depth_{nullptr};
     prometheus::Counter* metric_submitted_{nullptr};
     prometheus::Counter* metric_completed_{nullptr};
+
+    std::atomic<int64_t> submitted_tasks_delta_{0};
+    std::atomic<int64_t> completed_tasks_delta_{0};
+    std::atomic<int64_t> running_tasks_{0};
+    std::atomic<int64_t> max_running_tasks_{0};
+    std::atomic<int64_t> max_queue_depth_{0};
+    std::atomic<int64_t> queue_wait_samples_delta_{0};
+    std::atomic<int64_t> total_queue_wait_ns_delta_{0};
+    std::atomic<int64_t> max_queue_wait_ns_{0};
+    std::atomic<int64_t> last_pool_stats_log_ns_{0};
 };
 
 }  // namespace milvus

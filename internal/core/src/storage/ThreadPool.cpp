@@ -17,6 +17,7 @@
 #include "ThreadPool.h"
 
 #include <chrono>
+#include <algorithm>
 
 #include "log/Log.h"
 #include "storage/SafeQueue.h"
@@ -64,6 +65,134 @@ void
 SetThreadPoolMaxThreadsSize(const int size) {
     THREAD_POOL_MAX_THREADS_SIZE.store(size);
     LOG_INFO("set thread pool max threads size: {}", size);
+}
+
+namespace {
+
+constexpr int64_t POOL_STATS_LOG_INTERVAL_NS = 5LL * 1000 * 1000 * 1000;
+
+void
+UpdateMax(std::atomic<int64_t>& target, int64_t value) {
+    auto current = target.load(std::memory_order_relaxed);
+    while (current < value &&
+           !target.compare_exchange_weak(current,
+                                         value,
+                                         std::memory_order_relaxed,
+                                         std::memory_order_relaxed)) {
+    }
+}
+
+double
+NsToMs(int64_t ns) {
+    return static_cast<double>(ns) / 1000.0 / 1000.0;
+}
+
+}  // namespace
+
+int64_t
+ThreadPool::NowNs() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
+void
+ThreadPool::RecordTaskSubmitted(size_t queue_depth) {
+    submitted_tasks_delta_.fetch_add(1, std::memory_order_relaxed);
+    UpdateMax(max_queue_depth_,
+              static_cast<int64_t>(queue_depth));
+}
+
+void
+ThreadPool::RecordTaskStarted(int64_t submit_time_ns) {
+    auto queue_wait_ns = std::max<int64_t>(0, NowNs() - submit_time_ns);
+    queue_wait_samples_delta_.fetch_add(1, std::memory_order_relaxed);
+    total_queue_wait_ns_delta_.fetch_add(queue_wait_ns,
+                                         std::memory_order_relaxed);
+    UpdateMax(max_queue_wait_ns_, queue_wait_ns);
+
+    auto running =
+        running_tasks_.fetch_add(1, std::memory_order_relaxed) + 1;
+    UpdateMax(max_running_tasks_, running);
+    LogStatsIfNeeded();
+}
+
+void
+ThreadPool::RecordTaskFinished() {
+    running_tasks_.fetch_sub(1, std::memory_order_relaxed);
+    completed_tasks_delta_.fetch_add(1, std::memory_order_relaxed);
+    LogStatsIfNeeded();
+}
+
+void
+ThreadPool::LogStatsIfNeeded() {
+    auto now_ns = NowNs();
+    auto last_ns = last_pool_stats_log_ns_.load(std::memory_order_relaxed);
+    if (last_ns == 0) {
+        if (last_pool_stats_log_ns_.compare_exchange_strong(
+                last_ns,
+                now_ns,
+                std::memory_order_relaxed,
+                std::memory_order_relaxed)) {
+            return;
+        }
+    }
+    if (now_ns - last_ns < POOL_STATS_LOG_INTERVAL_NS) {
+        return;
+    }
+    if (!last_pool_stats_log_ns_.compare_exchange_strong(
+            last_ns,
+            now_ns,
+            std::memory_order_relaxed,
+            std::memory_order_relaxed)) {
+        return;
+    }
+
+    auto running = running_tasks_.load(std::memory_order_relaxed);
+    auto submitted =
+        submitted_tasks_delta_.exchange(0, std::memory_order_relaxed);
+    auto completed =
+        completed_tasks_delta_.exchange(0, std::memory_order_relaxed);
+    auto samples =
+        queue_wait_samples_delta_.exchange(0, std::memory_order_relaxed);
+    auto total_queue_wait_ns =
+        total_queue_wait_ns_delta_.exchange(0, std::memory_order_relaxed);
+    auto max_queue_wait_ns =
+        max_queue_wait_ns_.exchange(0, std::memory_order_relaxed);
+    auto max_running =
+        max_running_tasks_.exchange(running, std::memory_order_relaxed);
+
+    int current_threads = 0;
+    int idle_threads = 0;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        current_threads = current_threads_size_;
+        idle_threads = idle_threads_size_;
+    }
+    auto queue_depth = static_cast<int64_t>(work_queue_.size());
+    auto max_queue =
+        max_queue_depth_.exchange(queue_depth, std::memory_order_relaxed);
+    max_running = std::max(max_running, running);
+    max_queue = std::max(max_queue, queue_depth);
+
+    auto avg_queue_wait_ns = samples == 0 ? 0 : total_queue_wait_ns / samples;
+    LOG_WARN(
+        "[SN recovery] pool stats phase=segcore.thread_pool pool={} "
+        "capacity={} threads={} active={} idle={} queue={} submittedDelta={} "
+        "completedDelta={} maxActive={} maxQueue={} avgQueueWaitMs={:.3f} "
+        "maxQueueWaitMs={:.3f}",
+        name_,
+        max_threads_size_.load(std::memory_order_relaxed),
+        current_threads,
+        running,
+        idle_threads,
+        queue_depth,
+        submitted,
+        completed,
+        max_running,
+        max_queue,
+        NsToMs(avg_queue_wait_ns),
+        NsToMs(max_queue_wait_ns));
 }
 
 void

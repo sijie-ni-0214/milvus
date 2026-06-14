@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	ants "github.com/panjf2000/ants/v2"
@@ -31,8 +32,10 @@ import (
 
 // A goroutine pool
 type Pool[T any] struct {
-	inner *ants.Pool
-	opt   *poolOption
+	inner     *ants.Pool
+	opt       *poolOption
+	submitted atomic.Int64
+	completed atomic.Int64
 }
 
 // NewPool returns a goroutine pool.
@@ -67,7 +70,9 @@ func NewDefaultPool[T any]() *Pool[T] {
 // NOTE: As now golang doesn't support the member method being generic, we use Future[any]
 func (pool *Pool[T]) Submit(method func() (T, error)) *Future[T] {
 	future := newFuture[T]()
+	pool.submitted.Add(1)
 	err := pool.inner.Submit(func() {
+		defer pool.completed.Add(1)
 		defer close(future.ch)
 		defer func() {
 			if x := recover(); x != nil {
@@ -86,6 +91,7 @@ func (pool *Pool[T]) Submit(method func() (T, error)) *Future[T] {
 		future.value = res
 	})
 	if err != nil {
+		pool.submitted.Add(-1)
 		future.err = err
 		close(future.ch)
 	}
@@ -111,6 +117,14 @@ func (pool *Pool[T]) Free() int {
 // Waiting returns the number of tasks waiting to be executed
 func (pool *Pool[T]) Waiting() int {
 	return pool.inner.Waiting()
+}
+
+func (pool *Pool[T]) Submitted() int64 {
+	return pool.submitted.Load()
+}
+
+func (pool *Pool[T]) Completed() int64 {
+	return pool.completed.Load()
 }
 
 func (pool *Pool[T]) IsClosed() bool {

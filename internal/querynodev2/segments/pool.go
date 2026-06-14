@@ -31,6 +31,7 @@ import (
 	"math"
 	"runtime"
 	"sync"
+	"time"
 
 	"go.uber.org/atomic"
 	"go.uber.org/zap"
@@ -65,6 +66,8 @@ var (
 
 	bm25LoadPool atomic.Pointer[conc.Pool[any]]
 	bm25PoolOnce sync.Once
+
+	poolStatsLogOnce sync.Once
 
 	// intentionally leaked CGO tag names
 	cgoTagSQ      = C.CString("CGO_SQ")
@@ -110,6 +113,7 @@ func initDynamicPool() {
 		)
 
 		dp.Store(pool)
+		startPoolStatsLogger()
 		pt.Watch(pt.CommonCfg.DynamicPoolThreadCoreCoefficient.Key, config.NewHandler("qn.dynamicpool.dynamicpoolthreadcorecoefficient", ResizeDynamicPool))
 		log.Info("init dynamicPool done", zap.Int("size", size))
 	})
@@ -130,6 +134,7 @@ func initLoadPool() {
 		)
 
 		loadPool.Store(pool)
+		startPoolStatsLogger()
 
 		pt.Watch(pt.CommonCfg.MiddlePriorityThreadCoreCoefficient.Key, config.NewHandler("qn.loadpool.middlepriority", ResizeLoadPool))
 		log.Info("init loadPool done", zap.Int("size", poolSize))
@@ -327,4 +332,116 @@ func resizePool(pool *conc.Pool[any], newSize int, tag string) {
 		return
 	}
 	log.Info("pool resize successfully")
+}
+
+type poolStatsObservable interface {
+	Cap() int
+	Running() int
+	Free() int
+	Waiting() int
+	Submitted() int64
+	Completed() int64
+}
+
+type poolStatsWindow struct {
+	initialized   bool
+	lastSubmitted int64
+	lastCompleted int64
+	maxRunning    int
+	maxWaiting    int
+}
+
+func startPoolStatsLogger() {
+	poolStatsLogOnce.Do(func() {
+		go func() {
+			ticker := time.NewTicker(time.Second)
+			defer ticker.Stop()
+
+			lastLog := time.Now()
+			windows := make(map[string]*poolStatsWindow)
+			for now := range ticker.C {
+				refs := make([]struct {
+					name string
+					pool poolStatsObservable
+				}, 0, 2)
+				if pool := dp.Load(); pool != nil {
+					refs = append(refs, struct {
+						name string
+						pool poolStatsObservable
+					}{"DynamicPool", pool})
+				}
+				if pool := loadPool.Load(); pool != nil {
+					refs = append(refs, struct {
+						name string
+						pool poolStatsObservable
+					}{"LoadPool", pool})
+				}
+
+				for _, ref := range refs {
+					window := windows[ref.name]
+					if window == nil {
+						window = &poolStatsWindow{}
+						windows[ref.name] = window
+					}
+
+					running := ref.pool.Running()
+					waiting := ref.pool.Waiting()
+					if !window.initialized {
+						window.initialized = true
+						window.lastSubmitted = ref.pool.Submitted()
+						window.lastCompleted = ref.pool.Completed()
+						window.maxRunning = running
+						window.maxWaiting = waiting
+						continue
+					}
+					if running > window.maxRunning {
+						window.maxRunning = running
+					}
+					if waiting > window.maxWaiting {
+						window.maxWaiting = waiting
+					}
+				}
+
+				if now.Sub(lastLog) < 5*time.Second {
+					continue
+				}
+
+				for _, ref := range refs {
+					window := windows[ref.name]
+					if window == nil || !window.initialized {
+						continue
+					}
+
+					submitted := ref.pool.Submitted()
+					completed := ref.pool.Completed()
+					running := ref.pool.Running()
+					waiting := ref.pool.Waiting()
+					if running > window.maxRunning {
+						window.maxRunning = running
+					}
+					if waiting > window.maxWaiting {
+						window.maxWaiting = waiting
+					}
+
+					log.Warn("[SN recovery] pool stats",
+						zap.String("phase", "go.pool"),
+						zap.String("pool", ref.name),
+						zap.Int("capacity", ref.pool.Cap()),
+						zap.Int("running", running),
+						zap.Int("free", ref.pool.Free()),
+						zap.Int("waiting", waiting),
+						zap.Int64("submittedDelta", submitted-window.lastSubmitted),
+						zap.Int64("completedDelta", completed-window.lastCompleted),
+						zap.Int("maxRunning", window.maxRunning),
+						zap.Int("maxWaiting", window.maxWaiting))
+
+					window.lastSubmitted = submitted
+					window.lastCompleted = completed
+					window.maxRunning = running
+					window.maxWaiting = waiting
+				}
+				lastLog = now
+			}
+		}()
+	})
 }
