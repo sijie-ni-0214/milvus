@@ -222,7 +222,7 @@ func (sd *shardDelegator) ProcessInsert(insertRecords map[int64]*InsertData) {
 			if !sd.distribution.GrowingSegmentExists(segmentID) {
 				// register created growing segment after insert, avoid to add empty growing to delegator
 				if idfOracle := sd.getIDFOracle(); idfOracle != nil {
-					idfOracle.RegisterGrowing(segmentID, insertData.BM25Stats)
+					idfOracle.RegisterGrowing(segmentID, insertData.BM25Stats, insertData.PartitionID)
 				}
 				sd.segmentManager.Put(context.Background(), segments.SegmentTypeGrowing, growing)
 				sd.addGrowing(SegmentEntry{
@@ -474,9 +474,26 @@ func (sd *shardDelegator) LoadGrowing(ctx context.Context, infos []*querypb.Segm
 	segmentIDs = lo.Map(loaded, func(segment segments.Segment, _ int) int64 { return segment.ID() })
 	log.Info(ctx, "load growing segments done", mlog.Int64s("segmentIDs", segmentIDs))
 
+	// initialize checkpoint tracking for recovered growing segments (TEXT collections only)
+	if sd.checkpointTracker != nil {
+		for _, segment := range loaded {
+			// the segment was recovered from binlog, so the current row count is the flushed offset
+			flushedOffset := segment.RowNum()
+			manifest := segment.LoadInfo().GetManifestPath()
+			if manifest == "" && flushedOffset > 0 {
+				return fmt.Errorf("recovered growing segment %d has %d flushed rows but no manifest path, cannot safely resume flush", segment.ID(), flushedOffset)
+			}
+			sd.checkpointTracker.InitSegmentWithManifest(segment.ID(), flushedOffset, manifest)
+			log.Info(ctx, "initialized checkpoint tracker for recovered growing segment",
+				mlog.FieldSegmentID(segment.ID()),
+				mlog.Int64("flushedOffset", flushedOffset),
+				mlog.String("manifest", manifest))
+		}
+	}
+
 	if idfOracle := sd.getIDFOracle(); idfOracle != nil {
 		for _, segment := range loaded {
-			idfOracle.RegisterGrowing(segment.ID(), segment.GetBM25Stats())
+			idfOracle.RegisterGrowing(segment.ID(), segment.GetBM25Stats(), segment.Partition())
 		}
 	}
 	sd.addGrowing(lo.Map(loaded, func(segment segments.Segment, _ int) SegmentEntry {
@@ -1329,7 +1346,7 @@ func (sd *shardDelegator) buildBM25IDF(ctx context.Context, req *internalpb.Sear
 		return 0, merr.WrapErrServiceInternalMsg("functionRunner not found for field: %d", req.GetFieldId())
 	}
 
-	idfSparseVector, avgdl, err := idfOracle.BuildIDF(req.GetFieldId(), tfArray)
+	idfSparseVector, avgdl, err := idfOracle.BuildIDF(ctx, req.GetFieldId(), tfArray, req.GetPartitionIDs()...)
 	if err != nil {
 		return 0, err
 	}

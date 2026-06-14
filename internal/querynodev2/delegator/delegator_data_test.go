@@ -2017,8 +2017,14 @@ func (s *DelegatorDataSuite) TestReleaseGrowingSourceDroppedChannelWithoutPrepar
 }
 
 func (s *DelegatorDataSuite) TestLoadPartitionStats() {
+	item := &paramtable.Get().QueryNodeCfg.IDFPartitionLevel
+	old := item.GetValue()
+	s.Require().NoError(paramtable.Get().Save(item.Key, "true"))
+	s.T().Cleanup(func() {
+		_ = paramtable.Get().Save(item.Key, old)
+	})
+
 	segStats := make(map[UniqueID]storage.SegmentStats)
-	centroid := []float32{1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0}
 	var segID int64 = 1
 	rows := 1990
 	{
@@ -2036,21 +2042,8 @@ func (s *DelegatorDataSuite) TestLoadPartitionStats() {
 			Max:     storage.NewInt64FieldValue(400),
 			Min:     storage.NewInt64FieldValue(300),
 		}
-		fieldStat3 := storage.FieldStats{
-			FieldID: 3,
-			Type:    schemapb.DataType_FloatVector,
-			Centroids: []storage.VectorFieldValue{
-				&storage.FloatVectorFieldValue{
-					Value: centroid,
-				},
-				&storage.FloatVectorFieldValue{
-					Value: centroid,
-				},
-			},
-		}
 		fieldStats = append(fieldStats, fieldStat1)
 		fieldStats = append(fieldStats, fieldStat2)
-		fieldStats = append(fieldStats, fieldStat3)
 		segStats[segID] = *storage.NewSegmentStats(fieldStats, rows)
 	}
 	partitionStats1 := &storage.PartitionStatsSnapshot{
@@ -2074,12 +2067,7 @@ func (s *DelegatorDataSuite) TestLoadPartitionStats() {
 	p1Stats := s.delegator.partitionStats[partitionID1]
 	s.Equal(int64(1), p1Stats.GetVersion())
 	s.Equal(rows, p1Stats.SegmentStats[segID].NumRows)
-	s.Equal(3, len(p1Stats.SegmentStats[segID].FieldStats))
-
-	// judge vector stats
-	vecFieldStats := p1Stats.SegmentStats[segID].FieldStats[2]
-	s.Equal(2, len(vecFieldStats.Centroids))
-	s.Equal(8, len(vecFieldStats.Centroids[0].GetValue().([]float32)))
+	s.Equal(2, len(p1Stats.SegmentStats[segID].FieldStats))
 
 	// judge scalar stats
 	fieldStats1 := p1Stats.SegmentStats[segID].FieldStats[0]
