@@ -3644,6 +3644,8 @@ type queryNodeConfig struct {
 	// Idf Oracle
 	IDFPreload             ParamItem `refreshable:"true"`
 	IDFRemoteFetchOnly     ParamItem `refreshable:"true"`
+	IDFPartitionLevel      ParamItem `refreshable:"false"`
+	IDFPartitionLazyLoad   ParamItem `refreshable:"false"`
 	IDFReadBufferSize      ParamItem `refreshable:"true"`
 	BM25StatsBytesPerEntry ParamItem `refreshable:"true"`
 	// partial search
@@ -3688,6 +3690,24 @@ func (p *queryNodeConfig) init(base *BaseTable) {
 		Doc:          "Whether sealed BM25 stats should skip local disk cache and be fetched directly from remote storage. When true, preload parses remote stats directly into current and later target updates fetch from remote storage on demand.",
 	}
 	p.IDFRemoteFetchOnly.Init(base.mgr)
+
+	p.IDFPartitionLevel = ParamItem{
+		Key:          "queryNode.idfOracle.partitionLevel",
+		Version:      "2.6.15",
+		Export:       true,
+		DefaultValue: "false",
+		Doc:          "Whether sealed BM25 stats should be resolved and cached at partition granularity during BM25 search.",
+	}
+	p.IDFPartitionLevel.Init(base.mgr)
+
+	p.IDFPartitionLazyLoad = ParamItem{
+		Key:          "queryNode.idfOracle.partitionLazyLoad",
+		Version:      "2.6.15",
+		Export:       true,
+		DefaultValue: "false",
+		Doc:          "Whether partition-level sealed BM25 stats should skip load-time stats resolution and be loaded lazily during BM25 search. Only takes effect when queryNode.idfOracle.partitionLevel is true.",
+	}
+	p.IDFPartitionLazyLoad.Init(base.mgr)
 
 	p.IDFReadBufferSize = ParamItem{
 		Key:          "queryNode.idfOracle.readBufferSize",

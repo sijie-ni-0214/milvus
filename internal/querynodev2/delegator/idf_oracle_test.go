@@ -112,6 +112,24 @@ func (suite *IDFOracleSuite) setIDFRemoteFetchOnly(enabled bool) {
 	})
 }
 
+func (suite *IDFOracleSuite) setIDFPartitionLevel(enabled bool) {
+	item := &paramtable.Get().QueryNodeCfg.IDFPartitionLevel
+	old := item.GetValue()
+	suite.Require().NoError(paramtable.Get().Save(item.Key, fmt.Sprintf("%t", enabled)))
+	suite.T().Cleanup(func() {
+		_ = paramtable.Get().Save(item.Key, old)
+	})
+}
+
+func (suite *IDFOracleSuite) setIDFPartitionLazyLoad(enabled bool) {
+	item := &paramtable.Get().QueryNodeCfg.IDFPartitionLazyLoad
+	old := item.GetValue()
+	suite.Require().NoError(paramtable.Get().Save(item.Key, fmt.Sprintf("%t", enabled)))
+	suite.T().Cleanup(func() {
+		_ = paramtable.Get().Save(item.Key, old)
+	})
+}
+
 // registerSealed loads BM25 stats via LoadSealed with a mock ChunkManager.
 // Returns the disk size written. Idempotent via LoadSealed's internal check.
 func (suite *IDFOracleSuite) registerSealed(segID int64, start uint32, end uint32) int64 {
@@ -214,7 +232,7 @@ func (suite *IDFOracleSuite) TestSealed() {
 	suite.Equal(int64(1), suite.idfOracle.current.NumRow())
 
 	sparse := typeutil.CreateAndSortSparseFloatRow(map[uint32]float32{4: 1})
-	bytes, avgdl, err := suite.idfOracle.BuildIDF(102, &schemapb.SparseFloatArray{Contents: [][]byte{sparse}, Dim: 1})
+	bytes, avgdl, err := suite.idfOracle.BuildIDF(context.Background(), 102, &schemapb.SparseFloatArray{Contents: [][]byte{sparse}, Dim: 1})
 	suite.NoError(err)
 	suite.Equal(float64(1), avgdl)
 	suite.Equal(map[uint32]float32{4: 0.2876821}, typeutil.SparseFloatBytesToMap(bytes[0]))
@@ -329,7 +347,7 @@ func (suite *IDFOracleSuite) TestFetchStatsUsesExplicitRemoteFetchOnlyMode() {
 
 	_, err := stats.FetchStats()
 	suite.Error(err)
-	suite.Contains(err.Error(), "read local dir")
+	suite.Contains(err.Error(), "local dir is empty")
 }
 
 func (suite *IDFOracleSuite) TestDiskSizeTracking() {
@@ -526,6 +544,248 @@ func (suite *IDFOracleSuite) TestLoadSealedRemoteFetchOnlySyncDistribution() {
 	suite.waitTargetVersion(suite.targetVersion)
 	suite.Equal(int64(0), suite.idfOracle.current.NumRow())
 	suite.Equal(int64(0), suite.idfOracle.sealedDiskSize.Load())
+}
+
+func (suite *IDFOracleSuite) TestPartitionLazyLoadSealedStats() {
+	suite.setIDFPartitionLevel(true)
+	suite.setIDFPartitionLazyLoad(true)
+	suite.setIDFRemoteFetchOnly(true)
+
+	stats := suite.genStats(1, 2)
+	data, err := stats[102].Serialize()
+	suite.Require().NoError(err)
+
+	readerCalls := atomic.NewInt32(0)
+	cm := mocks.NewChunkManager(suite.T())
+	remotePath := "bm25stats/seg_1/field_102/0"
+	cm.EXPECT().Reader(mock.Anything, remotePath).RunAndReturn(
+		func(context.Context, string) (storage.FileReader, error) {
+			readerCalls.Inc()
+			return &bytesFileReader{bytes.NewReader(data)}, nil
+		},
+	).Once()
+
+	err = suite.idfOracle.LoadSealed(context.Background(), 1, &querypb.SegmentLoadInfo{
+		SegmentID:   1,
+		PartitionID: 10,
+		Bm25Logs: []*datapb.FieldBinlog{{
+			FieldID: 102,
+			Binlogs: []*datapb.Binlog{{LogPath: remotePath}},
+		}},
+	}, cm)
+	suite.Require().NoError(err)
+
+	err = suite.idfOracle.LoadSealed(context.Background(), 2, &querypb.SegmentLoadInfo{
+		SegmentID:   2,
+		PartitionID: 20,
+		Bm25Logs: []*datapb.FieldBinlog{{
+			FieldID: 102,
+			Binlogs: []*datapb.Binlog{{LogPath: "bm25stats/seg_2/field_102/0"}},
+		}},
+	}, cm)
+	suite.Require().NoError(err)
+
+	suite.Equal(int32(0), readerCalls.Load())
+	suite.Equal(int64(0), suite.idfOracle.current.NumRow())
+	suite.Equal(int64(0), suite.idfOracle.sealedDiskSize.Load())
+
+	sealedStats, ok := suite.idfOracle.sealed.Get(1)
+	suite.Require().True(ok)
+	sealedStats.RLock()
+	suite.False(sealedStats.pathsResolved)
+	suite.Equal(int64(10), sealedStats.partitionID)
+	sealedStats.RUnlock()
+
+	snapshot := &snapshot{
+		dist: []SnapshotItem{{NodeID: 1, Segments: []SegmentEntry{
+			{NodeID: 1, SegmentID: 1, PartitionID: 10, TargetVersion: 100},
+			{NodeID: 1, SegmentID: 2, PartitionID: 20, TargetVersion: 100},
+		}}},
+		targetVersion: 100,
+	}
+	suite.idfOracle.SetNext(snapshot)
+	suite.waitTargetVersion(snapshot.targetVersion)
+	suite.Equal(int32(0), readerCalls.Load())
+	suite.Equal(int64(0), suite.idfOracle.current.NumRow())
+
+	sparse := typeutil.CreateAndSortSparseFloatRow(map[uint32]float32{1: 1})
+	idfBytes, avgdl, err := suite.idfOracle.BuildIDF(context.Background(), 102, &schemapb.SparseFloatArray{Contents: [][]byte{sparse}, Dim: 1}, 10)
+	suite.Require().NoError(err)
+	suite.Len(idfBytes, 1)
+	suite.Equal(float64(1), avgdl)
+	suite.Equal(int32(1), readerCalls.Load())
+
+	_, avgdl, err = suite.idfOracle.BuildIDF(context.Background(), 102, &schemapb.SparseFloatArray{Contents: [][]byte{sparse}, Dim: 1}, 10)
+	suite.Require().NoError(err)
+	suite.Equal(float64(1), avgdl)
+	suite.Equal(int32(1), readerCalls.Load())
+	suite.Equal(int64(0), suite.idfOracle.current.NumRow())
+}
+
+func (suite *IDFOracleSuite) TestPartitionLevelNonLazyLoadSealedStats() {
+	suite.setIDFPartitionLevel(true)
+	suite.setIDFRemoteFetchOnly(true)
+
+	stats := suite.genStats(1, 2)
+	data, err := stats[102].Serialize()
+	suite.Require().NoError(err)
+
+	readerCalls := atomic.NewInt32(0)
+	cm := mocks.NewChunkManager(suite.T())
+	remotePath := "bm25stats/seg_1/field_102/0"
+	cm.EXPECT().Reader(mock.Anything, remotePath).RunAndReturn(
+		func(context.Context, string) (storage.FileReader, error) {
+			readerCalls.Inc()
+			return &bytesFileReader{bytes.NewReader(data)}, nil
+		},
+	).Once()
+
+	err = suite.idfOracle.LoadSealed(context.Background(), 1, &querypb.SegmentLoadInfo{
+		SegmentID:   1,
+		PartitionID: 10,
+		Bm25Logs: []*datapb.FieldBinlog{{
+			FieldID: 102,
+			Binlogs: []*datapb.Binlog{{LogPath: remotePath}},
+		}},
+	}, cm)
+	suite.Require().NoError(err)
+	suite.Equal(int32(0), readerCalls.Load())
+	suite.Equal(int64(0), suite.idfOracle.current.NumRow())
+	suite.Equal(int64(0), suite.idfOracle.sealedDiskSize.Load())
+
+	sealedStats, ok := suite.idfOracle.sealed.Get(1)
+	suite.Require().True(ok)
+	sealedStats.RLock()
+	suite.True(sealedStats.pathsResolved)
+	suite.Empty(sealedStats.localDir)
+	sealedStats.RUnlock()
+
+	snapshot := &snapshot{
+		dist: []SnapshotItem{{NodeID: 1, Segments: []SegmentEntry{
+			{NodeID: 1, SegmentID: 1, PartitionID: 10, TargetVersion: 100},
+		}}},
+		targetVersion: 100,
+	}
+	suite.idfOracle.SetNext(snapshot)
+	suite.waitTargetVersion(snapshot.targetVersion)
+	suite.Equal(int32(1), readerCalls.Load())
+
+	sparse := typeutil.CreateAndSortSparseFloatRow(map[uint32]float32{1: 1})
+	_, avgdl, err := suite.idfOracle.BuildIDF(context.Background(), 102, &schemapb.SparseFloatArray{Contents: [][]byte{sparse}, Dim: 1}, 10)
+	suite.Require().NoError(err)
+	suite.Equal(float64(1), avgdl)
+	suite.Equal(int32(1), readerCalls.Load())
+}
+
+func (suite *IDFOracleSuite) TestPartitionLazyLoadLocalCache() {
+	suite.setIDFPartitionLevel(true)
+	suite.setIDFPartitionLazyLoad(true)
+
+	stats := suite.genStats(1, 2)
+	data, err := stats[102].Serialize()
+	suite.Require().NoError(err)
+
+	readerCalls := atomic.NewInt32(0)
+	cm := mocks.NewChunkManager(suite.T())
+	remotePath := "bm25stats/seg_1/field_102/0"
+	cm.EXPECT().Reader(mock.Anything, remotePath).RunAndReturn(
+		func(context.Context, string) (storage.FileReader, error) {
+			readerCalls.Inc()
+			return &bytesFileReader{bytes.NewReader(data)}, nil
+		},
+	).Once()
+
+	err = suite.idfOracle.LoadSealed(context.Background(), 1, &querypb.SegmentLoadInfo{
+		SegmentID:   1,
+		PartitionID: 10,
+		Bm25Logs: []*datapb.FieldBinlog{{
+			FieldID: 102,
+			Binlogs: []*datapb.Binlog{{LogPath: remotePath}},
+		}},
+	}, cm)
+	suite.Require().NoError(err)
+
+	suite.Equal(int32(0), readerCalls.Load())
+	suite.Equal(int64(0), suite.idfOracle.sealedDiskSize.Load())
+
+	snapshot := &snapshot{
+		dist: []SnapshotItem{{NodeID: 1, Segments: []SegmentEntry{
+			{NodeID: 1, SegmentID: 1, PartitionID: 10, TargetVersion: 100},
+		}}},
+		targetVersion: 100,
+	}
+	suite.idfOracle.SetNext(snapshot)
+	suite.waitTargetVersion(snapshot.targetVersion)
+
+	sparse := typeutil.CreateAndSortSparseFloatRow(map[uint32]float32{1: 1})
+	_, avgdl, err := suite.idfOracle.BuildIDF(context.Background(), 102, &schemapb.SparseFloatArray{Contents: [][]byte{sparse}, Dim: 1}, 10)
+	suite.Require().NoError(err)
+	suite.Equal(float64(1), avgdl)
+	suite.Equal(int32(1), readerCalls.Load())
+	suite.Greater(suite.idfOracle.sealedDiskSize.Load(), int64(0))
+
+	sealedStats, ok := suite.idfOracle.sealed.Get(1)
+	suite.Require().True(ok)
+	sealedStats.RLock()
+	suite.False(sealedStats.remoteFetchOnly)
+	suite.True(sealedStats.pathsResolved)
+	suite.True(sealedStats.localReady)
+	suite.NotEmpty(sealedStats.localDir)
+	suite.Greater(sealedStats.diskSize, int64(0))
+	sealedStats.RUnlock()
+
+	segDir := path.Join(suite.idfOracle.dirPath, "1", "102")
+	entries, err := os.ReadDir(segDir)
+	suite.NoError(err)
+	suite.NotEmpty(entries)
+
+	_, avgdl, err = suite.idfOracle.BuildIDF(context.Background(), 102, &schemapb.SparseFloatArray{Contents: [][]byte{sparse}, Dim: 1}, 10)
+	suite.Require().NoError(err)
+	suite.Equal(float64(1), avgdl)
+	suite.Equal(int32(1), readerCalls.Load())
+}
+
+func (suite *IDFOracleSuite) TestPartitionLazyLoadIgnoredWithoutPartitionLevel() {
+	suite.setIDFPartitionLazyLoad(true)
+
+	partitionLevel, partitionLazyLoad, err := idfPartitionLoadConfig()
+	suite.NoError(err)
+	suite.False(partitionLevel)
+	suite.False(partitionLazyLoad)
+
+	stats := suite.genStats(1, 2)
+	data, err := stats[102].Serialize()
+	suite.Require().NoError(err)
+
+	readerCalls := atomic.NewInt32(0)
+	cm := mocks.NewChunkManager(suite.T())
+	remotePath := "bm25stats/seg_1/field_102/0"
+	cm.EXPECT().Reader(mock.Anything, remotePath).RunAndReturn(
+		func(context.Context, string) (storage.FileReader, error) {
+			readerCalls.Inc()
+			return &bytesFileReader{bytes.NewReader(data)}, nil
+		},
+	).Once()
+
+	err = suite.idfOracle.LoadSealed(context.Background(), 1, &querypb.SegmentLoadInfo{
+		SegmentID:   1,
+		PartitionID: 10,
+		Bm25Logs: []*datapb.FieldBinlog{{
+			FieldID: 102,
+			Binlogs: []*datapb.Binlog{{LogPath: remotePath}},
+		}},
+	}, cm)
+	suite.NoError(err)
+	suite.Equal(int32(1), readerCalls.Load())
+	suite.Equal(int64(1), suite.idfOracle.current.NumRow())
+
+	_, ok := suite.idfOracle.sealed.Get(1)
+	suite.Require().True(ok)
+
+	sparse := typeutil.CreateAndSortSparseFloatRow(map[uint32]float32{1: 1})
+	_, avgdl, err := suite.idfOracle.BuildIDF(context.Background(), 102, &schemapb.SparseFloatArray{Contents: [][]byte{sparse}, Dim: 1}, 10)
+	suite.NoError(err)
+	suite.Equal(float64(1), avgdl)
 }
 
 func (suite *IDFOracleSuite) TestLoadSealedFailureCleanup() {

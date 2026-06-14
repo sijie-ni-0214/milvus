@@ -500,7 +500,7 @@ func (sd *shardDelegator) ProcessInsert(insertRecords map[int64]*InsertData) {
 			if !sd.distribution.GrowingSegmentExists(segmentID) {
 				// register created growing segment after insert, avoid to add empty growing to delegator
 				if sd.idfOracle != nil {
-					sd.idfOracle.RegisterGrowing(segmentID, insertData.BM25Stats)
+					sd.idfOracle.RegisterGrowing(segmentID, insertData.BM25Stats, insertData.PartitionID)
 				}
 				sd.segmentManager.Put(context.Background(), segments.SegmentTypeGrowing, growing)
 				sd.addGrowing(SegmentEntry{
@@ -822,7 +822,7 @@ func (sd *shardDelegator) LoadGrowing(ctx context.Context, infos []*querypb.Segm
 
 	for _, segment := range loaded {
 		if sd.idfOracle != nil {
-			sd.idfOracle.RegisterGrowing(segment.ID(), segment.GetBM25Stats())
+			sd.idfOracle.RegisterGrowing(segment.ID(), segment.GetBM25Stats(), segment.Partition())
 		}
 	}
 	sd.addGrowing(lo.Map(loaded, func(segment segments.Segment, _ int) SegmentEntry {
@@ -1634,7 +1634,12 @@ func (sd *shardDelegator) TryCleanExcludedSegments(ts uint64) {
 	}
 }
 
-func (sd *shardDelegator) buildBM25IDF(req *internalpb.SearchRequest) (float64, error) {
+func (sd *shardDelegator) buildBM25IDF(req *internalpb.SearchRequest, ctxs ...context.Context) (float64, error) {
+	ctx := context.Background()
+	if len(ctxs) > 0 && ctxs[0] != nil {
+		ctx = ctxs[0]
+	}
+
 	pb := &commonpb.PlaceholderGroup{}
 	if err := proto.Unmarshal(req.GetPlaceholderGroup(), pb); err != nil {
 		return 0, merr.WrapErrServiceInternal("failed to unmarshal BM25 IDF placeholder group", err.Error())
@@ -1681,7 +1686,7 @@ func (sd *shardDelegator) buildBM25IDF(req *internalpb.SearchRequest) (float64, 
 		return 0, errors.New("functionRunner return unknown data")
 	}
 
-	idfSparseVector, avgdl, err := sd.idfOracle.BuildIDF(req.GetFieldId(), tfArray)
+	idfSparseVector, avgdl, err := sd.idfOracle.BuildIDF(ctx, req.GetFieldId(), tfArray, req.GetPartitionIDs()...)
 	if err != nil {
 		return 0, err
 	}
