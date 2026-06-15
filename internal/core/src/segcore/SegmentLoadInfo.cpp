@@ -13,6 +13,9 @@
 #include <cctype>
 #include <iterator>
 #include <memory>
+#include <mutex>
+#include <shared_mutex>
+#include <unordered_map>
 
 #include "common/Common.h"
 #include "common/Consts.h"
@@ -35,6 +38,65 @@
 #include "storage/loon_ffi/util.h"
 
 namespace milvus::segcore {
+namespace {
+
+constexpr size_t kIndexLoadResourceCacheMaxEntries = 4096;
+
+struct IndexLoadResourceCacheKey {
+    DataType field_type;
+    DataType element_type;
+    IndexVersion index_version;
+    uint64_t index_size_in_bytes;
+    bool mmap_enable;
+    int64_t num_rows;
+    int64_t dim;
+    std::map<std::string, std::string> index_params;
+
+    bool
+    operator==(const IndexLoadResourceCacheKey& other) const {
+        return field_type == other.field_type &&
+               element_type == other.element_type &&
+               index_version == other.index_version &&
+               index_size_in_bytes == other.index_size_in_bytes &&
+               mmap_enable == other.mmap_enable &&
+               num_rows == other.num_rows && dim == other.dim &&
+               index_params == other.index_params;
+    }
+};
+
+template <typename T>
+void
+HashCombine(size_t& seed, const T& value) {
+    seed ^= std::hash<T>{}(value) + 0x9e3779b97f4a7c15ULL + (seed << 6) +
+            (seed >> 2);
+}
+
+struct IndexLoadResourceCacheKeyHash {
+    size_t
+    operator()(const IndexLoadResourceCacheKey& key) const {
+        size_t seed = 0;
+        HashCombine(seed, static_cast<int64_t>(key.field_type));
+        HashCombine(seed, static_cast<int64_t>(key.element_type));
+        HashCombine(seed, static_cast<int64_t>(key.index_version));
+        HashCombine(seed, key.index_size_in_bytes);
+        HashCombine(seed, key.mmap_enable);
+        HashCombine(seed, key.num_rows);
+        HashCombine(seed, key.dim);
+        for (const auto& [param_key, param_value] : key.index_params) {
+            HashCombine(seed, param_key);
+            HashCombine(seed, param_value);
+        }
+        return seed;
+    }
+};
+
+std::shared_mutex g_index_load_resource_cache_mutex;
+std::unordered_map<IndexLoadResourceCacheKey,
+                   LoadResourceRequest,
+                   IndexLoadResourceCacheKeyHash>
+    g_index_load_resource_cache;
+
+}  // namespace
 
 std::shared_ptr<milvus_storage::api::ColumnGroups>
 SegmentLoadInfo::GetColumnGroups() const {
@@ -150,7 +212,27 @@ SegmentLoadInfo::CheckIndexHasRawData(const LoadIndexInfo& load_index_info) {
 
 LoadResourceRequest
 SegmentLoadInfo::GetIndexLoadResource(const LoadIndexInfo& load_index_info) {
-    return milvus::index::IndexFactory::GetInstance().IndexLoadResource(
+    IndexLoadResourceCacheKey cache_key{
+        load_index_info.field_type,
+        load_index_info.element_type,
+        load_index_info.index_engine_version,
+        static_cast<uint64_t>(load_index_info.index_size),
+        load_index_info.enable_mmap,
+        load_index_info.num_rows,
+        load_index_info.dim,
+        load_index_info.index_params,
+    };
+
+    {
+        std::shared_lock lock(g_index_load_resource_cache_mutex);
+        auto it = g_index_load_resource_cache.find(cache_key);
+        if (it != g_index_load_resource_cache.end()) {
+            return it->second;
+        }
+    }
+
+    auto request =
+        milvus::index::IndexFactory::GetInstance().IndexLoadResource(
         load_index_info.field_type,
         load_index_info.element_type,
         load_index_info.index_engine_version,
@@ -159,6 +241,17 @@ SegmentLoadInfo::GetIndexLoadResource(const LoadIndexInfo& load_index_info) {
         load_index_info.enable_mmap,
         load_index_info.num_rows,
         load_index_info.dim);
+
+    {
+        std::unique_lock lock(g_index_load_resource_cache_mutex);
+        if (g_index_load_resource_cache.size() >=
+            kIndexLoadResourceCacheMaxEntries) {
+            g_index_load_resource_cache.clear();
+        }
+        auto [it, _] =
+            g_index_load_resource_cache.emplace(std::move(cache_key), request);
+        return it->second;
+    }
 }
 
 std::shared_ptr<proto::indexcgo::LoadTextIndexInfo>
