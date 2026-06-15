@@ -851,11 +851,7 @@ func TestDistribution_NotifyAfterClose(t *testing.T) {
 	assert.False(t, dist.SealedSegmentExists(1))
 }
 
-func applyServiceableStateForTest(dist *distribution) {
-	dist.updateServiceable("test")
-}
-
-func TestDistribution_BuildAndApplyServiceableState(t *testing.T) {
+func TestDistribution_UpdateServiceable(t *testing.T) {
 	channelName := "test_channel"
 	growings := []int64{1, 2, 3}
 	sealedWithRowCount := map[int64]int64{4: 100, 5: 100, 6: 100}
@@ -866,7 +862,7 @@ func TestDistribution_BuildAndApplyServiceableState(t *testing.T) {
 	dist := NewDistribution(channelName, view)
 
 	// Test with no segments loaded
-	applyServiceableStateForTest(dist)
+	dist.updateServiceable("test")
 	assert.False(t, dist.Serviceable())
 	assert.Equal(t, float64(0), dist.queryView.GetLoadedRatio())
 
@@ -878,7 +874,7 @@ func TestDistribution_BuildAndApplyServiceableState(t *testing.T) {
 	dist.growingSegments[1] = SegmentEntry{
 		SegmentID: 1,
 	}
-	applyServiceableStateForTest(dist)
+	dist.updateServiceable("test")
 	assert.False(t, dist.Serviceable())
 	assert.Equal(t, float64(2)/float64(6), dist.queryView.GetLoadedRatio())
 
@@ -894,7 +890,7 @@ func TestDistribution_BuildAndApplyServiceableState(t *testing.T) {
 			SegmentID: id,
 		}
 	}
-	applyServiceableStateForTest(dist)
+	dist.updateServiceable("test")
 	assert.Equal(t, float64(1), dist.queryView.GetLoadedRatio())
 	assert.False(t, dist.Serviceable())
 	dist.queryView.syncedByCoord = true
@@ -1140,8 +1136,8 @@ func TestDistribution_ServiceableWithSyncedByCoord(t *testing.T) {
 		}
 		dist.SyncTargetVersion(action, partitions)
 
-		// Recalculate loaded ratio from current distribution.
-		applyServiceableStateForTest(dist)
+		// Update serviceable to calculate loaded ratio
+		dist.updateServiceable("test")
 
 		// Should be serviceable now
 		assert.True(t, dist.Serviceable())
@@ -1170,8 +1166,8 @@ func TestDistribution_ServiceableWithSyncedByCoord(t *testing.T) {
 			}
 		}
 
-		// Recalculate loaded ratio without syncing from coord.
-		applyServiceableStateForTest(dist)
+		// Update serviceable to calculate loaded ratio but don't sync
+		dist.updateServiceable("test")
 
 		// Should not be serviceable without sync (assuming partial result is disabled by default)
 		// The exact behavior depends on paramtable configuration, but we test the basic structure
