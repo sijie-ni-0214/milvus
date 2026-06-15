@@ -60,6 +60,34 @@
 #include "storage/RemoteChunkManagerSingleton.h"
 #include "storage/Util.h"
 
+namespace {
+
+LoadResourceRequest
+EstimateLoadIndexResourceImpl(
+    milvus::DataType field_type,
+    milvus::DataType element_type,
+    milvus::IndexVersion index_engine_version,
+    int64_t index_size,
+    const std::map<std::string, std::string>& index_params,
+    bool enable_mmap,
+    int64_t num_rows,
+    int64_t dim) {
+    bool find_index_type = index_params.count("index_type") > 0;
+    AssertInfo(find_index_type == true, "Can't find index type in index_params");
+
+    return milvus::index::IndexFactory::GetInstance().IndexLoadResource(
+        field_type,
+        element_type,
+        index_engine_version,
+        index_size,
+        index_params,
+        enable_mmap,
+        num_rows,
+        dim);
+}
+
+}  // namespace
+
 bool
 IsLoadWithDisk(const char* index_type, int index_engine_version) {
     SCOPE_CGO_CALL_METRIC();
@@ -154,25 +182,53 @@ EstimateLoadIndexResource(CLoadIndexInfo c_load_index_info) {
     try {
         auto load_index_info =
             (milvus::segcore::LoadIndexInfo*)c_load_index_info;
-        auto field_type = load_index_info->field_type;
-        auto element_type = load_index_info->element_type;
-        auto& index_params = load_index_info->index_params;
-        bool find_index_type =
-            index_params.count("index_type") > 0 ? true : false;
-        AssertInfo(find_index_type == true,
-                   "Can't find index type in index_params");
+        return EstimateLoadIndexResourceImpl(
+            load_index_info->field_type,
+            load_index_info->element_type,
+            load_index_info->index_engine_version,
+            load_index_info->index_size,
+            load_index_info->index_params,
+            load_index_info->enable_mmap,
+            load_index_info->num_rows,
+            load_index_info->dim);
+    } catch (std::exception& e) {
+        ThrowInfo(milvus::UnexpectedError,
+                  fmt::format("failed to estimate index load resource, "
+                              "encounter exception : {}",
+                              e.what()));
+        return LoadResourceRequest{0, 0, 0, 0, false};
+    }
+}
 
-        LoadResourceRequest request =
-            milvus::index::IndexFactory::GetInstance().IndexLoadResource(
-                field_type,
-                element_type,
-                load_index_info->index_engine_version,
-                load_index_info->index_size,
-                index_params,
-                load_index_info->enable_mmap,
-                load_index_info->num_rows,
-                load_index_info->dim);
-        return request;
+LoadResourceRequest
+EstimateLoadIndexResourceFromInfo(CLoadIndexResourceInfo c_load_index_info) {
+    SCOPE_CGO_CALL_METRIC();
+
+    try {
+        std::map<std::string, std::string> index_params;
+        if (c_load_index_info.index_param_count > 0) {
+            AssertInfo(c_load_index_info.index_param_keys != nullptr &&
+                           c_load_index_info.index_param_values != nullptr,
+                       "index params is null");
+            for (uint64_t i = 0; i < c_load_index_info.index_param_count; ++i) {
+                auto key = c_load_index_info.index_param_keys[i];
+                auto value = c_load_index_info.index_param_values[i];
+                AssertInfo(key != nullptr && value != nullptr,
+                           "index param key or value is null");
+                index_params[key] = value;
+            }
+        }
+
+        return EstimateLoadIndexResourceImpl(
+            static_cast<milvus::DataType>(c_load_index_info.field_type),
+            static_cast<milvus::DataType>(c_load_index_info.element_type),
+            static_cast<milvus::IndexVersion>(
+                c_load_index_info.index_engine_version),
+            c_load_index_info.index_size,
+            index_params,
+            c_load_index_info.enable_mmap,
+            c_load_index_info.num_rows,
+            c_load_index_info.dim);
     } catch (std::exception& e) {
         ThrowInfo(milvus::UnexpectedError,
                   fmt::format("failed to estimate index load resource, "

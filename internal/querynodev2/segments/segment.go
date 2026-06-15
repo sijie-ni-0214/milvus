@@ -1296,6 +1296,8 @@ type cLoadInfoTiming struct {
 	deleteInfoDur time.Duration
 }
 
+const scalarIndexEngineVersionKey = "scalar_index_engine_version"
+
 func GetCLoadInfoWithFunc(ctx context.Context,
 	fieldSchema *schemapb.FieldSchema,
 	loadInfo *querypb.SegmentLoadInfo,
@@ -1305,11 +1307,11 @@ func GetCLoadInfoWithFunc(ctx context.Context,
 	return getCLoadInfoWithFunc(ctx, fieldSchema, loadInfo, indexInfo, f, nil)
 }
 
-func getLoadIndexInfoProto(ctx context.Context,
+func prepareLoadIndexParams(ctx context.Context,
 	fieldSchema *schemapb.FieldSchema,
 	loadInfo *querypb.SegmentLoadInfo,
 	indexInfo *querypb.FieldIndexInfo,
-) (*cgopb.LoadIndexInfo, error) {
+) (map[string]string, bool, error) {
 	indexParams := funcutil.KeyValuePair2Map(indexInfo.IndexParams)
 	// as Knowhere reports error if encounter an unknown param, we need to delete it
 	delete(indexParams, common.MmapEnabledKey)
@@ -1317,7 +1319,7 @@ func getLoadIndexInfoProto(ctx context.Context,
 	// some build params also exist in indexParams, which are useless during loading process
 	if vecindexmgr.GetVecIndexMgrInstance().IsDiskANN(indexParams["index_type"]) {
 		if err := indexparams.SetDiskIndexLoadParams(paramtable.Get(), indexParams, indexInfo.GetNumRows()); err != nil {
-			return nil, err
+			return nil, false, err
 		}
 	}
 
@@ -1327,7 +1329,7 @@ func getLoadIndexInfoProto(ctx context.Context,
 	}
 
 	if err := indexparams.AppendPrepareLoadParams(paramtable.Get(), indexParams); err != nil {
-		return nil, err
+		return nil, false, err
 	}
 
 	enableMmap := isIndexMmapEnable(fieldSchema, indexInfo)
@@ -1348,6 +1350,20 @@ func getLoadIndexInfoProto(ctx context.Context,
 			indexParams[common.WarmupKey] = warmupPolicy
 		}
 	}
+
+	return indexParams, enableMmap, nil
+}
+
+func getLoadIndexInfoProto(ctx context.Context,
+	fieldSchema *schemapb.FieldSchema,
+	loadInfo *querypb.SegmentLoadInfo,
+	indexInfo *querypb.FieldIndexInfo,
+) (*cgopb.LoadIndexInfo, error) {
+	indexParams, enableMmap, err := prepareLoadIndexParams(ctx, fieldSchema, loadInfo, indexInfo)
+	if err != nil {
+		return nil, err
+	}
+
 	// Pass DataCoord-built index file paths through; QueryNode should not
 	// attach v0/v1 path layout semantics to the read path.
 	return &cgopb.LoadIndexInfo{
@@ -1368,58 +1384,135 @@ func getLoadIndexInfoProto(ctx context.Context,
 	}, nil
 }
 
+type loadIndexResourceEstimateInfo struct {
+	fieldType          int32
+	elementType        int32
+	indexEngineVersion int32
+	indexSize          int64
+	enableMmap         bool
+	numRows            int64
+	dim                int64
+	indexParams        map[string]string
+}
+
+type cIndexParamArrays struct {
+	keys     **C.char
+	values   **C.char
+	keyMem   unsafe.Pointer
+	valueMem unsafe.Pointer
+	strings  []*C.char
+	count    C.uint64_t
+}
+
+func newCIndexParamArrays(params map[string]string) *cIndexParamArrays {
+	if len(params) == 0 {
+		return &cIndexParamArrays{}
+	}
+
+	count := len(params)
+	keyMem := C.malloc(C.size_t(count) * C.size_t(unsafe.Sizeof(uintptr(0))))
+	valueMem := C.malloc(C.size_t(count) * C.size_t(unsafe.Sizeof(uintptr(0))))
+	keys := unsafe.Slice((**C.char)(keyMem), count)
+	values := unsafe.Slice((**C.char)(valueMem), count)
+	strings := make([]*C.char, 0, count*2)
+
+	idx := 0
+	for key, value := range params {
+		cKey := C.CString(key)
+		cValue := C.CString(value)
+		keys[idx] = cKey
+		values[idx] = cValue
+		strings = append(strings, cKey, cValue)
+		idx++
+	}
+
+	return &cIndexParamArrays{
+		keys:     (**C.char)(keyMem),
+		values:   (**C.char)(valueMem),
+		keyMem:   keyMem,
+		valueMem: valueMem,
+		strings:  strings,
+		count:    C.uint64_t(count),
+	}
+}
+
+func (a *cIndexParamArrays) free() {
+	for _, s := range a.strings {
+		C.free(unsafe.Pointer(s))
+	}
+	if a.keyMem != nil {
+		C.free(a.keyMem)
+	}
+	if a.valueMem != nil {
+		C.free(a.valueMem)
+	}
+}
+
+func getLoadIndexResourceEstimateInfo(ctx context.Context,
+	fieldSchema *schemapb.FieldSchema,
+	loadInfo *querypb.SegmentLoadInfo,
+	indexInfo *querypb.FieldIndexInfo,
+) (*loadIndexResourceEstimateInfo, error) {
+	indexParams, enableMmap, err := prepareLoadIndexParams(ctx, fieldSchema, loadInfo, indexInfo)
+	if err != nil {
+		return nil, err
+	}
+	if scalarVersion := indexInfo.GetCurrentScalarIndexVersion(); scalarVersion > 0 {
+		indexParams[scalarIndexEngineVersionKey] = fmt.Sprintf("%d", scalarVersion)
+	}
+
+	dim := int64(1)
+	if typeutil.IsVectorType(fieldSchema.GetDataType()) && !typeutil.IsSparseFloatVectorType(fieldSchema.GetDataType()) {
+		dim, err = typeutil.GetDim(fieldSchema)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	return &loadIndexResourceEstimateInfo{
+		fieldType:          int32(fieldSchema.GetDataType()),
+		elementType:        int32(fieldSchema.GetElementType()),
+		indexEngineVersion: indexInfo.GetCurrentIndexVersion(),
+		indexSize:          indexInfo.GetIndexSize(),
+		enableMmap:         enableMmap,
+		numRows:            indexInfo.GetNumRows(),
+		dim:                dim,
+		indexParams:        indexParams,
+	}, nil
+}
+
 func estimateLoadIndexResourceWithTiming(ctx context.Context,
 	fieldSchema *schemapb.FieldSchema,
 	loadInfo *querypb.SegmentLoadInfo,
 	indexInfo *querypb.FieldIndexInfo,
 	timing *cLoadInfoTiming,
 ) (ResourceEstimate, time.Duration, error) {
-	indexInfoProto, err := getLoadIndexInfoProto(ctx, fieldSchema, loadInfo, indexInfo)
+	estimateInfo, err := getLoadIndexResourceEstimateInfo(ctx, fieldSchema, loadInfo, indexInfo)
 	if err != nil {
 		return ResourceEstimate{}, 0, err
 	}
-	marshaled, err := proto.Marshal(indexInfoProto)
-	if err != nil {
-		return ResourceEstimate{}, 0, err
-	}
+	cIndexParams := newCIndexParamArrays(estimateInfo.indexParams)
+	defer cIndexParams.free()
 
-	var status C.CStatus
-	var cLoadIndexInfo C.CLoadIndexInfo
 	var request C.LoadResourceRequest
 	var estimateDur time.Duration
-	statusStage := ""
 	_, _ = GetDynamicPool().Submit(func() (any, error) {
-		statusStage = "NewLoadIndexInfo failed"
-		newInfoStart := time.Now()
-		status = C.NewLoadIndexInfo(&cLoadIndexInfo)
-		if timing != nil {
-			timing.newInfoDur += time.Since(newInfoStart)
-		}
-		if status.error_code != 0 {
-			return nil, nil
-		}
-		defer func() {
-			deleteInfoStart := time.Now()
-			C.DeleteLoadIndexInfo(cLoadIndexInfo)
-			if timing != nil {
-				timing.deleteInfoDur += time.Since(deleteInfoStart)
-			}
-		}()
-
-		statusStage = "FinishLoadIndexInfo failed"
-		appendInfoStart := time.Now()
-		status = C.FinishLoadIndexInfo(cLoadIndexInfo, (*C.uint8_t)(unsafe.Pointer(&marshaled[0])), (C.uint64_t)(len(marshaled)))
-		if timing != nil {
-			timing.appendInfoDur += time.Since(appendInfoStart)
-		}
-		if status.error_code != 0 {
-			return nil, nil
+		cInfo := C.CLoadIndexResourceInfo{
+			field_type:           C.int32_t(estimateInfo.fieldType),
+			element_type:         C.int32_t(estimateInfo.elementType),
+			index_engine_version: C.int32_t(estimateInfo.indexEngineVersion),
+			index_size:           C.int64_t(estimateInfo.indexSize),
+			enable_mmap:          C.bool(estimateInfo.enableMmap),
+			num_rows:             C.int64_t(estimateInfo.numRows),
+			dim:                  C.int64_t(estimateInfo.dim),
+			index_param_keys:     cIndexParams.keys,
+			index_param_values:   cIndexParams.values,
+			index_param_count:    cIndexParams.count,
 		}
 
-		statusStage = ""
 		callbackStart := time.Now()
 		estimateStart := time.Now()
-		request = C.EstimateLoadIndexResource(cLoadIndexInfo)
+		request = C.EstimateLoadIndexResourceFromInfo(cInfo)
 		estimateDur = time.Since(estimateStart)
 		if timing != nil {
 			timing.callbackDur += time.Since(callbackStart)
@@ -1427,9 +1520,6 @@ func estimateLoadIndexResourceWithTiming(ctx context.Context,
 		return nil, nil
 	}).Await()
 
-	if statusStage != "" {
-		return ResourceEstimate{}, estimateDur, HandleCStatus(ctx, &status, statusStage)
-	}
 	return GetResourceEstimate(&request), estimateDur, nil
 }
 

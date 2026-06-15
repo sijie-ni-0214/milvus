@@ -9,6 +9,8 @@
 // is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
 // or implied. See the License for the specific language governing permissions and limitations under the License
 
+#pragma once
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -24,6 +26,19 @@ extern "C" {
 
 typedef void* CLoadIndexInfo;
 
+typedef struct CLoadIndexResourceInfo {
+    int32_t field_type;
+    int32_t element_type;
+    int32_t index_engine_version;
+    int64_t index_size;
+    bool enable_mmap;
+    int64_t num_rows;
+    int64_t dim;
+    const char** index_param_keys;
+    const char** index_param_values;
+    uint64_t index_param_count;
+} CLoadIndexResourceInfo;
+
 bool
 IsLoadWithDisk(const char* index_type, int index_engine_version);
 
@@ -35,6 +50,9 @@ DeleteLoadIndexInfo(CLoadIndexInfo c_load_index_info);
 
 LoadResourceRequest
 EstimateLoadIndexResource(CLoadIndexInfo c_load_index_info);
+
+LoadResourceRequest
+EstimateLoadIndexResourceFromInfo(CLoadIndexResourceInfo c_load_index_info);
 
 bool
 TryReserveLoadingResourceWithTimeout(CResourceUsage size,
