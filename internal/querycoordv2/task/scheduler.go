@@ -693,7 +693,7 @@ func (scheduler *taskScheduler) Add(task Task) error {
 }
 
 func (scheduler *taskScheduler) updateTaskMetrics() {
-	if time.Since(scheduler.lastUpdateMetricTime.Load()) < 30*time.Second {
+	if time.Since(scheduler.lastUpdateMetricTime.Load()) < 10*time.Second {
 		return
 	}
 	segmentGrowNum, segmentReduceNum, segmentUpdateNum, segmentMoveNum := 0, 0, 0, 0
@@ -1081,6 +1081,7 @@ func (scheduler *taskScheduler) GetTasksJSON() string {
 // 2. step up the task's actions, set status to succeeded if all actions finished
 // 3. execute the current action of task
 func (scheduler *taskScheduler) schedule(node int64) {
+	scheduler.updateTaskMetrics()
 	if scheduler.tasks.Len() == 0 {
 		return
 	}
@@ -1133,7 +1134,6 @@ func (scheduler *taskScheduler) schedule(node int64) {
 		scheduler.remove(task)
 	}
 
-	scheduler.updateTaskMetrics()
 	totalDur := tr.ElapseSpan()
 	schedulerDispatchTiming.record(
 		node,
