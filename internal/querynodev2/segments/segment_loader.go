@@ -519,6 +519,23 @@ func (loader *segmentLoader) requestResource(ctx context.Context, infos ...*quer
 		return requestResourceResult{}, nil
 	}
 
+	loadingUsage, maxSegmentSize, err := loader.estimateSegmentLoadingResourceUsage(ctx, infos...)
+	if err != nil {
+		mlog.Warn(ctx, "no sufficient physical resource to load segments", mlog.Err(err))
+		return requestResourceResult{}, err
+	}
+	if err := checkSegmentGpuMemSize(loadingUsage.FieldGpuMemorySize, float32(paramtable.Get().GpuConfig.OverloadedMemoryThresholdPercentage.GetAsFloat())); err != nil {
+		return requestResourceResult{}, err
+	}
+
+	concurrencyLevel := funcutil.Min(hardware.GetCPUNum(), len(infos))
+	if loadingUsage.MemorySize == 0 && loadingUsage.DiskSize == 0 {
+		result := requestResourceResult{
+			ConcurrencyLevel: concurrencyLevel,
+		}
+		return result, nil
+	}
+
 	physicalMemoryUsage := hardware.GetUsedMemoryCount()
 	totalMemory := loader.totalMemory
 	if totalMemory == 0 {
@@ -530,15 +547,6 @@ func (loader *segmentLoader) requestResource(ctx context.Context, infos ...*quer
 		return requestResourceResult{}, merr.Wrap(err, "get local used size failed")
 	}
 	diskCap := paramtable.Get().QueryNodeCfg.DiskCapacityLimit.GetAsUint64()
-
-	loadingUsage, maxSegmentSize, err := loader.estimateSegmentLoadingResourceUsage(ctx, infos...)
-	if err != nil {
-		mlog.Warn(ctx, "no sufficient physical resource to load segments", mlog.Err(err))
-		return requestResourceResult{}, err
-	}
-	if err := checkSegmentGpuMemSize(loadingUsage.FieldGpuMemorySize, float32(paramtable.Get().GpuConfig.OverloadedMemoryThresholdPercentage.GetAsFloat())); err != nil {
-		return requestResourceResult{}, err
-	}
 
 	loader.mut.Lock()
 	finishLocked := func(result requestResourceResult, err error) (requestResourceResult, error) {
@@ -556,7 +564,7 @@ func (loader *segmentLoader) requestResource(ctx context.Context, infos ...*quer
 		return finishLocked(result, merr.WrapErrServiceDiskLimitExceeded(float32(loader.committedResource.DiskSize+uint64(physicalDiskUsage)), float32(diskCap)))
 	}
 
-	result.ConcurrencyLevel = funcutil.Min(hardware.GetCPUNum(), len(infos))
+	result.ConcurrencyLevel = concurrencyLevel
 
 	// TODO: disable logical resource checking for now
 	// lmu, ldu, err := loader.checkLogicalSegmentSize(ctx, infos, totalMemory)
@@ -649,6 +657,10 @@ func (loader *segmentLoader) requestResource(ctx context.Context, infos ...*quer
 
 // freeRequestResource returns request memory & storage usage request.
 func (loader *segmentLoader) freeRequestResource(requestResourceResult requestResourceResult) {
+	if requestResourceResult.Resource.IsZero() {
+		return
+	}
+
 	loader.mut.Lock()
 	defer loader.mut.Unlock()
 
@@ -2488,12 +2500,9 @@ func estimateLoadingResourceUsageOfSegment(schema *schemapb.CollectionSchema, lo
 		}
 	}
 
-	// PART 3: calculate size of stats data
-	// stats data isn't managed by the caching layer, so its size should always be included,
-	// regardless of the tiered eviction value
-	for _, fieldBinlog := range loadInfo.Statslogs {
-		segMemoryLoadingSize += uint64(getBinlogDataMemorySize(fieldBinlog))
-	}
+	// PART 3: stats logs are bloom-filter stats. Load installs lazy bloom-filter
+	// stubs and materializes the stats on demand, so they are not load-time
+	// resources.
 
 	// PART 4: calculate size of delete data
 	// delete data isn't managed by the caching layer, so its size should always be included,
