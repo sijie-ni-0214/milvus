@@ -693,6 +693,18 @@ func (ob *TargetObserver) updateCurrentTarget(ctx context.Context, collectionID 
 	log := log.Ctx(ctx).WithRateGroup("qcv2.TargetObserver", 1, 60)
 	log.RatedInfo(10, "observer trigger update current target", zap.Int64("collectionID", collectionID))
 	if ob.targetMgr.UpdateCollectionCurrentTarget(ctx, collectionID) {
+		currentVersion := ob.targetMgr.GetCollectionTargetVersion(ctx, collectionID, meta.CurrentTarget)
+		channels := ob.targetMgr.GetDmChannelsByCollection(ctx, collectionID, meta.CurrentTarget)
+		segments := ob.targetMgr.GetSealedSegmentsByCollection(ctx, collectionID, meta.CurrentTarget)
+		replicas := ob.meta.GetByCollection(ctx, collectionID)
+		log.Warn("collection current target ready",
+			zap.String("phase", "querycoord.current_target_ready"),
+			zap.Int64("collectionID", collectionID),
+			zap.Int64("targetVersion", currentVersion),
+			zap.Int("channelCount", len(channels)),
+			zap.Int("sealedSegmentCount", len(segments)),
+			zap.Int("replicaCount", len(replicas)))
+
 		ob.mut.Lock()
 		defer ob.mut.Unlock()
 		notifiers := ob.readyNotifiers[collectionID]
