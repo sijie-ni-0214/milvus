@@ -1424,16 +1424,21 @@ ChunkedSegmentSealedImpl::LoadVecIndex(LoadIndexInfo& info, bool is_replace) {
         info.field_id,
         id_);
     auto& field_meta = schema_->operator[](field_id);
-    LoadResourceRequest request =
-        milvus::index::IndexFactory::GetInstance().VecIndexLoadResource(
-            field_meta.get_data_type(),
-            info.element_type,
-            info.index_engine_version,
-            info.index_size,
-            info.index_params,
-            info.enable_mmap,
-            info.num_rows,
-            info.dim);
+    LoadResourceRequest request{};
+    if (info.has_load_resource_request) {
+        request = info.load_resource_request;
+    } else {
+        request =
+            milvus::index::IndexFactory::GetInstance().VecIndexLoadResource(
+                field_meta.get_data_type(),
+                info.element_type,
+                info.index_engine_version,
+                info.index_size,
+                info.index_params,
+                info.enable_mmap,
+                info.num_rows,
+                info.dim);
+    }
 
     // Note: raw data lifecycle (eviction/drop) is handled by LoadDiff + ApplyLoadDiff,
     // not here. This avoids unsafe ManualEvictCache on column groups.
@@ -1530,13 +1535,18 @@ ChunkedSegmentSealedImpl::LoadScalarIndex(LoadIndexInfo& info,
             {field_id, std::move(info.cache_index)});
     }
 
-    LoadResourceRequest request =
-        milvus::index::IndexFactory::GetInstance().ScalarIndexLoadResource(
-            field_meta.get_data_type(),
-            info.index_engine_version,
-            info.index_size,
-            info.index_params,
-            info.enable_mmap);
+    LoadResourceRequest request{};
+    if (info.has_load_resource_request) {
+        request = info.load_resource_request;
+    } else {
+        request =
+            milvus::index::IndexFactory::GetInstance().ScalarIndexLoadResource(
+                field_meta.get_data_type(),
+                info.index_engine_version,
+                info.index_size,
+                info.index_params,
+                info.enable_mmap);
+    }
 
     set_bit(index_ready_bitset_, field_id, true);
     index_has_raw_data_[field_id] = request.has_raw_data;

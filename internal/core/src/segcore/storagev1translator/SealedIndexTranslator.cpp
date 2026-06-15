@@ -44,7 +44,9 @@ SealedIndexTranslator::SealedIndexTranslator(
                         std::to_string(load_index_info->field_id),
                         load_index_info->num_rows,
                         load_index_info->dim,
-                        load_index_info->warmup_policy}),
+                        load_index_info->warmup_policy,
+                        load_index_info->has_load_resource_request,
+                        load_index_info->load_resource_request}),
       meta_(
           load_index_info->enable_mmap
               ? milvus::cachinglayer::StorageType::DISK
@@ -87,16 +89,21 @@ std::pair<milvus::cachinglayer::ResourceUsage,
           milvus::cachinglayer::ResourceUsage>
 SealedIndexTranslator::estimated_byte_size_of_cell(
     milvus::cachinglayer::cid_t cid) const {
-    LoadResourceRequest request =
-        milvus::index::IndexFactory::GetInstance().IndexLoadResource(
-            index_load_info_.field_type,
-            index_load_info_.element_type,
-            index_load_info_.index_engine_version,
-            index_load_info_.index_size,
-            index_load_info_.index_params,
-            index_load_info_.enable_mmap,
-            index_load_info_.num_rows,
-            index_load_info_.dim);
+    LoadResourceRequest request{};
+    if (index_load_info_.has_load_resource_request) {
+        request = index_load_info_.load_resource_request;
+    } else {
+        request =
+            milvus::index::IndexFactory::GetInstance().IndexLoadResource(
+                index_load_info_.field_type,
+                index_load_info_.element_type,
+                index_load_info_.index_engine_version,
+                index_load_info_.index_size,
+                index_load_info_.index_params,
+                index_load_info_.enable_mmap,
+                index_load_info_.num_rows,
+                index_load_info_.dim);
+    }
     // this is an estimation, error could be up to 20%.
     return {milvus::cachinglayer::ResourceUsage(request.final_memory_cost,
                                                 request.final_disk_cost),
@@ -119,16 +126,21 @@ SealedIndexTranslator::get_cells(milvus::OpContext* ctx,
     std::unique_ptr<milvus::index::IndexBase> index =
         milvus::index::IndexFactory::GetInstance().CreateIndex(
             index_info_, file_manager_context_);
-    LoadResourceRequest request =
-        milvus::index::IndexFactory::GetInstance().IndexLoadResource(
-            index_load_info_.field_type,
-            index_load_info_.element_type,
-            index_load_info_.index_engine_version,
-            index_load_info_.index_size,
-            index_load_info_.index_params,
-            index_load_info_.enable_mmap,
-            index_load_info_.num_rows,
-            index_load_info_.dim);
+    LoadResourceRequest request{};
+    if (index_load_info_.has_load_resource_request) {
+        request = index_load_info_.load_resource_request;
+    } else {
+        request =
+            milvus::index::IndexFactory::GetInstance().IndexLoadResource(
+                index_load_info_.field_type,
+                index_load_info_.element_type,
+                index_load_info_.index_engine_version,
+                index_load_info_.index_size,
+                index_load_info_.index_params,
+                index_load_info_.enable_mmap,
+                index_load_info_.num_rows,
+                index_load_info_.dim);
+    }
     index->SetCellSize(milvus::cachinglayer::ResourceUsage(
         request.final_memory_cost, request.final_disk_cost));
     if (index_load_info_.enable_mmap && index->IsMmapSupported()) {

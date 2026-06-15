@@ -1059,6 +1059,9 @@ class SegmentLoadInfo {
     [[nodiscard]] static bool
     CheckIndexHasRawData(const LoadIndexInfo& load_index_info);
 
+    [[nodiscard]] static LoadResourceRequest
+    GetIndexLoadResource(const LoadIndexInfo& load_index_info);
+
     /**
      * @brief Convert a TextIndexStats to LoadTextIndexInfo
      *
@@ -1109,6 +1112,9 @@ class SegmentLoadInfo {
             }
             auto load_index_info = ConvertFieldIndexInfoToLoadIndexInfo(
                 &index_info, info_.segmentid());
+            load_index_info.load_resource_request =
+                GetIndexLoadResource(load_index_info);
+            load_index_info.has_load_resource_request = true;
             converted_index_infos_.push_back(load_index_info);
             // Check if index has raw data before moving
             if (CheckIndexHasRawData(load_index_info)) {

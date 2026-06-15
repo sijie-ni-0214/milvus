@@ -11,6 +11,7 @@
 
 #include <cstdint>
 #include "cachinglayer/Translator.h"
+#include "common/resource_c.h"
 #include "index/Index.h"
 #include "segcore/ChunkedSegmentSealedImpl.h"
 
@@ -72,6 +73,8 @@ class SealedIndexTranslator
         int64_t dim;
         std::string
             warmup_policy;  // "disable", "sync", or "async"; empty means use global config
+        bool has_load_resource_request;
+        LoadResourceRequest load_resource_request;
     };
 
     milvus::index::CreateIndexInfo index_info_;
