@@ -83,12 +83,6 @@ type queryNodeLoadSegmentsTimingPhase struct {
 	totalDur              time.Duration
 }
 
-type collectionIndexMetaCacheEntry struct {
-	schemaVersion uint64
-	fingerprint   uint64
-	meta          *segcorepb.CollectionIndexMeta
-}
-
 type queryNodeLoadSegmentsTimingStats struct {
 	count              *atomic.Int64
 	segmentCount       *atomic.Int64
@@ -404,16 +398,7 @@ func (node *QueryNode) GetStatistics(ctx context.Context, req *querypb.GetStatis
 	return ret, nil
 }
 
-func (node *QueryNode) composeIndexMeta(ctx context.Context, collectionID int64, schemaVersion uint64, indexInfos []*indexpb.IndexInfo, schema *schemapb.CollectionSchema) *segcorepb.CollectionIndexMeta {
-	fingerprint := indexInfoFingerprint(indexInfos)
-	if node.indexMetaCache != nil {
-		if cached, ok := node.indexMetaCache.Get(collectionID); ok &&
-			cached.schemaVersion == schemaVersion &&
-			cached.fingerprint == fingerprint {
-			return cached.meta
-		}
-	}
-
+func (node *QueryNode) composeIndexMeta(ctx context.Context, indexInfos []*indexpb.IndexInfo, schema *schemapb.CollectionSchema) *segcorepb.CollectionIndexMeta {
 	fieldIndexMetas := make([]*segcorepb.FieldIndexMeta, 0)
 	for _, info := range indexInfos {
 		fieldIndexMetas = append(fieldIndexMetas, &segcorepb.FieldIndexMeta{
@@ -446,67 +431,10 @@ func (node *QueryNode) composeIndexMeta(ctx context.Context, collectionID int64,
 		maxIndexRecordPerSegment = int64(threshold * proportion / float64(sizePerRecord))
 	}
 
-	meta := &segcorepb.CollectionIndexMeta{
+	return &segcorepb.CollectionIndexMeta{
 		IndexMetas:       fieldIndexMetas,
 		MaxIndexRowCount: maxIndexRecordPerSegment,
 	}
-	if node.indexMetaCache != nil {
-		node.indexMetaCache.Insert(collectionID, collectionIndexMetaCacheEntry{
-			schemaVersion: schemaVersion,
-			fingerprint:   fingerprint,
-			meta:          meta,
-		})
-	}
-	return meta
-}
-
-func indexInfoFingerprint(indexInfos []*indexpb.IndexInfo) uint64 {
-	const (
-		offset64 = 1469598103934665603
-		prime64  = 1099511628211
-	)
-	fingerprint := uint64(offset64)
-	writeByte := func(value byte) {
-		fingerprint ^= uint64(value)
-		fingerprint *= prime64
-	}
-	writeInt64 := func(value int64) {
-		v := uint64(value)
-		for i := 0; i < 8; i++ {
-			writeByte(byte(v))
-			v >>= 8
-		}
-	}
-	writeString := func(value string) {
-		for i := 0; i < len(value); i++ {
-			writeByte(value[i])
-		}
-		writeByte(0)
-	}
-	writeKV := func(kvs []*commonpb.KeyValuePair) {
-		writeInt64(int64(len(kvs)))
-		for _, kv := range kvs {
-			writeString(kv.GetKey())
-			writeString(kv.GetValue())
-		}
-	}
-
-	writeInt64(int64(len(indexInfos)))
-	for _, info := range indexInfos {
-		writeInt64(info.GetCollectionID())
-		writeInt64(info.GetFieldID())
-		writeInt64(info.GetIndexID())
-		writeString(info.GetIndexName())
-		if info.GetIsAutoIndex() {
-			writeByte(1)
-		} else {
-			writeByte(0)
-		}
-		writeKV(info.GetTypeParams())
-		writeKV(info.GetIndexParams())
-		writeKV(info.GetUserIndexParams())
-	}
-	return fingerprint
 }
 
 // WatchDmChannels create consumers on dmChannels to receive Incremental data，which is the important part of real-time query
@@ -571,7 +499,7 @@ func (node *QueryNode) WatchDmChannels(ctx context.Context, req *querypb.WatchDm
 	}
 
 	err := node.manager.Collection.PutOrRef(req.GetCollectionID(), req.GetSchema(),
-		node.composeIndexMeta(ctx, req.GetCollectionID(), req.GetLoadMeta().GetSchemaVersion(), req.GetIndexInfoList(), req.Schema), req.GetLoadMeta())
+		node.composeIndexMeta(ctx, req.GetIndexInfoList(), req.Schema), req.GetLoadMeta())
 	if err != nil {
 		log.Warn("failed to ref collection", zap.Error(err))
 		return merr.Status(err), nil
@@ -870,7 +798,7 @@ func (node *QueryNode) LoadSegments(ctx context.Context, req *querypb.LoadSegmen
 
 	collectionStart := time.Now()
 	err := node.manager.Collection.PutOrRef(req.GetCollectionID(), req.GetSchema(),
-		node.composeIndexMeta(ctx, req.GetCollectionID(), req.GetLoadMeta().GetSchemaVersion(), req.GetIndexInfoList(), req.GetSchema()), req.GetLoadMeta())
+		node.composeIndexMeta(ctx, req.GetIndexInfoList(), req.GetSchema()), req.GetLoadMeta())
 	timing.collectionDur = time.Since(collectionStart)
 	if err != nil {
 		log.Warn("failed to ref collection", zap.Error(err))
