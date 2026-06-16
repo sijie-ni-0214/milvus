@@ -119,6 +119,8 @@ type QueryNode struct {
 	// segment loader
 	loader segments.Loader
 
+	indexMetaCache *typeutil.ConcurrentMap[int64, collectionIndexMetaCacheEntry]
+
 	// Search/Query
 	scheduler scheduler.Scheduler
 
@@ -431,6 +433,7 @@ func (node *QueryNode) Init() error {
 			})
 		})
 		node.delegators = typeutil.NewConcurrentMap[string, delegator.ShardDelegator]()
+		node.indexMetaCache = typeutil.NewConcurrentMap[int64, collectionIndexMetaCacheEntry]()
 		node.subscribingChannels = typeutil.NewConcurrentSet[string]()
 		node.unsubscribingChannels = typeutil.NewConcurrentSet[string]()
 		node.manager = segments.NewManager()
