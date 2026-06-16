@@ -2306,6 +2306,7 @@ func estimateLoadingResourceUsageOfSegment(schema *schemapb.CollectionSchema, lo
 	}
 	indexedFields := make(map[int64]struct{})
 	ctx := context.Background()
+	indexedFieldInfos := make(map[int64][]*querypb.FieldIndexInfo)
 
 	// PART 1: calculate size of indexes
 	for _, fieldIndexInfo := range loadInfo.IndexInfos {
@@ -2318,8 +2319,10 @@ func estimateLoadingResourceUsageOfSegment(schema *schemapb.CollectionSchema, lo
 				continue
 			}
 			indexedFields[fieldID] = struct{}{}
+			indexedFieldInfos[fieldID] = append(indexedFieldInfos[fieldID], fieldIndexInfo)
 
 			isVectorType := typeutil.IsVectorType(fieldSchema.GetDataType())
+			indexWarmupDisabled := getIndexWarmupPolicy(fieldSchema, fieldIndexInfo) == common.WarmupDisable
 
 			var estimateResult ResourceEstimate
 			if fastEstimate, ok := estimateIndexResourceFast(fieldSchema, fieldIndexInfo); ok {
@@ -2334,12 +2337,12 @@ func estimateLoadingResourceUsageOfSegment(schema *schemapb.CollectionSchema, lo
 				}
 			}
 
-			if !multiplyFactor.TieredEvictionEnabled {
+			if !multiplyFactor.TieredEvictionEnabled && !indexWarmupDisabled {
 				indexMemorySize += estimateResult.MaxMemoryCost
 				segDiskLoadingSize += estimateResult.MaxDiskCost
 			}
 
-			if gpuIndexRequiresGpu(fieldIndexInfo.IndexParams) {
+			if !indexWarmupDisabled && gpuIndexRequiresGpu(fieldIndexInfo.IndexParams) {
 				fieldGpuMemorySize = append(fieldGpuMemorySize, estimateResult.MaxMemoryCost)
 			}
 
@@ -2384,6 +2387,7 @@ func estimateLoadingResourceUsageOfSegment(schema *schemapb.CollectionSchema, lo
 		var containsTimestampField bool
 		var doubleMomoryDataField bool
 		var legacyNilSchema bool
+		var hasLoadTimeField bool
 		mmapEnabled := true
 		isVectorType := true
 		hasIndex := true
@@ -2410,6 +2414,11 @@ func estimateLoadingResourceUsageOfSegment(schema *schemapb.CollectionSchema, lo
 				break
 			}
 
+			if lazyManifestLoadResourceSkipped(schema, fieldSchema, indexedFieldInfos[fieldID]) {
+				continue
+			}
+			hasLoadTimeField = true
+
 			supportInterimIndexDataType = supportInterimIndexDataType || SupportInterimIndexDataType(fieldSchema.GetDataType())
 			isVectorType = isVectorType && typeutil.IsVectorType(fieldSchema.GetDataType())
 			mmapEnabled = mmapEnabled && isDataMmapEnable(fieldSchema)
@@ -2418,6 +2427,9 @@ func estimateLoadingResourceUsageOfSegment(schema *schemapb.CollectionSchema, lo
 		}
 		// legacy v2 segment without children
 		if legacyNilSchema {
+			continue
+		}
+		if !hasLoadTimeField {
 			continue
 		}
 
@@ -2588,6 +2600,74 @@ func SupportInterimIndexDataType(dataType schemapb.DataType) bool {
 		dataType == schemapb.DataType_SparseFloatVector ||
 		dataType == schemapb.DataType_Float16Vector ||
 		dataType == schemapb.DataType_BFloat16Vector
+}
+
+func lazyManifestLoadResourceSkipped(schema *schemapb.CollectionSchema, field *schemapb.FieldSchema, indexInfos []*querypb.FieldIndexInfo) bool {
+	if !paramtable.Get().QueryNodeCfg.TieredLazyManifestReaderEnabled.GetAsBool() {
+		return false
+	}
+	if getFieldWarmupPolicy(field) != common.WarmupDisable {
+		return false
+	}
+	return canUseLazyManifestResourceField(schema, field, indexInfos)
+}
+
+func canUseLazyManifestResourceField(schema *schemapb.CollectionSchema, field *schemapb.FieldSchema, indexInfos []*querypb.FieldIndexInfo) bool {
+	fieldID := field.GetFieldID()
+	if common.IsSystemField(fieldID) {
+		return false
+	}
+	if field.GetIsPrimaryKey() {
+		return false
+	}
+	if field.GetNullable() && typeutil.IsVectorType(field.GetDataType()) {
+		return false
+	}
+	if field.GetDataType() == schemapb.DataType_Geometry &&
+		paramtable.Get().QueryNodeCfg.EnableGeometryCache.GetAsBool() {
+		return false
+	}
+	if isStructArrayField(schema, fieldID) {
+		return false
+	}
+	helper := typeutil.CreateFieldSchemaHelper(field)
+	if helper.EnableMatch() {
+		return false
+	}
+	if mayGenerateInterimIndexResource(field, indexInfos) {
+		return false
+	}
+	return true
+}
+
+func isStructArrayField(schema *schemapb.CollectionSchema, fieldID int64) bool {
+	for _, structField := range schema.GetStructArrayFields() {
+		if structField.GetFieldID() == fieldID {
+			return true
+		}
+		for _, subField := range structField.GetFields() {
+			if subField.GetFieldID() == fieldID {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func mayGenerateInterimIndexResource(field *schemapb.FieldSchema, indexInfos []*querypb.FieldIndexInfo) bool {
+	if !paramtable.Get().QueryNodeCfg.EnableInterminSegmentIndex.GetAsBool() ||
+		isGrowingMmapEnable() ||
+		!SupportInterimIndexDataType(field.GetDataType()) ||
+		len(indexInfos) == 0 {
+		return false
+	}
+	for _, indexInfo := range indexInfos {
+		indexType := common.GetIndexType(indexInfo.GetIndexParams())
+		if indexType != "" && indexType != "FLAT" && indexType != "BIN_FLAT" {
+			return true
+		}
+	}
+	return false
 }
 
 func (loader *segmentLoader) getFieldType(collectionID, fieldID int64) (schemapb.DataType, error) {
