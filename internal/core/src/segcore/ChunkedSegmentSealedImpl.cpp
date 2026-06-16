@@ -154,6 +154,7 @@ using namespace milvus::cachinglayer;
 namespace {
 
 constexpr int64_t kApplyLoadDiffTimingLogIntervalNs = 5LL * 1000 * 1000 * 1000;
+constexpr bool kSnRecoveryLoadTimingEnabled = true;
 
 struct LazyManifestColumnGroupContext {
     int64_t segment_id;
@@ -670,6 +671,9 @@ RecordApplyLoadDiffTiming(int64_t total_ns,
                           int64_t binlog_count,
                           int64_t text_index_count,
                           int64_t json_stats_count) {
+    if (!kSnRecoveryLoadTimingEnabled) {
+        return;
+    }
     auto& stats = g_apply_load_diff_timing;
     stats.count.fetch_add(1, std::memory_order_relaxed);
     stats.total_ns.fetch_add(total_ns, std::memory_order_relaxed);
@@ -789,6 +793,9 @@ RecordSegmentLoadTiming(int64_t total_ns,
                         int64_t diff_log_ns,
                         int64_t apply_ns,
                         int64_t success_log_ns) {
+    if (!kSnRecoveryLoadTimingEnabled) {
+        return;
+    }
     auto& stats = g_segment_load_timing;
     stats.count.fetch_add(1, std::memory_order_relaxed);
     stats.total_ns.fetch_add(total_ns, std::memory_order_relaxed);
@@ -860,6 +867,9 @@ RecordIndexTaskTiming(DataType data_type,
                       int64_t queue_ns,
                       int64_t load_data_ns,
                       int64_t load_index_ns) {
+    if (!kSnRecoveryLoadTimingEnabled) {
+        return;
+    }
     auto& stats = g_index_task_timing;
     stats.count.fetch_add(1, std::memory_order_relaxed);
     stats.total_ns.fetch_add(total_ns, std::memory_order_relaxed);
@@ -956,6 +966,9 @@ RecordColumnGroupTaskTiming(bool has_pk,
                             int64_t cache_slot_ns,
                             int64_t attach_ns,
                             int64_t pk_attach_ns) {
+    if (!kSnRecoveryLoadTimingEnabled) {
+        return;
+    }
     auto& stats = g_column_group_task_timing;
     stats.count.fetch_add(1, std::memory_order_relaxed);
     stats.total_ns.fetch_add(total_ns, std::memory_order_relaxed);

@@ -16,6 +16,8 @@
 #include <folly/ExceptionWrapper.h>
 #include <folly/Try.h>
 #include <folly/futures/Promise.h>
+#include <atomic>
+#include <chrono>
 #include <exception>
 #include <functional>
 #include <limits>
@@ -92,6 +94,104 @@
 #include <arrow/record_batch.h>
 #include <arrow/type.h>
 
+namespace {
+
+constexpr int64_t kNewSegmentWithLoadInfoTimingLogIntervalNs =
+    5LL * 1000 * 1000 * 1000;
+
+struct NewSegmentWithLoadInfoTimingStats {
+    std::atomic<int64_t> count{0};
+    std::atomic<int64_t> total_ns{0};
+    std::atomic<int64_t> parse_ns{0};
+    std::atomic<int64_t> create_ns{0};
+    std::atomic<int64_t> set_load_info_ns{0};
+    std::atomic<int64_t> max_total_ns{0};
+    std::atomic<int64_t> last_log_ns{0};
+};
+
+NewSegmentWithLoadInfoTimingStats g_new_segment_with_load_info_timing;
+
+int64_t
+SteadyNowNs() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
+int64_t
+DurationSinceNs(std::chrono::steady_clock::time_point start) {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::steady_clock::now() - start)
+        .count();
+}
+
+void
+UpdateMax(std::atomic<int64_t>& target, int64_t value) {
+    auto old = target.load(std::memory_order_relaxed);
+    while (value > old &&
+           !target.compare_exchange_weak(old, value, std::memory_order_relaxed)) {
+    }
+}
+
+double
+AvgMs(int64_t total_ns, int64_t count) {
+    if (count == 0) {
+        return 0.0;
+    }
+    return static_cast<double>(total_ns) / static_cast<double>(count) / 1e6;
+}
+
+void
+RecordNewSegmentWithLoadInfoTiming(int64_t total_ns,
+                                   int64_t parse_ns,
+                                   int64_t create_ns,
+                                   int64_t set_load_info_ns) {
+    auto& stats = g_new_segment_with_load_info_timing;
+    stats.count.fetch_add(1, std::memory_order_relaxed);
+    stats.total_ns.fetch_add(total_ns, std::memory_order_relaxed);
+    stats.parse_ns.fetch_add(parse_ns, std::memory_order_relaxed);
+    stats.create_ns.fetch_add(create_ns, std::memory_order_relaxed);
+    stats.set_load_info_ns.fetch_add(set_load_info_ns,
+                                     std::memory_order_relaxed);
+    UpdateMax(stats.max_total_ns, total_ns);
+
+    auto now_ns = SteadyNowNs();
+    auto last_ns = stats.last_log_ns.load(std::memory_order_relaxed);
+    if (now_ns - last_ns < kNewSegmentWithLoadInfoTimingLogIntervalNs) {
+        return;
+    }
+    if (!stats.last_log_ns.compare_exchange_strong(
+            last_ns, now_ns, std::memory_order_relaxed)) {
+        return;
+    }
+    auto window_ns = last_ns == 0 ? 0 : now_ns - last_ns;
+
+    auto count = stats.count.exchange(0, std::memory_order_relaxed);
+    if (count == 0) {
+        return;
+    }
+    auto total = stats.total_ns.exchange(0, std::memory_order_relaxed);
+    auto parse = stats.parse_ns.exchange(0, std::memory_order_relaxed);
+    auto create = stats.create_ns.exchange(0, std::memory_order_relaxed);
+    auto set_load_info =
+        stats.set_load_info_ns.exchange(0, std::memory_order_relaxed);
+    auto max_total = stats.max_total_ns.exchange(0, std::memory_order_relaxed);
+
+    LOG_WARN(
+        "[SN recovery] load timing stats phase=segcore.new_segment_with_load_info "
+        "count={} windowMs={:.3f} avgTotalMs={:.3f} avgParseMs={:.3f} "
+        "avgCreateSegmentMs={:.3f} avgSetLoadInfoMs={:.3f} maxTotalMs={:.3f}",
+        count,
+        static_cast<double>(window_ns) / 1e6,
+        AvgMs(total, count),
+        AvgMs(parse, count),
+        AvgMs(create, count),
+        AvgMs(set_load_info, count),
+        static_cast<double>(max_total) / 1e6);
+}
+
+}  // namespace
+
 //////////////////////////////    common interfaces    //////////////////////////////
 
 /**
@@ -167,16 +267,30 @@ NewSegmentWithLoadInfo(CCollection collection,
     SCOPE_CGO_CALL_METRIC();
 
     try {
+        auto total_start = std::chrono::steady_clock::now();
+        int64_t parse_ns = 0;
+        int64_t create_ns = 0;
+        int64_t set_load_info_ns = 0;
         AssertInfo(load_info_blob, "load info is null");
+        auto stage_start = std::chrono::steady_clock::now();
         milvus::proto::segcore::SegmentLoadInfo load_info;
         auto suc = load_info.ParseFromArray(load_info_blob, load_info_length);
         AssertInfo(suc, "unmarshal load info failed");
+        parse_ns = DurationSinceNs(stage_start);
 
         auto col = static_cast<milvus::segcore::Collection*>(collection);
 
+        stage_start = std::chrono::steady_clock::now();
         auto segment =
             CreateSegment(col, seg_type, segment_id, is_sorted_by_pk);
+        create_ns = DurationSinceNs(stage_start);
+        stage_start = std::chrono::steady_clock::now();
         segment->SetLoadInfo(std::move(load_info));
+        set_load_info_ns = DurationSinceNs(stage_start);
+        RecordNewSegmentWithLoadInfoTiming(DurationSinceNs(total_start),
+                                           parse_ns,
+                                           create_ns,
+                                           set_load_info_ns);
         *newSegment = segment.release();
         return milvus::SuccessCStatus();
     } catch (std::exception& e) {
