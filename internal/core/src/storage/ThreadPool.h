@@ -128,7 +128,7 @@ class ThreadPool {
         auto task_ptr =
             std::make_shared<std::packaged_task<decltype(f(args...))()>>(func);
 
-        auto submit_time_ns = NowNs();
+        auto submit_time_ns = int64_t{0};
         std::function<void()> wrap_func = [this, task_ptr, submit_time_ns]() {
             RecordTaskStarted(submit_time_ns);
             try {
@@ -163,7 +163,6 @@ class ThreadPool {
                 current_threads_size_++;
             }
         }
-        LogStatsIfNeeded();
 
         return task_ptr->get_future();
     }
