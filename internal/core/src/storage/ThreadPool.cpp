@@ -70,7 +70,6 @@ SetThreadPoolMaxThreadsSize(const int size) {
 namespace {
 
 constexpr int64_t POOL_STATS_LOG_INTERVAL_NS = 5LL * 1000 * 1000 * 1000;
-constexpr bool kSnRecoveryThreadPoolStatsEnabled = false;
 
 void
 UpdateMax(std::atomic<int64_t>& target, int64_t value) {
@@ -99,9 +98,6 @@ ThreadPool::NowNs() {
 
 void
 ThreadPool::RecordTaskSubmitted(size_t queue_depth) {
-    if (!kSnRecoveryThreadPoolStatsEnabled) {
-        return;
-    }
     submitted_tasks_delta_.fetch_add(1, std::memory_order_relaxed);
     UpdateMax(max_queue_depth_,
               static_cast<int64_t>(queue_depth));
@@ -109,9 +105,6 @@ ThreadPool::RecordTaskSubmitted(size_t queue_depth) {
 
 void
 ThreadPool::RecordTaskStarted(int64_t submit_time_ns) {
-    if (!kSnRecoveryThreadPoolStatsEnabled) {
-        return;
-    }
     auto queue_wait_ns = std::max<int64_t>(0, NowNs() - submit_time_ns);
     queue_wait_samples_delta_.fetch_add(1, std::memory_order_relaxed);
     total_queue_wait_ns_delta_.fetch_add(queue_wait_ns,
@@ -126,9 +119,6 @@ ThreadPool::RecordTaskStarted(int64_t submit_time_ns) {
 
 void
 ThreadPool::RecordTaskFinished() {
-    if (!kSnRecoveryThreadPoolStatsEnabled) {
-        return;
-    }
     running_tasks_.fetch_sub(1, std::memory_order_relaxed);
     completed_tasks_delta_.fetch_add(1, std::memory_order_relaxed);
     LogStatsIfNeeded();
@@ -136,9 +126,6 @@ ThreadPool::RecordTaskFinished() {
 
 void
 ThreadPool::LogStatsIfNeeded() {
-    if (!kSnRecoveryThreadPoolStatsEnabled) {
-        return;
-    }
     auto now_ns = NowNs();
     auto last_ns = last_pool_stats_log_ns_.load(std::memory_order_relaxed);
     if (last_ns == 0) {
