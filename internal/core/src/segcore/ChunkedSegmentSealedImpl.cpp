@@ -161,6 +161,11 @@ CheckVectorOutputCellsLoaded(int64_t segment_id,
 
 namespace {
 
+bool
+CanUseLazyManifestSystemField(FieldId field_id) {
+    return field_id == RowFieldID || field_id == TimestampFieldID;
+}
+
 struct LazyManifestColumnGroupContext {
     int64_t segment_id;
     int64_t column_group_index;
@@ -746,6 +751,18 @@ ChunkedSegmentSealedImpl::is_system_field_ready() const {
         return true;
     }
     return get_column(TimestampFieldID) != nullptr;
+}
+
+Timestamp
+ChunkedSegmentSealedImpl::get_max_timestamp() const {
+    if (auto effective_commit_ts = EffectiveCommitTs()) {
+        return *effective_commit_ts;
+    }
+    auto ts_index = PinTimestampIndex(nullptr);
+    if (ts_index.get() != nullptr) {
+        return ts_index.get()->timestamp_index().get_max_timestamp();
+    }
+    return insert_record_.timestamp_index_.get_max_timestamp();
 }
 
 void
@@ -4961,7 +4978,8 @@ ChunkedSegmentSealedImpl::LazyManifestFieldBlockReason(
     const FieldMeta& field_meta,
     bool allow_match_field_lazy) const {
     if (SystemProperty::Instance().IsSystem(field_id)) {
-        return "system field";
+        return CanUseLazyManifestSystemField(field_id) ? nullptr
+                                                       : "system field";
     }
 
     auto data_type = field_meta.get_data_type();
@@ -6109,6 +6127,16 @@ ChunkedSegmentSealedImpl::LoadColumnGroup(
                                    std::nullopt,
                                    true,
                                    "disable");
+            if (field_id == TimestampFieldID) {
+                int64_t num_rows = load_info->GetNumOfRows();
+                if (commit_ts_ != 0) {
+                    std::vector<Timestamp> ts(num_rows, commit_ts_);
+                    init_storage_v1_timestamp_index(std::move(ts), num_rows);
+                } else {
+                    init_storage_v2_timestamp_index(
+                        column, num_rows, "disable");
+                }
+            }
             LOG_INFO(
                 "[StorageV2] attached lazy manifest column, segment {}, cg {}, "
                 "field {}, rows {}, accounted bytes {}",

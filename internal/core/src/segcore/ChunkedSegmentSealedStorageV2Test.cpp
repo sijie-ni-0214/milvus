@@ -1228,7 +1228,10 @@ TEST_P(TestChunkSegmentStorageV2,
             is_sorted_by_pk);
         auto* segment_impl =
             dynamic_cast<ChunkedSegmentSealedImpl*>(manifest_segment.get());
+        auto* segment_internal =
+            dynamic_cast<SegmentInternalInterface*>(manifest_segment.get());
         ASSERT_NE(segment_impl, nullptr);
+        ASSERT_NE(segment_internal, nullptr);
 
         proto::segcore::SegmentLoadInfo load_info;
         load_info.set_segmentid(segment_id);
@@ -1249,22 +1252,29 @@ TEST_P(TestChunkSegmentStorageV2,
         ASSERT_NE(pk_column, nullptr);
         EXPECT_EQ(pk_column->DataByteSize(), 0);
 
+        auto [ts_column, ts_exists] =
+            segment_impl->GetFieldDataIfExist(TimestampFieldID);
+        ASSERT_TRUE(ts_exists);
+        ASSERT_NE(ts_column, nullptr);
+        EXPECT_EQ(ts_column->DataByteSize(), 0);
+
         int64_t non_pk_offsets[] = {0, 42};
         auto non_pk_result = manifest_segment->bulk_subscript(
             nullptr, fields.at("int64"), non_pk_offsets, 2);
         ASSERT_EQ(non_pk_result->scalars().long_data().data_size(), 2);
         EXPECT_EQ(pk_column->DataByteSize(), 0);
+        EXPECT_EQ(ts_column->DataByteSize(), 0);
 
         std::unique_ptr<IdArray> delete_ids = std::make_unique<IdArray>();
-        Timestamp delete_ts = MAX_TIMESTAMP;
         if (GetParam()) {
-            int64_t offsets[] = {0, 1};
+            int64_t offsets[] = {0, 42};
             auto pk_result = manifest_segment->bulk_subscript(
                 nullptr, fields.at("pk"), offsets, 2);
             auto& string_data = pk_result->scalars().string_data();
             ASSERT_GE(string_data.data_size(), 2);
-            auto existing_pk = string_data.data(0);
+            auto existing_pk = string_data.data(1);
             EXPECT_GT(pk_column->DataByteSize(), 0);
+            EXPECT_EQ(ts_column->DataByteSize(), 0);
             EXPECT_TRUE(segment_impl->Contain(existing_pk));
             EXPECT_FALSE(segment_impl->Contain(std::string("test_missing")));
 
@@ -1276,6 +1286,7 @@ TEST_P(TestChunkSegmentStorageV2,
             ASSERT_EQ(pk_result->scalars().long_data().data(0), 0);
             ASSERT_EQ(pk_result->scalars().long_data().data(1), 42);
             EXPECT_GT(pk_column->DataByteSize(), 0);
+            EXPECT_EQ(ts_column->DataByteSize(), 0);
 
             PkType existing_pk = int64_t(42);
             PkType missing_pk = int64_t(-1);
@@ -1284,7 +1295,29 @@ TEST_P(TestChunkSegmentStorageV2,
             delete_ids->mutable_int_id()->mutable_data()->Add(42);
         }
 
-        auto status = manifest_segment->Delete(1, delete_ids.get(), &delete_ts);
+        Timestamp same_ts = 42;
+        auto status = manifest_segment->Delete(1, delete_ids.get(), &same_ts);
+        ASSERT_TRUE(status.ok());
+        ASSERT_EQ(manifest_segment->get_deleted_count(), 0);
+        EXPECT_GT(ts_column->DataByteSize(), 0);
+
+        BitsetType timestamp_mask(test_data.TotalRows());
+        BitsetTypeView timestamp_mask_view(timestamp_mask);
+        segment_internal->mask_with_timestamps(timestamp_mask_view, 42, 0);
+        ASSERT_FALSE(timestamp_mask[42]);
+        ASSERT_TRUE(timestamp_mask[43]);
+
+        std::vector<int64_t> timestamp_offsets{
+            0, 42, test_data.TotalRows() - 1};
+        auto timestamp_values =
+            segment_impl->TestBulkSubscriptTimestamp(timestamp_offsets);
+        ASSERT_EQ(timestamp_values.size(), timestamp_offsets.size());
+        EXPECT_EQ(timestamp_values[0], 0);
+        EXPECT_EQ(timestamp_values[1], 42);
+        EXPECT_EQ(timestamp_values[2], test_data.TotalRows() - 1);
+
+        Timestamp delete_ts = MAX_TIMESTAMP;
+        status = manifest_segment->Delete(1, delete_ids.get(), &delete_ts);
         ASSERT_TRUE(status.ok());
         ASSERT_EQ(manifest_segment->get_deleted_count(), 1);
 
@@ -1363,6 +1396,50 @@ TEST_P(TestChunkSegmentStorageV2,
     EXPECT_EQ(element_indices[0], std::vector<int32_t>({1}));
     EXPECT_EQ(element_indices[1], std::vector<int32_t>({0, 1}));
     EXPECT_TRUE(has_more);
+
+    manifest_segment.reset();
+    std::filesystem::remove_all(std::filesystem::path(TestLocalPath) /
+                                base_path);
+}
+
+TEST_P(TestChunkSegmentStorageV2, TestLazyManifestTimestampMaxUsesLazyIndex) {
+    LazyManifestReaderGuard guard(true);
+
+    const int64_t segment_id = 3300 + (GetParam() ? 100 : 0);
+    auto base_path = std::string("timestamp_lazy_manifest_max_") +
+                     (GetParam() ? "varchar" : "int64");
+    std::filesystem::remove_all(std::filesystem::path(TestLocalPath) /
+                                base_path);
+    milvus::test::V3SegmentTestData test_data(
+        schema_, 1, 16, 128, TestLocalPath, base_path);
+
+    auto manifest_segment = segcore::CreateSealedSegment(
+        schema_, nullptr, segment_id, segcore::SegcoreConfig::default_config());
+    auto* segment_impl =
+        dynamic_cast<ChunkedSegmentSealedImpl*>(manifest_segment.get());
+    ASSERT_NE(segment_impl, nullptr);
+
+    proto::segcore::SegmentLoadInfo load_info;
+    load_info.set_segmentid(segment_id);
+    load_info.set_partitionid(1);
+    load_info.set_collectionid(1);
+    load_info.set_num_of_rows(test_data.TotalRows());
+    load_info.set_storageversion(STORAGE_V3);
+    load_info.set_manifest_path(test_data.ManifestPath());
+    load_info.set_priority(proto::common::LoadPriority::LOW);
+
+    segment_impl->SetLoadInfo(load_info);
+    milvus::tracer::TraceContext trace_ctx;
+    segment_impl->Load(trace_ctx, nullptr);
+
+    auto [ts_column, ts_exists] =
+        segment_impl->GetFieldDataIfExist(TimestampFieldID);
+    ASSERT_TRUE(ts_exists);
+    ASSERT_NE(ts_column, nullptr);
+    EXPECT_EQ(ts_column->DataByteSize(), 0);
+
+    EXPECT_EQ(segment_impl->get_max_timestamp(), test_data.TotalRows() - 1);
+    EXPECT_GT(ts_column->DataByteSize(), 0);
 
     manifest_segment.reset();
     std::filesystem::remove_all(std::filesystem::path(TestLocalPath) /

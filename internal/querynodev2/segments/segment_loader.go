@@ -2614,7 +2614,9 @@ func lazyManifestLoadResourceSkipped(schema *schemapb.CollectionSchema, field *s
 
 func canUseLazyManifestResourceField(schema *schemapb.CollectionSchema, field *schemapb.FieldSchema, indexInfos []*querypb.FieldIndexInfo) bool {
 	fieldID := field.GetFieldID()
-	if common.IsSystemField(fieldID) {
+	if common.IsSystemField(fieldID) &&
+		fieldID != common.RowIDField &&
+		fieldID != common.TimeStampField {
 		return false
 	}
 	if field.GetNullable() && typeutil.IsVectorType(field.GetDataType()) {

@@ -355,9 +355,7 @@ class ChunkedSegmentSealedImpl : public SegmentSealed {
     get_deleted_count() const override;
 
     Timestamp
-    get_max_timestamp() const override {
-        return insert_record_.timestamp_index_.get_max_timestamp();
-    }
+    get_max_timestamp() const override;
 
     const Schema&
     get_schema() const override;
@@ -1518,6 +1516,17 @@ class ChunkedSegmentSealedImpl : public SegmentSealed {
     void
     TestRecordTextIndexCreated(FieldId field_id) {
         RecordTextIndexCreated(field_id);
+    }
+
+    std::vector<Timestamp>
+    TestBulkSubscriptTimestamp(const std::vector<int64_t>& offsets) const {
+        std::vector<Timestamp> output(offsets.size());
+        bulk_subscript(nullptr,
+                       SystemFieldType::Timestamp,
+                       offsets.data(),
+                       static_cast<int64_t>(offsets.size()),
+                       output.data());
+        return output;
     }
 #endif
 
