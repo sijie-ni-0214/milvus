@@ -586,7 +586,8 @@ class ChunkedSegmentSealedImpl : public SegmentSealed {
         const std::shared_ptr<milvus_storage::api::Properties>& properties,
         const std::shared_ptr<arrow::Schema>& reader_schema,
         int64_t column_group_index,
-        const std::shared_ptr<std::vector<std::string>>& needed_columns) const;
+        const std::shared_ptr<std::vector<std::string>>& needed_columns,
+        bool lazy_manifest) const;
 
     void
     check_search(const query::Plan* plan) const override;

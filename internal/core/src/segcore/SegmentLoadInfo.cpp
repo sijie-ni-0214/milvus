@@ -13,6 +13,7 @@
 #include <cctype>
 #include <iterator>
 #include <memory>
+#include <utility>
 
 #include "common/Common.h"
 #include "common/Consts.h"
@@ -22,6 +23,7 @@
 #include "log/Log.h"
 #include "common/resource_c.h"
 #include "index/IndexFactory.h"
+#include "milvus-storage/diagnostics.h"
 #include "milvus-storage/column_groups.h"
 #include "milvus-storage/manifest.h"
 #include "pb/schema.pb.h"
@@ -49,6 +51,13 @@ SegmentLoadInfo::GetColumnGroups() const {
     auto properties = milvus::storage::LoonFFIPropertiesSingleton::GetInstance()
                           .GetProperties();
 
+    milvus_storage::diagnostics::RecoveryIoContext context;
+    context.operation = "manifest";
+    context.segment_id = GetSegmentID();
+    context.field_ids = "manifest";
+    context.format = "avro";
+    milvus_storage::diagnostics::ScopedRecoveryIoContext scope(
+        std::move(context));
     auto loon_manifest = ::GetLoonManifest(manifest_path, properties);
     column_groups_ = std::make_shared<milvus_storage::api::ColumnGroups>(
         loon_manifest->columnGroups());

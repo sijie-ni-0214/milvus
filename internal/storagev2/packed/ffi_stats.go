@@ -18,6 +18,7 @@ package packed
 #cgo pkg-config: milvus_core milvus-storage
 
 #include <stdlib.h>
+#include "milvus-storage/diagnostics_c.h"
 #include "milvus-storage/ffi_c.h"
 */
 import "C"
@@ -102,6 +103,15 @@ func GetManifestStats(
 	manifestPath string,
 	storageConfig *indexpb.StorageConfig,
 ) (map[string]ManifestStat, error) {
+	cOp := C.CString("manifest")
+	defer C.free(unsafe.Pointer(cOp))
+	cFieldIDs := C.CString("stats_resolver")
+	defer C.free(unsafe.Pointer(cFieldIDs))
+	cFormat := C.CString("avro")
+	defer C.free(unsafe.Pointer(cFormat))
+	ioContext := C.loon_recovery_io_context_begin(cOp, cFieldIDs, C.int64_t(-1), C.int(0), C.int(0), cFormat)
+	defer C.loon_recovery_io_context_end(ioContext)
+
 	cManifest, err := GetManifestHandle(manifestPath, storageConfig)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get manifest: %w", err)
