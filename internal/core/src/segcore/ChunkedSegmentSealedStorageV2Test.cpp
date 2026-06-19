@@ -27,6 +27,7 @@
 #include <time.h>
 #include <algorithm>
 #include <cstdint>
+#include <filesystem>
 #include <map>
 #include <memory>
 #include <numeric>
@@ -38,10 +39,12 @@
 
 #include "NamedType/named_type_impl.hpp"
 #include "cachinglayer/CacheSlot.h"
+#include "common/ArrayOffsets.h"
 #include "common/Consts.h"
 #include "common/LoadInfo.h"
 #include "common/Schema.h"
 #include "common/Span.h"
+#include "common/Tracer.h"
 #include "common/Types.h"
 #include "common/protobuf_utils.h"
 #include "exec/expression/EvalCtx.h"
@@ -70,7 +73,9 @@
 #include "segcore/storagev1translator/ChunkTranslator.h"
 #include "storage/FileManager.h"
 #include "storage/Types.h"
+#include "test_utils/Constants.h"
 #include "test_utils/DataGen.h"
+#include "test_utils/ManifestTestUtil.h"
 #include "test_utils/cachinglayer_test_utils.h"
 
 using namespace milvus;
@@ -182,6 +187,50 @@ class StorageV2CellTargetGuard {
  private:
     int64_t old_bytes_;
 };
+
+class LazyManifestReaderGuard {
+ public:
+    explicit LazyManifestReaderGuard(bool enabled)
+        : previous_(SegcoreConfig::default_config()
+                        .get_lazy_manifest_reader_enabled()) {
+        SegcoreConfig::default_config().set_lazy_manifest_reader_enabled(
+            enabled);
+    }
+
+    ~LazyManifestReaderGuard() {
+        SegcoreConfig::default_config().set_lazy_manifest_reader_enabled(
+            previous_);
+    }
+
+ private:
+    bool previous_;
+};
+
+class CacheWarmupPolicyGuard {
+ public:
+    explicit CacheWarmupPolicyGuard(
+        milvus::cachinglayer::CacheWarmupPolicies warmup_policies)
+        : previous_(milvus::cachinglayer::TieredStorageConfig::GetInstance()
+                        .GetSnapshot()) {
+        milvus::cachinglayer::Manager::UpdateConfig(
+            previous_.loading_timeout,
+            previous_.warmup_loading_timeout,
+            previous_.storage_usage_tracking_enabled,
+            warmup_policies);
+    }
+
+    ~CacheWarmupPolicyGuard() {
+        milvus::cachinglayer::Manager::UpdateConfig(
+            previous_.loading_timeout,
+            previous_.warmup_loading_timeout,
+            previous_.storage_usage_tracking_enabled,
+            previous_.warmup_policies);
+    }
+
+ private:
+    milvus::cachinglayer::TieredStorageConfig::Snapshot previous_;
+};
+
 }  // namespace
 
 class TestChunkSegmentStorageV2 : public testing::TestWithParam<bool> {
@@ -1148,4 +1197,174 @@ TEST_P(TestChunkSegmentStorageV2, TestLazySystemIndexesOnSortedSegment) {
         ASSERT_EQ(pk_result->scalars().long_data().data(0), 0);
         ASSERT_EQ(pk_result->scalars().long_data().data(1), 42);
     }
+}
+
+TEST_P(TestChunkSegmentStorageV2,
+       TestLazyManifestPrimaryKeyMaterializesOnDemand) {
+    LazyManifestReaderGuard guard(true);
+    auto warmup_policies =
+        milvus::cachinglayer::TieredStorageConfig::GetInstance()
+            .warmup_policies();
+    warmup_policies.scalarIndexCacheWarmupPolicy =
+        CacheWarmupPolicy::CacheWarmupPolicy_Sync;
+    CacheWarmupPolicyGuard warmup_guard(warmup_policies);
+
+    for (auto is_sorted_by_pk : {false, true}) {
+        const int64_t segment_id =
+            3100 + (GetParam() ? 100 : 0) + (is_sorted_by_pk ? 1 : 0);
+        auto base_path = std::string("pk_lazy_manifest_") +
+                         (GetParam() ? "varchar" : "int64") +
+                         (is_sorted_by_pk ? "_sorted" : "_unsorted");
+        std::filesystem::remove_all(std::filesystem::path(TestLocalPath) /
+                                    base_path);
+        milvus::test::V3SegmentTestData test_data(
+            schema_, 1, 256, 128, TestLocalPath, base_path);
+
+        auto manifest_segment = segcore::CreateSealedSegment(
+            schema_,
+            nullptr,
+            segment_id,
+            segcore::SegcoreConfig::default_config(),
+            is_sorted_by_pk);
+        auto* segment_impl =
+            dynamic_cast<ChunkedSegmentSealedImpl*>(manifest_segment.get());
+        ASSERT_NE(segment_impl, nullptr);
+
+        proto::segcore::SegmentLoadInfo load_info;
+        load_info.set_segmentid(segment_id);
+        load_info.set_partitionid(1);
+        load_info.set_collectionid(1);
+        load_info.set_num_of_rows(test_data.TotalRows());
+        load_info.set_storageversion(STORAGE_V3);
+        load_info.set_manifest_path(test_data.ManifestPath());
+        load_info.set_priority(proto::common::LoadPriority::LOW);
+
+        segment_impl->SetLoadInfo(load_info);
+        milvus::tracer::TraceContext trace_ctx;
+        segment_impl->Load(trace_ctx, nullptr);
+
+        auto [pk_column, exists] =
+            segment_impl->GetFieldDataIfExist(fields.at("pk"));
+        ASSERT_TRUE(exists);
+        ASSERT_NE(pk_column, nullptr);
+        EXPECT_EQ(pk_column->DataByteSize(), 0);
+
+        int64_t non_pk_offsets[] = {0, 42};
+        auto non_pk_result = manifest_segment->bulk_subscript(
+            nullptr, fields.at("int64"), non_pk_offsets, 2);
+        ASSERT_EQ(non_pk_result->scalars().long_data().data_size(), 2);
+        EXPECT_EQ(pk_column->DataByteSize(), 0);
+
+        std::unique_ptr<IdArray> delete_ids = std::make_unique<IdArray>();
+        Timestamp delete_ts = MAX_TIMESTAMP;
+        if (GetParam()) {
+            int64_t offsets[] = {0, 1};
+            auto pk_result = manifest_segment->bulk_subscript(
+                nullptr, fields.at("pk"), offsets, 2);
+            auto& string_data = pk_result->scalars().string_data();
+            ASSERT_GE(string_data.data_size(), 2);
+            auto existing_pk = string_data.data(0);
+            EXPECT_GT(pk_column->DataByteSize(), 0);
+            EXPECT_TRUE(segment_impl->Contain(existing_pk));
+            EXPECT_FALSE(segment_impl->Contain(std::string("test_missing")));
+
+            *delete_ids->mutable_str_id()->mutable_data()->Add() = existing_pk;
+        } else {
+            int64_t offsets[] = {0, 42};
+            auto pk_result = manifest_segment->bulk_subscript(
+                nullptr, fields.at("pk"), offsets, 2);
+            ASSERT_EQ(pk_result->scalars().long_data().data(0), 0);
+            ASSERT_EQ(pk_result->scalars().long_data().data(1), 42);
+            EXPECT_GT(pk_column->DataByteSize(), 0);
+
+            PkType existing_pk = int64_t(42);
+            PkType missing_pk = int64_t(-1);
+            EXPECT_TRUE(segment_impl->Contain(existing_pk));
+            EXPECT_FALSE(segment_impl->Contain(missing_pk));
+            delete_ids->mutable_int_id()->mutable_data()->Add(42);
+        }
+
+        auto status = manifest_segment->Delete(1, delete_ids.get(), &delete_ts);
+        ASSERT_TRUE(status.ok());
+        ASSERT_EQ(manifest_segment->get_deleted_count(), 1);
+
+        manifest_segment.reset();
+        std::filesystem::remove_all(std::filesystem::path(TestLocalPath) /
+                                    base_path);
+    }
+}
+
+TEST_P(TestChunkSegmentStorageV2,
+       TestLazyManifestPrimaryKeyElementIteratorUsesLazyIndex) {
+    LazyManifestReaderGuard guard(true);
+    auto warmup_policies =
+        milvus::cachinglayer::TieredStorageConfig::GetInstance()
+            .warmup_policies();
+    warmup_policies.scalarIndexCacheWarmupPolicy =
+        CacheWarmupPolicy::CacheWarmupPolicy_Sync;
+    CacheWarmupPolicyGuard warmup_guard(warmup_policies);
+
+    const int64_t segment_id = 3200 + (GetParam() ? 100 : 0);
+    auto base_path = std::string("pk_lazy_manifest_element_") +
+                     (GetParam() ? "varchar" : "int64");
+    std::filesystem::remove_all(std::filesystem::path(TestLocalPath) /
+                                base_path);
+    milvus::test::V3SegmentTestData test_data(
+        schema_, 1, 16, 128, TestLocalPath, base_path);
+
+    auto manifest_segment = segcore::CreateSealedSegment(
+        schema_, nullptr, segment_id, segcore::SegcoreConfig::default_config());
+    auto* segment_impl =
+        dynamic_cast<ChunkedSegmentSealedImpl*>(manifest_segment.get());
+    ASSERT_NE(segment_impl, nullptr);
+
+    proto::segcore::SegmentLoadInfo load_info;
+    load_info.set_segmentid(segment_id);
+    load_info.set_partitionid(1);
+    load_info.set_collectionid(1);
+    load_info.set_num_of_rows(test_data.TotalRows());
+    load_info.set_storageversion(STORAGE_V3);
+    load_info.set_manifest_path(test_data.ManifestPath());
+    load_info.set_priority(proto::common::LoadPriority::LOW);
+
+    segment_impl->SetLoadInfo(load_info);
+    milvus::tracer::TraceContext trace_ctx;
+    segment_impl->Load(trace_ctx, nullptr);
+
+    auto [pk_column, exists] =
+        segment_impl->GetFieldDataIfExist(fields.at("pk"));
+    ASSERT_TRUE(exists);
+    ASSERT_NE(pk_column, nullptr);
+    EXPECT_EQ(pk_column->DataByteSize(), 0);
+
+    if (GetParam()) {
+        EXPECT_FALSE(segment_impl->Contain(std::string("test_missing")));
+        EXPECT_GT(pk_column->DataByteSize(), 0);
+    }
+
+    std::vector<int32_t> row_to_element_start;
+    row_to_element_start.reserve(test_data.TotalRows() + 1);
+    for (int32_t row = 0; row <= test_data.TotalRows(); ++row) {
+        row_to_element_start.push_back(row * 2);
+    }
+    ArrayOffsetsSealed array_offsets(std::move(row_to_element_start));
+    BitsetType element_bitset(test_data.TotalRows() * 2);
+    element_bitset.reset();
+    element_bitset.set(0);
+    BitsetTypeView element_bitset_view(element_bitset);
+
+    auto [doc_offsets, element_indices, has_more] =
+        segment_impl->find_first_n_element(
+            3, element_bitset_view, &array_offsets, std::nullopt);
+
+    EXPECT_GT(pk_column->DataByteSize(), 0);
+    ASSERT_EQ(doc_offsets, std::vector<int64_t>({0, 1}));
+    ASSERT_EQ(element_indices.size(), 2);
+    EXPECT_EQ(element_indices[0], std::vector<int32_t>({1}));
+    EXPECT_EQ(element_indices[1], std::vector<int32_t>({0, 1}));
+    EXPECT_TRUE(has_more);
+
+    manifest_segment.reset();
+    std::filesystem::remove_all(std::filesystem::path(TestLocalPath) /
+                                base_path);
 }

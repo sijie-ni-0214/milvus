@@ -226,7 +226,8 @@ PkIndexTranslator::PkIndexTranslator(
     int64_t segment_id,
     std::shared_ptr<ChunkedColumnInterface> column,
     DataType data_type,
-    bool is_sorted_by_pk)
+    bool is_sorted_by_pk,
+    const std::string& warmup_policy)
     : segment_id_(segment_id),
       column_(std::move(column)),
       data_type_(data_type),
@@ -235,7 +236,7 @@ PkIndexTranslator::PkIndexTranslator(
       meta_(milvus::cachinglayer::StorageType::MEMORY,
             milvus::cachinglayer::CellIdMappingMode::ALWAYS_ZERO,
             milvus::cachinglayer::CellDataType::OTHER,
-            milvus::segcore::getCacheWarmupPolicy(/* warmup_policy */ "",
+            milvus::segcore::getCacheWarmupPolicy(warmup_policy,
                                                   /* is_vector */ false,
                                                   /* is_index */ true),
             /* support_eviction */ true) {

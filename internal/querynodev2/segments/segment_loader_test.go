@@ -2500,6 +2500,41 @@ func TestEstimateLoadingResourceUsage_DroppedFieldSkipped(t *testing.T) {
 	})
 }
 
+func TestLazyManifestLoadResourceSkippedAllowsPrimaryKey(t *testing.T) {
+	paramtable.Init()
+	paramtable.Get().Save(paramtable.Get().QueryNodeCfg.TieredLazyManifestReaderEnabled.Key, "true")
+	defer paramtable.Get().Reset(paramtable.Get().QueryNodeCfg.TieredLazyManifestReaderEnabled.Key)
+
+	pkField := &schemapb.FieldSchema{
+		FieldID:      100,
+		Name:         "pk",
+		DataType:     schemapb.DataType_Int64,
+		IsPrimaryKey: true,
+		TypeParams: []*commonpb.KeyValuePair{
+			{Key: common.WarmupKey, Value: common.WarmupDisable},
+		},
+	}
+	schema := &schemapb.CollectionSchema{
+		Name:   "pk_lazy_manifest_resource",
+		Fields: []*schemapb.FieldSchema{pkField},
+	}
+
+	assert.True(t, lazyManifestLoadResourceSkipped(schema, pkField, nil))
+	paramtable.Get().Save(paramtable.Get().QueryNodeCfg.TieredLazyManifestReaderEnabled.Key, "false")
+	assert.False(t, lazyManifestLoadResourceSkipped(schema, pkField, nil))
+	paramtable.Get().Save(paramtable.Get().QueryNodeCfg.TieredLazyManifestReaderEnabled.Key, "true")
+
+	systemField := &schemapb.FieldSchema{
+		FieldID:  common.TimeStampField,
+		Name:     "timestamp",
+		DataType: schemapb.DataType_Int64,
+		TypeParams: []*commonpb.KeyValuePair{
+			{Key: common.WarmupKey, Value: common.WarmupDisable},
+		},
+	}
+	assert.False(t, lazyManifestLoadResourceSkipped(schema, systemField, nil))
+}
+
 func TestSegmentLoader(t *testing.T) {
 	suite.Run(t, &SegmentLoaderSuite{})
 	suite.Run(t, &SegmentLoaderDetailSuite{})

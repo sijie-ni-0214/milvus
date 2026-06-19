@@ -150,7 +150,8 @@ class PkIndexTranslator : public milvus::cachinglayer::Translator<PkIndexCell> {
     PkIndexTranslator(int64_t segment_id,
                       std::shared_ptr<ChunkedColumnInterface> column,
                       DataType data_type,
-                      bool is_sorted_by_pk);
+                      bool is_sorted_by_pk,
+                      const std::string& warmup_policy = "");
 
     ~PkIndexTranslator() override = default;
 
