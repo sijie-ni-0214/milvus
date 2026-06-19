@@ -3318,9 +3318,6 @@ func canUseLazyManifestResourceField(schema *schemapb.CollectionSchema, field *s
 	if common.IsSystemField(fieldID) {
 		return false
 	}
-	if field.GetIsPrimaryKey() {
-		return false
-	}
 	if field.GetNullable() && typeutil.IsVectorType(field.GetDataType()) {
 		return false
 	}

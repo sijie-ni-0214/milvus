@@ -1382,7 +1382,8 @@ class ChunkedSegmentSealedImpl : public SegmentSealed {
         bool is_replace = false,
         std::optional<size_t> memory_accounting_bytes = {},
         std::optional<size_t> avg_size_bytes = {},
-        bool skip_avg_size_update = false);
+        bool skip_avg_size_update = false,
+        const std::string& pk_index_warmup_policy = "");
 
     std::shared_ptr<ChunkedColumnInterface>
     get_column(FieldId field_id) const {
@@ -1419,7 +1420,8 @@ class ChunkedSegmentSealedImpl : public SegmentSealed {
     init_storage_v2_pk_index(
         FieldId field_id,
         const std::shared_ptr<ChunkedColumnInterface>& column,
-        DataType data_type);
+        DataType data_type,
+        const std::string& warmup_policy = "");
 
 #ifdef MILVUS_UNIT_TEST
  public:

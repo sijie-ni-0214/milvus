@@ -1378,13 +1378,14 @@ void
 ChunkedSegmentSealedImpl::init_storage_v2_pk_index(
     FieldId field_id,
     const std::shared_ptr<ChunkedColumnInterface>& column,
-    DataType data_type) {
+    DataType data_type,
+    const std::string& warmup_policy) {
     if (schema_->get_primary_field_id() != field_id) {
         return;
     }
     std::unique_ptr<Translator<storagev2translator::PkIndexCell>> translator =
         std::make_unique<storagev2translator::PkIndexTranslator>(
-            id_, column, data_type, is_sorted_by_pk_);
+            id_, column, data_type, is_sorted_by_pk_, warmup_policy);
     *pk_index_slot_.wlock() =
         Manager::GetInstance().CreateCacheSlot(std::move(translator));
 }
@@ -3266,7 +3267,14 @@ ChunkedSegmentSealedImpl::find_first_n_element(
     const IArrayOffsets* array_offsets,
     const std::optional<QueryIteratorCursor>& cursor) const {
     if (!is_sorted_by_pk_) {
-        // Not sorted by PK, use pk2offset_ to iterate in PK order
+        auto pk_index = PinPkIndex(nullptr);
+        auto* pk_cell = pk_index.get();
+        AssertInfo(pk_cell != nullptr || !insert_record_.empty_pks(),
+                   "primary key index is not ready");
+        if (pk_cell != nullptr) {
+            return pk_cell->pk2offset().find_first_n_element(
+                limit, element_bitset, array_offsets, cursor);
+        }
         return insert_record_.pk2offset_->find_first_n_element(
             limit, element_bitset, array_offsets, cursor);
     }
@@ -4482,26 +4490,29 @@ ChunkedSegmentSealedImpl::bulk_subscript(milvus::OpContext* op_ctx,
         return fill_with_empty(field_id, count);
     }
 
-    // Fast path for int64 PK field: use compressed offset2pk index
+    // Fast path for int64 PK field: use compressed offset2pk index.
+    // Keep PinPkIndex inside the PK branch so retrieving other fields does not
+    // materialize a lazy primary-key column as a side effect.
     auto pk_field_id = schema_->get_primary_field_id();
-    auto pk_index = PinPkIndex(op_ctx);
     if (pk_field_id.has_value() && pk_field_id.value() == field_id &&
-        field_meta.get_data_type() == DataType::INT64 &&
-        (pk_index.get() != nullptr ? pk_index.get()->has_int64_pk_index()
-                                   : insert_record_.has_int64_pk_index())) {
-        auto ret = fill_with_empty(field_id, count);
-        auto* output = ret->mutable_scalars()
-                           ->mutable_long_data()
-                           ->mutable_data()
-                           ->mutable_data();
-        if (pk_index.get() != nullptr) {
-            pk_index.get()->bulk_get_int64_pks_by_offsets(
-                seg_offsets, count, output);
-        } else {
-            insert_record_.bulk_get_int64_pks_by_offsets(
-                seg_offsets, count, output);
+        field_meta.get_data_type() == DataType::INT64) {
+        auto pk_index = PinPkIndex(op_ctx);
+        if (pk_index.get() != nullptr ? pk_index.get()->has_int64_pk_index()
+                                      : insert_record_.has_int64_pk_index()) {
+            auto ret = fill_with_empty(field_id, count);
+            auto* output = ret->mutable_scalars()
+                               ->mutable_long_data()
+                               ->mutable_data()
+                               ->mutable_data();
+            if (pk_index.get() != nullptr) {
+                pk_index.get()->bulk_get_int64_pks_by_offsets(
+                    seg_offsets, count, output);
+            } else {
+                insert_record_.bulk_get_int64_pks_by_offsets(
+                    seg_offsets, count, output);
+            }
+            return ret;
         }
-        return ret;
     }
 
     // Decide once whether to serve this retrieve from column data instead of
@@ -5142,11 +5153,6 @@ ChunkedSegmentSealedImpl::LazyManifestFieldBlockReason(
         return "system field";
     }
 
-    auto primary_field_id = schema_->get_primary_field_id();
-    if (primary_field_id.has_value() && primary_field_id.value() == field_id) {
-        return "primary key";
-    }
-
     auto data_type = field_meta.get_data_type();
     if (field_meta.is_nullable() && IsVectorDataType(data_type)) {
         return "nullable vector";
@@ -5219,7 +5225,8 @@ ChunkedSegmentSealedImpl::load_field_data_common(
     bool is_replace,
     std::optional<size_t> memory_accounting_bytes,
     std::optional<size_t> avg_size_bytes,
-    bool skip_avg_size_update) {
+    bool skip_avg_size_update,
+    const std::string& pk_index_warmup_policy) {
     const bool is_system_field = SystemProperty::Instance().IsSystem(field_id);
     const bool should_account_field_data =
         !enable_mmap &&
@@ -5338,7 +5345,8 @@ ChunkedSegmentSealedImpl::load_field_data_common(
     if (schema_->get_primary_field_id() == field_id) {
         if (std::atomic_load(&segment_load_info_)->GetStorageVersion() >=
             STORAGE_V2) {
-            init_storage_v2_pk_index(field_id, column, data_type);
+            init_storage_v2_pk_index(
+                field_id, column, data_type, pk_index_warmup_policy);
         } else {
             init_storage_v1_pk_index(field_id, column, data_type, is_replace);
         }
@@ -6389,7 +6397,8 @@ ChunkedSegmentSealedImpl::LoadColumnGroup(
                                    is_replace,
                                    std::make_optional<size_t>(0),
                                    std::nullopt,
-                                   true);
+                                   true,
+                                   "disable");
             LOG_INFO(
                 "[StorageV2] attached lazy manifest column, segment {}, cg {}, "
                 "field {}, rows {}, accounted bytes {}",
