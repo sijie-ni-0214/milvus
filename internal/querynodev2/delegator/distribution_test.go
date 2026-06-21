@@ -829,6 +829,40 @@ func TestDistribution_NewDistribution(t *testing.T) {
 	assert.NotNil(t, dist.current)
 }
 
+func TestDistribution_PreSyncDefersSealedSnapshotForGetDistribution(t *testing.T) {
+	dist := NewDistribution("test_channel", NewChannelQueryView(nil, nil, []int64{1}, 10))
+	defer dist.Close()
+
+	initialSnapshot := dist.current.Load()
+	dist.AddDistributions(SegmentEntry{
+		NodeID:      10,
+		SegmentID:   100,
+		PartitionID: 1,
+		Version:     1,
+	})
+
+	current := dist.current.Load()
+	assert.Equal(t, initialSnapshot.version, current.version)
+	sealedInSnapshot, _ := current.Peek()
+	requireSnapshotSegments(t, sealedInSnapshot, map[int64][]int64{})
+
+	liveSealed, _ := dist.PeekSegments(false)
+	requireSnapshotSegments(t, liveSealed, map[int64][]int64{10: {100}})
+
+	readableSealed, _ := dist.PeekSegments(true)
+	requireSnapshotSegments(t, readableSealed, map[int64][]int64{})
+
+	dist.SyncTargetVersion(&querypb.SyncAction{
+		TargetVersion:         100,
+		SealedSegmentRowCount: map[int64]int64{100: 10},
+	}, []int64{1})
+
+	sealedAfterSync, _ := dist.current.Load().Peek()
+	requireSnapshotSegments(t, sealedAfterSync, map[int64][]int64{10: {100}})
+	_, _, _, _, err := dist.PinReadableSegments(1.0, 1)
+	assert.NoError(t, err)
+}
+
 func TestDistribution_NotifyAfterClose(t *testing.T) {
 	dist := NewDistribution("test_channel", NewChannelQueryView(nil, nil, []int64{1}, initialTargetVersion))
 	dist.Close()
@@ -874,6 +908,7 @@ func TestDistribution_UpdateServiceable(t *testing.T) {
 	dist.growingSegments[1] = SegmentEntry{
 		SegmentID: 1,
 	}
+	dist.genSnapshot()
 	dist.updateServiceable("test")
 	assert.False(t, dist.Serviceable())
 	assert.Equal(t, float64(2)/float64(6), dist.queryView.GetLoadedRatio())
@@ -890,6 +925,7 @@ func TestDistribution_UpdateServiceable(t *testing.T) {
 			SegmentID: id,
 		}
 	}
+	dist.genSnapshot()
 	dist.updateServiceable("test")
 	assert.Equal(t, float64(1), dist.queryView.GetLoadedRatio())
 	assert.False(t, dist.Serviceable())
@@ -1165,6 +1201,7 @@ func TestDistribution_ServiceableWithSyncedByCoord(t *testing.T) {
 				Offline:   false,
 			}
 		}
+		dist.genSnapshot()
 
 		// Update serviceable to calculate loaded ratio but don't sync
 		dist.updateServiceable("test")
@@ -2026,7 +2063,7 @@ func TestDistribution_ApplySnapshotDeltaAdd(t *testing.T) {
 
 	sealed, _ := dist.PeekSegments(false)
 	requireSnapshotSegments(t, sealed, map[int64][]int64{10: {100}})
-	assert.Equal(t, 0.5, dist.queryView.GetLoadedRatio())
+	assert.Equal(t, float64(10)/float64(30), dist.queryView.GetLoadedRatio())
 	assert.Contains(t, dist.queryView.unloadedSealedSegments, int64(200))
 }
 

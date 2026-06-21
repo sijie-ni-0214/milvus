@@ -545,6 +545,41 @@ func (d *distribution) PinOnlineSegments(partitions ...int64) (sealed []Snapshot
 	return sealed, growing, version
 }
 
+func (d *distribution) isPreSyncRecoveryLocked() bool {
+	return !d.queryView.syncedByCoord
+}
+
+func (d *distribution) peekLiveSegmentsLocked(partitions ...int64) (sealed []SnapshotItem, growing []SegmentEntry) {
+	matched := func(entry SegmentEntry) bool {
+		return len(partitions) == 0 || lo.Contains(partitions, entry.PartitionID)
+	}
+
+	nodeSegments := make(map[int64][]SegmentEntry)
+	for _, entry := range d.sealedSegments {
+		if !matched(entry) {
+			continue
+		}
+		entry = d.snapshotEntryForQueryView(entry)
+		nodeSegments[entry.NodeID] = append(nodeSegments[entry.NodeID], entry)
+	}
+	sealed = make([]SnapshotItem, 0, len(nodeSegments))
+	for nodeID, segments := range nodeSegments {
+		sealed = append(sealed, SnapshotItem{
+			NodeID:   nodeID,
+			Segments: segments,
+		})
+	}
+
+	growing = make([]SegmentEntry, 0, len(d.growingSegments))
+	for _, entry := range d.growingSegments {
+		if !matched(entry) {
+			continue
+		}
+		growing = append(growing, d.snapshotEntryForQueryView(entry))
+	}
+	return sealed, growing
+}
+
 func (d *distribution) filterSegments(sealed []SnapshotItem, growing []SegmentEntry, filter func(SegmentEntry, int) bool) ([]SnapshotItem, []SegmentEntry) {
 	growing = lo.Filter(growing, filter)
 	sealed = lo.Map(sealed, func(item SnapshotItem, _ int) SnapshotItem {
@@ -560,6 +595,14 @@ func (d *distribution) filterSegments(sealed []SnapshotItem, growing []SegmentEn
 // PeekAllSegments returns current snapshot without increasing inuse count
 // show only used by GetDataDistribution.
 func (d *distribution) PeekSegments(readable bool, partitions ...int64) (sealed []SnapshotItem, growing []SegmentEntry) {
+	d.mut.RLock()
+	if !readable && d.isPreSyncRecoveryLocked() {
+		sealed, growing = d.peekLiveSegmentsLocked(partitions...)
+		d.mut.RUnlock()
+		return
+	}
+	d.mut.RUnlock()
+
 	current := d.current.Load()
 	sealed, growing = current.Peek(partitions...)
 
@@ -723,6 +766,7 @@ func (d *distribution) AddDistributions(entries ...SegmentEntry) {
 
 	d.mut.Lock()
 	updated := false
+	skipSnapshotUpdate := d.isPreSyncRecoveryLocked()
 	for _, entry := range entries {
 		oldEntry, ok := d.sealedSegments[entry.SegmentID]
 		if ok && oldEntry.Version >= entry.Version {
@@ -753,7 +797,7 @@ func (d *distribution) AddDistributions(entries ...SegmentEntry) {
 	}
 	d.mut.Unlock()
 
-	if updated {
+	if updated && !skipSnapshotUpdate {
 		d.notifySnapshotUpdate()
 	}
 	refundCandidates(toRefund)
@@ -903,6 +947,7 @@ func (d *distribution) RemoveDistributions(sealedSegments []SegmentEntry, growin
 	var toRefund []pkoracle.Candidate
 
 	d.mut.Lock()
+	updated := false
 	for _, sealed := range sealedSegments {
 		entry, ok := d.sealedSegments[sealed.SegmentID]
 		if !ok {
@@ -914,6 +959,7 @@ func (d *distribution) RemoveDistributions(sealedSegments []SegmentEntry, growin
 			}
 			delete(d.sealedSegments, sealed.SegmentID)
 			d.recordSealedSnapshotDeleteLocked(sealed.SegmentID)
+			updated = true
 		}
 	}
 
@@ -924,12 +970,16 @@ func (d *distribution) RemoveDistributions(sealedSegments []SegmentEntry, growin
 		}
 		delete(d.growingSegments, growing.SegmentID)
 		d.recordGrowingSnapshotDeleteLocked(growing.SegmentID)
+		updated = true
 	}
 
 	// Capture current snapshot's cleared channel. The next genSnapshot will
 	// create a new snapshot and expire this one, closing the channel.
 	var signal chan struct{}
-	if current := d.current.Load(); current != nil {
+	if !updated {
+		signal = make(chan struct{})
+		close(signal)
+	} else if current := d.current.Load(); current != nil {
 		signal = current.cleared
 	} else {
 		signal = make(chan struct{})
@@ -944,7 +994,9 @@ func (d *distribution) RemoveDistributions(sealedSegments []SegmentEntry, growin
 		mlog.Int("sealedCandidatesRefunded", len(toRefund)),
 	)
 
-	d.notifySnapshotUpdate()
+	if updated {
+		d.notifySnapshotUpdate()
+	}
 	refundCandidates(toRefund)
 
 	return signal
