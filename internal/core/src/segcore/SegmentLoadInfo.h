@@ -420,7 +420,6 @@ class SegmentLoadInfo {
     SegmentLoadInfo(const SegmentLoadInfo& other)
         : info_(other.info_),
           schema_(other.schema_),
-          converted_index_infos_(other.converted_index_infos_),
           converted_field_index_cache_(other.converted_field_index_cache_),
           field_index_has_raw_data_(other.field_index_has_raw_data_),
           column_groups_(other.column_groups_),
@@ -435,7 +434,6 @@ class SegmentLoadInfo {
     SegmentLoadInfo(SegmentLoadInfo&& other) noexcept
         : info_(std::move(other.info_)),
           schema_(std::move(other.schema_)),
-          converted_index_infos_(std::move(other.converted_index_infos_)),
           converted_field_index_cache_(
               std::move(other.converted_field_index_cache_)),
           field_index_has_raw_data_(std::move(other.field_index_has_raw_data_)),
@@ -456,9 +454,7 @@ class SegmentLoadInfo {
         if (this != &other) {
             info_ = other.info_;
             schema_ = other.schema_;
-            converted_index_infos_ = other.converted_index_infos_;
-            converted_field_index_cache_ =
-                other.converted_field_index_cache_;
+            converted_field_index_cache_ = other.converted_field_index_cache_;
             field_index_has_raw_data_ = other.field_index_has_raw_data_;
             column_groups_ = other.column_groups_;
             fields_filled_with_default_ = other.fields_filled_with_default_;
@@ -476,7 +472,6 @@ class SegmentLoadInfo {
         if (this != &other) {
             info_ = std::move(other.info_);
             schema_ = std::move(other.schema_);
-            converted_index_infos_ = std::move(other.converted_index_infos_);
             converted_field_index_cache_ =
                 std::move(other.converted_field_index_cache_);
             field_index_has_raw_data_ =
@@ -1098,7 +1093,6 @@ class SegmentLoadInfo {
         BuildFieldBinlogCache();
 
         // Convert index infos to LoadIndexInfo and build per-field cache
-        converted_index_infos_.clear();
         converted_field_index_cache_.clear();
         field_index_has_raw_data_.clear();
         for (int i = 0; i < info_.index_infos_size(); i++) {
@@ -1115,7 +1109,6 @@ class SegmentLoadInfo {
             load_index_info.load_resource_request =
                 GetIndexLoadResource(load_index_info);
             load_index_info.has_load_resource_request = true;
-            converted_index_infos_.push_back(load_index_info);
             // Check if index has raw data before moving
             if (CheckIndexHasRawData(load_index_info)) {
                 field_index_has_raw_data_.insert(field_id);
@@ -1152,8 +1145,6 @@ class SegmentLoadInfo {
     ProtoType info_;
 
     SchemaPtr schema_;
-
-    std::vector<LoadIndexInfo> converted_index_infos_;
 
     // Cache for quick field -> converted LoadIndexInfo lookup
     std::unordered_map<FieldId, std::vector<LoadIndexInfo>>
