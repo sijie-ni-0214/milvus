@@ -437,6 +437,21 @@ TEST_F(SchemaTest, ConvertToLoonArrowSchemaFieldNamesAreFieldIds) {
     EXPECT_EQ(loon_schema->field(1)->name(), std::to_string(float_id.get()));
 }
 
+TEST_F(SchemaTest, ConvertToLoonArrowSchemaUsesCache) {
+    schema_->AddDebugField("pk_field", DataType::INT64, false);
+
+    auto first = schema_->ConvertToLoonArrowSchema();
+    auto second = schema_->ConvertToLoonArrowSchema();
+    EXPECT_EQ(first.get(), second.get());
+
+    auto float_id =
+        schema_->AddDebugField("float_field", DataType::FLOAT, false);
+    auto updated = schema_->ConvertToLoonArrowSchema();
+    EXPECT_NE(first.get(), updated.get());
+    ASSERT_EQ(updated->num_fields(), 2);
+    EXPECT_EQ(updated->field(1)->name(), std::to_string(float_id.get()));
+}
+
 TEST_F(SchemaTest, ConvertToLoonArrowSchemaVsConvertToArrowSchema) {
     auto pk_id = schema_->AddDebugField("pk_field", DataType::INT64, false);
     schema_->set_primary_field_id(pk_id);

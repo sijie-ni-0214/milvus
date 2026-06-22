@@ -33,6 +33,69 @@ namespace milvus {
 
 using std::string;
 const std::string namespace_field_name = "$namespace_id";
+
+Schema::Schema(const Schema& other) {
+    std::lock_guard<std::mutex> lock(other.arrow_schema_cache_mutex_);
+    debug_id = other.debug_id;
+    field_ids_ = other.field_ids_;
+    fields_ = other.fields_;
+    name_ids_ = other.name_ids_;
+    id_names_ = other.id_names_;
+    primary_field_id_opt_ = other.primary_field_id_opt_;
+    dynamic_field_id_opt_ = other.dynamic_field_id_opt_;
+    namespace_field_id_opt_ = other.namespace_field_id_opt_;
+    ttl_field_id_opt_ = other.ttl_field_id_opt_;
+    load_fields_ = other.load_fields_;
+    bm25_function_output_fields_ = other.bm25_function_output_fields_;
+    schema_version_ = other.schema_version_;
+    has_mmap_setting_ = other.has_mmap_setting_;
+    mmap_enabled_ = other.mmap_enabled_;
+    mmap_fields_ = other.mmap_fields_;
+    struct_array_field_cache_ = other.struct_array_field_cache_;
+    warmup_vector_index_ = other.warmup_vector_index_;
+    warmup_scalar_index_ = other.warmup_scalar_index_;
+    warmup_scalar_field_ = other.warmup_scalar_field_;
+    warmup_vector_field_ = other.warmup_vector_field_;
+    warmup_fields_ = other.warmup_fields_;
+    external_source_ = other.external_source_;
+    external_spec_ = other.external_spec_;
+}
+
+Schema&
+Schema::operator=(const Schema& other) {
+    if (this == &other) {
+        return *this;
+    }
+
+    std::scoped_lock lock(arrow_schema_cache_mutex_,
+                          other.arrow_schema_cache_mutex_);
+    debug_id = other.debug_id;
+    field_ids_ = other.field_ids_;
+    fields_ = other.fields_;
+    name_ids_ = other.name_ids_;
+    id_names_ = other.id_names_;
+    primary_field_id_opt_ = other.primary_field_id_opt_;
+    dynamic_field_id_opt_ = other.dynamic_field_id_opt_;
+    namespace_field_id_opt_ = other.namespace_field_id_opt_;
+    ttl_field_id_opt_ = other.ttl_field_id_opt_;
+    load_fields_ = other.load_fields_;
+    bm25_function_output_fields_ = other.bm25_function_output_fields_;
+    schema_version_ = other.schema_version_;
+    has_mmap_setting_ = other.has_mmap_setting_;
+    mmap_enabled_ = other.mmap_enabled_;
+    mmap_fields_ = other.mmap_fields_;
+    struct_array_field_cache_ = other.struct_array_field_cache_;
+    warmup_vector_index_ = other.warmup_vector_index_;
+    warmup_scalar_index_ = other.warmup_scalar_index_;
+    warmup_scalar_field_ = other.warmup_scalar_field_;
+    warmup_vector_field_ = other.warmup_vector_field_;
+    warmup_fields_ = other.warmup_fields_;
+    external_source_ = other.external_source_;
+    external_spec_ = other.external_spec_;
+    loon_arrow_schema_cache_.reset();
+    return *this;
+}
+
 std::shared_ptr<Schema>
 Schema::ParseFrom(const milvus::proto::schema::CollectionSchema& schema_proto) {
     auto schema = std::make_shared<Schema>();
@@ -177,6 +240,11 @@ Schema::ConvertToArrowSchema() const {
 
 const ArrowSchemaPtr
 Schema::ConvertToLoonArrowSchema() const {
+    std::lock_guard<std::mutex> lock(arrow_schema_cache_mutex_);
+    if (loon_arrow_schema_cache_ != nullptr) {
+        return loon_arrow_schema_cache_;
+    }
+
     arrow::FieldVector arrow_fields;
     arrow_fields.reserve(field_ids_.size());
     for (const auto& field_id : field_ids_) {
@@ -201,7 +269,8 @@ Schema::ConvertToLoonArrowSchema() const {
                                            meta.is_nullable());
         arrow_fields.push_back(arrow_field);
     }
-    return arrow::schema(arrow_fields);
+    loon_arrow_schema_cache_ = arrow::schema(arrow_fields);
+    return loon_arrow_schema_cache_;
 }
 
 proto::schema::CollectionSchema

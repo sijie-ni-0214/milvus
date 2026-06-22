@@ -21,6 +21,7 @@
 #include <cstdint>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <type_traits>
@@ -63,6 +64,13 @@ GetStructNameForArrayField(const FieldMeta& field_meta) {
 
 class Schema {
  public:
+    Schema() = default;
+
+    Schema(const Schema& other);
+
+    Schema&
+    operator=(const Schema& other);
+
     FieldId
     AddDebugField(const std::string& name,
                   DataType data_type,
@@ -468,6 +476,10 @@ class Schema {
 
     void
     AddField(FieldMeta&& field_meta) {
+        {
+            std::lock_guard<std::mutex> lock(arrow_schema_cache_mutex_);
+            loon_arrow_schema_cache_.reset();
+        }
         auto field_name = field_meta.get_name();
         auto field_id = field_meta.get_id();
         AssertInfo(!name_ids_.count(field_name), "duplicated field name");
@@ -601,6 +613,9 @@ class Schema {
         external_source_;  // External data source identifier (e.g., S3 path, table name)
     std::string
         external_spec_;  // External data source specification (JSON format)
+
+    mutable std::mutex arrow_schema_cache_mutex_;
+    mutable ArrowSchemaPtr loon_arrow_schema_cache_;
 };
 
 using SchemaPtr = std::shared_ptr<Schema>;
