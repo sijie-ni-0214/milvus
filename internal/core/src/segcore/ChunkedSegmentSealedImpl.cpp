@@ -6000,6 +6000,8 @@ void
 ChunkedSegmentSealedImpl::LoadGeometryCache(
     FieldId field_id, const std::shared_ptr<ChunkedColumnInterface>& column) {
     try {
+        EnsureGeosContext();
+
         // Get geometry cache for this segment+field
         auto& geometry_cache =
             milvus::exec::SimpleGeometryCacheManager::Instance()
