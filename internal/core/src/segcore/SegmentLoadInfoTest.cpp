@@ -242,7 +242,20 @@ TEST_F(SegmentLoadInfoTest, IndexInfo) {
 }
 
 TEST_F(SegmentLoadInfoTest, CompactRuntimeInfoForManifest) {
-    SegmentLoadInfo info(proto_, schema_);
+    auto proto = proto_;
+    for (int i = 0; i < 16; ++i) {
+        proto.add_index_infos()->CopyFrom(proto.index_infos(0));
+        proto.add_binlog_paths()->CopyFrom(proto.binlog_paths(0));
+        proto.add_statslogs()->CopyFrom(proto.statslogs(0));
+        proto.add_deltalogs()->CopyFrom(proto.deltalogs(0));
+        proto.add_bm25logs()->CopyFrom(proto.bm25logs(0));
+    }
+    SegmentLoadInfo info(proto, schema_);
+    auto index_capacity = info.GetProto().index_infos().Capacity();
+    auto binlog_capacity = info.GetProto().binlog_paths().Capacity();
+    auto stats_capacity = info.GetProto().statslogs().Capacity();
+    auto delta_capacity = info.GetProto().deltalogs().Capacity();
+    auto bm25_capacity = info.GetProto().bm25logs().Capacity();
 
     info.CompactRuntimeInfoForManifest();
 
@@ -256,6 +269,16 @@ TEST_F(SegmentLoadInfoTest, CompactRuntimeInfoForManifest) {
     EXPECT_EQ(info.GetStatslogCount(), 0);
     EXPECT_EQ(info.GetDeltalogCount(), 0);
     EXPECT_EQ(info.GetBm25logCount(), 0);
+    EXPECT_LT(info.GetProto().index_infos().Capacity(), index_capacity);
+    EXPECT_LT(info.GetProto().binlog_paths().Capacity(), binlog_capacity);
+    EXPECT_LT(info.GetProto().statslogs().Capacity(), stats_capacity);
+    EXPECT_LT(info.GetProto().deltalogs().Capacity(), delta_capacity);
+    EXPECT_LT(info.GetProto().bm25logs().Capacity(), bm25_capacity);
+    EXPECT_LE(info.GetProto().index_infos().Capacity(), 1);
+    EXPECT_LE(info.GetProto().binlog_paths().Capacity(), 1);
+    EXPECT_LE(info.GetProto().statslogs().Capacity(), 1);
+    EXPECT_LE(info.GetProto().deltalogs().Capacity(), 1);
+    EXPECT_LE(info.GetProto().bm25logs().Capacity(), 1);
     EXPECT_TRUE(info.HasTextStatsLog(101));
     EXPECT_TRUE(info.HasJsonKeyStatsLog(102));
     EXPECT_EQ(info.GetManifestPath(), "/path/to/manifest");

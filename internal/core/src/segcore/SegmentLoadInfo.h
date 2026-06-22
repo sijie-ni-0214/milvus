@@ -1033,12 +1033,26 @@ class SegmentLoadInfo {
             return;
         }
 
-        ProtoType compact(info_);
-        compact.clear_index_infos();
-        compact.clear_binlog_paths();
-        compact.clear_statslogs();
-        compact.clear_deltalogs();
-        compact.clear_bm25logs();
+        ProtoType compact;
+        compact.set_segmentid(info_.segmentid());
+        compact.set_partitionid(info_.partitionid());
+        compact.set_collectionid(info_.collectionid());
+        compact.set_dbid(info_.dbid());
+        compact.set_flush_time(info_.flush_time());
+        compact.set_num_of_rows(info_.num_of_rows());
+        *compact.mutable_compactionfrom() = info_.compactionfrom();
+        compact.set_segment_size(info_.segment_size());
+        compact.set_insert_channel(info_.insert_channel());
+        compact.set_readableversion(info_.readableversion());
+        compact.set_storageversion(info_.storageversion());
+        compact.set_is_sorted(info_.is_sorted());
+        *compact.mutable_textstatslogs() = info_.textstatslogs();
+        *compact.mutable_jsonkeystatslogs() = info_.jsonkeystatslogs();
+        compact.set_priority(info_.priority());
+        compact.set_manifest_path(info_.manifest_path());
+        compact.set_use_take_for_output(info_.use_take_for_output());
+        compact.set_estimated_bytes_per_row(info_.estimated_bytes_per_row());
+        compact.set_commit_timestamp(info_.commit_timestamp());
         info_.Swap(&compact);
         BuildFieldBinlogCache();
         decltype(converted_field_index_cache_)().swap(
