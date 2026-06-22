@@ -27,6 +27,7 @@ import (
 
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/mock"
+	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
 	"go.uber.org/atomic"
 
@@ -811,6 +812,30 @@ func (suite *IDFOracleSuite) TestLoadSealedFailureCleanup() {
 	segDir := path.Join(suite.idfOracle.dirPath, "1")
 	_, statErr := os.Stat(segDir)
 	suite.True(os.IsNotExist(statErr))
+}
+
+func TestSealedBm25Source(t *testing.T) {
+	loadInfo := &querypb.SegmentLoadInfo{
+		ManifestPath: "manifest/path",
+		Bm25Logs: []*datapb.FieldBinlog{{
+			FieldID: 102,
+			Binlogs: []*datapb.Binlog{{
+				LogPath: "bm25stats/seg_1/field_102/0",
+			}},
+		}},
+	}
+
+	source := newSealedBm25Source(loadInfo)
+	require.Equal(t, "manifest/path", source.manifestPath)
+	require.Empty(t, source.bm25Logs)
+
+	loadInfo.ManifestPath = ""
+	source = newSealedBm25Source(loadInfo)
+	loadInfo.Bm25Logs[0].Binlogs[0].LogPath = "changed"
+
+	paths, err := source.BM25StatsPaths()
+	require.NoError(t, err)
+	require.Equal(t, []string{"bm25stats/seg_1/field_102/0"}, paths[102])
 }
 
 func TestIDFOracle(t *testing.T) {

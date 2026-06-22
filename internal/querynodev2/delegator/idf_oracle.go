@@ -146,9 +146,38 @@ type sealedBm25Stats struct {
 	localReady      bool
 	cm              storage.ChunkManager
 	fieldList       []int64 // bm25 field list
-	loadInfo        *querypb.SegmentLoadInfo
+	source          sealedBm25Source
 	diskSize        int64 // total disk size of local files
 	diskSizeTracker *atomic.Int64
+}
+
+type sealedBm25Source struct {
+	manifestPath string
+	bm25Logs     []*datapb.FieldBinlog
+}
+
+func newSealedBm25Source(loadInfo *querypb.SegmentLoadInfo) sealedBm25Source {
+	source := sealedBm25Source{
+		manifestPath: loadInfo.GetManifestPath(),
+	}
+	if source.manifestPath == "" && len(loadInfo.GetBm25Logs()) > 0 {
+		source.bm25Logs = make([]*datapb.FieldBinlog, 0, len(loadInfo.GetBm25Logs()))
+		for _, log := range loadInfo.GetBm25Logs() {
+			source.bm25Logs = append(source.bm25Logs, typeutil.Clone(log))
+		}
+	}
+	return source
+}
+
+func (s sealedBm25Source) hasSource() bool {
+	return s.manifestPath != "" || len(s.bm25Logs) > 0
+}
+
+func (s sealedBm25Source) BM25StatsPaths() (map[int64][]string, error) {
+	if s.manifestPath != "" {
+		return packed.NewStatsResolver(s.manifestPath, packed.CreateStorageConfig()).BM25StatsPaths()
+	}
+	return packed.NewStatsResolver("", nil).WithBM25Logs(s.bm25Logs).BM25StatsPaths()
 }
 
 func (s *sealedBm25Stats) Remove() {
@@ -193,11 +222,11 @@ func (s *sealedBm25Stats) FetchStats(ctxs ...context.Context) (map[int64]*storag
 }
 
 func (s *sealedBm25Stats) resolveRemotePathsLocked() error {
-	if s.pathsResolved || s.loadInfo == nil {
+	if s.pathsResolved || !s.source.hasSource() {
 		return nil
 	}
 
-	logpaths, err := packed.NewStatsResolverFromLoadInfo(s.loadInfo).BM25StatsPaths()
+	logpaths, err := s.source.BM25StatsPaths()
 	if err != nil {
 		return err
 	}
@@ -441,7 +470,7 @@ func (o *idfOracle) LoadSealed(ctx context.Context, segmentID int64, loadInfo *q
 				localDir:        partitionLocalDir(o.dirPath, segmentID, remoteFetchOnly),
 				remoteFetchOnly: remoteFetchOnly,
 				cm:              cm,
-				loadInfo:        typeutil.Clone(loadInfo),
+				source:          newSealedBm25Source(loadInfo),
 				diskSizeTracker: o.sealedDiskSize,
 			}
 			o.sealed.Insert(segmentID, segStats)
