@@ -64,7 +64,7 @@ static std::atomic<uint64_t> g_mmap_path_generation{0};
 GroupChunkTranslator::GroupChunkTranslator(
     int64_t segment_id,
     GroupChunkType group_chunk_type,
-    const std::unordered_map<FieldId, FieldMeta>& field_metas,
+    std::shared_ptr<const std::unordered_map<FieldId, FieldMeta>> field_metas,
     FieldDataInfo column_group_info,
     std::vector<std::string> insert_files,
     std::vector<milvus_storage::RowGroupMetadataVector>&& row_group_meta_list,
@@ -91,7 +91,7 @@ GroupChunkTranslator::GroupChunkTranslator(
                                      column_group_info.field_id);
           }
       }()),
-      field_metas_(field_metas),
+      field_metas_(std::move(field_metas)),
       column_group_info_(column_group_info),
       insert_files_(std::move(insert_files)),
       row_group_meta_list_(std::move(row_group_meta_list)),
@@ -105,7 +105,7 @@ GroupChunkTranslator::GroupChunkTranslator(
             milvus::segcore::getCellDataType(
                 /* is_vector */
                 [&]() {
-                    for (const auto& [fid, field_meta] : field_metas_) {
+                    for (const auto& [fid, field_meta] : *field_metas_) {
                         if (IsVectorDataType(field_meta.get_data_type())) {
                             return true;
                         }
@@ -118,7 +118,7 @@ GroupChunkTranslator::GroupChunkTranslator(
                 warmup_policy,
                 /* is_vector */
                 [&]() {
-                    for (const auto& [fid, field_meta] : field_metas_) {
+                    for (const auto& [fid, field_meta] : *field_metas_) {
                         if (IsVectorDataType(field_meta.get_data_type())) {
                             return true;
                         }
@@ -464,9 +464,9 @@ GroupChunkTranslator::load_group_chunk(
             // ignore row id field
             continue;
         }
-        auto it = field_metas_.find(fid);
+        auto it = field_metas_->find(fid);
         AssertInfo(
-            it != field_metas_.end(),
+            it != field_metas_->end(),
             "[StorageV2] translator {} field id {} not found in field_metas",
             key_,
             fid.get());

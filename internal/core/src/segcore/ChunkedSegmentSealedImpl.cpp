@@ -196,7 +196,7 @@ struct LazyManifestColumnGroupContext {
     std::shared_ptr<std::vector<std::string>> needed_columns;
     std::function<std::shared_ptr<milvus_storage::api::ChunkReader>()>
         chunk_reader_factory;
-    std::unordered_map<FieldId, FieldMeta> field_metas;
+    std::shared_ptr<const std::unordered_map<FieldId, FieldMeta>> field_metas;
     bool use_mmap;
     bool mmap_populate;
     std::string mmap_dir_path;
@@ -2063,14 +2063,16 @@ ChunkedSegmentSealedImpl::load_column_group_data_internal(
             num_rows,
             mmap_dir_path);
 
-        auto field_metas = schema_->get_field_metas(milvus_field_ids);
+        auto field_metas =
+            std::make_shared<const std::unordered_map<FieldId, FieldMeta>>(
+                schema_->get_field_metas(milvus_field_ids));
 
         std::vector<FieldId> fields_for_stats;
         if (ENABLE_PARQUET_STATS_SKIP_INDEX) {
             fields_for_stats = milvus_field_ids;
         } else {
             for (auto field_id : milvus_field_ids) {
-                const auto& fm = field_metas.at(field_id);
+                const auto& fm = field_metas->at(field_id);
                 if (fm.is_nullable() && IsVectorDataType(fm.get_data_type())) {
                     fields_for_stats.push_back(field_id);
                 }
@@ -2102,7 +2104,7 @@ ChunkedSegmentSealedImpl::load_column_group_data_internal(
 
         // Create ProxyChunkColumn for each field in this column group
         for (const auto& field_id : milvus_field_ids) {
-            const auto& field_meta = field_metas.at(field_id);
+            const auto& field_meta = field_metas->at(field_id);
             auto column = std::make_shared<ProxyChunkColumn>(
                 chunked_column_group, field_id, field_meta);
             auto data_type = field_meta.get_data_type();
@@ -6317,7 +6319,9 @@ ChunkedSegmentSealedImpl::LoadColumnGroup(
                    field_id.get());
     }
 
-    auto field_metas = schema_->get_field_metas(milvus_field_ids);
+    auto field_metas =
+        std::make_shared<const std::unordered_map<FieldId, FieldMeta>>(
+            schema_->get_field_metas(milvus_field_ids));
 
     // assumption: vector field occupies whole column group
     bool is_vector = false;
@@ -6325,7 +6329,7 @@ ChunkedSegmentSealedImpl::LoadColumnGroup(
     bool mmap_enabled = false;
     bool has_warmup_setting = false;
     std::string aggregated_warmup_policy = "disable";
-    for (auto& [field_id, field_meta] : field_metas) {
+    for (const auto& [field_id, field_meta] : *field_metas) {
         if (IsVectorDataType(field_meta.get_data_type())) {
             is_vector = true;
         }
@@ -6399,7 +6403,7 @@ ChunkedSegmentSealedImpl::LoadColumnGroup(
         segcore_config_.get_lazy_manifest_reader_enabled() &&
         effective_warmup_policy ==
             CacheWarmupPolicy::CacheWarmupPolicy_Disable &&
-        CanUseLazyManifestColumnGroup(field_metas, allow_match_field_lazy);
+        CanUseLazyManifestColumnGroup(*field_metas, allow_match_field_lazy);
 
     // Multiple warmup-disabled entries can share the same column-group index
     // (one per field), so the translator cache key must be disambiguated by
@@ -6450,7 +6454,7 @@ ChunkedSegmentSealedImpl::LoadColumnGroup(
             std::make_shared<LazyManifestColumnGroup>(std::move(context));
 
         for (const auto& field_id : milvus_field_ids) {
-            const auto& field_meta = field_metas.at(field_id);
+            const auto& field_meta = field_metas->at(field_id);
             auto column = std::make_shared<LazyManifestProxyColumn>(
                 lazy_column_group,
                 field_id,
@@ -6495,7 +6499,7 @@ ChunkedSegmentSealedImpl::LoadColumnGroup(
         bool has_pk = false;
         auto primary_field_id = schema_->get_primary_field_id();
         for (const auto& field_id : milvus_field_ids) {
-            const auto& field_meta = field_metas.at(field_id);
+            const auto& field_meta = field_metas->at(field_id);
             has_vector =
                 has_vector || IsVectorDataType(field_meta.get_data_type());
             has_varchar =
@@ -6552,7 +6556,7 @@ ChunkedSegmentSealedImpl::LoadColumnGroup(
     // Create ProxyChunkColumn for each field
     stage_start = std::chrono::steady_clock::now();
     for (const auto& field_id : milvus_field_ids) {
-        const auto& field_meta = field_metas.at(field_id);
+        const auto& field_meta = field_metas->at(field_id);
         auto column = std::make_shared<ProxyChunkColumn>(
             chunked_column_group, field_id, field_meta);
         auto data_type = field_meta.get_data_type();
@@ -6592,7 +6596,7 @@ ChunkedSegmentSealedImpl::LoadColumnGroup(
     bool has_pk = false;
     auto primary_field_id = schema_->get_primary_field_id();
     for (const auto& field_id : milvus_field_ids) {
-        const auto& field_meta = field_metas.at(field_id);
+        const auto& field_meta = field_metas->at(field_id);
         has_vector = has_vector || IsVectorDataType(field_meta.get_data_type());
         has_varchar =
             has_varchar || field_meta.get_data_type() == DataType::VARCHAR;

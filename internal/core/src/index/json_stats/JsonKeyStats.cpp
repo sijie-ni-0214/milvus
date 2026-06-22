@@ -1066,11 +1066,14 @@ JsonKeyStats::LoadColumnGroup(int64_t column_group_id,
     auto group_chunk_metadata = milvus::segcore::LoadGroupChunkMetadata(
         files, {}, fmt::format("seg_{}_jks_{}", segment_id_, field_id_));
 
+    auto shared_field_meta_map =
+        std::make_shared<const std::unordered_map<FieldId, FieldMeta>>(
+            std::move(field_meta_map));
     auto translator = std::make_unique<
         milvus::segcore::storagev2translator::GroupChunkTranslator>(
         segment_id_,
         GroupChunkType::JSON_KEY_STATS,
-        field_meta_map,
+        shared_field_meta_map,
         column_group_info,
         std::move(files),
         std::move(group_chunk_metadata.row_group_meta_list),

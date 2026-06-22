@@ -63,7 +63,7 @@ ManifestGroupTranslator::ManifestGroupTranslator(
     GroupChunkType group_chunk_type,
     int64_t column_group_index,
     std::shared_ptr<milvus_storage::api::ChunkReader> chunk_reader,
-    const std::unordered_map<FieldId, FieldMeta>& field_metas,
+    std::shared_ptr<const std::unordered_map<FieldId, FieldMeta>> field_metas,
     bool use_mmap,
     bool mmap_populate,
     const std::string& mmap_dir_path,
@@ -83,7 +83,7 @@ ManifestGroupTranslator::ManifestGroupTranslator(
                              segment_id,
                              column_group_index,
                              cache_key_suffix)),
-      field_metas_(field_metas),
+      field_metas_(std::move(field_metas)),
       mmap_dir_path_(mmap_dir_path),
       meta_(num_fields,
             use_mmap ? milvus::cachinglayer::StorageType::DISK
@@ -92,7 +92,7 @@ ManifestGroupTranslator::ManifestGroupTranslator(
             milvus::segcore::getCellDataType(
                 /* is_vector */
                 [&]() {
-                    for (const auto& [fid, field_meta] : field_metas_) {
+                    for (const auto& [fid, field_meta] : *field_metas_) {
                         if (IsVectorDataType(field_meta.get_data_type())) {
                             return true;
                         }
@@ -105,7 +105,7 @@ ManifestGroupTranslator::ManifestGroupTranslator(
                 warmup_policy,
                 /* is_vector */
                 [&]() {
-                    for (const auto& [fid, field_meta] : field_metas_) {
+                    for (const auto& [fid, field_meta] : *field_metas_) {
                         if (IsVectorDataType(field_meta.get_data_type())) {
                             return true;
                         }
@@ -406,7 +406,7 @@ ManifestGroupTranslator::load_group_chunk(
             field_id = std::stoll(column_name);
         } catch (const std::exception&) {
             // External collection fallback: resolve by column name
-            for (const auto& [fid, meta] : field_metas_) {
+            for (const auto& [fid, meta] : *field_metas_) {
                 if (meta.is_external_field() &&
                     meta.get_external_field() == column_name) {
                     field_id = fid.get();
@@ -427,9 +427,9 @@ ManifestGroupTranslator::load_group_chunk(
             // ignore row id field
             continue;
         }
-        auto it = field_metas_.find(fid);
+        auto it = field_metas_->find(fid);
         AssertInfo(
-            it != field_metas_.end(),
+            it != field_metas_->end(),
             "[StorageV2] translator {} field id {} not found in field_metas",
             key_,
             fid.get());
