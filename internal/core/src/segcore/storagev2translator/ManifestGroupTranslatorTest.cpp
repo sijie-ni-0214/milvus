@@ -66,9 +66,14 @@ class ManifestGroupTranslatorTest : public ::testing::TestWithParam<bool> {
     MakeTranslator(int64_t cg_index, bool use_mmap) {
         auto chunk_reader = test_data_->CreateChunkReader(cg_index);
         auto field_metas = test_data_->GetFieldMetas(cg_index);
-        auto shared_field_metas =
-            std::make_shared<const std::unordered_map<FieldId, FieldMeta>>(
-                std::move(field_metas));
+        auto mutable_field_metas =
+            std::make_shared<std::unordered_map<FieldId, const FieldMeta*>>();
+        mutable_field_metas->reserve(field_metas.size());
+        for (const auto& pair : field_metas) {
+            mutable_field_metas->emplace(pair.first, &(*schema_)[pair.first]);
+        }
+        std::shared_ptr<const std::unordered_map<FieldId, const FieldMeta*>>
+            shared_field_metas = std::move(mutable_field_metas);
         return std::make_unique<ManifestGroupTranslator>(
             segment_id_,
             GroupChunkType::DEFAULT,

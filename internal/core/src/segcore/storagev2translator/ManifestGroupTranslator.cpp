@@ -63,7 +63,8 @@ ManifestGroupTranslator::ManifestGroupTranslator(
     GroupChunkType group_chunk_type,
     int64_t column_group_index,
     std::shared_ptr<milvus_storage::api::ChunkReader> chunk_reader,
-    std::shared_ptr<const std::unordered_map<FieldId, FieldMeta>> field_metas,
+    std::shared_ptr<const std::unordered_map<FieldId, const FieldMeta*>>
+        field_metas,
     bool use_mmap,
     bool mmap_populate,
     const std::string& mmap_dir_path,
@@ -93,7 +94,7 @@ ManifestGroupTranslator::ManifestGroupTranslator(
                 /* is_vector */
                 [&]() {
                     for (const auto& [fid, field_meta] : *field_metas_) {
-                        if (IsVectorDataType(field_meta.get_data_type())) {
+                        if (IsVectorDataType(field_meta->get_data_type())) {
                             return true;
                         }
                     }
@@ -106,7 +107,7 @@ ManifestGroupTranslator::ManifestGroupTranslator(
                 /* is_vector */
                 [&]() {
                     for (const auto& [fid, field_meta] : *field_metas_) {
-                        if (IsVectorDataType(field_meta.get_data_type())) {
+                        if (IsVectorDataType(field_meta->get_data_type())) {
                             return true;
                         }
                     }
@@ -407,8 +408,8 @@ ManifestGroupTranslator::load_group_chunk(
         } catch (const std::exception&) {
             // External collection fallback: resolve by column name
             for (const auto& [fid, meta] : *field_metas_) {
-                if (meta.is_external_field() &&
-                    meta.get_external_field() == column_name) {
+                if (meta->is_external_field() &&
+                    meta->get_external_field() == column_name) {
                     field_id = fid.get();
                     break;
                 }
@@ -433,7 +434,7 @@ ManifestGroupTranslator::load_group_chunk(
             "[StorageV2] translator {} field id {} not found in field_metas",
             key_,
             fid.get());
-        const auto& field_meta = it->second;
+        const auto& field_meta = *it->second;
 
         // Merge arrays from all tables for this field
         // All tables in a cell come from the same column group with consistent schema

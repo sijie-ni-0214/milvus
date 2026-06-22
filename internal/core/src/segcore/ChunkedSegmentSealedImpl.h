@@ -1204,7 +1204,7 @@ class ChunkedSegmentSealedImpl : public SegmentSealed {
 
     bool
     CanUseLazyManifestColumnGroup(
-        const std::unordered_map<FieldId, FieldMeta>& field_metas,
+        const std::unordered_map<FieldId, const FieldMeta*>& field_metas,
         bool allow_match_field_lazy = false) const;
 
     void
