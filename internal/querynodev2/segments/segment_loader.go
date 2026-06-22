@@ -78,6 +78,25 @@ var errRetryTimerNotified = errors.New("retry timer notified")
 
 const requestResourceTimingLogInterval = 5 * time.Second
 
+type bloomFilterStatsSource struct {
+	manifestPath string
+	statslogs    []*datapb.FieldBinlog
+}
+
+func newBloomFilterStatsSource(loadInfo *querypb.SegmentLoadInfo) bloomFilterStatsSource {
+	if loadInfo.GetManifestPath() != "" {
+		return bloomFilterStatsSource{manifestPath: loadInfo.GetManifestPath()}
+	}
+	return bloomFilterStatsSource{statslogs: loadInfo.GetStatslogs()}
+}
+
+func (s bloomFilterStatsSource) BloomFilterPaths(pkFieldID int64) ([]string, error) {
+	if s.manifestPath != "" {
+		return packed.NewStatsResolver(s.manifestPath, packed.CreateStorageConfig()).BloomFilterPaths(pkFieldID)
+	}
+	return packed.NewStatsResolver("", nil).WithStatslogs(s.statslogs).BloomFilterPaths(pkFieldID)
+}
+
 var (
 	requestResourceTiming         = newRequestResourceTimingStats()
 	estimateSegmentResourceTiming = newEstimateSegmentResourceTimingStats()
@@ -1506,12 +1525,13 @@ func (loader *segmentLoader) loadSingleBloomFilterSet(ctx context.Context, colle
 
 	lazyCtx := context.WithoutCancel(ctx)
 	pkFieldID := pkField.GetFieldID()
+	statsSource := newBloomFilterStatsSource(loadInfo)
 	return pkoracle.NewLazyBloomFilterSet(segmentID, partitionID, segtype, func(bfs *pkoracle.BloomFilterSet) error {
 		start := time.Now()
 		log.Debug("lazy loading bloom filter for remote segment")
 
 		stageStart := time.Now()
-		pkStatsBinlogs, err := packed.NewStatsResolverFromLoadInfo(loadInfo).BloomFilterPaths(pkFieldID)
+		pkStatsBinlogs, err := statsSource.BloomFilterPaths(pkFieldID)
 		resolveDur := time.Since(stageStart)
 		if err != nil {
 			return err
@@ -1604,10 +1624,11 @@ func (loader *segmentLoader) LoadBloomFilterSet(ctx context.Context, collectionI
 		info := info
 		segmentID := info.GetSegmentID()
 		partitionID := info.GetPartitionID()
+		statsSource := newBloomFilterStatsSource(info)
 		bfSets[i] = pkoracle.NewLazyBloomFilterSet(segmentID, partitionID, commonpb.SegmentState_Sealed, func(bfs *pkoracle.BloomFilterSet) error {
 			start := time.Now()
 			stageStart := time.Now()
-			pkStatsBinlogs, err := packed.NewStatsResolverFromLoadInfo(info).BloomFilterPaths(pkFieldID)
+			pkStatsBinlogs, err := statsSource.BloomFilterPaths(pkFieldID)
 			resolveDur := time.Since(stageStart)
 			if err != nil {
 				return err
