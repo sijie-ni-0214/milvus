@@ -187,8 +187,8 @@ class ProxyChunkColumn : public ChunkedColumnInterface {
                               const FieldMeta& field_meta)
         : group_(group),
           field_id_(field_id),
-          field_meta_(field_meta),
-          data_type_(field_meta.get_data_type()) {
+          data_type_(field_meta.get_data_type()),
+          nullable_(field_meta.is_nullable()) {
     }
 
     ~ProxyChunkColumn() override {
@@ -234,7 +234,7 @@ class ProxyChunkColumn : public ChunkedColumnInterface {
                 std::function<void(bool, size_t)> fn,
                 const int64_t* offsets = nullptr,
                 int64_t count = 0) const override {
-        if (!field_meta_.is_nullable()) {
+        if (!nullable_) {
             if (offsets == nullptr) {
                 for (int64_t i = 0; i < group_->NumRows(); i++) {
                     fn(true, i);
@@ -261,7 +261,7 @@ class ProxyChunkColumn : public ChunkedColumnInterface {
 
     bool
     IsNullable() const override {
-        return field_meta_.is_nullable();
+        return nullable_;
     }
 
     size_t
@@ -446,9 +446,8 @@ class ProxyChunkColumn : public ChunkedColumnInterface {
                 const int64_t* offsets,
                 int64_t count) override {
         auto [cids, offsets_in_chunk] =
-            field_meta_.is_nullable()
-                ? ToChunkIdAndOffsetByPhysical(offsets, count)
-                : ToChunkIdAndOffset(offsets, count);
+            nullable_ ? ToChunkIdAndOffsetByPhysical(offsets, count)
+                      : ToChunkIdAndOffset(offsets, count);
         auto ca = group_->GetGroupChunks(op_ctx, cids);
         for (int64_t i = 0; i < count; i++) {
             auto* group_chunk = ca->get_cell_of(cids[i]);
@@ -550,9 +549,8 @@ class ProxyChunkColumn : public ChunkedColumnInterface {
                       int64_t element_sizeof,
                       int64_t count) override {
         auto [cids, offsets_in_chunk] =
-            field_meta_.is_nullable()
-                ? ToChunkIdAndOffsetByPhysical(offsets, count)
-                : ToChunkIdAndOffset(offsets, count);
+            nullable_ ? ToChunkIdAndOffsetByPhysical(offsets, count)
+                      : ToChunkIdAndOffset(offsets, count);
         auto ca = group_->GetGroupChunks(op_ctx, cids);
         auto dst_vec = reinterpret_cast<char*>(dst);
         for (int64_t i = 0; i < count; i++) {
@@ -696,9 +694,8 @@ class ProxyChunkColumn : public ChunkedColumnInterface {
                       "ChunkedVectorArrayColumn");
         }
         auto [cids, offsets_in_chunk] =
-            field_meta_.is_nullable()
-                ? ToChunkIdAndOffsetByPhysical(offsets, count)
-                : ToChunkIdAndOffset(offsets, count);
+            nullable_ ? ToChunkIdAndOffsetByPhysical(offsets, count)
+                      : ToChunkIdAndOffset(offsets, count);
         auto ca = group_->GetGroupChunks(op_ctx, cids);
         for (int64_t i = 0; i < count; i++) {
             auto* group_chunk = ca->get_cell_of(cids[i]);
@@ -713,8 +710,8 @@ class ProxyChunkColumn : public ChunkedColumnInterface {
  private:
     std::shared_ptr<ChunkedColumnGroup> group_;
     FieldId field_id_;
-    const FieldMeta field_meta_;
     DataType data_type_;
+    bool nullable_;
 };
 
 }  // namespace milvus
