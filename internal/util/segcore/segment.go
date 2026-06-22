@@ -15,19 +15,15 @@ import "C"
 import (
 	"context"
 	"fmt"
-	"os"
 	"runtime"
 	"strings"
-	"time"
 	"unsafe"
 
 	"github.com/cockroachdb/errors"
-	"go.uber.org/atomic"
 	"go.uber.org/zap"
 	"google.golang.org/protobuf/proto"
 
 	"github.com/milvus-io/milvus-proto/go-api/v3/commonpb"
-	"github.com/milvus-io/milvus-proto/go-api/v3/schemapb"
 	"github.com/milvus-io/milvus/internal/storage"
 	"github.com/milvus-io/milvus/internal/storagev2/packed"
 	"github.com/milvus-io/milvus/internal/util/cgo"
@@ -39,274 +35,17 @@ import (
 	"github.com/milvus-io/milvus/pkg/v3/util/metautil"
 	"github.com/milvus-io/milvus/pkg/v3/util/paramtable"
 	"github.com/milvus-io/milvus/pkg/v3/util/tsoutil"
-	"github.com/milvus-io/milvus/pkg/v3/util/typeutil"
 )
 
 const (
 	SegmentTypeGrowing SegmentType = commonpb.SegmentState_Growing
 	SegmentTypeSealed  SegmentType = commonpb.SegmentState_Sealed
-
-	createCSegmentTimingLogInterval = 5 * time.Second
 )
 
 type (
 	SegmentType       = commonpb.SegmentState
 	CSegmentInterface C.CSegmentInterface
 )
-
-var createCSegmentTiming = newCreateCSegmentTimingStats()
-
-type segmentLoadInfoConversionTiming struct {
-	binlogFieldCount   int
-	statslogFieldCount int
-	deltalogFieldCount int
-	indexInfoCount     int
-	textStatsCount     int
-	bm25FieldCount     int
-	jsonStatsCount     int
-
-	resolveStatsDur time.Duration
-	binlogsDur      time.Duration
-	statslogsDur    time.Duration
-	deltalogsDur    time.Duration
-	indexInfosDur   time.Duration
-	textStatsDur    time.Duration
-	bm25Dur         time.Duration
-	jsonStatsDur    time.Duration
-	totalDur        time.Duration
-}
-
-type createCSegmentTimingStats struct {
-	count          *atomic.Int64
-	loadInfoCount  *atomic.Int64
-	storageV2Count *atomic.Int64
-	storageV3Count *atomic.Int64
-	storageOther   *atomic.Int64
-
-	totalBinlogField   *atomic.Int64
-	totalStatslogField *atomic.Int64
-	totalDeltalogField *atomic.Int64
-	totalIndexInfo     *atomic.Int64
-	totalTextStats     *atomic.Int64
-	totalBM25Field     *atomic.Int64
-	totalJSONStats     *atomic.Int64
-	totalBlobBytes     *atomic.Int64
-
-	totalResolveStats *atomic.Int64
-	totalBinlogs      *atomic.Int64
-	totalStatslogs    *atomic.Int64
-	totalDeltalogs    *atomic.Int64
-	totalIndexInfos   *atomic.Int64
-	totalTextStatsDur *atomic.Int64
-	totalBM25         *atomic.Int64
-	totalJSONStatsDur *atomic.Int64
-	totalConvertOther *atomic.Int64
-	totalConvert      *atomic.Int64
-	totalMarshal      *atomic.Int64
-	totalCNew         *atomic.Int64
-	totalCommit       *atomic.Int64
-	totalCreate       *atomic.Int64
-
-	maxConvert *atomic.Int64
-	maxMarshal *atomic.Int64
-	maxCNew    *atomic.Int64
-	maxCreate  *atomic.Int64
-
-	lastLogUnixNano *atomic.Int64
-}
-
-func newCreateCSegmentTimingStats() *createCSegmentTimingStats {
-	return &createCSegmentTimingStats{
-		count:          atomic.NewInt64(0),
-		loadInfoCount:  atomic.NewInt64(0),
-		storageV2Count: atomic.NewInt64(0),
-		storageV3Count: atomic.NewInt64(0),
-		storageOther:   atomic.NewInt64(0),
-
-		totalBinlogField:   atomic.NewInt64(0),
-		totalStatslogField: atomic.NewInt64(0),
-		totalDeltalogField: atomic.NewInt64(0),
-		totalIndexInfo:     atomic.NewInt64(0),
-		totalTextStats:     atomic.NewInt64(0),
-		totalBM25Field:     atomic.NewInt64(0),
-		totalJSONStats:     atomic.NewInt64(0),
-		totalBlobBytes:     atomic.NewInt64(0),
-
-		totalResolveStats: atomic.NewInt64(0),
-		totalBinlogs:      atomic.NewInt64(0),
-		totalStatslogs:    atomic.NewInt64(0),
-		totalDeltalogs:    atomic.NewInt64(0),
-		totalIndexInfos:   atomic.NewInt64(0),
-		totalTextStatsDur: atomic.NewInt64(0),
-		totalBM25:         atomic.NewInt64(0),
-		totalJSONStatsDur: atomic.NewInt64(0),
-		totalConvertOther: atomic.NewInt64(0),
-		totalConvert:      atomic.NewInt64(0),
-		totalMarshal:      atomic.NewInt64(0),
-		totalCNew:         atomic.NewInt64(0),
-		totalCommit:       atomic.NewInt64(0),
-		totalCreate:       atomic.NewInt64(0),
-
-		maxConvert: atomic.NewInt64(0),
-		maxMarshal: atomic.NewInt64(0),
-		maxCNew:    atomic.NewInt64(0),
-		maxCreate:  atomic.NewInt64(0),
-
-		lastLogUnixNano: atomic.NewInt64(time.Now().UnixNano()),
-	}
-}
-
-func updateCreateCSegmentMaxDuration(max *atomic.Int64, value time.Duration) {
-	for {
-		old := max.Load()
-		if int64(value) <= old {
-			return
-		}
-		if max.CompareAndSwap(old, int64(value)) {
-			return
-		}
-	}
-}
-
-func avgCreateCSegmentDuration(total, count int64) time.Duration {
-	if count == 0 {
-		return 0
-	}
-	return time.Duration(total / count)
-}
-
-func (s *createCSegmentTimingStats) record(hasLoadInfo bool, storageVersion int64, blobBytes int, conversion segmentLoadInfoConversionTiming, marshalDur, cNewDur, commitDur, totalDur time.Duration) {
-	s.count.Inc()
-	if hasLoadInfo {
-		s.loadInfoCount.Inc()
-		switch storageVersion {
-		case storage.StorageV2:
-			s.storageV2Count.Inc()
-		case storage.StorageV3:
-			s.storageV3Count.Inc()
-		default:
-			s.storageOther.Inc()
-		}
-	}
-
-	s.totalBinlogField.Add(int64(conversion.binlogFieldCount))
-	s.totalStatslogField.Add(int64(conversion.statslogFieldCount))
-	s.totalDeltalogField.Add(int64(conversion.deltalogFieldCount))
-	s.totalIndexInfo.Add(int64(conversion.indexInfoCount))
-	s.totalTextStats.Add(int64(conversion.textStatsCount))
-	s.totalBM25Field.Add(int64(conversion.bm25FieldCount))
-	s.totalJSONStats.Add(int64(conversion.jsonStatsCount))
-	s.totalBlobBytes.Add(int64(blobBytes))
-
-	convertAccounted := conversion.resolveStatsDur + conversion.binlogsDur + conversion.statslogsDur +
-		conversion.deltalogsDur + conversion.indexInfosDur + conversion.textStatsDur +
-		conversion.bm25Dur + conversion.jsonStatsDur
-	convertOther := conversion.totalDur - convertAccounted
-	if convertOther < 0 {
-		convertOther = 0
-	}
-
-	s.totalResolveStats.Add(int64(conversion.resolveStatsDur))
-	s.totalBinlogs.Add(int64(conversion.binlogsDur))
-	s.totalStatslogs.Add(int64(conversion.statslogsDur))
-	s.totalDeltalogs.Add(int64(conversion.deltalogsDur))
-	s.totalIndexInfos.Add(int64(conversion.indexInfosDur))
-	s.totalTextStatsDur.Add(int64(conversion.textStatsDur))
-	s.totalBM25.Add(int64(conversion.bm25Dur))
-	s.totalJSONStatsDur.Add(int64(conversion.jsonStatsDur))
-	s.totalConvertOther.Add(int64(convertOther))
-	s.totalConvert.Add(int64(conversion.totalDur))
-	s.totalMarshal.Add(int64(marshalDur))
-	s.totalCNew.Add(int64(cNewDur))
-	s.totalCommit.Add(int64(commitDur))
-	s.totalCreate.Add(int64(totalDur))
-
-	updateCreateCSegmentMaxDuration(s.maxConvert, conversion.totalDur)
-	updateCreateCSegmentMaxDuration(s.maxMarshal, marshalDur)
-	updateCreateCSegmentMaxDuration(s.maxCNew, cNewDur)
-	updateCreateCSegmentMaxDuration(s.maxCreate, totalDur)
-
-	now := time.Now()
-	last := s.lastLogUnixNano.Load()
-	if now.UnixNano()-last < int64(createCSegmentTimingLogInterval) {
-		return
-	}
-	if !s.lastLogUnixNano.CompareAndSwap(last, now.UnixNano()) {
-		return
-	}
-	windowDur := time.Duration(now.UnixNano() - last)
-
-	count := s.count.Swap(0)
-	loadInfoCount := s.loadInfoCount.Swap(0)
-	storageV2Count := s.storageV2Count.Swap(0)
-	storageV3Count := s.storageV3Count.Swap(0)
-	storageOther := s.storageOther.Swap(0)
-	totalBinlogField := s.totalBinlogField.Swap(0)
-	totalStatslogField := s.totalStatslogField.Swap(0)
-	totalDeltalogField := s.totalDeltalogField.Swap(0)
-	totalIndexInfo := s.totalIndexInfo.Swap(0)
-	totalTextStats := s.totalTextStats.Swap(0)
-	totalBM25Field := s.totalBM25Field.Swap(0)
-	totalJSONStats := s.totalJSONStats.Swap(0)
-	totalBlobBytes := s.totalBlobBytes.Swap(0)
-	totalResolveStats := s.totalResolveStats.Swap(0)
-	totalBinlogs := s.totalBinlogs.Swap(0)
-	totalStatslogs := s.totalStatslogs.Swap(0)
-	totalDeltalogs := s.totalDeltalogs.Swap(0)
-	totalIndexInfos := s.totalIndexInfos.Swap(0)
-	totalTextStatsDur := s.totalTextStatsDur.Swap(0)
-	totalBM25 := s.totalBM25.Swap(0)
-	totalJSONStatsDur := s.totalJSONStatsDur.Swap(0)
-	totalConvertOther := s.totalConvertOther.Swap(0)
-	totalConvert := s.totalConvert.Swap(0)
-	totalMarshal := s.totalMarshal.Swap(0)
-	totalCNew := s.totalCNew.Swap(0)
-	totalCommit := s.totalCommit.Swap(0)
-	totalCreate := s.totalCreate.Swap(0)
-	maxConvert := s.maxConvert.Swap(0)
-	maxMarshal := s.maxMarshal.Swap(0)
-	maxCNew := s.maxCNew.Swap(0)
-	maxCreate := s.maxCreate.Swap(0)
-	if count == 0 {
-		return
-	}
-
-	log.Warn("[SN recovery] load timing stats",
-		zap.String("phase", "segcore.create_segment"),
-		zap.Duration("windowDur", windowDur),
-		zap.Int64("count", count),
-		zap.Int64("loadInfoCount", loadInfoCount),
-		zap.Int64("storageV2Count", storageV2Count),
-		zap.Int64("storageV3Count", storageV3Count),
-		zap.Int64("storageOtherCount", storageOther),
-		zap.Int64("avgBinlogFieldCount", totalBinlogField/count),
-		zap.Int64("avgStatslogFieldCount", totalStatslogField/count),
-		zap.Int64("avgDeltalogFieldCount", totalDeltalogField/count),
-		zap.Int64("avgIndexInfoCount", totalIndexInfo/count),
-		zap.Int64("avgTextStatsCount", totalTextStats/count),
-		zap.Int64("avgBM25FieldCount", totalBM25Field/count),
-		zap.Int64("avgJSONStatsCount", totalJSONStats/count),
-		zap.Int64("avgLoadInfoBlobBytes", totalBlobBytes/count),
-		zap.Duration("avgResolveStatsDur", avgCreateCSegmentDuration(totalResolveStats, count)),
-		zap.Duration("avgConvertBinlogsDur", avgCreateCSegmentDuration(totalBinlogs, count)),
-		zap.Duration("avgConvertStatslogsDur", avgCreateCSegmentDuration(totalStatslogs, count)),
-		zap.Duration("avgConvertDeltalogsDur", avgCreateCSegmentDuration(totalDeltalogs, count)),
-		zap.Duration("avgConvertIndexInfosDur", avgCreateCSegmentDuration(totalIndexInfos, count)),
-		zap.Duration("avgConvertTextStatsDur", avgCreateCSegmentDuration(totalTextStatsDur, count)),
-		zap.Duration("avgConvertBM25Dur", avgCreateCSegmentDuration(totalBM25, count)),
-		zap.Duration("avgConvertJSONStatsDur", avgCreateCSegmentDuration(totalJSONStatsDur, count)),
-		zap.Duration("avgConvertOtherDur", avgCreateCSegmentDuration(totalConvertOther, count)),
-		zap.Duration("avgConvertTotalDur", avgCreateCSegmentDuration(totalConvert, count)),
-		zap.Duration("avgMarshalDur", avgCreateCSegmentDuration(totalMarshal, count)),
-		zap.Duration("avgCNewDur", avgCreateCSegmentDuration(totalCNew, count)),
-		zap.Duration("avgCommitDur", avgCreateCSegmentDuration(totalCommit, count)),
-		zap.Duration("avgTotalDur", avgCreateCSegmentDuration(totalCreate, count)),
-		zap.Duration("maxConvertTotalDur", time.Duration(maxConvert)),
-		zap.Duration("maxMarshalDur", time.Duration(maxMarshal)),
-		zap.Duration("maxCNewDur", time.Duration(maxCNew)),
-		zap.Duration("maxTotalDur", time.Duration(maxCreate)),
-	)
-}
 
 // CreateCSegmentRequest is a request to create a segment.
 type CreateCSegmentRequest struct {
@@ -331,63 +70,30 @@ func (req *CreateCSegmentRequest) getCSegmentType() C.SegmentType {
 }
 
 // CreateCSegment creates a segment from a CreateCSegmentRequest.
-func CreateCSegment(req *CreateCSegmentRequest) (seg CSegment, err error) {
-	start := time.Now()
+func CreateCSegment(req *CreateCSegmentRequest) (CSegment, error) {
 	var ptr C.CSegmentInterface
 	var status C.CStatus
-	var conversionTiming segmentLoadInfoConversionTiming
-	var marshalDur time.Duration
-	var cNewDur time.Duration
-	var commitDur time.Duration
-	var blobBytes int
-	defer func() {
-		storageVersion := int64(0)
-		if req.LoadInfo != nil {
-			storageVersion = req.LoadInfo.GetStorageVersion()
-		}
-		createCSegmentTiming.record(req.LoadInfo != nil, storageVersion, blobBytes, conversionTiming, marshalDur, cNewDur, commitDur, time.Since(start))
-	}()
-
 	if req.LoadInfo != nil {
-		resolveManifestStats := true
-		if req.Collection != nil {
-			resolveManifestStats = schemaNeedsManifestStats(req.Collection.Schema())
-		}
-		if forceSkipNewSegmentStatsExperiment() {
-			resolveManifestStats = false
-		}
-		segLoadInfo, timing := convertToSegcoreSegmentLoadInfoWithTiming(req.LoadInfo, resolveManifestStats)
-		conversionTiming = timing
-		marshalStart := time.Now()
+		segLoadInfo := ConvertToSegcoreSegmentLoadInfo(req.LoadInfo)
 		loadInfoBlob, err := proto.Marshal(segLoadInfo)
-		marshalDur = time.Since(marshalStart)
 		if err != nil {
 			return nil, err
 		}
-		blobBytes = len(loadInfoBlob)
 
-		cNewStart := time.Now()
 		status = C.NewSegmentWithLoadInfo(req.Collection.rawPointer(), req.getCSegmentType(), C.int64_t(req.SegmentID), &ptr, C.bool(req.IsSorted), (*C.uint8_t)(unsafe.Pointer(&loadInfoBlob[0])), C.int64_t(len(loadInfoBlob)))
-		cNewDur = time.Since(cNewStart)
 	} else {
-		cNewStart := time.Now()
 		status = C.NewSegment(req.Collection.rawPointer(), req.getCSegmentType(), C.int64_t(req.SegmentID), &ptr, C.bool(req.IsSorted))
-		cNewDur = time.Since(cNewStart)
 	}
 	if err := ConsumeCStatusIntoError(&status); err != nil {
 		return nil, err
 	}
-	cseg := &cSegmentImpl{id: req.SegmentID, ptr: ptr}
-	seg = cseg
+	seg := &cSegmentImpl{id: req.SegmentID, ptr: ptr}
 	if req.LoadInfo != nil {
 		if commitTs := req.LoadInfo.GetCommitTimestamp(); commitTs != 0 {
-			commitStart := time.Now()
-			if err := cseg.SetCommitTimestamp(commitTs); err != nil {
-				commitDur = time.Since(commitStart)
+			if err := seg.SetCommitTimestamp(commitTs); err != nil {
 				C.DeleteSegment(ptr)
 				return nil, errors.Wrap(err, "failed to set commit timestamp on segment")
 			}
-			commitDur = time.Since(commitStart)
 		}
 	}
 	return seg, nil
@@ -723,115 +429,41 @@ func (s *cSegmentImpl) SetCommitTimestamp(ts uint64) error {
 // This function is needed because segcorepb.SegmentLoadInfo is a simplified version that doesn't
 // depend on data_coord.proto and excludes fields like start_position, delta_position, and level.
 func ConvertToSegcoreSegmentLoadInfo(src *querypb.SegmentLoadInfo) *segcorepb.SegmentLoadInfo {
-	info, _ := convertToSegcoreSegmentLoadInfoWithTiming(src, true)
-	return info
-}
-
-func forceSkipNewSegmentStatsExperiment() bool {
-	switch strings.ToLower(os.Getenv("MILVUS_EXPERIMENT_SKIP_NEW_SEGMENT_STATS")) {
-	case "1", "true", "yes", "on":
-		return true
-	default:
-		return false
-	}
-}
-
-func schemaNeedsManifestStats(schema *schemapb.CollectionSchema) bool {
-	if schema == nil {
-		return true
-	}
-	for _, field := range typeutil.GetAllFieldSchemas(schema) {
-		helper := typeutil.CreateFieldSchemaHelper(field)
-		if helper.EnableMatch() {
-			return true
-		}
-		if paramtable.Get().CommonCfg.EnabledJSONKeyStats.GetAsBool() && helper.EnableJSONKeyStatsIndex() {
-			return true
-		}
-	}
-	return false
-}
-
-func convertToSegcoreSegmentLoadInfoWithTiming(src *querypb.SegmentLoadInfo, resolveManifestStats bool) (info *segcorepb.SegmentLoadInfo, timing segmentLoadInfoConversionTiming) {
-	start := time.Now()
-	defer func() {
-		timing.totalDur = time.Since(start)
-	}()
-
 	if src == nil {
-		return nil, timing
+		return nil
 	}
 
 	// Resolve text/json stats with basePaths.
 	// V2: stats come from src proto fields, basePaths computed from metadata + rootPath.
 	// V3: stats resolved from manifest (src proto fields are empty), basePaths from manifest paths.
-	stageStart := time.Now()
-	textStats, jsonStats, textBasePaths, jsonBasePaths := resolveStatsWithBasePathsOption(src, resolveManifestStats)
-	timing.resolveStatsDur = time.Since(stageStart)
+	textStats, jsonStats, textBasePaths, jsonBasePaths := resolveStatsWithBasePaths(src)
 
-	timing.binlogFieldCount = len(src.GetBinlogPaths())
-	timing.statslogFieldCount = len(src.GetStatslogs())
-	timing.deltalogFieldCount = len(src.GetDeltalogs())
-	timing.indexInfoCount = len(src.GetIndexInfos())
-	timing.textStatsCount = len(textStats)
-	timing.bm25FieldCount = len(src.GetBm25Logs())
-	timing.jsonStatsCount = len(jsonStats)
-
-	stageStart = time.Now()
-	binlogPaths := convertFieldBinlogs(src.GetBinlogPaths())
-	timing.binlogsDur = time.Since(stageStart)
-
-	stageStart = time.Now()
-	statslogs := convertFieldBinlogs(src.GetStatslogs())
-	timing.statslogsDur = time.Since(stageStart)
-
-	stageStart = time.Now()
-	deltalogs := convertFieldBinlogs(src.GetDeltalogs())
-	timing.deltalogsDur = time.Since(stageStart)
-
-	stageStart = time.Now()
-	indexInfos := convertFieldIndexInfos(src.GetIndexInfos())
-	timing.indexInfosDur = time.Since(stageStart)
-
-	stageStart = time.Now()
-	textStatsLogs := convertTextIndexStats(textStats, textBasePaths)
-	timing.textStatsDur = time.Since(stageStart)
-
-	stageStart = time.Now()
-	bm25Logs := convertFieldBinlogs(src.GetBm25Logs())
-	timing.bm25Dur = time.Since(stageStart)
-
-	stageStart = time.Now()
-	jsonKeyStatsLogs := convertJSONKeyStats(jsonStats, jsonBasePaths)
-	timing.jsonStatsDur = time.Since(stageStart)
-
-	info = &segcorepb.SegmentLoadInfo{
+	return &segcorepb.SegmentLoadInfo{
 		SegmentID:            src.GetSegmentID(),
 		PartitionID:          src.GetPartitionID(),
 		CollectionID:         src.GetCollectionID(),
 		DbID:                 src.GetDbID(),
 		FlushTime:            src.GetFlushTime(),
-		BinlogPaths:          binlogPaths,
+		BinlogPaths:          convertFieldBinlogs(src.GetBinlogPaths()),
 		NumOfRows:            src.GetNumOfRows(),
-		Statslogs:            statslogs,
-		Deltalogs:            deltalogs,
+		Statslogs:            convertFieldBinlogs(src.GetStatslogs()),
+		Deltalogs:            convertFieldBinlogs(src.GetDeltalogs()),
 		CompactionFrom:       src.GetCompactionFrom(),
-		IndexInfos:           indexInfos,
+		IndexInfos:           convertFieldIndexInfos(src.GetIndexInfos()),
 		SegmentSize:          src.GetSegmentSize(),
 		InsertChannel:        src.GetInsertChannel(),
 		ReadableVersion:      src.GetReadableVersion(),
 		StorageVersion:       src.GetStorageVersion(),
 		IsSorted:             src.GetIsSorted(),
-		TextStatsLogs:        textStatsLogs,
-		Bm25Logs:             bm25Logs,
-		JsonKeyStatsLogs:     jsonKeyStatsLogs,
+		TextStatsLogs:        convertTextIndexStats(textStats, textBasePaths),
+		Bm25Logs:             convertFieldBinlogs(src.GetBm25Logs()),
+		JsonKeyStatsLogs:     convertJSONKeyStats(jsonStats, jsonBasePaths),
 		Priority:             src.GetPriority(),
 		ManifestPath:         src.GetManifestPath(),
 		UseTakeForOutput:     paramtable.Get().QueryNodeCfg.ExternalCollectionUseTakeForOutput.GetAsBool(),
 		EstimatedBytesPerRow: src.GetEstimatedBytesPerRow(),
 		CommitTimestamp:      src.GetCommitTimestamp(),
 	}
-	return info, timing
 }
 
 // resolveStatsWithBasePaths resolves text/json stats and computes basePaths.
@@ -843,20 +475,11 @@ func resolveStatsWithBasePaths(src *querypb.SegmentLoadInfo) (
 	map[int64]string, // textBasePaths
 	map[int64]string, // jsonBasePaths
 ) {
-	return resolveStatsWithBasePathsOption(src, true)
-}
-
-func resolveStatsWithBasePathsOption(src *querypb.SegmentLoadInfo, resolveManifestStats bool) (
-	map[int64]*datapb.TextIndexStats,
-	map[int64]*datapb.JsonKeyStats,
-	map[int64]string, // textBasePaths
-	map[int64]string, // jsonBasePaths
-) {
 	textStats := src.GetTextStatsLogs()
 	jsonStats := src.GetJsonKeyStatsLogs()
 
 	// For V3 (manifest-based): resolve stats from manifest if proto fields are empty.
-	if src.GetStorageVersion() == storage.StorageV3 && resolveManifestStats {
+	if src.GetStorageVersion() == storage.StorageV3 {
 		result := packed.NewStatsResolverFromLoadInfo(src).TextAndJSONIndexStatsWithBasePaths()
 		if result.Err() != nil {
 			log.Warn("failed to resolve stats from manifest for segcore load info",

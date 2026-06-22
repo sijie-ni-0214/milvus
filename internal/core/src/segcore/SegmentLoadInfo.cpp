@@ -11,10 +11,8 @@
 
 #include <algorithm>
 #include <cctype>
-#include <cstdlib>
 #include <iterator>
 #include <memory>
-#include <string>
 #include <utility>
 
 #include "common/Common.h"
@@ -734,20 +732,6 @@ SegmentLoadInfo::ComputeDiffDefaultFields(LoadDiff& diff,
 
 namespace {
 
-bool
-ForceSkipNewSegmentStatsExperimentEnabled() {
-    const auto* raw = std::getenv("MILVUS_EXPERIMENT_SKIP_NEW_SEGMENT_STATS");
-    if (raw == nullptr) {
-        return false;
-    }
-
-    std::string value(raw);
-    std::transform(value.begin(), value.end(), value.begin(), [](auto ch) {
-        return static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
-    });
-    return value == "1" || value == "true" || value == "yes" || value == "on";
-}
-
 int64_t
 CurrentJsonStatsDataFormatVersion() {
     return std::stoll(JSON_STATS_DATA_FORMAT_VERSION);
@@ -818,10 +802,6 @@ SegmentLoadInfo::ComputeDiffTextIndexes(LoadDiff& diff,
                 new_info.ConvertTextIndexStatsToLoadTextIndexInfo(*stats,
                                                                   field_id);
         }
-    }
-
-    if (ForceSkipNewSegmentStatsExperimentEnabled()) {
-        return;
     }
 
     // Find text indexes to create: enable_match fields without pre-built index
