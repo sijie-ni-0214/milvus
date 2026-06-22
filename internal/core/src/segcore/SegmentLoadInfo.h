@@ -1017,6 +1017,27 @@ class SegmentLoadInfo {
         BuildCache();
     }
 
+    void
+    CompactRuntimeInfoForManifest() {
+        if (!HasManifestPath()) {
+            return;
+        }
+        if (info_.index_infos_size() == 0 &&
+            info_.binlog_paths_size() == 0 && info_.statslogs_size() == 0 &&
+            info_.deltalogs_size() == 0 && info_.bm25logs_size() == 0) {
+            return;
+        }
+
+        ProtoType compact(info_);
+        compact.clear_index_infos();
+        compact.clear_binlog_paths();
+        compact.clear_statslogs();
+        compact.clear_deltalogs();
+        compact.clear_bm25logs();
+        info_.Swap(&compact);
+        BuildFieldBinlogCache();
+    }
+
     /**
      * @brief Check if the SegmentLoadInfo is empty/unset
      */

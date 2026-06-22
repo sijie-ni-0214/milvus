@@ -241,6 +241,27 @@ TEST_F(SegmentLoadInfoTest, IndexInfo) {
     EXPECT_TRUE(empty_infos.empty());
 }
 
+TEST_F(SegmentLoadInfoTest, CompactRuntimeInfoForManifest) {
+    SegmentLoadInfo info(proto_, schema_);
+
+    info.CompactRuntimeInfoForManifest();
+
+    EXPECT_EQ(info.GetIndexInfoCount(), 0);
+    EXPECT_TRUE(info.HasIndexInfo(FieldId(101)));
+    EXPECT_TRUE(info.HasIndexInfo(FieldId(102)));
+    auto index_infos = info.GetFieldIndexInfos(FieldId(101));
+    ASSERT_EQ(index_infos.size(), 1);
+    EXPECT_EQ(index_infos[0].index_id, 1001);
+    EXPECT_EQ(info.GetBinlogPathCount(), 0);
+    EXPECT_FALSE(info.HasBinlogPath(FieldId(101)));
+    EXPECT_EQ(info.GetStatslogCount(), 0);
+    EXPECT_EQ(info.GetDeltalogCount(), 0);
+    EXPECT_EQ(info.GetBm25logCount(), 0);
+    EXPECT_TRUE(info.HasTextStatsLog(101));
+    EXPECT_TRUE(info.HasJsonKeyStatsLog(102));
+    EXPECT_EQ(info.GetManifestPath(), "/path/to/manifest");
+}
+
 TEST_F(SegmentLoadInfoTest, BinlogInfo) {
     SegmentLoadInfo info(proto_, schema_);
 
