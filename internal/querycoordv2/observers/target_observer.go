@@ -734,6 +734,9 @@ func (ob *TargetObserver) updateAllReplicasCheckpointMetric(ctx context.Context,
 func (ob *TargetObserver) updateCurrentTarget(ctx context.Context, collectionID int64) {
 	mlog.RatedInfo(ctx, rate.Limit(10), "observer trigger update current target", mlog.FieldCollectionID(collectionID))
 	if ob.targetMgr.UpdateCollectionCurrentTarget(ctx, collectionID) {
+		mlog.Warn(ctx, "[SN recovery] collection current target ready",
+			mlog.FieldCollectionID(collectionID),
+			mlog.Int64("targetVersion", ob.targetMgr.GetCollectionTargetVersion(ctx, collectionID, meta.CurrentTarget)))
 		ob.nextTargetSyncStarted.Remove(collectionID)
 		ob.mut.Lock()
 		defer ob.mut.Unlock()

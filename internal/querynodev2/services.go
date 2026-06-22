@@ -74,6 +74,8 @@ type segmentDetacher interface {
 	DetachStreaming(ctx context.Context, segmentID typeutil.UniqueID) int
 }
 
+var firstLoadSegmentsTaskLogOnce sync.Once
+
 // GetComponentStates returns information about whether the node is healthy
 func (node *QueryNode) GetComponentStates(ctx context.Context, req *milvuspb.GetComponentStatesRequest) (*milvuspb.ComponentStates, error) {
 	stats := &milvuspb.ComponentStates{
@@ -588,6 +590,11 @@ func (node *QueryNode) LoadSegments(ctx context.Context, req *querypb.LoadSegmen
 	}
 
 	// Actual load segment
+	firstLoadSegmentsTaskLogOnce.Do(func() {
+		log.Warn(ctx, "[SN recovery] first load segments task started",
+			mlog.Int64("version", req.GetVersion()),
+			mlog.Int("segmentNum", len(req.GetInfos())))
+	})
 	log.Info(ctx, "start to load segments...")
 	loaded, err := node.loader.Load(ctx,
 		req.GetCollectionID(),
