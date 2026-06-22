@@ -6921,6 +6921,13 @@ ChunkedSegmentSealedImpl::Load(milvus::tracer::TraceContext& trace_ctx,
     stage_start = std::chrono::steady_clock::now();
     ApplyLoadDiff(op_ctx, mutable_copy, diff);
     apply_ns = DurationSinceNs(stage_start);
+
+    mutable_copy.CompactRuntimeInfoForManifest();
+    auto published =
+        std::make_shared<const SegmentLoadInfo>(std::move(mutable_copy));
+    std::atomic_store(&segment_load_info_, published);
+    use_take_for_output_.store(published->GetUseTakeForOutput(),
+                               std::memory_order_relaxed);
 }
 
 void

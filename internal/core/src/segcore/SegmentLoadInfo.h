@@ -421,6 +421,7 @@ class SegmentLoadInfo {
         : info_(other.info_),
           schema_(other.schema_),
           converted_field_index_cache_(other.converted_field_index_cache_),
+          field_index_id_cache_(other.field_index_id_cache_),
           field_index_has_raw_data_(other.field_index_has_raw_data_),
           column_groups_(other.column_groups_),
           fields_filled_with_default_(other.fields_filled_with_default_),
@@ -436,6 +437,7 @@ class SegmentLoadInfo {
           schema_(std::move(other.schema_)),
           converted_field_index_cache_(
               std::move(other.converted_field_index_cache_)),
+          field_index_id_cache_(std::move(other.field_index_id_cache_)),
           field_index_has_raw_data_(std::move(other.field_index_has_raw_data_)),
           fields_filled_with_default_(
               std::move(other.fields_filled_with_default_)),
@@ -455,6 +457,7 @@ class SegmentLoadInfo {
             info_ = other.info_;
             schema_ = other.schema_;
             converted_field_index_cache_ = other.converted_field_index_cache_;
+            field_index_id_cache_ = other.field_index_id_cache_;
             field_index_has_raw_data_ = other.field_index_has_raw_data_;
             column_groups_ = other.column_groups_;
             fields_filled_with_default_ = other.fields_filled_with_default_;
@@ -474,6 +477,7 @@ class SegmentLoadInfo {
             schema_ = std::move(other.schema_);
             converted_field_index_cache_ =
                 std::move(other.converted_field_index_cache_);
+            field_index_id_cache_ = std::move(other.field_index_id_cache_);
             field_index_has_raw_data_ =
                 std::move(other.field_index_has_raw_data_);
             fields_filled_with_default_ =
@@ -631,8 +635,8 @@ class SegmentLoadInfo {
      */
     [[nodiscard]] bool
     HasIndexInfo(FieldId field_id) const {
-        return converted_field_index_cache_.find(field_id) !=
-               converted_field_index_cache_.end();
+        return field_index_id_cache_.find(field_id) !=
+               field_index_id_cache_.end();
     }
 
     /**
@@ -656,7 +660,7 @@ class SegmentLoadInfo {
     [[nodiscard]] std::set<FieldId>
     GetIndexedFieldIds() const {
         std::set<FieldId> result;
-        for (const auto& pair : converted_field_index_cache_) {
+        for (const auto& pair : field_index_id_cache_) {
             result.insert(pair.first);
         }
         return result;
@@ -1017,6 +1021,44 @@ class SegmentLoadInfo {
         BuildCache();
     }
 
+    void
+    CompactRuntimeInfoForManifest() {
+        if (!HasManifestPath()) {
+            return;
+        }
+        if (info_.index_infos_size() == 0 && info_.binlog_paths_size() == 0 &&
+            info_.statslogs_size() == 0 && info_.deltalogs_size() == 0 &&
+            info_.bm25logs_size() == 0 &&
+            converted_field_index_cache_.empty()) {
+            return;
+        }
+
+        ProtoType compact;
+        compact.set_segmentid(info_.segmentid());
+        compact.set_partitionid(info_.partitionid());
+        compact.set_collectionid(info_.collectionid());
+        compact.set_dbid(info_.dbid());
+        compact.set_flush_time(info_.flush_time());
+        compact.set_num_of_rows(info_.num_of_rows());
+        *compact.mutable_compactionfrom() = info_.compactionfrom();
+        compact.set_segment_size(info_.segment_size());
+        compact.set_insert_channel(info_.insert_channel());
+        compact.set_readableversion(info_.readableversion());
+        compact.set_storageversion(info_.storageversion());
+        compact.set_is_sorted(info_.is_sorted());
+        *compact.mutable_textstatslogs() = info_.textstatslogs();
+        *compact.mutable_jsonkeystatslogs() = info_.jsonkeystatslogs();
+        compact.set_priority(info_.priority());
+        compact.set_manifest_path(info_.manifest_path());
+        compact.set_use_take_for_output(info_.use_take_for_output());
+        compact.set_estimated_bytes_per_row(info_.estimated_bytes_per_row());
+        compact.set_commit_timestamp(info_.commit_timestamp());
+        info_.Swap(&compact);
+        BuildFieldBinlogCache();
+        decltype(converted_field_index_cache_)().swap(
+            converted_field_index_cache_);
+    }
+
     /**
      * @brief Check if the SegmentLoadInfo is empty/unset
      */
@@ -1094,6 +1136,7 @@ class SegmentLoadInfo {
 
         // Convert index infos to LoadIndexInfo and build per-field cache
         converted_field_index_cache_.clear();
+        field_index_id_cache_.clear();
         field_index_has_raw_data_.clear();
         for (int i = 0; i < info_.index_infos_size(); i++) {
             const auto& index_info = info_.index_infos(i);
@@ -1104,6 +1147,7 @@ class SegmentLoadInfo {
             if (!HasFieldInSchema(field_id)) {
                 continue;
             }
+            field_index_id_cache_[field_id].push_back(index_info.indexid());
             auto load_index_info = ConvertFieldIndexInfoToLoadIndexInfo(
                 &index_info, info_.segmentid());
             load_index_info.load_resource_request =
@@ -1149,6 +1193,11 @@ class SegmentLoadInfo {
     // Cache for quick field -> converted LoadIndexInfo lookup
     std::unordered_map<FieldId, std::vector<LoadIndexInfo>>
         converted_field_index_cache_;
+
+    // Lightweight runtime identity for current loaded indexes. Manifest mode
+    // can drop converted_field_index_cache_ after load, but reopen diff still
+    // needs to know which index ids are already present per field.
+    std::unordered_map<FieldId, std::vector<int64_t>> field_index_id_cache_;
 
     // set of field ids that corresponding index has raw data
     std::set<FieldId> field_index_has_raw_data_;

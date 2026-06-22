@@ -241,6 +241,96 @@ TEST_F(SegmentLoadInfoTest, IndexInfo) {
     EXPECT_TRUE(empty_infos.empty());
 }
 
+TEST_F(SegmentLoadInfoTest, CompactRuntimeInfoForManifest) {
+    auto proto = proto_;
+    for (int i = 0; i < 16; ++i) {
+        proto.add_index_infos()->CopyFrom(proto.index_infos(0));
+        proto.add_binlog_paths()->CopyFrom(proto.binlog_paths(0));
+        proto.add_statslogs()->CopyFrom(proto.statslogs(0));
+        proto.add_deltalogs()->CopyFrom(proto.deltalogs(0));
+        proto.add_bm25logs()->CopyFrom(proto.bm25logs(0));
+    }
+    SegmentLoadInfo info(proto, schema_);
+    auto index_capacity = info.GetProto().index_infos().Capacity();
+    auto binlog_capacity = info.GetProto().binlog_paths().Capacity();
+    auto stats_capacity = info.GetProto().statslogs().Capacity();
+    auto delta_capacity = info.GetProto().deltalogs().Capacity();
+    auto bm25_capacity = info.GetProto().bm25logs().Capacity();
+
+    info.CompactRuntimeInfoForManifest();
+
+    EXPECT_EQ(info.GetIndexInfoCount(), 0);
+    EXPECT_TRUE(info.HasIndexInfo(FieldId(101)));
+    EXPECT_TRUE(info.HasIndexInfo(FieldId(102)));
+    auto index_infos = info.GetFieldIndexInfos(FieldId(101));
+    EXPECT_TRUE(index_infos.empty());
+    EXPECT_EQ(info.GetBinlogPathCount(), 0);
+    EXPECT_FALSE(info.HasBinlogPath(FieldId(101)));
+    EXPECT_EQ(info.GetStatslogCount(), 0);
+    EXPECT_EQ(info.GetDeltalogCount(), 0);
+    EXPECT_EQ(info.GetBm25logCount(), 0);
+    EXPECT_LT(info.GetProto().index_infos().Capacity(), index_capacity);
+    EXPECT_LT(info.GetProto().binlog_paths().Capacity(), binlog_capacity);
+    EXPECT_LT(info.GetProto().statslogs().Capacity(), stats_capacity);
+    EXPECT_LT(info.GetProto().deltalogs().Capacity(), delta_capacity);
+    EXPECT_LT(info.GetProto().bm25logs().Capacity(), bm25_capacity);
+    EXPECT_LE(info.GetProto().index_infos().Capacity(), 1);
+    EXPECT_LE(info.GetProto().binlog_paths().Capacity(), 1);
+    EXPECT_LE(info.GetProto().statslogs().Capacity(), 1);
+    EXPECT_LE(info.GetProto().deltalogs().Capacity(), 1);
+    EXPECT_LE(info.GetProto().bm25logs().Capacity(), 1);
+    EXPECT_TRUE(info.HasTextStatsLog(101));
+    EXPECT_TRUE(info.HasJsonKeyStatsLog(102));
+    EXPECT_EQ(info.GetManifestPath(), "/path/to/manifest");
+}
+
+TEST_F(SegmentLoadInfoTest,
+       CompactRuntimeInfoForManifestKeepsIndexDiffIdentity) {
+    proto::segcore::SegmentLoadInfo current_proto;
+    current_proto.set_segmentid(100);
+    current_proto.set_num_of_rows(1000);
+    current_proto.set_manifest_path("/path/to/current_manifest");
+    auto* cur_index = current_proto.add_index_infos();
+    cur_index->set_fieldid(101);
+    cur_index->set_indexid(1001);
+    cur_index->add_index_file_paths("/path/to/old_index");
+    auto* cur_param = cur_index->add_index_params();
+    cur_param->set_key("index_type");
+    cur_param->set_value(knowhere::IndexEnum::INDEX_FAISS_IVFSQ8);
+
+    proto::segcore::SegmentLoadInfo new_proto;
+    new_proto.set_segmentid(100);
+    new_proto.set_num_of_rows(1000);
+    new_proto.set_manifest_path("/path/to/current_manifest");
+    auto* new_index = new_proto.add_index_infos();
+    new_index->set_fieldid(101);
+    new_index->set_indexid(2001);
+    new_index->add_index_file_paths("/path/to/new_index");
+    auto* new_param = new_index->add_index_params();
+    new_param->set_key("index_type");
+    new_param->set_value(knowhere::IndexEnum::INDEX_FAISS_IVFSQ8);
+
+    SegmentLoadInfo current_info(current_proto, schema_);
+    SegmentLoadInfo new_info(new_proto, schema_);
+    current_info.SetColumnGroupsForTesting(
+        std::make_shared<milvus_storage::api::ColumnGroups>());
+    new_info.SetColumnGroupsForTesting(
+        std::make_shared<milvus_storage::api::ColumnGroups>());
+
+    current_info.CompactRuntimeInfoForManifest();
+    EXPECT_EQ(current_info.GetIndexInfoCount(), 0);
+    EXPECT_TRUE(current_info.HasIndexInfo(FieldId(101)));
+    EXPECT_TRUE(current_info.GetFieldIndexInfos(FieldId(101)).empty());
+
+    auto diff = current_info.ComputeDiff(new_info);
+    EXPECT_EQ(diff.indexes_to_replace.size(), 1);
+    ASSERT_TRUE(diff.indexes_to_replace.count(FieldId(101)) > 0);
+    ASSERT_EQ(diff.indexes_to_replace[FieldId(101)].size(), 1);
+    EXPECT_EQ(diff.indexes_to_replace[FieldId(101)][0].index_id, 2001);
+    EXPECT_EQ(diff.indexes_to_drop.size(), 1);
+    EXPECT_TRUE(diff.indexes_to_drop.count(FieldId(101)) > 0);
+}
+
 TEST_F(SegmentLoadInfoTest, BinlogInfo) {
     SegmentLoadInfo info(proto_, schema_);
 

@@ -261,11 +261,10 @@ SegmentLoadInfo::ComputeDiffIndexes(LoadDiff& diff, SegmentLoadInfo& new_info) {
     std::set<int64_t> current_index_ids;
     // Build a set of field IDs that currently have indexes loaded
     std::set<FieldId> current_indexed_fields;
-    for (const auto& [field_id, load_index_infos] :
-         converted_field_index_cache_) {
+    for (const auto& [field_id, index_ids] : field_index_id_cache_) {
         current_indexed_fields.insert(field_id);
-        for (const auto& load_index_info : load_index_infos) {
-            current_index_ids.insert(load_index_info.index_id);
+        for (auto index_id : index_ids) {
+            current_index_ids.insert(index_id);
         }
     }
 
@@ -291,12 +290,10 @@ SegmentLoadInfo::ComputeDiffIndexes(LoadDiff& diff, SegmentLoadInfo& new_info) {
     }
 
     // Find indexes to drop: fields that have indexes in current but not in new_info
-    for (const auto& [field_id, load_index_infos] :
-         converted_field_index_cache_) {
-        for (const auto& load_index_info : load_index_infos) {
+    for (const auto& [field_id, index_ids] : field_index_id_cache_) {
+        for (auto index_id : index_ids) {
             if (!new_info.HasFieldInSchema(field_id) ||
-                new_index_ids.find(load_index_info.index_id) ==
-                    new_index_ids.end()) {
+                new_index_ids.find(index_id) == new_index_ids.end()) {
                 diff.indexes_to_drop.insert(field_id);
             }
         }
