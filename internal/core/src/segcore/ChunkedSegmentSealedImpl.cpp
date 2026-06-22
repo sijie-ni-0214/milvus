@@ -287,13 +287,15 @@ class LazyManifestColumnGroup {
 
 class LazyManifestProxyColumn : public ChunkedColumnInterface {
  public:
-    LazyManifestProxyColumn(std::shared_ptr<LazyManifestColumnGroup> group,
-                            FieldId field_id,
-                            const FieldMeta& field_meta,
-                            size_t num_rows)
+    LazyManifestProxyColumn(
+        std::shared_ptr<LazyManifestColumnGroup> group,
+        FieldId field_id,
+        std::shared_ptr<const std::unordered_map<FieldId, FieldMeta>>
+            field_metas,
+        size_t num_rows)
         : group_(std::move(group)),
           field_id_(field_id),
-          field_meta_(field_meta),
+          field_metas_(std::move(field_metas)),
           num_rows_(num_rows) {
     }
 
@@ -340,7 +342,7 @@ class LazyManifestProxyColumn : public ChunkedColumnInterface {
 
     bool
     IsNullable() const override {
-        return field_meta_.is_nullable();
+        return FieldMetaRef().is_nullable();
     }
 
     size_t
@@ -541,9 +543,14 @@ class LazyManifestProxyColumn : public ChunkedColumnInterface {
         std::lock_guard<std::mutex> lock(mutex_);
         if (column_ == nullptr) {
             column_ = std::make_shared<ProxyChunkColumn>(
-                group_->Materialize(), field_id_, field_meta_);
+                group_->Materialize(), field_id_, FieldMetaRef());
         }
         return column_;
+    }
+
+    const FieldMeta&
+    FieldMetaRef() const {
+        return field_metas_->at(field_id_);
     }
 
     std::shared_ptr<ChunkedColumnInterface>
@@ -554,7 +561,7 @@ class LazyManifestProxyColumn : public ChunkedColumnInterface {
 
     std::shared_ptr<LazyManifestColumnGroup> group_;
     FieldId field_id_;
-    FieldMeta field_meta_;
+    std::shared_ptr<const std::unordered_map<FieldId, FieldMeta>> field_metas_;
     size_t num_rows_;
     mutable std::mutex mutex_;
     mutable std::shared_ptr<ChunkedColumnInterface> column_;
@@ -6458,7 +6465,7 @@ ChunkedSegmentSealedImpl::LoadColumnGroup(
             auto column = std::make_shared<LazyManifestProxyColumn>(
                 lazy_column_group,
                 field_id,
-                field_meta,
+                field_metas,
                 load_info->GetNumOfRows());
             load_field_data_common(field_id,
                                    column,
