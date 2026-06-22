@@ -20,6 +20,8 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cctype>
+#include <cstdlib>
 #include <cstdint>
 #include <ctime>
 #include <exception>
@@ -156,6 +158,20 @@ namespace {
 
 constexpr int64_t kApplyLoadDiffTimingLogIntervalNs = 5LL * 1000 * 1000 * 1000;
 constexpr bool kSnRecoveryLoadTimingEnabled = true;
+
+bool
+ForceSkipNewSegmentStatsExperimentEnabled() {
+    const auto* raw = std::getenv("MILVUS_EXPERIMENT_SKIP_NEW_SEGMENT_STATS");
+    if (raw == nullptr) {
+        return false;
+    }
+
+    std::string value(raw);
+    std::transform(value.begin(), value.end(), value.begin(), [](auto ch) {
+        return static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+    });
+    return value == "1" || value == "true" || value == "yes" || value == "on";
+}
 
 std::string
 JoinNeededColumns(
@@ -5730,6 +5746,14 @@ ChunkedSegmentSealedImpl::ApplyLoadDiff(milvus::OpContext* op_ctx,
             std::unordered_set<FieldId> lazy_match_fields;
             for (const auto& [field_id, _] : diff.text_indexes_to_load) {
                 lazy_match_fields.insert(field_id);
+            }
+            if (ForceSkipNewSegmentStatsExperimentEnabled()) {
+                for (const auto& [field_id, field_meta] :
+                     schema_->get_fields()) {
+                    if (field_meta.enable_match()) {
+                        lazy_match_fields.insert(field_id);
+                    }
+                }
             }
             {
                 std::lock_guard<std::mutex> lock(reader_mutex_);
