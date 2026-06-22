@@ -2447,6 +2447,8 @@ SegmentGrowingImpl::BuildGeometryCacheForInsert(FieldId field_id,
                                                 const DataArray* data_array,
                                                 int64_t num_rows) {
     try {
+        EnsureGeosContext();
+
         // Get geometry cache for this segment+field
         auto& geometry_cache =
             milvus::exec::SimpleGeometryCacheManager::Instance()
@@ -2491,6 +2493,8 @@ void
 SegmentGrowingImpl::BuildGeometryCacheForLoad(
     FieldId field_id, const std::vector<FieldDataPtr>& field_data) {
     try {
+        EnsureGeosContext();
+
         // Get geometry cache for this segment+field
         auto& geometry_cache =
             milvus::exec::SimpleGeometryCacheManager::Instance()

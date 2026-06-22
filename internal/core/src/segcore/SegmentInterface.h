@@ -20,6 +20,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <shared_mutex>
 #include <string>
@@ -775,10 +776,23 @@ class SegmentInternalInterface : public SegmentInterface {
 
     virtual GEOSContextHandle_t
     get_ctx() const {
+        EnsureGeosContext();
         return ctx_;
     };
 
  protected:
+    void
+    EnsureGeosContext() const {
+        if (ctx_ != nullptr) {
+            return;
+        }
+
+        std::lock_guard<std::mutex> lock(geos_ctx_mutex_);
+        if (ctx_ == nullptr) {
+            ctx_ = GEOS_init_r();
+        }
+    }
+
     // mutex protecting rw options on schema_
     std::shared_mutex sch_mutex_;
 
@@ -802,7 +816,8 @@ class SegmentInternalInterface : public SegmentInterface {
     std::unordered_map<FieldId, std::shared_ptr<index::JsonKeyStats>>
         json_stats_;
 
-    GEOSContextHandle_t ctx_ = GEOS_init_r();
+    mutable std::mutex geos_ctx_mutex_;
+    mutable GEOSContextHandle_t ctx_ = nullptr;
 };
 
 }  // namespace milvus::segcore
