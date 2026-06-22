@@ -97,6 +97,24 @@ class PkIndexCell;
 
 using namespace milvus::cachinglayer;
 
+struct LazyTimestampIndexSource {
+    std::shared_ptr<ChunkedColumnInterface> column;
+    int64_t num_rows;
+    std::string warmup_policy;
+};
+
+struct LazyPkIndexSource {
+    std::shared_ptr<ChunkedColumnInterface> column;
+    DataType data_type;
+    std::string warmup_policy;
+};
+
+template <typename CellT, typename SourceT>
+struct LazySystemIndexState {
+    std::shared_ptr<CacheSlot<CellT>> slot;
+    std::optional<SourceT> source;
+};
+
 // Test-only accessor that pokes private members to simulate v2/v3 segment
 // state (raw timestamp column emplaced into fields_ alongside an overwritten
 // timestamp index). Defined in internal/core/unittest/test_commit_timestamp.cpp.
@@ -1512,12 +1530,14 @@ class ChunkedSegmentSealedImpl : public SegmentSealed {
 
     // inserted fields data and row_ids, timestamps
     InsertRecord<true> insert_record_;
-    folly::Synchronized<
-        std::shared_ptr<CacheSlot<storagev2translator::TimestampIndexCell>>>
-        timestamp_index_slot_;
-    folly::Synchronized<
-        std::shared_ptr<CacheSlot<storagev2translator::PkIndexCell>>>
-        pk_index_slot_;
+    mutable folly::Synchronized<
+        LazySystemIndexState<storagev2translator::TimestampIndexCell,
+                             LazyTimestampIndexSource>>
+        timestamp_index_;
+    mutable folly::Synchronized<
+        LazySystemIndexState<storagev2translator::PkIndexCell,
+                             LazyPkIndexSource>>
+        pk_index_;
 
     // deleted pks
     mutable DeletedRecord<true> deleted_record_;
