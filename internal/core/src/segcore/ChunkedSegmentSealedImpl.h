@@ -1222,7 +1222,7 @@ class ChunkedSegmentSealedImpl : public SegmentSealed {
 
     bool
     CanUseLazyManifestColumnGroup(
-        const std::unordered_map<FieldId, const FieldMeta*>& field_metas,
+        const std::vector<std::pair<FieldId, const FieldMeta*>>& field_metas,
         bool allow_match_field_lazy = false) const;
 
     void
@@ -1445,8 +1445,7 @@ class ChunkedSegmentSealedImpl : public SegmentSealed {
     // Test-only: inject a mock Reader for unit testing take() paths.
     void
     SetReaderForTesting(std::unique_ptr<milvus_storage::api::Reader> r) {
-        reader_ =
-            std::shared_ptr<milvus_storage::api::Reader>(std::move(r));
+        reader_ = std::shared_ptr<milvus_storage::api::Reader>(std::move(r));
     }
 
     // Wrappers for protected methods to enable direct unit testing.
