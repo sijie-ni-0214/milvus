@@ -1139,6 +1139,9 @@ func (loader *segmentLoader) Load(ctx context.Context,
 		stageStart = time.Now()
 		loader.notifyLoadFinish(loadInfo)
 		notifyDur = time.Since(stageStart)
+		if localSegment, ok := segment.(*LocalSegment); ok {
+			localSegment.compactLoadInfoForRuntime()
+		}
 
 		metrics.QueryNodeLoadSegmentLatency.WithLabelValues(paramtable.GetStringNodeID()).Observe(float64(tr.ElapseSpan().Milliseconds()))
 		return nil
