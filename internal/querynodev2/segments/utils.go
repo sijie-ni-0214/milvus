@@ -188,6 +188,11 @@ func FilterZeroValuesFromSlice(intVals []int64) []int64 {
 
 func GetSegmentRelatedDataSize(segment Segment) int64 {
 	if segment.Type() == SegmentTypeSealed {
+		if localSegment, ok := segment.(*LocalSegment); ok {
+			if binlogSize := localSegment.binlogSize.Load(); binlogSize > 0 {
+				return binlogSize
+			}
+		}
 		return calculateSegmentLogSize(segment.LoadInfo())
 	}
 	return segment.MemSize()
