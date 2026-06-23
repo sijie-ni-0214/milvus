@@ -269,6 +269,20 @@ func TestGetFieldWarmupPolicy(t *testing.T) {
 	})
 }
 
+func TestGetLoadFieldWarmupPolicy(t *testing.T) {
+	paramtable.Init()
+
+	field := &schemapb.FieldSchema{
+		DataType: schemapb.DataType_FloatVector,
+		TypeParams: []*commonpb.KeyValuePair{
+			{Key: common.WarmupKey, Value: common.WarmupDisable},
+		},
+	}
+
+	assert.Equal(t, common.WarmupDisable, getLoadFieldWarmupPolicy(&querypb.SegmentLoadInfo{}, field))
+	assert.Equal(t, common.WarmupSync, getLoadFieldWarmupPolicy(&querypb.SegmentLoadInfo{ForceSyncWarmup: true}, field))
+}
+
 func TestGetScalarDataWarmupPolicy(t *testing.T) {
 	paramtable.Init()
 
@@ -330,6 +344,20 @@ func TestGetScalarDataWarmupPolicy(t *testing.T) {
 		})
 		assert.Equal(t, common.WarmupSync, policy)
 	})
+}
+
+func TestGetLoadScalarDataWarmupPolicy(t *testing.T) {
+	paramtable.Init()
+
+	field := &schemapb.FieldSchema{
+		DataType: schemapb.DataType_JSON,
+		TypeParams: []*commonpb.KeyValuePair{
+			{Key: common.WarmupKey, Value: common.WarmupDisable},
+		},
+	}
+
+	assert.Equal(t, common.WarmupDisable, getLoadScalarDataWarmupPolicy(&querypb.SegmentLoadInfo{}, field))
+	assert.Equal(t, common.WarmupSync, getLoadScalarDataWarmupPolicy(&querypb.SegmentLoadInfo{ForceSyncWarmup: true}, field))
 }
 
 // Tests for external collection utilities

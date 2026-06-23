@@ -448,6 +448,30 @@ func (suite *LoadCollectionJobSuite) TestGetLocalReplicaConfig_AllocIDError() {
 	suite.Nil(replicas)
 }
 
+func (suite *LoadCollectionJobSuite) TestForceSyncWarmupOfLoad() {
+	forced := &meta.Partition{PartitionLoadInfo: &querypb.PartitionLoadInfo{PartitionID: 100, ForceSyncWarmup: true}}
+	plain := &meta.Partition{PartitionLoadInfo: &querypb.PartitionLoadInfo{PartitionID: 101}}
+	current := map[int64]*meta.Partition{100: forced, 101: plain}
+
+	req := &messagespb.AlterLoadConfigMessageHeader{PartitionIds: []int64{101, 102}}
+	suite.False(loadForceSyncWarmup(req, current))
+	suite.False(partitionForceSyncWarmup(req, plain))
+	suite.False(partitionForceSyncWarmup(req, nil))
+
+	// A requested partition whose forced warmup no prewarm cleared keeps the
+	// collection forced.
+	req = &messagespb.AlterLoadConfigMessageHeader{PartitionIds: []int64{100, 102}}
+	suite.True(loadForceSyncWarmup(req, current))
+	suite.True(partitionForceSyncWarmup(req, forced))
+
+	// The request's flag forces the collection and the new partitions; an
+	// existing partition keeps its own flag.
+	req = &messagespb.AlterLoadConfigMessageHeader{PartitionIds: []int64{101, 102}, ForceSyncWarmup: true}
+	suite.True(loadForceSyncWarmup(req, current))
+	suite.True(partitionForceSyncWarmup(req, nil))
+	suite.False(partitionForceSyncWarmup(req, plain))
+}
+
 func TestLoadCollectionJob(t *testing.T) {
 	suite.Run(t, new(LoadCollectionJobSuite))
 }

@@ -402,6 +402,7 @@ message AlterLoadConfigMessageHeader {
     bool user_specified_replica_mode = 6; // whether the replica mode is user specified.
     bool use_local_replica_config = 7; // when true, use local cluster-level replica config instead of the replicas field above.
     repeated LoadFieldConfig required_fields = 8; // Internal, explicit nonempty query field scope. Never inferred from preload hints.
+    bool force_sync_warmup = 12; // whether load should synchronously warm mmap/cache data.
 }
 
 // AlterLoadConfigMessageBody is the body of alter load config message.
