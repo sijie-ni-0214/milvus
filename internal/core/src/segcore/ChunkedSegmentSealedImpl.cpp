@@ -11493,4 +11493,31 @@ ChunkedSegmentSealedImpl::prefetch_vector(milvus::OpContext* op_ctx,
         this->prefetch_chunks_locked(op_ctx, field_id);
     }
 }
+
+void
+ChunkedSegmentSealedImpl::Prewarm(
+    milvus::OpContext* op_ctx,
+    const std::vector<FieldId>& requested_field_ids) const {
+    std::vector<FieldId> field_ids = requested_field_ids;
+    if (field_ids.empty()) {
+        auto published = CapturePublishedState();
+        if (published != nullptr && published->fields != nullptr) {
+            field_ids = published->fields->get_field_ids();
+        }
+    }
+
+    auto runtime = CaptureRuntimeResourceState();
+    for (auto field_id : field_ids) {
+        prefetch_chunks(op_ctx, field_id);
+        if (runtime == nullptr) {
+            continue;
+        }
+        // Pinning an inventory entry loads its cache cell; the pin is dropped
+        // right away and the warmed cell stays under the caching layer policy.
+        for (const auto& entry : runtime->indexes.Entries(field_id)) {
+            auto pin = runtime->indexes.PinIndex(op_ctx, entry.key);
+            (void)pin;
+        }
+    }
+}
 }  // namespace milvus::segcore

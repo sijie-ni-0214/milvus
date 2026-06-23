@@ -1209,6 +1209,10 @@ func (s *MockMixCoord) LoadPartitions(ctx context.Context, req *querypb.LoadPart
 	panic("implement me")
 }
 
+func (s *MockMixCoord) Prewarm(ctx context.Context, req *querypb.PrewarmRequest) (*commonpb.Status, error) {
+	panic("implement me")
+}
+
 func (s *MockMixCoord) ReleasePartitions(ctx context.Context, req *querypb.ReleasePartitionsRequest) (*commonpb.Status, error) {
 	panic("implement me")
 }
