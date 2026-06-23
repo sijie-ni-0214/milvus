@@ -638,9 +638,6 @@ class ChunkedSegmentSealedImpl : public SegmentSealed {
     init_storage_v1_timestamp_index(std::vector<Timestamp> timestamps,
                                     size_t num_rows);
 
-    void
-    init_constant_timestamp_data(size_t num_rows, Timestamp timestamp);
-
     template <typename PK>
     void
     search_sorted_pk_range_impl(
