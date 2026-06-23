@@ -2158,7 +2158,8 @@ ChunkedSegmentSealedImpl::load_column_group_data_internal(
                                    is_replace);
             if (field_id == TimestampFieldID) {
                 if (commit_ts_ != 0) {
-                    init_constant_timestamp_data(num_rows, commit_ts_);
+                    std::vector<Timestamp> ts(num_rows, commit_ts_);
+                    init_storage_v1_timestamp_index(std::move(ts), num_rows);
                 } else {
                     init_storage_v2_timestamp_index(
                         column, num_rows, info.warmup_policy);
@@ -2282,15 +2283,6 @@ ChunkedSegmentSealedImpl::load_system_field_internal(
     auto system_field_type =
         SystemProperty::Instance().GetSystemFieldType(field_id);
     if (system_field_type == SystemFieldType::Timestamp) {
-        if (commit_ts_ != 0) {
-            std::shared_ptr<milvus::ArrowDataWrapper> r;
-            while (data.arrow_reader_channel->pop(r)) {
-            }
-            init_constant_timestamp_data(num_rows, commit_ts_);
-            std::unique_lock lck(mutex_);
-            update_row_count(num_rows);
-            return;
-        }
         std::vector<Timestamp> timestamps(num_rows);
         int64_t offset = 0;
         FieldMeta field_meta(
@@ -2306,6 +2298,9 @@ ChunkedSegmentSealedImpl::load_system_field_internal(
             offset += chunk_ptr->Span().row_count();
         }
 
+        if (commit_ts_ != 0) {
+            std::fill(timestamps.begin(), timestamps.end(), commit_ts_);
+        }
         init_storage_v1_timestamp_index(std::move(timestamps), num_rows);
     } else {
         AssertInfo(system_field_type == SystemFieldType::RowId,
@@ -5035,29 +5030,32 @@ ChunkedSegmentSealedImpl::mask_with_timestamps(BitsetTypeView& bitset_chunk,
     if (schema_->is_external_collection()) {
         return;
     }
-    auto effective_commit_ts = EffectiveCommitTs();
-    if (effective_commit_ts) {
-        if (collection_ttl > 0 && *effective_commit_ts <= collection_ttl) {
-            bitset_chunk.set();
-            return;
-        }
-        if (*effective_commit_ts > timestamp) {
-            bitset_chunk.set();
-        }
-        return;
-    }
     auto ts_index = PinTimestampIndex(nullptr);
     auto* ts_cell = ts_index.get();
     AssertInfo(ts_cell != nullptr || !insert_record_.timestamps_.empty(),
                "timestamp index is not ready");
     auto& ts_index_data = ts_cell != nullptr ? ts_cell->timestamp_index()
                                              : insert_record_.timestamp_index_;
-    auto ts_column =
-        ts_cell != nullptr ? get_column(TimestampFieldID) : nullptr;
+    auto effective_commit_ts = EffectiveCommitTs();
+    // When commit_ts_ is set, the per-row scan must use commit_ts_, not the
+    // raw v2/v3 timestamp column (which still holds the original row_ts). The
+    // index itself is already commit_ts-overwritten at load time, so the
+    // get_active_range narrowing above is consistent — only the per-bit scan
+    // below needs the override.
+    auto ts_column = (ts_cell != nullptr && !effective_commit_ts)
+                         ? get_column(TimestampFieldID)
+                         : nullptr;
     auto total_size = static_cast<int64_t>(get_row_count());
 
-    // Lambda to dispatch scan_timestamp_range to the right overload.
+    // Lambda to dispatch scan_timestamp_range to the right overload, or to
+    // apply the predicate uniformly with commit_ts_ when set.
     auto do_scan = [&](int64_t beg, int64_t end, auto pred) {
+        if (effective_commit_ts) {
+            for (int64_t i = beg; i < end; ++i) {
+                pred(i, *effective_commit_ts);
+            }
+            return;
+        }
         if (ts_column) {
             scan_timestamp_range(*ts_column, beg, end, pred);
         } else {
@@ -5532,14 +5530,6 @@ ChunkedSegmentSealedImpl::init_storage_v1_timestamp_index(
     insert_record_.init_timestamps_from_owned(std::move(timestamps),
                                               std::move(index));
     stats_.mem_size += sizeof(Timestamp) * num_rows;
-}
-
-void
-ChunkedSegmentSealedImpl::init_constant_timestamp_data(size_t num_rows,
-                                                       Timestamp timestamp) {
-    std::unique_lock lck(mutex_);
-    AssertInfo(insert_record_.timestamps_.empty(), "already exists");
-    insert_record_.init_timestamps_constant(num_rows, timestamp);
 }
 
 void
@@ -6519,7 +6509,8 @@ ChunkedSegmentSealedImpl::LoadColumnGroup(
             if (field_id == TimestampFieldID) {
                 int64_t num_rows = load_info->GetNumOfRows();
                 if (commit_ts_ != 0) {
-                    init_constant_timestamp_data(num_rows, commit_ts_);
+                    std::vector<Timestamp> ts(num_rows, commit_ts_);
+                    init_storage_v1_timestamp_index(std::move(ts), num_rows);
                 } else {
                     init_storage_v2_timestamp_index(
                         column, num_rows, "disable");
@@ -6623,7 +6614,8 @@ ChunkedSegmentSealedImpl::LoadColumnGroup(
         if (field_id == TimestampFieldID) {
             int64_t num_rows = load_info->GetNumOfRows();
             if (commit_ts_ != 0) {
-                init_constant_timestamp_data(num_rows, commit_ts_);
+                std::vector<Timestamp> ts(num_rows, commit_ts_);
+                init_storage_v1_timestamp_index(std::move(ts), num_rows);
             } else {
                 init_storage_v2_timestamp_index(column, num_rows);
             }
