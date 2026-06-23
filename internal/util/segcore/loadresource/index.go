@@ -135,7 +135,9 @@ func buildCLoadIndexInfo(field *schemapb.FieldSchema, segment *querypb.SegmentLo
 	if err := indexparams.AppendPrepareLoadParams(paramtable.Get(), indexParams); err != nil {
 		return nil, err
 	}
-	if _, ok := indexParams[common.WarmupKey]; !ok {
+	if segment.GetForceSyncWarmup() {
+		indexParams[common.WarmupKey] = common.WarmupSync
+	} else if _, ok := indexParams[common.WarmupKey]; !ok {
 		if warmupPolicy := getIndexWarmupPolicy(field, index); warmupPolicy != "" {
 			indexParams[common.WarmupKey] = warmupPolicy
 		}

@@ -237,6 +237,20 @@ func TestBuildCLoadIndexInfoResolvesWarmup(t *testing.T) {
 		require.NoError(t, err)
 		require.Equal(t, common.WarmupAsync, info.GetIndexParams()[common.WarmupKey])
 	})
+
+	t.Run("force sync warmup overrides index setting", func(t *testing.T) {
+		info, err := buildCLoadIndexInfo(
+			&schemapb.FieldSchema{DataType: schemapb.DataType_String},
+			&querypb.SegmentLoadInfo{ForceSyncWarmup: true},
+			&querypb.FieldIndexInfo{IndexParams: []*commonpb.KeyValuePair{
+				{Key: common.IndexTypeKey, Value: "INVERTED"},
+				{Key: common.WarmupKey, Value: common.WarmupDisable},
+			}},
+		)
+
+		require.NoError(t, err)
+		require.Equal(t, common.WarmupSync, info.GetIndexParams()[common.WarmupKey])
+	})
 }
 
 func TestEstimateIndexLoadResourceReturnsErrorWithoutIndexType(t *testing.T) {

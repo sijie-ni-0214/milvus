@@ -100,6 +100,7 @@ func (s *Server) broadcastAlterLoadConfigCollectionV2ForLoadPartitions(ctx conte
 			ExpectedRequiredFields:           loadmgr.FieldsToMessage(loadmgr.RequiredFieldsForSchema(coll.Schema)),
 			ExpectedPriority:                 req.GetPriority(),
 			ExpectedUserSpecifiedReplicaMode: userSpecifiedReplicaMode,
+			ExpectedForceSyncWarmup:          req.GetForceSyncWarmup(),
 		},
 		ScopedResourceGroups: scopedResourceGroups,
 	}
