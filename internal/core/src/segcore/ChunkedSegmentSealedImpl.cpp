@@ -1291,20 +1291,7 @@ cancel_and_clear_json_indices(std::vector<JsonIndexT>& json_indices) {
 
 PinWrapper<const storagev2translator::TimestampIndexCell*>
 ChunkedSegmentSealedImpl::PinTimestampIndex(milvus::OpContext* op_ctx) const {
-    std::shared_ptr<CacheSlot<storagev2translator::TimestampIndexCell>> slot;
-    {
-        auto state = timestamp_index_.wlock();
-        if (state->slot == nullptr && state->source.has_value()) {
-            const auto& source = state->source.value();
-            std::unique_ptr<Translator<storagev2translator::TimestampIndexCell>>
-                translator = std::make_unique<
-                    storagev2translator::TimestampIndexTranslator>(
-                    id_, source.column, source.num_rows, source.warmup_policy);
-            state->slot =
-                Manager::GetInstance().CreateCacheSlot(std::move(translator));
-        }
-        slot = state->slot;
-    }
+    auto slot = *timestamp_index_slot_.rlock();
     if (!slot) {
         return PinWrapper<const storagev2translator::TimestampIndexCell*>(
             nullptr);
@@ -1318,24 +1305,7 @@ ChunkedSegmentSealedImpl::PinTimestampIndex(milvus::OpContext* op_ctx) const {
 
 PinWrapper<const storagev2translator::PkIndexCell*>
 ChunkedSegmentSealedImpl::PinPkIndex(milvus::OpContext* op_ctx) const {
-    std::shared_ptr<CacheSlot<storagev2translator::PkIndexCell>> slot;
-    {
-        auto state = pk_index_.wlock();
-        if (state->slot == nullptr && state->source.has_value()) {
-            const auto& source = state->source.value();
-            std::unique_ptr<Translator<storagev2translator::PkIndexCell>>
-                translator =
-                    std::make_unique<storagev2translator::PkIndexTranslator>(
-                        id_,
-                        source.column,
-                        source.data_type,
-                        is_sorted_by_pk_,
-                        source.warmup_policy);
-            state->slot =
-                Manager::GetInstance().CreateCacheSlot(std::move(translator));
-        }
-        slot = state->slot;
-    }
+    auto slot = *pk_index_slot_.rlock();
     if (!slot) {
         return PinWrapper<const storagev2translator::PkIndexCell*>(nullptr);
     }
@@ -1420,15 +1390,12 @@ ChunkedSegmentSealedImpl::init_storage_v2_timestamp_index(
     const std::shared_ptr<ChunkedColumnInterface>& column,
     size_t num_rows,
     const std::string& warmup_policy) {
-    {
-        auto state = timestamp_index_.wlock();
-        state->slot.reset();
-        state->source = LazyTimestampIndexSource{
-            column,
-            static_cast<int64_t>(num_rows),
-            warmup_policy,
-        };
-    }
+    std::unique_ptr<Translator<storagev2translator::TimestampIndexCell>>
+        translator =
+            std::make_unique<storagev2translator::TimestampIndexTranslator>(
+                id_, column, num_rows, warmup_policy);
+    *timestamp_index_slot_.wlock() =
+        Manager::GetInstance().CreateCacheSlot(std::move(translator));
 
     // Provide a callback so DeletedRecord can read insert timestamps
     // from the column even when insert_record_.timestamps_ is empty
@@ -1487,13 +1454,11 @@ ChunkedSegmentSealedImpl::init_storage_v2_pk_index(
     if (schema_->get_primary_field_id() != field_id) {
         return;
     }
-    auto state = pk_index_.wlock();
-    state->slot.reset();
-    state->source = LazyPkIndexSource{
-        column,
-        data_type,
-        warmup_policy,
-    };
+    std::unique_ptr<Translator<storagev2translator::PkIndexCell>> translator =
+        std::make_unique<storagev2translator::PkIndexTranslator>(
+            id_, column, data_type, is_sorted_by_pk_, warmup_policy);
+    *pk_index_slot_.wlock() =
+        Manager::GetInstance().CreateCacheSlot(std::move(translator));
 }
 
 void
@@ -3923,8 +3888,8 @@ ChunkedSegmentSealedImpl::ClearData() {
             cancel_and_clear_json_indices(json_indexings);
         });
         insert_record_.clear();
-        *timestamp_index_.wlock() = {};
-        *pk_index_.wlock() = {};
+        timestamp_index_slot_.wlock()->reset();
+        pk_index_slot_.wlock()->reset();
         fields_.wlock()->clear();
         variable_fields_avg_size_.clear();
         field_data_accounted_bytes_.clear();
