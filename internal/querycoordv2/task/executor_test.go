@@ -19,11 +19,15 @@ package task
 import (
 	"context"
 	"fmt"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/mock"
 
+	"github.com/milvus-io/milvus-proto/go-api/v3/milvuspb"
+	"github.com/milvus-io/milvus-proto/go-api/v3/schemapb"
 	"github.com/milvus-io/milvus/internal/querycoordv2/meta"
 	"github.com/milvus-io/milvus/internal/querycoordv2/session"
 	"github.com/milvus-io/milvus/pkg/v3/proto/querypb"
@@ -60,6 +64,69 @@ type testSource string
 
 func (s testSource) String() string {
 	return string(s)
+}
+
+func TestExecutorGetCollectionInfoCoalescesConcurrentCalls(t *testing.T) {
+	ctx := context.Background()
+	collectionID := int64(1000)
+	broker := meta.NewMockBroker(t)
+	ex := NewExecutor(1, nil, nil, broker, nil, nil, session.NewNodeManager())
+
+	var describeCalls atomic.Int32
+	entered := make(chan struct{}, 1)
+	release := make(chan struct{})
+	broker.EXPECT().DescribeCollection(mock.Anything, collectionID).
+		RunAndReturn(func(ctx context.Context, collectionID int64) (*milvuspb.DescribeCollectionResponse, error) {
+			describeCalls.Add(1)
+			select {
+			case entered <- struct{}{}:
+			default:
+			}
+			<-release
+			return &milvuspb.DescribeCollectionResponse{
+				CollectionID: collectionID,
+				Schema: &schemapb.CollectionSchema{
+					Name: "TestExecutorGetCollectionInfoCoalescesConcurrentCalls",
+				},
+			}, nil
+		})
+
+	const callers = 16
+	start := make(chan struct{})
+	errs := make(chan error, callers)
+	for i := 0; i < callers; i++ {
+		go func() {
+			<-start
+			collectionInfo, err := ex.getCollectionInfo(ctx, collectionID)
+			if err != nil {
+				errs <- err
+				return
+			}
+			if collectionInfo.GetCollectionID() != collectionID {
+				errs <- fmt.Errorf("unexpected collection id %d", collectionInfo.GetCollectionID())
+				return
+			}
+			errs <- nil
+		}()
+	}
+
+	close(start)
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("DescribeCollection was not called")
+	}
+	time.Sleep(20 * time.Millisecond)
+	close(release)
+
+	for i := 0; i < callers; i++ {
+		assert.NoError(t, <-errs)
+	}
+	assert.Equal(t, int32(1), describeCalls.Load())
+
+	_, err := ex.getCollectionInfo(ctx, collectionID)
+	assert.NoError(t, err)
+	assert.Equal(t, int32(2), describeCalls.Load())
 }
 
 func TestExecutorCapacity(t *testing.T) {
