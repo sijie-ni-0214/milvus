@@ -72,6 +72,45 @@ func TestCompactionExecutor(t *testing.T) {
 		assert.Equal(t, 1, len(ex.taskCh))
 	})
 
+	t.Run("Test_Enqueue_BlockingSendDoesNotHoldLock", func(t *testing.T) {
+		ex := NewExecutor()
+		for i := 0; i < cap(ex.taskCh); i++ {
+			ex.taskCh <- nil
+		}
+
+		mockC := NewMockCompactor(t)
+		mockC.EXPECT().GetPlanID().Return(int64(100))
+		mockC.EXPECT().GetSlotUsage().Return(int64(3))
+
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			succeed, err := ex.Enqueue(mockC)
+			assert.True(t, succeed)
+			assert.NoError(t, err)
+		}()
+
+		require.Eventually(t, func() bool {
+			return ex.Slots() == 3
+		}, time.Second, time.Millisecond)
+
+		select {
+		case <-done:
+			t.Fatal("enqueue should block while task channel is full")
+		default:
+		}
+
+		<-ex.taskCh
+		require.Eventually(t, func() bool {
+			select {
+			case <-done:
+				return true
+			default:
+				return false
+			}
+		}, time.Second, time.Millisecond)
+	})
+
 	t.Run("Test_Enqueue_DefaultSlotUsage", func(t *testing.T) {
 		ex := NewExecutor()
 
@@ -368,6 +407,25 @@ func TestCompactionExecutor(t *testing.T) {
 		ex.mu.RUnlock()
 		assert.Equal(t, datapb.CompactionTaskState_completed, task.state)
 		assert.Equal(t, result, task.result)
+	})
+
+	t.Run("Test_CompleteTask_CallbackCanQuerySlots", func(t *testing.T) {
+		ex := NewExecutor()
+		mockC := NewMockCompactor(t)
+
+		planID := int64(1)
+		mockC.EXPECT().GetPlanID().Return(planID)
+		mockC.EXPECT().GetSlotUsage().Return(int64(10)).Times(2)
+		mockC.EXPECT().Complete().Run(func() {
+			assert.Equal(t, int64(0), ex.Slots())
+		}).Return()
+		mockC.EXPECT().GetStorageConfig().Return(nil)
+
+		succeed, err := ex.Enqueue(mockC)
+		assert.True(t, succeed)
+		assert.NoError(t, err)
+
+		ex.completeTask(planID, &datapb.CompactionPlanResult{PlanID: planID})
 	})
 
 	t.Run("Test_CompleteTask_NegativeSlotProtection", func(t *testing.T) {
