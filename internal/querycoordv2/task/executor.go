@@ -41,6 +41,7 @@ import (
 	"github.com/milvus-io/milvus/pkg/v3/proto/indexpb"
 	"github.com/milvus-io/milvus/pkg/v3/proto/querypb"
 	"github.com/milvus-io/milvus/pkg/v3/util/commonpbutil"
+	"github.com/milvus-io/milvus/pkg/v3/util/conc"
 	"github.com/milvus-io/milvus/pkg/v3/util/funcutil"
 	"github.com/milvus-io/milvus/pkg/v3/util/indexparams"
 	"github.com/milvus-io/milvus/pkg/v3/util/merr"
@@ -69,6 +70,8 @@ type Executor struct {
 	executingTasks    *typeutil.ConcurrentSet[string] // task index
 	channelTaskNum    atomic.Int32                    // channel task pool counter
 	nonChannelTaskNum atomic.Int32                    // non-channel task pool counter
+
+	collectionInfoSingleflight conc.Singleflight[*milvuspb.DescribeCollectionResponse]
 }
 
 func NewExecutor(nodeID int64,
@@ -863,7 +866,7 @@ func (ex *Executor) getMetaInfo(ctx context.Context, task Task) (*milvuspb.Descr
 	collectionID := task.CollectionID()
 	shard := task.Shard()
 	log := log.Ctx(ctx)
-	collectionInfo, err := ex.broker.DescribeCollection(ctx, collectionID)
+	collectionInfo, err := ex.getCollectionInfo(ctx, collectionID)
 	if err != nil {
 		log.Warn("failed to get collection info", zap.Error(err))
 		return nil, nil, nil, err
@@ -884,6 +887,13 @@ func (ex *Executor) getMetaInfo(ctx context.Context, task Task) (*milvuspb.Descr
 	}
 
 	return collectionInfo, loadMeta, channel, nil
+}
+
+func (ex *Executor) getCollectionInfo(ctx context.Context, collectionID int64) (*milvuspb.DescribeCollectionResponse, error) {
+	collectionInfo, err, _ := ex.collectionInfoSingleflight.Do(fmt.Sprint(collectionID), func() (*milvuspb.DescribeCollectionResponse, error) {
+		return ex.broker.DescribeCollection(ctx, collectionID)
+	})
+	return collectionInfo, err
 }
 
 func (ex *Executor) getLoadInfo(ctx context.Context, collectionID, segmentID int64, channel *meta.DmChannel, priority commonpb.LoadPriority) (*querypb.SegmentLoadInfo, []*indexpb.IndexInfo, error) {
