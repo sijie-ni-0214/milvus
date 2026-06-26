@@ -13,11 +13,9 @@
 
 #include <optional>
 #include <string>
-#include <utility>
 #include <vector>
 
 #include "cachinglayer/Translator.h"
-#include "cachinglayer/Utils.h"
 #include "common/Chunk.h"
 #include "common/ChunkTarget.h"
 #include "common/type_c.h"
