@@ -110,7 +110,8 @@ func (s *Server) GetQueryNodeDistribution(ctx context.Context, req *querypb.GetQ
 		}, nil
 	}
 
-	if s.nodeMgr.Get(req.GetNodeID()) == nil {
+	node := s.nodeMgr.Get(req.GetNodeID())
+	if node == nil {
 		err := merr.WrapErrNodeNotFound(req.GetNodeID(), errMsg)
 		log.Warn(ctx, errMsg, mlog.Err(err))
 		return &querypb.GetQueryNodeDistributionResponse{
@@ -121,8 +122,9 @@ func (s *Server) GetQueryNodeDistribution(ctx context.Context, req *querypb.GetQ
 	// QueryNodes no longer host channel delegators. Read confirmed segment
 	// resources from QueryView reports, not the retired distribution heartbeat.
 	return &querypb.GetQueryNodeDistributionResponse{
-		Status:           merr.Success(),
-		SealedSegmentIDs: s.qviewsRuntime.shardViewRegistry.LoadedSegmentsOnNode(req.GetNodeID()),
+		Status:                   merr.Success(),
+		SealedSegmentIDs:         s.qviewsRuntime.shardViewRegistry.LoadedSegmentsOnNode(req.GetNodeID()),
+		CacheShardDiskUsageStats: node.CacheShardDiskUsageStats(),
 	}, nil
 }
 
