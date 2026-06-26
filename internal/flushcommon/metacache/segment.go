@@ -175,7 +175,11 @@ func NewSegmentInfo(info *datapb.SegmentInfo, bfs pkoracle.PkStat, bm25Stats *Se
 				Fields:  group.GetChildFields(),
 			})
 		}
-		log.Info("recover split info", zap.Int64("segmentID", info.GetID()), zap.Stringers("columnGroup", currentSplit))
+		if log.L().Core().Enabled(zap.DebugLevel) {
+			log.Debug("recover split info",
+				zap.Int64("segmentID", info.GetID()),
+				zap.Stringers("columnGroup", currentSplit))
+		}
 	}
 	return &SegmentInfo{
 		segmentID:        info.GetID(),

@@ -724,10 +724,17 @@ func (node *QueryNode) LoadSegments(ctx context.Context, req *querypb.LoadSegmen
 		zap.Int64("dstNodeID", req.GetDstNodeID()),
 	)
 
-	log.Info("received load segments request",
+	loadRequestFields := []zap.Field{
 		zap.Int64("version", req.GetVersion()),
 		zap.Bool("needTransfer", req.GetNeedTransfer()),
-		zap.String("loadScope", req.GetLoadScope().String()))
+		zap.String("loadScope", req.GetLoadScope().String()),
+		zap.Int("segmentNum", segmentNum),
+	}
+	if segmentNum > 1 {
+		log.Info("received load segments request", loadRequestFields...)
+	} else {
+		log.Debug("received load segments request", loadRequestFields...)
+	}
 	// check node healthy
 	healthCheckStart := time.Now()
 	if err := node.lifetime.Add(merr.IsHealthy); err != nil {
@@ -834,7 +841,11 @@ func (node *QueryNode) LoadSegments(ctx context.Context, req *querypb.LoadSegmen
 	}
 
 	// Actual load segment
-	log.Info("start to load segments...")
+	if segmentNum > 1 {
+		log.Info("start to load segments...", zap.Int("segmentNum", segmentNum))
+	} else {
+		log.Debug("start to load segments...")
+	}
 	loaderStart := time.Now()
 	loaded, err := node.loader.Load(ctx,
 		req.GetCollectionID(),
@@ -851,8 +862,12 @@ func (node *QueryNode) LoadSegments(ctx context.Context, req *querypb.LoadSegmen
 	node.manager.Collection.Ref(req.GetCollectionID(), uint32(len(loaded)))
 	timing.collectionRefDur = time.Since(collectionRefStart)
 
-	log.Info("load segments done...",
-		zap.Int64s("segments", lo.Map(loaded, func(s segments.Segment, _ int) int64 { return s.ID() })))
+	if segmentNum > 1 {
+		log.Info("load segments done...", zap.Int("loadedSegmentNum", len(loaded)))
+	} else {
+		log.Debug("load segments done...",
+			zap.Int64s("segments", lo.Map(loaded, func(s segments.Segment, _ int) int64 { return s.ID() })))
+	}
 
 	// Publish filesystem metrics after load task completion
 	// Use default filesystem (empty path) for load tasks

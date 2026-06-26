@@ -988,7 +988,9 @@ func (loader *segmentLoader) Load(ctx context.Context,
 	defer loader.unregister(infos...)
 
 	// continue to wait other task done
-	log.Info("start loading...", zap.Int("segmentNum", len(segments)), zap.Int("afterFilter", len(infos)))
+	log.Debug("start loading...",
+		zap.Int("segmentNum", len(segments)),
+		zap.Int("afterFilter", len(infos)))
 
 	var err error
 	var requestResourceResult requestResourceResult
@@ -1089,10 +1091,10 @@ func (loader *segmentLoader) Load(ctx context.Context,
 			if err != nil {
 				logger.Warn("load segment failed when load data into memory", zap.Error(err))
 			}
-			logger.Info("load segment done")
+			logger.Debug("load segment done")
 		}()
 		tr := timerecord.NewTimeRecorder("loadDurationPerSegment")
-		logger.Info("load segment...")
+		logger.Debug("load segment...")
 
 		// L0 segment has no index or data to be load.
 		if loadInfo.GetLevel() != datapb.SegmentLevel_L0 {
@@ -1168,7 +1170,7 @@ func (loader *segmentLoader) Load(ctx context.Context,
 
 	// Start to load,
 	// Make sure we can always benefit from concurrency, and not spawn too many idle goroutines
-	log.Info("start to load segments in parallel",
+	log.Debug("start to load segments in parallel",
 		zap.Int("segmentNum", len(infos)),
 		zap.Int("concurrencyLevel", requestResourceResult.ConcurrencyLevel))
 
@@ -1191,7 +1193,7 @@ func (loader *segmentLoader) Load(ctx context.Context,
 	}
 	waitLoadDoneDur = time.Since(stageStart)
 
-	log.Info("all segment load done")
+	log.Debug("all segment load done", zap.Int("loadedSegmentNum", len(infos)))
 	var result []Segment
 	stageStart = time.Now()
 	loaded.Range(func(_ int64, s Segment) bool {
@@ -1387,7 +1389,7 @@ func (loader *segmentLoader) requestResource(ctx context.Context, infos ...*quer
 	loader.mut.Unlock()
 	requestResourceTiming.record(estimateDur, lockWaitDur, lockHoldDur, time.Since(requestStart))
 
-	log.Info("predict memory and disk usage while loading (in MiB)",
+	log.Debug("predict memory and disk usage while loading (in MiB)",
 		zap.Float64("maxSegmentSize(MB)", logutil.ToMB(float64(maxSegmentSize))),
 		zap.Float64("committedMemSize(MB)", logutil.ToMB(float64(result.CommittedResource.MemorySize))),
 		zap.Float64("memLimit(MB)", logutil.ToMB(float64(totalMemory))),
@@ -1398,7 +1400,7 @@ func (loader *segmentLoader) requestResource(ctx context.Context, infos ...*quer
 		zap.Float64("predictDiskUsage(MB)", logutil.ToMB(float64(predictDiskUsage))),
 		zap.Int("mmapFieldCount", loadingUsage.MmapFieldCount),
 	)
-	log.Info("request resource for loading segments (unit in MiB)",
+	log.Debug("request resource for loading segments (unit in MiB)",
 		zap.Float64("memory", logutil.ToMB(float64(result.Resource.MemorySize))),
 		zap.Float64("committedMemory", logutil.ToMB(float64(committedResource.MemorySize))),
 		zap.Float64("disk", logutil.ToMB(float64(result.Resource.DiskSize))),
@@ -1510,7 +1512,7 @@ func (loader *segmentLoader) loadSingleBloomFilterSet(ctx context.Context, colle
 	}
 	pkField := GetPkField(collection.Schema())
 
-	log.Info("start loading remote...", zap.Int("segmentNum", 1))
+	log.Debug("start loading remote...", zap.Int("segmentNum", 1))
 
 	// For external collections, return empty bloom filter set.
 	// External collections use ExternalSegmentCandidate for PK checking (set on segment)
@@ -1914,10 +1916,10 @@ func (loader *segmentLoader) loadSealedSegment(ctx context.Context, loadInfo *qu
 
 	log := log.Ctx(ctx).With(zap.Int64("segmentID", segment.ID()))
 	tr := timerecord.NewTimeRecorder("segmentLoader.loadSealedSegment")
-	if log.Core().Enabled(zap.InfoLevel) {
+	if log.Core().Enabled(zap.DebugLevel) {
 		collection := segment.GetCollection()
 		indexedFieldInfos, _, textIndexes, unindexedTextFields, jsonKeyStats, _, _ := separateLoadInfoV2(loadInfo, collection.Schema())
-		log.Info("Start loading fields...",
+		log.Debug("Start loading fields...",
 			zap.Int("indexedFields count", len(indexedFieldInfos)),
 			zap.Int64s("indexed text fields", lo.Keys(textIndexes)),
 			zap.Int64s("unindexed text fields", lo.Keys(unindexedTextFields)),
@@ -1963,7 +1965,7 @@ func (loader *segmentLoader) loadSealedSegment(ctx context.Context, loadInfo *qu
 	}
 	patchEntryNumberSpan = time.Since(patchEntryStart)
 	sealedLoadSpan := tr.RecordSpan()
-	log.Info("Finish loading segment",
+	log.Debug("Finish loading segment",
 		zap.Duration("patchEntryNumberSpan", patchEntryNumberSpan),
 		zap.Duration("sealedLoadSpan", sealedLoadSpan),
 	)
@@ -1985,7 +1987,7 @@ func (loader *segmentLoader) LoadSegment(ctx context.Context,
 		zap.Int64("segmentID", segment.ID()),
 	)
 
-	log.Info("start loading segment files",
+	log.Debug("start loading segment files",
 		zap.Int64("rowNum", loadInfo.GetNumOfRows()),
 		zap.String("segmentType", segment.Type().String()),
 		zap.Int32("priority", int32(loadInfo.GetPriority())))
@@ -2225,7 +2227,7 @@ func (loader *segmentLoader) loadDeltalogs(ctx context.Context, segment Segment,
 		zap.Int64("segmentID", segment.ID()),
 		zap.Int("deltaNum", len(deltaLogs)),
 	)
-	log.Info("loading delta...")
+	log.Debug("loading delta...")
 
 	var rowNums int64
 	valid := func(binlog *datapb.Binlog, _ int) bool {
@@ -2324,7 +2326,12 @@ func (loader *segmentLoader) loadDeltalogs(ctx context.Context, segment Segment,
 		return err
 	}
 
-	log.Info("load delta logs done", zap.Int64("deleteCount", deltaData.DeleteRowCount()))
+	deleteCount := deltaData.DeleteRowCount()
+	if deleteCount > 0 {
+		log.Info("load delta logs done", zap.Int64("deleteCount", deleteCount))
+	} else {
+		log.Debug("load delta logs done", zap.Int64("deleteCount", deleteCount))
+	}
 	return nil
 }
 

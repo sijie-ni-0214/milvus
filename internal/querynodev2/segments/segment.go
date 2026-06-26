@@ -678,7 +678,7 @@ func NewSegment(ctx context.Context,
 		return nil, err
 	}
 	createSubmitDur = time.Since(stageStart)
-	logger.Info("create segment done")
+	logger.Debug("create segment done")
 
 	stageStart = time.Now()
 	segment := &LocalSegment{

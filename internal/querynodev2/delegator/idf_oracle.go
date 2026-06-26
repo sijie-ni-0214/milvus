@@ -589,7 +589,10 @@ func (o *idfOracle) streamLoad(ctx context.Context, segmentID int64, binlogPaths
 					}
 				}
 				stats[fieldID] = fieldStats
-				log.Info("loaded remote bm25 stats", zap.Duration("time", time.Since(startTs)), zap.Int64("numRow", fieldStats.NumRow()), zap.Int64("fieldID", fieldID))
+				log.Debug("loaded remote bm25 stats",
+					zap.Duration("time", time.Since(startTs)),
+					zap.Int64("numRow", fieldStats.NumRow()),
+					zap.Int64("fieldID", fieldID))
 			}
 		} else {
 			for fieldID := range binlogPaths {
@@ -597,7 +600,11 @@ func (o *idfOracle) streamLoad(ctx context.Context, segmentID int64, binlogPaths
 			}
 		}
 
-		log.Info("stream load bm25 stats done", zap.Duration("time", time.Since(startTs)), zap.Int64("diskSize", 0), zap.Bool("parsed", needParse), zap.Bool("remoteFetchOnly", true))
+		log.Debug("stream load bm25 stats done",
+			zap.Duration("time", time.Since(startTs)),
+			zap.Int64("diskSize", 0),
+			zap.Bool("parsed", needParse),
+			zap.Bool("remoteFetchOnly", true))
 		return streamLoadResult{
 			remoteFetchOnly: true,
 			remotePaths:     binlogPaths,

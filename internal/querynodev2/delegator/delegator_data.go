@@ -1356,6 +1356,7 @@ func (sd *shardDelegator) loadStreamDelete(ctx context.Context,
 	}
 
 	// === Phase 2: Process snapshot WITHOUT lock (expensive — seconds) ===
+	debugLogEnabled := log.Core().Enabled(zap.DebugLevel)
 	phaseStart = time.Now()
 	for i, info := range infos {
 		candidate := idCandidates[info.GetSegmentID()]
@@ -1364,14 +1365,22 @@ func (sd *shardDelegator) loadStreamDelete(ctx context.Context,
 		if err != nil {
 			return err
 		}
-		log.Info("forward delete to worker (phase 2: snapshot)...",
-			zap.String("channel", info.InsertChannel),
-			zap.Int64("segmentID", info.GetSegmentID()),
-			zap.Time("startPosition", tsoutil.PhysicalTime(info.GetStartPosition().GetTimestamp())),
-			zap.Int64("tsHitDeleteRowNum", tsHit),
-			zap.Int64("bfHitDeleteRowNum", bfHit),
-			zap.Int64("bfCost", time.Since(start).Milliseconds()),
-		)
+		hasDeleteHit := tsHit > 0 || bfHit > 0
+		if hasDeleteHit || debugLogEnabled {
+			fields := []zap.Field{
+				zap.String("channel", info.InsertChannel),
+				zap.Int64("segmentID", info.GetSegmentID()),
+				zap.Time("startPosition", tsoutil.PhysicalTime(info.GetStartPosition().GetTimestamp())),
+				zap.Int64("tsHitDeleteRowNum", tsHit),
+				zap.Int64("bfHitDeleteRowNum", bfHit),
+				zap.Int64("bfCost", time.Since(start).Milliseconds()),
+			}
+			if hasDeleteHit {
+				log.Info("forward delete to worker (phase 2: snapshot)...", fields...)
+			} else {
+				log.Debug("forward delete to worker (phase 2: snapshot)...", fields...)
+			}
+		}
 	}
 	timing.phase2SnapshotProcessDur = time.Since(phaseStart)
 
@@ -1404,13 +1413,21 @@ func (sd *shardDelegator) loadStreamDelete(ctx context.Context,
 				timing.phase3LockHoldDur = time.Since(phaseStart)
 				return err
 			}
-			log.Info("forward delete to worker (phase 3: catch-up)...",
-				zap.String("channel", info.InsertChannel),
-				zap.Int64("segmentID", info.GetSegmentID()),
-				zap.Int64("tsHitDeleteRowNum", tsHit),
-				zap.Int64("bfHitDeleteRowNum", bfHit),
-				zap.Int64("bfCost", time.Since(start).Milliseconds()),
-			)
+			hasDeleteHit := tsHit > 0 || bfHit > 0
+			if hasDeleteHit || debugLogEnabled {
+				fields := []zap.Field{
+					zap.String("channel", info.InsertChannel),
+					zap.Int64("segmentID", info.GetSegmentID()),
+					zap.Int64("tsHitDeleteRowNum", tsHit),
+					zap.Int64("bfHitDeleteRowNum", bfHit),
+					zap.Int64("bfCost", time.Since(start).Milliseconds()),
+				}
+				if hasDeleteHit {
+					log.Info("forward delete to worker (phase 3: catch-up)...", fields...)
+				} else {
+					log.Debug("forward delete to worker (phase 3: catch-up)...", fields...)
+				}
+			}
 		}
 		timing.phase3CatchUpDur += time.Since(catchUpStart)
 
@@ -1437,7 +1454,6 @@ func (sd *shardDelegator) loadStreamDelete(ctx context.Context,
 	timing.phase3AddDistributionDur = time.Since(addDistributionStart)
 	sd.deleteMut.RUnlock()
 	timing.phase3LockHoldDur = time.Since(phaseStart)
-	log.Info("load stream delete done")
 	return nil
 }
 

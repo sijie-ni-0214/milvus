@@ -242,13 +242,23 @@ class LazyManifestColumnGroup {
         auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                               std::chrono::steady_clock::now() - start)
                               .count();
-        LOG_INFO(
-            "[StorageV2] lazy manifest column group materialized, segment {}, "
-            "cg {}, column_count {}, elapsed {}ms",
-            context_.segment_id,
-            context_.column_group_index,
-            context_.needed_columns->size(),
-            elapsed_ms);
+        if (elapsed_ms >= 100) {
+            LOG_INFO(
+                "[StorageV2] lazy manifest column group materialized, segment "
+                "{}, cg {}, column_count {}, elapsed {}ms",
+                context_.segment_id,
+                context_.column_group_index,
+                context_.needed_columns->size(),
+                elapsed_ms);
+        } else {
+            LOG_DEBUG(
+                "[StorageV2] lazy manifest column group materialized, segment "
+                "{}, cg {}, column_count {}, elapsed {}ms",
+                context_.segment_id,
+                context_.column_group_index,
+                context_.needed_columns->size(),
+                elapsed_ms);
+        }
         return group_;
     }
 
@@ -1503,7 +1513,7 @@ ChunkedSegmentSealedImpl::LoadVecIndex(LoadIndexInfo& info, bool is_replace) {
             !get_bit(index_ready_bitset_, field_id),
             "vector index has been exist at " + std::to_string(field_id.get()));
     }
-    LOG_INFO(
+    LOG_DEBUG(
         "Before setting field_bit for field index, fieldID:{}. "
         "segmentID:{}, ",
         info.field_id,
@@ -1536,9 +1546,9 @@ ChunkedSegmentSealedImpl::LoadVecIndex(LoadIndexInfo& info, bool is_replace) {
         field_id, metric_type, std::move(info.cache_index));
     set_bit(index_ready_bitset_, field_id, true);
     index_has_raw_data_[field_id] = request.has_raw_data;
-    LOG_INFO("Has load vec index done, fieldID:{}. segmentID:{}, ",
-             info.field_id,
-             id_);
+    LOG_DEBUG("Has load vec index done, fieldID:{}. segmentID:{}, ",
+              info.field_id,
+              id_);
 }
 
 void
@@ -1550,10 +1560,10 @@ ChunkedSegmentSealedImpl::LoadScalarIndex(LoadIndexInfo& info,
 
     auto is_pk = field_id == schema_->get_primary_field_id();
 
-    LOG_INFO("LoadScalarIndex, fieldID:{}. segmentID:{}, is_pk:{}",
-             info.field_id,
-             id_,
-             is_pk);
+    LOG_DEBUG("LoadScalarIndex, fieldID:{}. segmentID:{}, is_pk:{}",
+              info.field_id,
+              id_,
+              is_pk);
     // if segment is pk sorted, user created indexes bring no performance gain but extra memory usage
     if (is_pk && is_sorted_by_pk_) {
         LOG_INFO(
@@ -1637,7 +1647,7 @@ ChunkedSegmentSealedImpl::LoadScalarIndex(LoadIndexInfo& info,
     index_has_raw_data_[field_id] = request.has_raw_data;
     // Note: raw data lifecycle (eviction/drop) is handled by LoadDiff + ApplyLoadDiff,
     // not here. This avoids unsafe ManualEvictCache on column groups.
-    LOG_INFO(
+    LOG_DEBUG(
         "Has load scalar index done, fieldID:{}. segmentID:{}, has_raw_data:{}",
         info.field_id,
         id_,
@@ -6062,7 +6072,7 @@ ChunkedSegmentSealedImpl::SetLoadInfo(
     std::atomic_store(&segment_load_info_, published);
     use_take_for_output_.store(published->GetUseTakeForOutput(),
                                std::memory_order_relaxed);
-    LOG_INFO(
+    LOG_DEBUG(
         "SetLoadInfo for segment {}, num_rows: {}, index count: {}, "
         "storage_version: {}, use_take_for_output: {}, commit_ts: {}",
         id_,
@@ -6272,7 +6282,7 @@ ChunkedSegmentSealedImpl::LoadColumnGroups(
         }
         if (warmup_field_count > 0 &&
             (lazy_manifest_field_count > 0 || fallback_field_count > 0)) {
-            LOG_INFO(
+            LOG_DEBUG(
                 "[StorageV2] segment {} cg {} split by warmup policy: {} "
                 "warmup fields, {} lazy manifest fields, {} fallback fields",
                 get_segment_id(),
@@ -6481,7 +6491,7 @@ ChunkedSegmentSealedImpl::LoadColumnGroup(
                         column, num_rows, "disable");
                 }
             }
-            LOG_INFO(
+            LOG_DEBUG(
                 "[StorageV2] attached lazy manifest column, segment {}, cg {}, "
                 "field {}, rows {}, accounted bytes {}",
                 get_segment_id(),
@@ -7435,9 +7445,9 @@ ChunkedSegmentSealedImpl::ExecuteTake(
         }
         reader_ =
             CreateManifestReader(load_info->GetColumnGroups(), needed_columns);
-        LOG_INFO("[TakeAPI] {} lazily created reader for segment {}",
-                 caller_tag,
-                 id_);
+        LOG_DEBUG("[TakeAPI] {} lazily created reader for segment {}",
+                  caller_tag,
+                  id_);
     }
     auto take_start = std::chrono::high_resolution_clock::now();
     auto result = reader_->take(unique_offsets, 1, needed_columns);

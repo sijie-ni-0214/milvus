@@ -247,11 +247,13 @@ func (b *listDeleteBuffer[T]) Pin(ts uint64, segmentID int64) {
 	}
 	b.pinnedTimestamps[ts][segmentID] = struct{}{}
 
-	log.Info("pin timestamp for segment",
-		zap.Uint64("timestamp", ts),
-		zap.Int64("segmentID", segmentID),
-		zap.Time("physicalTime", tsoutil.PhysicalTime(ts)),
-	)
+	if log.L().Core().Enabled(zap.DebugLevel) {
+		log.Debug("pin timestamp for segment",
+			zap.Uint64("timestamp", ts),
+			zap.Int64("segmentID", segmentID),
+			zap.Time("physicalTime", tsoutil.PhysicalTime(ts)),
+		)
+	}
 }
 
 // Unpin removes protection for a specific timestamp by a specific segment and triggers cleanup
@@ -266,9 +268,11 @@ func (b *listDeleteBuffer[T]) Unpin(ts uint64, segmentID int64) {
 		}
 	}
 
-	log.Info("unpin timestamp for segment",
-		zap.Uint64("timestamp", ts),
-		zap.Int64("segmentID", segmentID),
-		zap.Time("physicalTime", tsoutil.PhysicalTime(ts)),
-	)
+	if log.L().Core().Enabled(zap.DebugLevel) {
+		log.Debug("unpin timestamp for segment",
+			zap.Uint64("timestamp", ts),
+			zap.Int64("segmentID", segmentID),
+			zap.Time("physicalTime", tsoutil.PhysicalTime(ts)),
+		)
+	}
 }

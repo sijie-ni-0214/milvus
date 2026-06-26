@@ -613,14 +613,16 @@ func convertTextIndexStats(src map[int64]*datapb.TextIndexStats, basePaths map[i
 			}
 			files = stripped
 		}
-		log.Info("convertTextIndexStats",
-			zap.Int64("fieldID", v.GetFieldID()),
-			zap.Int64("buildID", v.GetBuildID()),
-			zap.Int64("version", v.GetVersion()),
-			zap.String("basePath", basePath),
-			zap.Int("fileCount", len(files)),
-			zap.Strings("files", files),
-		)
+		if log.L().Core().Enabled(zap.DebugLevel) {
+			log.Debug("convertTextIndexStats",
+				zap.Int64("fieldID", v.GetFieldID()),
+				zap.Int64("buildID", v.GetBuildID()),
+				zap.Int64("version", v.GetVersion()),
+				zap.String("basePath", basePath),
+				zap.Int("fileCount", len(files)),
+				zap.Strings("files", files),
+			)
+		}
 
 		result[k] = &segcorepb.TextIndexStats{
 			FieldID:                   v.GetFieldID(),
@@ -661,14 +663,16 @@ func convertJSONKeyStats(src map[int64]*datapb.JsonKeyStats, basePaths map[int64
 			}
 			files = stripped
 		}
-		log.Info("convertJSONKeyStats",
-			zap.Int64("fieldID", v.GetFieldID()),
-			zap.Int64("buildID", v.GetBuildID()),
-			zap.Int64("version", v.GetVersion()),
-			zap.String("basePath", basePath),
-			zap.Int("fileCount", len(files)),
-			zap.Strings("files", files),
-		)
+		if log.L().Core().Enabled(zap.DebugLevel) {
+			log.Debug("convertJSONKeyStats",
+				zap.Int64("fieldID", v.GetFieldID()),
+				zap.Int64("buildID", v.GetBuildID()),
+				zap.Int64("version", v.GetVersion()),
+				zap.String("basePath", basePath),
+				zap.Int("fileCount", len(files)),
+				zap.Strings("files", files),
+			)
+		}
 
 		result[k] = &segcorepb.JsonKeyStats{
 			FieldID:                v.GetFieldID(),
