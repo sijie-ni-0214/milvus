@@ -474,23 +474,6 @@ func (sd *shardDelegator) LoadGrowing(ctx context.Context, infos []*querypb.Segm
 	segmentIDs = lo.Map(loaded, func(segment segments.Segment, _ int) int64 { return segment.ID() })
 	log.Info(ctx, "load growing segments done", mlog.Int64s("segmentIDs", segmentIDs))
 
-	// initialize checkpoint tracking for recovered growing segments (TEXT collections only)
-	if sd.checkpointTracker != nil {
-		for _, segment := range loaded {
-			// the segment was recovered from binlog, so the current row count is the flushed offset
-			flushedOffset := segment.RowNum()
-			manifest := segment.LoadInfo().GetManifestPath()
-			if manifest == "" && flushedOffset > 0 {
-				return fmt.Errorf("recovered growing segment %d has %d flushed rows but no manifest path, cannot safely resume flush", segment.ID(), flushedOffset)
-			}
-			sd.checkpointTracker.InitSegmentWithManifest(segment.ID(), flushedOffset, manifest)
-			log.Info(ctx, "initialized checkpoint tracker for recovered growing segment",
-				mlog.FieldSegmentID(segment.ID()),
-				mlog.Int64("flushedOffset", flushedOffset),
-				mlog.String("manifest", manifest))
-		}
-	}
-
 	if idfOracle := sd.getIDFOracle(); idfOracle != nil {
 		for _, segment := range loaded {
 			idfOracle.RegisterGrowing(segment.ID(), segment.GetBM25Stats(), segment.Partition())

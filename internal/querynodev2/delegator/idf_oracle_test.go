@@ -1325,7 +1325,7 @@ func TestIDFSyncFunctionsAddsNewBM25Field(t *testing.T) {
 	assert.Equal(t, int64(0), added.NumRow())
 
 	sparse := typeutil.CreateAndSortSparseFloatRow(map[uint32]float32{7: 1})
-	_, avgdl, err := idfOracle.BuildIDF(104, &schemapb.SparseFloatArray{Contents: [][]byte{sparse}, Dim: 1})
+	_, avgdl, err := idfOracle.BuildIDF(context.Background(), 104, &schemapb.SparseFloatArray{Contents: [][]byte{sparse}, Dim: 1})
 	require.NoError(t, err)
 	assert.Equal(t, float64(0), avgdl)
 }
@@ -1341,7 +1341,7 @@ func TestBuildIDFNewFieldAfterSyncFunctions(t *testing.T) {
 	defer idfOracle.Close()
 
 	sparse := typeutil.CreateAndSortSparseFloatRow(map[uint32]float32{7: 1})
-	_, _, err := idfOracle.BuildIDF(104, &schemapb.SparseFloatArray{Contents: [][]byte{sparse}, Dim: 1})
+	_, _, err := idfOracle.BuildIDF(context.Background(), 104, &schemapb.SparseFloatArray{Contents: [][]byte{sparse}, Dim: 1})
 	require.Error(t, err)
 
 	err = idfOracle.SyncFunctions([]*schemapb.FunctionSchema{
@@ -1358,7 +1358,7 @@ func TestBuildIDFNewFieldAfterSyncFunctions(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	_, avgdl, err := idfOracle.BuildIDF(104, &schemapb.SparseFloatArray{Contents: [][]byte{sparse}, Dim: 1})
+	_, avgdl, err := idfOracle.BuildIDF(context.Background(), 104, &schemapb.SparseFloatArray{Contents: [][]byte{sparse}, Dim: 1})
 	require.NoError(t, err)
 	assert.Equal(t, float64(0), avgdl)
 }

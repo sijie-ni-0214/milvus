@@ -354,6 +354,18 @@ class LazyManifestProxyColumn : public ChunkedColumnInterface {
         MaterializedColumn()->PrefetchChunks(op_ctx, chunk_ids);
     }
 
+    bool
+    CellsLoaded(const int64_t* offsets, int64_t count) const override {
+        if (count == 0) {
+            return true;
+        }
+        auto column = MaterializedColumnIfReady();
+        if (column == nullptr) {
+            return false;
+        }
+        return column->CellsLoaded(offsets, count);
+    }
+
     PinWrapper<std::pair<std::vector<std::string_view>, FixedVector<bool>>>
     StringViews(milvus::OpContext* op_ctx,
                 int64_t chunk_id,
@@ -5116,32 +5128,6 @@ ChunkedSegmentSealedImpl::load_field_data_common(
     // system field only needs to emplace column to fields_ map
     if (is_system_field) {
         return;
-    }
-
-    auto& field_meta = schema_->operator[](field_id);
-    if (field_meta.is_nullable() && IsVectorDataType(data_type)) {
-        bool lazy_inited = false;
-        if (statistics.has_value() && !statistics.value().empty()) {
-            const auto& stats = statistics.value();
-            bool any_null = false;
-            for (const auto& s : stats) {
-                if (s == nullptr) {
-                    any_null = true;
-                    break;
-                }
-            }
-            if (!any_null) {
-                lazy_inited = column->TryInitValidRowIdsFromRowGroups(
-                    stats.size(),
-                    [&](size_t i) {
-                        return stats[i]->num_values() + stats[i]->null_count();
-                    },
-                    [&](size_t i) { return stats[i]->null_count(); });
-            }
-        }
-        if (!lazy_inited) {
-            column->BuildValidRowIds(op_ctx);
-        }
     }
 
     if (!enable_mmap) {

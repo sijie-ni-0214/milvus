@@ -2396,7 +2396,7 @@ func TestUpdateSchemaSyncsAdditiveIDFOracleFunctions(t *testing.T) {
 	err := sd.UpdateSchema(context.Background(), newSchema, 100)
 	require.NoError(t, err)
 
-	_, _, err = sd.getIDFOracle().BuildIDF(105, &schemapb.SparseFloatArray{Contents: [][]byte{typeutil.CreateAndSortSparseFloatRow(map[uint32]float32{7: 1})}, Dim: 1})
+	_, _, err = sd.getIDFOracle().BuildIDF(context.Background(), 105, &schemapb.SparseFloatArray{Contents: [][]byte{typeutil.CreateAndSortSparseFloatRow(map[uint32]float32{7: 1})}, Dim: 1})
 	require.NoError(t, err)
 }
 
@@ -2430,7 +2430,7 @@ func TestUpdateSchemaDoesNotSyncIDFOracleWhenWorkerUpdateFails(t *testing.T) {
 	err := sd.UpdateSchema(context.Background(), newSchema, 100)
 	require.Error(t, err)
 
-	_, _, err = sd.getIDFOracle().BuildIDF(105, &schemapb.SparseFloatArray{Contents: [][]byte{typeutil.CreateAndSortSparseFloatRow(map[uint32]float32{7: 1})}, Dim: 1})
+	_, _, err = sd.getIDFOracle().BuildIDF(context.Background(), 105, &schemapb.SparseFloatArray{Contents: [][]byte{typeutil.CreateAndSortSparseFloatRow(map[uint32]float32{7: 1})}, Dim: 1})
 	require.Error(t, err)
 }
 
@@ -2467,7 +2467,7 @@ func TestUpdateSchemaInitializesIDFOracleWhenBM25Added(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, sd.getIDFOracle())
 
-	_, _, err = sd.getIDFOracle().BuildIDF(102, &schemapb.SparseFloatArray{Contents: [][]byte{typeutil.CreateAndSortSparseFloatRow(map[uint32]float32{7: 1})}, Dim: 1})
+	_, _, err = sd.getIDFOracle().BuildIDF(context.Background(), 102, &schemapb.SparseFloatArray{Contents: [][]byte{typeutil.CreateAndSortSparseFloatRow(map[uint32]float32{7: 1})}, Dim: 1})
 	require.NoError(t, err)
 }
 

@@ -66,9 +66,9 @@ func (s *BloomFilterSet) ensureLazyLoaded() error {
 	s.lazyOnce.Do(func() {
 		s.lazyErr = s.lazyLoad(s)
 		if s.lazyErr != nil {
-			log.Warn("failed to lazy load bloom filter set",
-				zap.Int64("segmentID", s.segmentID),
-				zap.Error(s.lazyErr))
+			mlog.Warn(context.TODO(), "failed to lazy load bloom filter set",
+				mlog.FieldSegmentID(s.segmentID),
+				mlog.Err(s.lazyErr))
 			return
 		}
 		s.Charge()

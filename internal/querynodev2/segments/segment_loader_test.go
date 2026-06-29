@@ -1166,9 +1166,11 @@ func (suite *SegmentLoaderSuite) TestLoadSingleBloomFilterSetExternalRealPKUsesE
 	bfs, err := suite.loader.(*segmentLoader).loadSingleBloomFilterSet(ctx, suite.collectionID, loadInfo, SegmentTypeSealed)
 
 	suite.NoError(err)
+	suite.EqualValues(0, readCalls.Load())
+	suite.Empty(gotPaths)
+	suite.True(bfs.PkCandidateExist())
 	suite.EqualValues(2, readCalls.Load())
 	suite.Equal(externalStatsPaths, gotPaths)
-	suite.True(bfs.PkCandidateExist())
 	suite.True(bfs.MayPkExist(storage.NewLocationsCache(storage.NewInt64PrimaryKey(1))))
 }
 
@@ -1192,9 +1194,11 @@ func (suite *SegmentLoaderSuite) TestLoadSingleBloomFilterSetExternalRealPKIgnor
 	bfs, err := suite.loader.(*segmentLoader).loadSingleBloomFilterSet(ctx, suite.collectionID, loadInfo, SegmentTypeSealed)
 
 	suite.NoError(err)
+	suite.EqualValues(0, readCalls.Load())
+	suite.Empty(gotPaths)
+	suite.True(bfs.PkCandidateExist())
 	suite.EqualValues(2, readCalls.Load())
 	suite.Equal(externalStatsPaths, gotPaths)
-	suite.True(bfs.PkCandidateExist())
 	suite.True(bfs.MayPkExist(storage.NewLocationsCache(storage.NewInt64PrimaryKey(1))))
 }
 
@@ -1219,9 +1223,11 @@ func (suite *SegmentLoaderSuite) TestLoadBloomFilterSetExternalRealPKUsesExterna
 
 	suite.NoError(err)
 	suite.Len(bfs, 1)
+	suite.EqualValues(0, readCalls.Load())
+	suite.Empty(gotPaths)
+	suite.True(bfs[0].PkCandidateExist())
 	suite.EqualValues(2, readCalls.Load())
 	suite.Equal(externalStatsPaths, gotPaths)
-	suite.True(bfs[0].PkCandidateExist())
 	suite.True(bfs[0].MayPkExist(storage.NewLocationsCache(storage.NewInt64PrimaryKey(1))))
 }
 
@@ -1246,9 +1252,11 @@ func (suite *SegmentLoaderSuite) TestLoadBloomFilterSetExternalRealPKIgnoresBloo
 
 	suite.NoError(err)
 	suite.Len(bfs, 1)
+	suite.EqualValues(0, readCalls.Load())
+	suite.Empty(gotPaths)
+	suite.True(bfs[0].PkCandidateExist())
 	suite.EqualValues(2, readCalls.Load())
 	suite.Equal(externalStatsPaths, gotPaths)
-	suite.True(bfs[0].PkCandidateExist())
 	suite.True(bfs[0].MayPkExist(storage.NewLocationsCache(storage.NewInt64PrimaryKey(1))))
 }
 

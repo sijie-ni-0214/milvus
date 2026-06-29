@@ -736,15 +736,15 @@ func (d *distribution) updateServiceableByChangedSegments(triggerAction string, 
 
 	serviceable := loadedRatio >= 1.0
 	if serviceable != d.queryView.Serviceable() {
-		log.Info("channel distribution serviceable changed",
-			zap.String("channel", d.channelName),
-			zap.Bool("serviceable", serviceable),
-			zap.Float64("loadedRatio", loadedRatio),
-			zap.Int64("loadedSealedRowCount", loadedSealedSegments),
-			zap.Int64("totalSealedRowCount", d.queryView.totalSealedRowCount),
-			zap.Int("unloadedSealedSegmentNum", len(d.queryView.unloadedSealedSegments)),
-			zap.Int("totalSealedSegmentNum", len(d.queryView.sealedSegmentRowCount)),
-			zap.String("action", triggerAction))
+		mlog.Info(context.TODO(), "channel distribution serviceable changed",
+			mlog.String("channel", d.channelName),
+			mlog.Bool("serviceable", serviceable),
+			mlog.Float64("loadedRatio", loadedRatio),
+			mlog.Int64("loadedSealedRowCount", loadedSealedSegments),
+			mlog.Int64("totalSealedRowCount", d.queryView.totalSealedRowCount),
+			mlog.Int("unloadedSealedSegmentNum", len(d.queryView.unloadedSealedSegments)),
+			mlog.Int("totalSealedSegmentNum", len(d.queryView.sealedSegmentRowCount)),
+			mlog.String("action", triggerAction))
 	}
 
 	d.queryView.loadedRatio.Store(loadedRatio)

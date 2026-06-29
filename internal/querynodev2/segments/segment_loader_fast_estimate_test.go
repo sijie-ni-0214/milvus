@@ -77,8 +77,8 @@ func TestEstimateScalarIndexResourceFast(t *testing.T) {
 			indexType: indexparamcheck.IndexBitmap,
 			mmap:      "true",
 			expected: ResourceEstimate{
-				MaxMemoryCost: expectedIndexSize,
-				MaxDiskCost:   expectedIndexSize,
+				MaxMemoryCost: 2 * expectedIndexSize,
+				MaxDiskCost:   2 * expectedIndexSize,
 				FinalDiskCost: expectedIndexSize,
 			},
 		},

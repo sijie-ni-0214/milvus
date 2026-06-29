@@ -533,8 +533,7 @@ func (s *CollectionManagerSuite) TestPutOrRefSkipSameIndexMeta() {
 
 	sameIndexMeta := proto.Clone(originIndexMeta).(*segcorepb.CollectionIndexMeta)
 	err := s.cm.PutOrRef(1, coll.Schema(), sameIndexMeta, &querypb.LoadMetaInfo{
-		LoadType:      querypb.LoadType_LoadCollection,
-		SchemaVersion: coll.SchemaVersion(),
+		LoadType: querypb.LoadType_LoadCollection,
 	})
 	s.Require().NoError(err)
 	defer s.cm.Unref(1, 1)

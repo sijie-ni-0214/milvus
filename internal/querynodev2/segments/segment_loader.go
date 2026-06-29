@@ -2231,12 +2231,18 @@ func estimateScalarIndexResourceFast(fieldSchema *schemapb.FieldSchema, indexInf
 	}
 	indexType := common.GetIndexType(indexInfo.GetIndexParams())
 	mmapEnable := isIndexMmapEnable(fieldSchema, indexInfo)
+	streamMemoryOverhead, ok := scalarIndexStreamMemoryOverhead(indexSize, indexInfo.GetCurrentScalarIndexVersion())
+	if !ok {
+		return ResourceEstimate{}, false
+	}
 
 	switch indexType {
 	case indexparamcheck.IndexSTLSORT:
+		legacyAuxBytes := sortLegacyAuxBytes(indexInfo.GetNumRows())
+		finalMemoryCost := saturatingAddUint64(indexSize, legacyAuxBytes)
 		return ResourceEstimate{
-			MaxMemoryCost:   2 * indexSize,
-			FinalMemoryCost: indexSize,
+			MaxMemoryCost:   saturatingAddUint64(finalMemoryCost, streamMemoryOverhead),
+			FinalMemoryCost: finalMemoryCost,
 			HasRawData:      true,
 		}, true
 	case indexparamcheck.IndexTRIE, indexparamcheck.IndexTrie:
@@ -2262,10 +2268,13 @@ func estimateScalarIndexResourceFast(fieldSchema *schemapb.FieldSchema, indexInf
 		}, true
 	case indexparamcheck.IndexBitmap:
 		if mmapEnable {
+			residentBytes := bitsetBytes(indexInfo.GetNumRows())
+			frozenBufferBytes := bitmapMmapFrozenBufferBytes(indexInfo.GetNumRows(), indexSize)
 			return ResourceEstimate{
-				MaxMemoryCost: indexSize,
-				MaxDiskCost:   indexSize,
-				FinalDiskCost: indexSize,
+				MaxMemoryCost:   saturatingAddUint64(saturatingAddUint64(residentBytes, streamMemoryOverhead), frozenBufferBytes),
+				MaxDiskCost:     saturatingMulUint64(indexSize, 2),
+				FinalMemoryCost: residentBytes,
+				FinalDiskCost:   indexSize,
 			}, true
 		}
 		return ResourceEstimate{
@@ -2282,6 +2291,71 @@ func estimateScalarIndexResourceFast(fieldSchema *schemapb.FieldSchema, indexInf
 	default:
 		return ResourceEstimate{}, false
 	}
+}
+
+func scalarIndexStreamMemoryOverhead(indexSize uint64, scalarVersion int32) (uint64, bool) {
+	if indexSize == 0 {
+		return 0, true
+	}
+	if scalarVersion <= 0 {
+		scalarVersion = 1
+	}
+	if scalarVersion < 3 {
+		return indexSize, true
+	}
+	return 0, false
+}
+
+func bitsetBytes(numRows int64) uint64 {
+	if numRows <= 0 {
+		return 0
+	}
+	return (uint64(numRows) + 7) / 8
+}
+
+func alignUpUint64(size, alignment uint64) uint64 {
+	if alignment == 0 || size == 0 {
+		return size
+	}
+	if size > ^uint64(0)-(alignment-1) {
+		return ^uint64(0)
+	}
+	return ((size + alignment - 1) / alignment) * alignment
+}
+
+func bitmapMmapFrozenBufferBytes(numRows int64, indexSize uint64) uint64 {
+	const bitmapFrozenAlignment = 32
+	denseBitmapBytes := alignUpUint64(bitsetBytes(numRows), bitmapFrozenAlignment)
+	if denseBitmapBytes > indexSize {
+		return denseBitmapBytes
+	}
+	return indexSize
+}
+
+func sortLegacyAuxBytes(numRows int64) uint64 {
+	if numRows <= 0 {
+		return 0
+	}
+	rows := uint64(numRows)
+	bits := bitsetBytes(numRows)
+	if rows > (^uint64(0)-bits)/4 {
+		return ^uint64(0)
+	}
+	return rows*4 + bits
+}
+
+func saturatingAddUint64(left, right uint64) uint64 {
+	if left > ^uint64(0)-right {
+		return ^uint64(0)
+	}
+	return left + right
+}
+
+func saturatingMulUint64(left, right uint64) uint64 {
+	if left != 0 && right > ^uint64(0)/left {
+		return ^uint64(0)
+	}
+	return left * right
 }
 
 // estimateLoadingResourceUsageOfSegment estimates the resource usage of the segment when loading,
