@@ -285,6 +285,12 @@ class ChunkedSegmentSealedImpl : public SegmentSealed {
            SchemaPtr new_schema) override;
 
     void
+    Reopen(milvus::OpContext* op_ctx,
+           const milvus::proto::segcore::SegmentLoadInfo& new_load_info,
+           SchemaPtr new_schema,
+           bool stats_only) override;
+
+    void
     LazyCheckSchema(SchemaPtr sch, milvus::OpContext* op_ctx) override;
 
     void
@@ -404,6 +410,9 @@ class ChunkedSegmentSealedImpl : public SegmentSealed {
         bool ignore_non_pk,
         bool fill_ids,
         milvus::OpContext* op_ctx = nullptr) const;
+
+    void
+    PrepareForQuery(milvus::OpContext* op_ctx) const override;
 
     // count of chunk that has raw data
     int64_t
@@ -1268,6 +1277,9 @@ class ChunkedSegmentSealedImpl : public SegmentSealed {
     InitTextLobPaths(const std::string& manifest_path);
 
     void
+    EnsureDeferredManifestColumnGroups(milvus::OpContext* op_ctx) const;
+
+    void
     LoadColumnGroups(
         const std::shared_ptr<milvus_storage::api::ColumnGroups>& column_groups,
         const std::shared_ptr<milvus_storage::api::Properties>& properties,
@@ -1538,6 +1550,8 @@ class ChunkedSegmentSealedImpl : public SegmentSealed {
     // Lock order: reopen_mutex_ → mutex_ (outer → inner) only. Never inverse,
     // and reader paths that take mutex_ must not take reopen_mutex_.
     std::mutex reopen_mutex_;
+    mutable std::mutex deferred_manifest_mutex_;
+    mutable std::atomic<bool> deferred_manifest_column_groups_{false};
 
     SchemaPtr schema_;
     int64_t id_;

@@ -5,13 +5,16 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/bytedance/mockey"
 	"github.com/stretchr/testify/assert"
+	"go.uber.org/atomic"
 	"google.golang.org/protobuf/proto"
 
 	"github.com/milvus-io/milvus-proto/go-api/v3/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v3/schemapb"
 	"github.com/milvus-io/milvus/internal/mocks/util/mock_segcore"
 	"github.com/milvus-io/milvus/internal/storage"
+	"github.com/milvus-io/milvus/internal/storagev2/packed"
 	"github.com/milvus-io/milvus/internal/util/initcore"
 	"github.com/milvus-io/milvus/internal/util/segcore"
 	"github.com/milvus-io/milvus/pkg/v3/proto/datapb"
@@ -179,6 +182,111 @@ func TestConvertToSegcoreSegmentLoadInfo_CommitTimestamp(t *testing.T) {
 	assert.NotNil(t, result2)
 	assert.Equal(t, int64(43), result2.GetSegmentID(),
 		"SegmentID must be preserved through conversion when CommitTimestamp is zero")
+}
+
+func TestConvertToSegcoreSegmentLoadInfo_LazyManifestSkipsStatsResolver(t *testing.T) {
+	paramtable.Init()
+	oldLazyManifest := paramtable.Get().QueryNodeCfg.TieredLazyManifestMetadataReadEnabled.SwapTempValue("true")
+	defer paramtable.Get().QueryNodeCfg.TieredLazyManifestMetadataReadEnabled.SwapTempValue(oldLazyManifest)
+
+	statsResolverCalled := atomic.NewInt32(0)
+	patchStatsResolver := mockey.Mock(packed.NewStatsResolverFromLoadInfo).To(
+		func(loadInfo *querypb.SegmentLoadInfo) *packed.StatsResolver {
+			statsResolverCalled.Inc()
+			return packed.NewStatsResolver("", nil)
+		},
+	).Build()
+	defer patchStatsResolver.UnPatch()
+
+	src := &querypb.SegmentLoadInfo{
+		SegmentID:      1001,
+		PartitionID:    2001,
+		CollectionID:   3001,
+		StorageVersion: storage.StorageV3,
+		ManifestPath:   `{"base_path":"/tmp/lazy-manifest-segment","ver":1}`,
+	}
+	schema := &schemapb.CollectionSchema{
+		Fields: []*schemapb.FieldSchema{
+			{FieldID: 100, Name: "pk", DataType: schemapb.DataType_Int64, IsPrimaryKey: true},
+			{FieldID: 101, Name: "scalar", DataType: schemapb.DataType_Int64},
+		},
+	}
+	result := segcore.ConvertToSegcoreSegmentLoadInfoWithSchema(src, schema)
+
+	assert.NotNil(t, result)
+	assert.Equal(t, src.GetManifestPath(), result.GetManifestPath())
+	assert.Equal(t, storage.StorageV3, result.GetStorageVersion())
+	assert.Empty(t, result.GetTextStatsLogs())
+	assert.Empty(t, result.GetJsonKeyStatsLogs())
+	assert.EqualValues(t, 0, statsResolverCalled.Load(),
+		"lazy manifest metadata must not parse V3 text/json stats during load-info conversion")
+}
+
+func TestConvertToSegcoreSegmentLoadInfo_LazyManifestStatsResolverGuard(t *testing.T) {
+	paramtable.Init()
+	oldLazyManifest := paramtable.Get().QueryNodeCfg.TieredLazyManifestMetadataReadEnabled.SwapTempValue("true")
+	defer paramtable.Get().QueryNodeCfg.TieredLazyManifestMetadataReadEnabled.SwapTempValue(oldLazyManifest)
+
+	statsResolverCalled := atomic.NewInt32(0)
+	patchStatsResolver := mockey.Mock(packed.NewStatsResolverFromLoadInfo).To(
+		func(loadInfo *querypb.SegmentLoadInfo) *packed.StatsResolver {
+			statsResolverCalled.Inc()
+			return packed.NewStatsResolver("", nil)
+		},
+	).Build()
+	defer patchStatsResolver.UnPatch()
+
+	src := &querypb.SegmentLoadInfo{
+		SegmentID:      1001,
+		PartitionID:    2001,
+		CollectionID:   3001,
+		StorageVersion: storage.StorageV3,
+		ManifestPath:   `{"base_path":"/tmp/lazy-manifest-segment","ver":1}`,
+	}
+	textMatchSchema := &schemapb.CollectionSchema{
+		Fields: []*schemapb.FieldSchema{
+			{FieldID: 100, Name: "pk", DataType: schemapb.DataType_Int64, IsPrimaryKey: true},
+			{
+				FieldID:  101,
+				Name:     "text",
+				DataType: schemapb.DataType_VarChar,
+				TypeParams: []*commonpb.KeyValuePair{
+					{Key: "enable_match", Value: "true"},
+					{Key: "enable_analyzer", Value: "true"},
+					{Key: "max_length", Value: "1024"},
+				},
+			},
+		},
+	}
+
+	result := segcore.ConvertToSegcoreSegmentLoadInfoWithSchema(src, textMatchSchema)
+
+	assert.NotNil(t, result)
+	assert.EqualValues(t, 0, statsResolverCalled.Load(),
+		"text match schema must defer manifest stats resolution when lazy manifest metadata read is enabled")
+}
+
+func TestCanUseLazyManifestMetadataReadSkipsL0(t *testing.T) {
+	paramtable.Init()
+	oldLazyManifest := paramtable.Get().QueryNodeCfg.TieredLazyManifestMetadataReadEnabled.SwapTempValue("true")
+	defer paramtable.Get().QueryNodeCfg.TieredLazyManifestMetadataReadEnabled.SwapTempValue(oldLazyManifest)
+
+	src := &querypb.SegmentLoadInfo{
+		SegmentID:      1001,
+		PartitionID:    2001,
+		CollectionID:   3001,
+		StorageVersion: storage.StorageV3,
+		ManifestPath:   `{"base_path":"/tmp/lazy-manifest-segment","ver":1}`,
+		Level:          datapb.SegmentLevel_L0,
+	}
+	schema := &schemapb.CollectionSchema{
+		Fields: []*schemapb.FieldSchema{
+			{FieldID: 100, Name: "pk", DataType: schemapb.DataType_Int64, IsPrimaryKey: true},
+			{FieldID: 101, Name: "scalar", DataType: schemapb.DataType_Int64},
+		},
+	}
+
+	assert.False(t, segcore.CanUseLazyManifestMetadataRead(src, schema))
 }
 
 func TestConvertToSegcoreSegmentLoadInfo(t *testing.T) {

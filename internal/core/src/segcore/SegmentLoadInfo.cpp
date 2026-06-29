@@ -44,7 +44,8 @@ SegmentLoadInfo::GetColumnGroups() const {
     if (manifest_path.empty()) {
         return nullptr;
     }
-    // return cached result if exists
+
+    std::lock_guard<std::mutex> lock(*column_groups_mutex_);
     if (column_groups_ != nullptr) {
         return column_groups_;
     }
@@ -919,17 +920,26 @@ LoadDiff
 SegmentLoadInfo::ComputeDiff(SegmentLoadInfo& new_info) {
     LoadDiff diff;
 
+    const bool defer_manifest_metadata =
+        new_info.HasManifestPath() && !new_info.schema_->is_external_collection() &&
+        new_info.CanDeferManifestMetadataRead();
+    const bool has_resolved_manifest_stats =
+        new_info.GetTextStatsLogs().size() > 0 ||
+        new_info.GetJsonKeyStatsLogs().size() > 0;
+
     // Handle index changes
     ComputeDiffIndexes(diff, new_info);
 
     // Compute fields that need to be reloaded due to index raw data changes
     ComputeDiffReloadFields(diff, new_info);
 
-    // Compute text index changes
-    ComputeDiffTextIndexes(diff, new_info);
+    if (!defer_manifest_metadata || has_resolved_manifest_stats) {
+        // Compute text index changes
+        ComputeDiffTextIndexes(diff, new_info);
 
-    // Compute JSON key stats changes
-    ComputeDiffJsonKeyStats(diff, new_info);
+        // Compute JSON key stats changes
+        ComputeDiffJsonKeyStats(diff, new_info);
+    }
 
     // Handle field data changes
     // Note: Updates can only happen within the same category:
@@ -947,6 +957,8 @@ SegmentLoadInfo::ComputeDiff(SegmentLoadInfo& new_info) {
             if (diff.manifest_updated) {
                 diff.load_external_manifest = true;
             }
+        } else if (defer_manifest_metadata) {
+            diff.defer_manifest_column_groups = true;
         } else {
             ComputeDiffColumnGroups(diff, new_info);
         }
@@ -958,10 +970,19 @@ SegmentLoadInfo::ComputeDiff(SegmentLoadInfo& new_info) {
     }
 
     // Compute fields that need default value filling (schema evolution)
-    if (!schema_->is_external_collection()) {
+    if (!schema_->is_external_collection() && !diff.defer_manifest_column_groups) {
         ComputeDiffDefaultFields(diff, new_info);
     }
 
+    return diff;
+}
+
+LoadDiff
+SegmentLoadInfo::ComputeStatsOnlyDiff(SegmentLoadInfo& new_info) {
+    LoadDiff diff;
+    ComputeDiffTextIndexes(diff, new_info);
+    diff.text_indexes_to_create.clear();
+    ComputeDiffJsonKeyStats(diff, new_info);
     return diff;
 }
 
@@ -978,20 +999,29 @@ SegmentLoadInfo::GetLoadDiff() {
 
     SegmentLoadInfo empty_info(empty_load_info, schema_);
 
+    const bool defer_manifest_metadata =
+        HasManifestPath() && !schema_->is_external_collection() &&
+        CanDeferManifestMetadataRead();
+    const bool has_resolved_manifest_stats =
+        GetTextStatsLogs().size() > 0 || GetJsonKeyStatsLogs().size() > 0;
+
     // Handle index changes
     empty_info.ComputeDiffIndexes(diff, *this);
 
-    // Handle text index changes
-    empty_info.ComputeDiffTextIndexes(diff, *this);
+    if (!defer_manifest_metadata || has_resolved_manifest_stats) {
+        // Handle text index changes
+        empty_info.ComputeDiffTextIndexes(diff, *this);
 
-    // Handle JSON key stats changes
-    empty_info.ComputeDiffJsonKeyStats(diff, *this);
+        // Handle JSON key stats changes
+        empty_info.ComputeDiffJsonKeyStats(diff, *this);
+    }
 
     // Handle field data changes
     // Note: Updates can only happen within the same category:
     // - binlog -> binlog
     // - manifest -> manifest
     // Cross-category changes are not supported.
+    bool deferred_manifest_column_groups = false;
     if (HasManifestPath()) {
         if (schema_->is_external_collection()) {
             // External collections use parquet field names (e.g., "id",
@@ -999,6 +1029,9 @@ SegmentLoadInfo::GetLoadDiff() {
             // ComputeDiffColumnGroups calls std::stoll which would crash.
             // Flag for direct manifest loading in ApplyLoadDiff.
             diff.load_external_manifest = true;
+        } else if (defer_manifest_metadata) {
+            diff.defer_manifest_column_groups = true;
+            deferred_manifest_column_groups = true;
         } else {
             // set mock path for null check
             empty_info.info_.set_manifest_path("mocked manifest path");
@@ -1014,11 +1047,23 @@ SegmentLoadInfo::GetLoadDiff() {
     // Skip for external collections: collect_data_fields() calls std::stoll
     // on column group names, and external collections don't need default fills
     // (all fields are either external or virtual PK).
-    if (!schema_->is_external_collection()) {
+    if (!schema_->is_external_collection() && !deferred_manifest_column_groups) {
         empty_info.ComputeDiffDefaultFields(diff, *this);
     }
 
     return diff;
+}
+
+bool
+SegmentLoadInfo::CanDeferManifestMetadataRead() const {
+    if (!HasManifestPath() || GetStorageVersion() != STORAGE_V3 ||
+        schema_->is_external_collection() ||
+        !SegcoreConfig::default_config()
+             .get_lazy_manifest_metadata_read_enabled()) {
+        return false;
+    }
+
+    return true;
 }
 
 }  // namespace milvus::segcore

@@ -383,9 +383,10 @@ type idfOracle struct {
 
 	dirPath string
 
-	closeCh chan struct{}
-	sf      conc.Singleflight[any]
-	wg      sync.WaitGroup
+	currentDirty *atomic.Bool
+	closeCh      chan struct{}
+	sf           conc.Singleflight[any]
+	wg           sync.WaitGroup
 
 	// resource tracking for caching layer
 	resourceMu    sync.Mutex
@@ -457,7 +458,7 @@ func (o *idfOracle) LoadSealed(ctx context.Context, segmentID int64, loadInfo *q
 		}
 
 		remoteFetchOnly := paramtable.Get().QueryNodeCfg.IDFRemoteFetchOnly.GetAsBool()
-		if partitionLevel && partitionLazyLoad {
+		if (partitionLevel && partitionLazyLoad) || canLazyManifestBM25Stats(loadInfo) {
 			if !hasBM25StatsSource(loadInfo) {
 				return nil, nil
 			}
@@ -475,9 +476,11 @@ func (o *idfOracle) LoadSealed(ctx context.Context, segmentID int64, loadInfo *q
 			}
 			o.sealed.Insert(segmentID, segStats)
 
-			o.Lock()
-			o.clearPartitionStatsLocked(loadInfo.GetPartitionID())
-			o.Unlock()
+			if partitionLevel && partitionLazyLoad {
+				o.Lock()
+				o.clearPartitionStatsLocked(loadInfo.GetPartitionID())
+				o.Unlock()
+			}
 
 			o.syncResource()
 			return nil, nil
@@ -538,6 +541,16 @@ func (o *idfOracle) LoadSealed(ctx context.Context, segmentID int64, loadInfo *q
 
 func hasBM25StatsSource(loadInfo *querypb.SegmentLoadInfo) bool {
 	return loadInfo.GetManifestPath() != "" || len(loadInfo.GetBm25Logs()) > 0
+}
+
+func canLazyManifestBM25Stats(loadInfo *querypb.SegmentLoadInfo) bool {
+	if loadInfo == nil {
+		return false
+	}
+	return paramtable.Get().QueryNodeCfg.TieredLazyManifestMetadataReadEnabled.GetAsBool() &&
+		loadInfo.GetStorageVersion() == storage.StorageV3 &&
+		loadInfo.GetManifestPath() != "" &&
+		loadInfo.GetLevel() != datapb.SegmentLevel_L0
 }
 
 func idfPartitionLoadConfig() (partitionLevel bool, partitionLazyLoad bool, err error) {
@@ -995,6 +1008,9 @@ func (o *idfOracle) SyncDistribution() error {
 	if partitionLevel {
 		return o.syncDistributionPartitionLevel(snapshot, snapshotTs, targetMap, reserveMap, partitionLazyLoad)
 	}
+	if o.hasLazyManifestBM25Source(targetMap) {
+		return o.syncDistributionLazyCurrent(snapshot, snapshotTs, targetMap, reserveMap)
+	}
 
 	diff := bm25Stats{}
 
@@ -1081,7 +1097,82 @@ func (o *idfOracle) SyncDistribution() error {
 	return nil
 }
 
+func (o *idfOracle) hasLazyManifestBM25Source(targetMap typeutil.Set[UniqueID]) bool {
+	if !paramtable.Get().QueryNodeCfg.TieredLazyManifestMetadataReadEnabled.GetAsBool() {
+		return false
+	}
+
+	checkTarget := targetMap != nil && targetMap.Len() > 0
+	needed := false
+	o.sealed.Range(func(segmentID int64, stats *sealedBm25Stats) bool {
+		if stats.source.manifestPath != "" && (!checkTarget || targetMap.Contain(segmentID) || stats.activate.Load()) {
+			needed = true
+			return false
+		}
+		return true
+	})
+	return needed
+}
+
+func (o *idfOracle) syncDistributionLazyCurrent(snapshot *snapshot, snapshotTs time.Time, targetMap, reserveMap typeutil.Set[UniqueID]) error {
+	dirty := false
+
+	o.Lock()
+	for segmentID, stats := range o.growing {
+		if stats.droppedVersion != 0 && stats.droppedVersion <= snapshot.targetVersion {
+			if stats.activate {
+				dirty = true
+			}
+			delete(o.growing, segmentID)
+		}
+	}
+
+	o.sealed.Range(func(segmentID int64, stats *sealedBm25Stats) bool {
+		reserve := reserveMap.Contain(segmentID)
+		intarget := targetMap.Contain(segmentID)
+
+		activate := stats.activate.Load()
+		if intarget && !activate {
+			stats.activate.Store(true)
+			dirty = true
+		}
+		if !intarget && activate {
+			stats.activate.Store(false)
+			dirty = true
+		}
+
+		if !intarget && !reserve && stats.ts.Before(snapshotTs) {
+			o.sealedDiskSize.Add(-stats.diskSize)
+			stats.Remove()
+			o.sealed.Remove(segmentID)
+			dirty = true
+		}
+		return true
+	})
+
+	if dirty {
+		o.currentDirty.Store(true)
+	}
+	o.targetVersion.Store(snapshot.targetVersion)
+	numRow := o.current.NumRow()
+	growingLen := len(o.growing)
+	sealedLen := o.sealed.Len()
+	currentDirty := o.currentDirty.Load()
+	o.Unlock()
+
+	o.syncResource()
+	log.Ctx(context.TODO()).Info("sync idf distribution finished",
+		zap.Int64("version", snapshot.targetVersion),
+		zap.Int64("numrow", numRow),
+		zap.Int("growing", growingLen),
+		zap.Int("sealed", sealedLen),
+		zap.Bool("lazyManifestBM25", true),
+		zap.Bool("currentDirty", currentDirty))
+	return nil
+}
+
 func (o *idfOracle) syncDistributionPartitionLevel(snapshot *snapshot, snapshotTs time.Time, targetMap, reserveMap typeutil.Set[UniqueID], partitionLazyLoad bool) error {
+	partitionLazyLoad = partitionLazyLoad || o.hasLazyManifestBM25Source(targetMap)
 	if !partitionLazyLoad {
 		return o.syncDistributionPartitionLevelLoaded(snapshot, snapshotTs, targetMap, reserveMap)
 	}
@@ -1260,6 +1351,7 @@ func (o *idfOracle) BuildIDF(ctx context.Context, fieldID int64, tfs *schemapb.S
 		return nil, 0, err
 	}
 	if partitionLevel {
+		partitionLazyLoad = partitionLazyLoad || o.hasLazyManifestBM25Source(nil)
 		partitionStats, err := o.getPartitionStats(ctx, partitionLazyLoad, partitions...)
 		if err != nil {
 			return nil, 0, err
@@ -1271,6 +1363,10 @@ func (o *idfOracle) BuildIDF(ctx context.Context, fieldID int64, tfs *schemapb.S
 		return buildIDFWithStats(stats, tfs), stats.GetAvgdl(), nil
 	}
 
+	if err := o.ensureCurrentStats(ctx); err != nil {
+		return nil, 0, err
+	}
+
 	o.RLock()
 	defer o.RUnlock()
 
@@ -1279,6 +1375,51 @@ func (o *idfOracle) BuildIDF(ctx context.Context, fieldID int64, tfs *schemapb.S
 		return nil, 0, err
 	}
 	return buildIDFWithStats(stats, tfs), stats.GetAvgdl(), nil
+}
+
+func (o *idfOracle) ensureCurrentStats(ctx context.Context) error {
+	if !o.currentDirty.Load() {
+		return nil
+	}
+
+	_, err, _ := o.sf.Do("rebuild_current_bm25_stats", func() (any, error) {
+		if !o.currentDirty.Load() {
+			return nil, nil
+		}
+
+		o.Lock()
+		current := o.emptyStatsLocked()
+		for _, stats := range o.growing {
+			if stats.droppedVersion == 0 && stats.activate {
+				current.Merge(stats.bm25Stats)
+			}
+		}
+
+		var rangeErr error
+		o.sealed.Range(func(segmentID int64, stats *sealedBm25Stats) bool {
+			if !stats.activate.Load() {
+				return true
+			}
+			segmentStats, err := stats.FetchStats(ctx)
+			if err != nil {
+				rangeErr = fmt.Errorf("fetch stats for segment %d failed with error: %v", segmentID, err)
+				return false
+			}
+			current.Merge(segmentStats)
+			return true
+		})
+		if rangeErr != nil {
+			o.Unlock()
+			return nil, rangeErr
+		}
+
+		o.current = current
+		o.currentDirty.Store(false)
+		o.Unlock()
+		o.syncResource()
+		return nil, nil
+	})
+	return err
 }
 
 func buildIDFWithStats(stats *storage.BM25Stats, tfs *schemapb.SparseFloatArray) [][]byte {
@@ -1481,6 +1622,7 @@ func NewIDFOracle(channel string, functions []*schemapb.FunctionSchema) IDFOracl
 		sealedDiskSize: atomic.NewInt64(0),
 		dirPath:        path.Join(pathutil.GetPath(pathutil.BM25Path, paramtable.GetNodeID()), channel),
 		syncNotify:     make(chan struct{}, 1),
+		currentDirty:   atomic.NewBool(false),
 		closeCh:        make(chan struct{}),
 		sf:             conc.Singleflight[any]{},
 	}

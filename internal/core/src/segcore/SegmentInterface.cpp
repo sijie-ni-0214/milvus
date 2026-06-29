@@ -52,6 +52,7 @@ void
 SegmentInternalInterface::FillPrimaryKeys(const query::Plan* plan,
                                           SearchResult& results,
                                           milvus::OpContext* op_ctx) const {
+    PrepareForQuery(op_ctx);
     std::shared_lock lck(mutex_);
     AssertInfo(plan, "empty plan");
     auto size = results.distances_.size();
@@ -91,6 +92,7 @@ void
 SegmentInternalInterface::FillTargetEntry(const query::Plan* plan,
                                           SearchResult& results,
                                           milvus::OpContext* op_ctx) const {
+    PrepareForQuery(op_ctx);
     std::shared_lock lck(mutex_);
     AssertInfo(plan, "empty plan");
     auto size = results.distances_.size();
@@ -144,6 +146,7 @@ SegmentInternalInterface::Search(
     int64_t entity_ttl_physical_time_us,
     bool filter_only,
     bool enable_expr_cache) const {
+    PrepareForQuery(nullptr);
     std::shared_lock lck(mutex_);
     milvus::tracer::AddEvent("obtained_segment_lock_mutex");
 
@@ -206,6 +209,7 @@ SegmentInternalInterface::Retrieve(tracer::TraceContext* trace_ctx,
                                    int32_t consistency_level,
                                    Timestamp collection_ttl,
                                    int64_t entity_ttl_physical_time_us) const {
+    PrepareForQuery(nullptr);
     std::shared_lock lck(mutex_);
     tracer::AutoSpan span("Retrieve", tracer::GetRootSpan(), true);
     auto results = std::make_unique<proto::segcore::RetrieveResults>();
@@ -445,6 +449,7 @@ SegmentInternalInterface::FillTargetEntry(
     bool ignore_non_pk,
     bool fill_ids,
     milvus::OpContext* op_ctx) const {
+    PrepareForQuery(op_ctx);
     tracer::AutoSpan span("FillTargetEntry", tracer::GetRootSpan());
 
     // Fast path: use take() API for external tables with small result sets.
@@ -578,6 +583,7 @@ SegmentInternalInterface::Retrieve(
     const int64_t* offsets,
     int64_t size,
     const folly::CancellationToken& cancel_token) const {
+    PrepareForQuery(nullptr);
     std::shared_lock lck(mutex_);
     tracer::AutoSpan span("RetrieveByOffsets", tracer::GetRootSpan());
     auto results = std::make_unique<proto::segcore::RetrieveResults>();

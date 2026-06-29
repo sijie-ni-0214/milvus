@@ -3500,26 +3500,27 @@ type queryNodeConfig struct {
 	MultipleChunkedEnable         ParamItem `refreshable:"false"` // Deprecated
 	EnableGeometryCache           ParamItem `refreshable:"false"`
 
-	TieredWarmupScalarField         ParamItem `refreshable:"true"`
-	TieredWarmupScalarIndex         ParamItem `refreshable:"true"`
-	TieredWarmupVectorField         ParamItem `refreshable:"true"`
-	TieredWarmupVectorIndex         ParamItem `refreshable:"true"`
-	TieredMemoryLowWatermarkRatio   ParamItem `refreshable:"false"`
-	TieredMemoryHighWatermarkRatio  ParamItem `refreshable:"false"`
-	TieredDiskLowWatermarkRatio     ParamItem `refreshable:"false"`
-	TieredDiskHighWatermarkRatio    ParamItem `refreshable:"false"`
-	TieredEvictionEnabled           ParamItem `refreshable:"false"`
-	TieredEvictableMemoryCacheRatio ParamItem `refreshable:"false"`
-	TieredEvictableDiskCacheRatio   ParamItem `refreshable:"false"`
-	TieredCacheTouchWindowMs        ParamItem `refreshable:"false"`
-	TieredBackgroundEvictionEnabled ParamItem `refreshable:"false"`
-	TieredEvictionIntervalMs        ParamItem `refreshable:"false"`
-	CacheCellUnaccessedSurvivalTime ParamItem `refreshable:"false"`
-	TieredLoadingResourceFactor     ParamItem `refreshable:"false"`
-	TieredLoadingTimeoutMs          ParamItem `refreshable:"true"`
-	TieredWarmupLoadingTimeoutMs    ParamItem `refreshable:"true"`
-	StorageUsageTrackingEnabled     ParamItem `refreshable:"true"`
-	TieredLazyManifestReaderEnabled ParamItem `refreshable:"true"`
+	TieredWarmupScalarField               ParamItem `refreshable:"true"`
+	TieredWarmupScalarIndex               ParamItem `refreshable:"true"`
+	TieredWarmupVectorField               ParamItem `refreshable:"true"`
+	TieredWarmupVectorIndex               ParamItem `refreshable:"true"`
+	TieredMemoryLowWatermarkRatio         ParamItem `refreshable:"false"`
+	TieredMemoryHighWatermarkRatio        ParamItem `refreshable:"false"`
+	TieredDiskLowWatermarkRatio           ParamItem `refreshable:"false"`
+	TieredDiskHighWatermarkRatio          ParamItem `refreshable:"false"`
+	TieredEvictionEnabled                 ParamItem `refreshable:"false"`
+	TieredEvictableMemoryCacheRatio       ParamItem `refreshable:"false"`
+	TieredEvictableDiskCacheRatio         ParamItem `refreshable:"false"`
+	TieredCacheTouchWindowMs              ParamItem `refreshable:"false"`
+	TieredBackgroundEvictionEnabled       ParamItem `refreshable:"false"`
+	TieredEvictionIntervalMs              ParamItem `refreshable:"false"`
+	CacheCellUnaccessedSurvivalTime       ParamItem `refreshable:"false"`
+	TieredLoadingResourceFactor           ParamItem `refreshable:"false"`
+	TieredLoadingTimeoutMs                ParamItem `refreshable:"true"`
+	TieredWarmupLoadingTimeoutMs          ParamItem `refreshable:"true"`
+	StorageUsageTrackingEnabled           ParamItem `refreshable:"true"`
+	TieredLazyManifestReaderEnabled       ParamItem `refreshable:"true"`
+	TieredLazyManifestMetadataReadEnabled ParamItem `refreshable:"true"`
 
 	KnowhereScoreConsistency ParamItem `refreshable:"false"`
 
@@ -3811,6 +3812,15 @@ Defaults to "sync".`,
 		Export:       true,
 	}
 	p.TieredLazyManifestReaderEnabled.Init(base.mgr)
+
+	p.TieredLazyManifestMetadataReadEnabled = ParamItem{
+		Key:          "queryNode.segcore.tieredStorage.lazyManifestMetadataReadEnabled",
+		Version:      "3.0.0",
+		DefaultValue: "false",
+		Doc:          "When enabled, StorageV3 manifest column-group metadata, text/json stats, and delta manifest paths are deferred from load to first query path for sealed non-external segments.",
+		Export:       true,
+	}
+	p.TieredLazyManifestMetadataReadEnabled.Init(base.mgr)
 
 	p.TieredEvictionEnabled = ParamItem{
 		Key:          "queryNode.segcore.tieredStorage.evictionEnabled",

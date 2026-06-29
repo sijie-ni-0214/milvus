@@ -17,6 +17,7 @@ import (
 	"github.com/milvus-io/milvus-proto/go-api/v3/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v3/schemapb"
 	"github.com/milvus-io/milvus/internal/storage"
+	"github.com/milvus-io/milvus/internal/storagev2/packed"
 	"github.com/milvus-io/milvus/internal/util/initcore"
 	"github.com/milvus-io/milvus/pkg/v3/proto/datapb"
 	"github.com/milvus-io/milvus/pkg/v3/proto/querypb"
@@ -120,7 +121,9 @@ func (req *cLoadFieldDataRequest) Release() {
 }
 
 type ReopenRequest struct {
-	LoadInfo      *querypb.SegmentLoadInfo
-	Schema        *schemapb.CollectionSchema
-	SchemaVersion uint64
+	LoadInfo         *querypb.SegmentLoadInfo
+	Schema           *schemapb.CollectionSchema
+	SchemaVersion    uint64
+	PreResolvedStats *packed.StatsResult
+	StatsOnly        bool
 }

@@ -24,6 +24,7 @@ import (
 	"google.golang.org/protobuf/proto"
 
 	"github.com/milvus-io/milvus-proto/go-api/v3/commonpb"
+	"github.com/milvus-io/milvus-proto/go-api/v3/schemapb"
 	"github.com/milvus-io/milvus/internal/storage"
 	"github.com/milvus-io/milvus/internal/storagev2/packed"
 	"github.com/milvus-io/milvus/internal/util/cgo"
@@ -35,6 +36,7 @@ import (
 	"github.com/milvus-io/milvus/pkg/v3/util/metautil"
 	"github.com/milvus-io/milvus/pkg/v3/util/paramtable"
 	"github.com/milvus-io/milvus/pkg/v3/util/tsoutil"
+	"github.com/milvus-io/milvus/pkg/v3/util/typeutil"
 )
 
 const (
@@ -74,7 +76,7 @@ func CreateCSegment(req *CreateCSegmentRequest) (CSegment, error) {
 	var ptr C.CSegmentInterface
 	var status C.CStatus
 	if req.LoadInfo != nil {
-		segLoadInfo := ConvertToSegcoreSegmentLoadInfo(req.LoadInfo)
+		segLoadInfo := ConvertToSegcoreSegmentLoadInfoWithSchema(req.LoadInfo, req.Collection.Schema())
 		loadInfoBlob, err := proto.Marshal(segLoadInfo)
 		if err != nil {
 			return nil, err
@@ -359,7 +361,7 @@ func (s *cSegmentImpl) Reopen(ctx context.Context, req *ReopenRequest) error {
 	defer runtime.KeepAlive(traceCtx)
 	defer runtime.KeepAlive(req)
 
-	segLoadInfo := ConvertToSegcoreSegmentLoadInfo(req.LoadInfo)
+	segLoadInfo := convertToSegcoreSegmentLoadInfoWithSchemaAndStats(req.LoadInfo, req.Schema, req.PreResolvedStats)
 	loadInfoBlob, err := proto.Marshal(segLoadInfo)
 	if err != nil {
 		return err
@@ -387,6 +389,7 @@ func (s *cSegmentImpl) Reopen(ctx context.Context, req *ReopenRequest) error {
 				unsafe.Pointer(&schemaBlob[0]),
 				C.int64_t(len(schemaBlob)),
 				C.uint64_t(req.SchemaVersion),
+				C.bool(req.StatsOnly),
 			))
 		},
 		cgo.WithName("segment-reopen"),
@@ -429,6 +432,18 @@ func (s *cSegmentImpl) SetCommitTimestamp(ts uint64) error {
 // This function is needed because segcorepb.SegmentLoadInfo is a simplified version that doesn't
 // depend on data_coord.proto and excludes fields like start_position, delta_position, and level.
 func ConvertToSegcoreSegmentLoadInfo(src *querypb.SegmentLoadInfo) *segcorepb.SegmentLoadInfo {
+	return ConvertToSegcoreSegmentLoadInfoWithSchema(src, nil)
+}
+
+func ConvertToSegcoreSegmentLoadInfoWithSchema(src *querypb.SegmentLoadInfo, schema *schemapb.CollectionSchema) *segcorepb.SegmentLoadInfo {
+	return convertToSegcoreSegmentLoadInfoWithSchemaAndStats(src, schema, nil)
+}
+
+func convertToSegcoreSegmentLoadInfoWithSchemaAndStats(
+	src *querypb.SegmentLoadInfo,
+	schema *schemapb.CollectionSchema,
+	preResolvedStats *packed.StatsResult,
+) *segcorepb.SegmentLoadInfo {
 	if src == nil {
 		return nil
 	}
@@ -436,7 +451,7 @@ func ConvertToSegcoreSegmentLoadInfo(src *querypb.SegmentLoadInfo) *segcorepb.Se
 	// Resolve text/json stats with basePaths.
 	// V2: stats come from src proto fields, basePaths computed from metadata + rootPath.
 	// V3: stats resolved from manifest (src proto fields are empty), basePaths from manifest paths.
-	textStats, jsonStats, textBasePaths, jsonBasePaths := resolveStatsWithBasePaths(src)
+	textStats, jsonStats, textBasePaths, jsonBasePaths := resolveStatsWithBasePaths(src, schema, preResolvedStats)
 
 	return &segcorepb.SegmentLoadInfo{
 		SegmentID:            src.GetSegmentID(),
@@ -466,20 +481,44 @@ func ConvertToSegcoreSegmentLoadInfo(src *querypb.SegmentLoadInfo) *segcorepb.Se
 	}
 }
 
+func CanUseLazyManifestMetadataRead(src *querypb.SegmentLoadInfo, schema *schemapb.CollectionSchema) bool {
+	if src == nil || schema == nil {
+		return false
+	}
+	if !paramtable.Get().QueryNodeCfg.TieredLazyManifestMetadataReadEnabled.GetAsBool() ||
+		src.GetStorageVersion() != storage.StorageV3 ||
+		src.GetManifestPath() == "" ||
+		src.GetLevel() == datapb.SegmentLevel_L0 ||
+		typeutil.IsExternalCollection(schema) {
+		return false
+	}
+	return true
+}
+
 // resolveStatsWithBasePaths resolves text/json stats and computes basePaths.
 // V2: stats from src proto fields, basePaths computed from rootPath + metadata.
 // V3: stats resolved from manifest via StatsResolver, basePaths extracted from manifest paths.
-func resolveStatsWithBasePaths(src *querypb.SegmentLoadInfo) (
+func resolveStatsWithBasePaths(src *querypb.SegmentLoadInfo, schema *schemapb.CollectionSchema, preResolvedStats *packed.StatsResult) (
 	map[int64]*datapb.TextIndexStats,
 	map[int64]*datapb.JsonKeyStats,
 	map[int64]string, // textBasePaths
 	map[int64]string, // jsonBasePaths
 ) {
+	if preResolvedStats != nil {
+		return preResolvedStats.TextIndexStats,
+			preResolvedStats.JSONKeyStats,
+			preResolvedStats.TextBasePaths,
+			preResolvedStats.JSONBasePaths
+	}
+
 	textStats := src.GetTextStatsLogs()
 	jsonStats := src.GetJsonKeyStatsLogs()
 
 	// For V3 (manifest-based): resolve stats from manifest if proto fields are empty.
 	if src.GetStorageVersion() == storage.StorageV3 {
+		if CanUseLazyManifestMetadataRead(src, schema) {
+			return textStats, jsonStats, map[int64]string{}, map[int64]string{}
+		}
 		result := packed.NewStatsResolverFromLoadInfo(src).TextAndJSONIndexStatsWithBasePaths()
 		if result.Err() != nil {
 			log.Warn("failed to resolve stats from manifest for segcore load info",

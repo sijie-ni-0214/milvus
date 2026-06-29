@@ -32,11 +32,13 @@ import "C"
 import (
 	"context"
 	"fmt"
+	"io"
 	"strings"
 	"sync"
 	"time"
 	"unsafe"
 
+	"github.com/apache/arrow/go/v17/arrow/array"
 	"github.com/cockroachdb/errors"
 	"go.opentelemetry.io/otel"
 	"go.uber.org/atomic"
@@ -600,12 +602,20 @@ type LocalSegment struct {
 	rowNum      *atomic.Int64
 	insertCount *atomic.Int64
 
-	deltaMut           sync.Mutex
-	lastDeltaTimestamp *atomic.Uint64
-	fields             *typeutil.ConcurrentMap[int64, *FieldInfo]
-	fieldIndexes       *typeutil.ConcurrentMap[int64, *IndexedFieldInfo] // indexID -> IndexedFieldInfo
-	fieldJSONStats     map[int64]*querypb.JsonStatsInfo
-	fieldJSONStatsMu   sync.RWMutex
+	deltaMut             sync.Mutex
+	manifestDeltaMut     sync.Mutex
+	manifestDeltaPending bool
+	manifestDeltaLoaded  bool
+	manifestDeltaKey     string
+	manifestStatsMut     sync.Mutex
+	manifestStatsPending bool
+	manifestStatsLoaded  bool
+	manifestStatsKey     string
+	lastDeltaTimestamp   *atomic.Uint64
+	fields               *typeutil.ConcurrentMap[int64, *FieldInfo]
+	fieldIndexes         *typeutil.ConcurrentMap[int64, *IndexedFieldInfo] // indexID -> IndexedFieldInfo
+	fieldJSONStats       map[int64]*querypb.JsonStatsInfo
+	fieldJSONStatsMu     sync.RWMutex
 }
 
 func NewSegment(ctx context.Context,
@@ -706,6 +716,7 @@ func NewSegment(ctx context.Context,
 		return nil, err
 	}
 	initializeDur = time.Since(stageStart)
+	segment.deferManifestStatsIfNeeded(loadInfo)
 	return segment, nil
 }
 
@@ -836,6 +847,245 @@ func (s *LocalSegment) MemSize() int64 {
 
 func (s *LocalSegment) LastDeltaTimestamp() uint64 {
 	return s.lastDeltaTimestamp.Load()
+}
+
+func (s *LocalSegment) SetLoadInfo(loadInfo *querypb.SegmentLoadInfo) {
+	s.manifestDeltaMut.Lock()
+	s.baseSegment.SetLoadInfo(loadInfo)
+	s.manifestDeltaPending = false
+	s.manifestDeltaLoaded = false
+	s.manifestDeltaKey = ""
+	s.manifestDeltaMut.Unlock()
+	s.deferManifestStatsIfNeeded(loadInfo)
+}
+
+func (s *LocalSegment) deferManifestDeltas(loadInfo *querypb.SegmentLoadInfo) {
+	s.manifestDeltaMut.Lock()
+	s.baseSegment.SetLoadInfo(loadInfo)
+	s.manifestDeltaPending = true
+	s.manifestDeltaLoaded = false
+	s.manifestDeltaKey = manifestDeltaLoadKey(loadInfo)
+	s.manifestDeltaMut.Unlock()
+	s.deferManifestStatsIfNeeded(loadInfo)
+}
+
+func manifestDeltaLoadKey(loadInfo *querypb.SegmentLoadInfo) string {
+	if loadInfo == nil {
+		return ""
+	}
+	var builder strings.Builder
+	builder.WriteString(loadInfo.GetManifestPath())
+	_, _ = fmt.Fprintf(&builder, "|data=%d|readable=%d", loadInfo.GetDataVersion(), loadInfo.GetReadableVersion())
+	for _, deltaLog := range loadInfo.GetDeltalogs() {
+		_, _ = fmt.Fprintf(&builder, "|field=%d", deltaLog.GetFieldID())
+		for _, binlog := range deltaLog.GetBinlogs() {
+			_, _ = fmt.Fprintf(&builder, ",%d,%s,%d,%d",
+				binlog.GetLogID(),
+				binlog.GetLogPath(),
+				binlog.GetTimestampTo(),
+				binlog.GetEntriesNum())
+		}
+	}
+	return builder.String()
+}
+
+func (s *LocalSegment) deferManifestStatsIfNeeded(loadInfo *querypb.SegmentLoadInfo) {
+	s.manifestStatsMut.Lock()
+	defer s.manifestStatsMut.Unlock()
+
+	if s.collection == nil ||
+		!segcore.CanUseLazyManifestMetadataRead(loadInfo, s.collection.Schema()) ||
+		!s.hasManifestStatsField() {
+		s.manifestStatsPending = false
+		s.manifestStatsLoaded = false
+		s.manifestStatsKey = ""
+		return
+	}
+
+	s.manifestStatsPending = true
+	s.manifestStatsLoaded = false
+	s.manifestStatsKey = manifestStatsLoadKey(loadInfo)
+}
+
+func manifestStatsLoadKey(loadInfo *querypb.SegmentLoadInfo) string {
+	if loadInfo == nil {
+		return ""
+	}
+	var builder strings.Builder
+	builder.WriteString(loadInfo.GetManifestPath())
+	_, _ = fmt.Fprintf(&builder, "|data=%d|readable=%d", loadInfo.GetDataVersion(), loadInfo.GetReadableVersion())
+	return builder.String()
+}
+
+func (s *LocalSegment) hasManifestStatsField() bool {
+	for _, field := range s.collection.Schema().GetFields() {
+		helper := typeutil.CreateFieldSchemaHelper(field)
+		if helper.EnableMatch() || helper.EnableJSONKeyStatsIndex() {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *LocalSegment) ensureManifestDeltasLoaded(ctx context.Context) error {
+	s.manifestDeltaMut.Lock()
+	defer s.manifestDeltaMut.Unlock()
+	if !s.manifestDeltaPending {
+		return nil
+	}
+
+	loadInfo := s.LoadInfo()
+	loadKey := manifestDeltaLoadKey(loadInfo)
+	if s.manifestDeltaLoaded && s.manifestDeltaKey == loadKey {
+		s.manifestDeltaPending = false
+		return nil
+	}
+	if loadInfo == nil || loadInfo.GetManifestPath() == "" {
+		s.manifestDeltaPending = false
+		s.manifestDeltaLoaded = true
+		s.manifestDeltaKey = loadKey
+		return nil
+	}
+
+	paths, err := packed.GetDeltaLogPathsFromManifest(loadInfo.GetManifestPath(), createStorageConfig())
+	if err != nil {
+		return err
+	}
+	if len(paths) == 0 {
+		s.manifestDeltaPending = false
+		s.manifestDeltaLoaded = true
+		s.manifestDeltaKey = loadKey
+		return nil
+	}
+
+	collection := s.collection
+	helper, err := typeutil.CreateSchemaHelper(collection.Schema())
+	if err != nil {
+		return err
+	}
+	pkField, err := helper.GetPrimaryKeyField()
+	if err != nil {
+		return err
+	}
+
+	var rowNums int64
+	for _, deltaLog := range loadInfo.GetDeltalogs() {
+		for _, binlog := range deltaLog.GetBinlogs() {
+			rowNums += binlog.GetEntriesNum()
+		}
+	}
+
+	deltaData, err := storage.NewDeltaDataWithPkType(rowNums, pkField.DataType)
+	if err != nil {
+		return err
+	}
+
+	reader, err := storage.NewDeltalogReader(
+		pkField.DataType,
+		paths,
+		storage.WithStorageConfig(createStorageConfig()),
+		storage.WithVersion(storage.StorageV3),
+	)
+	if err != nil {
+		return err
+	}
+	defer reader.Close()
+
+	for {
+		dl, err := reader.Next()
+		if err != nil {
+			if err == io.EOF {
+				break
+			}
+			return err
+		}
+
+		for i := 0; i < dl.Len(); i++ {
+			var pk storage.PrimaryKey
+			switch pkField.DataType {
+			case schemapb.DataType_Int64:
+				pk = storage.NewInt64PrimaryKey(dl.Column(0).(*array.Int64).Value(i))
+			case schemapb.DataType_VarChar:
+				pk = storage.NewVarCharPrimaryKey(dl.Column(0).(*array.String).Value(i))
+			default:
+				return merr.WrapErrParameterInvalidMsg("unsupported primary key type %s", pkField.DataType.String())
+			}
+			ts := typeutil.Timestamp(dl.Column(1).(*array.Int64).Value(i))
+			if err := deltaData.Append(pk, ts); err != nil {
+				return err
+			}
+		}
+	}
+
+	if err := s.LoadDeltaData(ctx, deltaData); err != nil {
+		return err
+	}
+	s.manifestDeltaPending = false
+	s.manifestDeltaLoaded = true
+	s.manifestDeltaKey = loadKey
+	log.Ctx(ctx).Debug("lazy manifest delta loaded",
+		zap.Int64("segmentID", s.ID()),
+		zap.Int("pathCount", len(paths)))
+	return nil
+}
+
+func (s *LocalSegment) ensureManifestStatsLoaded(ctx context.Context) error {
+	s.manifestStatsMut.Lock()
+	defer s.manifestStatsMut.Unlock()
+
+	if !s.manifestStatsPending {
+		return nil
+	}
+
+	loadInfo := s.LoadInfo()
+	loadKey := manifestStatsLoadKey(loadInfo)
+	if s.manifestStatsLoaded && s.manifestStatsKey == loadKey {
+		s.manifestStatsPending = false
+		return nil
+	}
+	if loadInfo == nil || loadInfo.GetManifestPath() == "" {
+		s.manifestStatsPending = false
+		s.manifestStatsLoaded = true
+		s.manifestStatsKey = loadKey
+		return nil
+	}
+
+	statsResult := packed.NewStatsResolverFromLoadInfo(loadInfo).TextAndJSONIndexStatsWithBasePaths()
+	if statsResult.Err() != nil {
+		return statsResult.Err()
+	}
+	if len(statsResult.TextIndexStats) == 0 && len(statsResult.JSONKeyStats) == 0 {
+		s.manifestStatsPending = false
+		s.manifestStatsLoaded = true
+		s.manifestStatsKey = loadKey
+		return nil
+	}
+
+	if !s.ptrLock.PinIf(state.IsNotReleased) {
+		return merr.WrapErrSegmentNotLoaded(s.ID(), "segment released")
+	}
+	schema, schemaVersion := s.collection.SchemaAndVersion()
+	err := s.csegment.Reopen(ctx, &segcore.ReopenRequest{
+		LoadInfo:         loadInfo,
+		Schema:           schema,
+		SchemaVersion:    schemaVersion,
+		PreResolvedStats: &statsResult.StatsResult,
+		StatsOnly:        true,
+	})
+	s.ptrLock.Unpin()
+	if err != nil {
+		return err
+	}
+
+	s.syncFieldJSONStats(ctx, loadInfo, statsResult.JSONKeyStats)
+	s.manifestStatsPending = false
+	s.manifestStatsLoaded = true
+	s.manifestStatsKey = loadKey
+	log.Ctx(ctx).Debug("lazy manifest stats loaded",
+		zap.Int64("segmentID", s.ID()),
+		zap.Int("textStatsCount", len(statsResult.TextIndexStats)),
+		zap.Int("jsonStatsCount", len(statsResult.JSONKeyStats)))
+	return nil
 }
 
 // advanceLastDeltaTimestamp moves lastDeltaTimestamp forward to max(current, max(tss)).
@@ -986,6 +1236,15 @@ func (s *LocalSegment) Search(ctx context.Context, searchReq *segcore.SearchRequ
 		zap.Bool("filterOnly", filterOnly),
 	)
 
+	if err := s.ensureManifestDeltasLoaded(ctx); err != nil {
+		log.Warn("failed to load lazy manifest deltas", zap.Error(err))
+		return nil, err
+	}
+	if err := s.ensureManifestStatsLoaded(ctx); err != nil {
+		log.Warn("failed to load lazy manifest stats", zap.Error(err))
+		return nil, err
+	}
+
 	if !s.ptrLock.PinIf(state.IsNotReleased) {
 		// TODO: check if the segment is readable but not released. too many related logic need to be refactor.
 		return nil, merr.WrapErrSegmentNotLoaded(s.ID(), "segment released")
@@ -1012,6 +1271,15 @@ func (s *LocalSegment) Search(ctx context.Context, searchReq *segcore.SearchRequ
 }
 
 func (s *LocalSegment) retrieve(ctx context.Context, plan *segcore.RetrievePlan, log *zap.Logger) (*segcore.RetrieveResult, error) {
+	if err := s.ensureManifestDeltasLoaded(ctx); err != nil {
+		log.Warn("failed to load lazy manifest deltas", zap.Error(err))
+		return nil, err
+	}
+	if err := s.ensureManifestStatsLoaded(ctx); err != nil {
+		log.Warn("failed to load lazy manifest stats", zap.Error(err))
+		return nil, err
+	}
+
 	if !s.ptrLock.PinIf(state.IsNotReleased) {
 		// TODO: check if the segment is readable but not released. too many related logic need to be refactor.
 		return nil, merr.WrapErrSegmentNotLoaded(s.ID(), "segment released")
@@ -1059,6 +1327,11 @@ func (s *LocalSegment) Retrieve(ctx context.Context, plan *segcore.RetrievePlan)
 }
 
 func (s *LocalSegment) retrieveByOffsets(ctx context.Context, plan *segcore.RetrievePlanWithOffsets, log *zap.Logger) (*segcore.RetrieveResult, error) {
+	if err := s.ensureManifestDeltasLoaded(ctx); err != nil {
+		log.Warn("failed to load lazy manifest deltas", zap.Error(err))
+		return nil, err
+	}
+
 	if !s.ptrLock.PinIf(state.IsNotReleased) {
 		// TODO: check if the segment is readable but not released. too many related logic need to be refactor.
 		return nil, merr.WrapErrSegmentNotLoaded(s.ID(), "segment released")
@@ -1845,18 +2118,27 @@ func (s *LocalSegment) UpdateFieldRawDataSize(ctx context.Context, numRows int64
 }
 
 func (s *LocalSegment) syncFieldJSONStatsFromLoadInfo(ctx context.Context, loadInfo *querypb.SegmentLoadInfo) {
-	jsonStatsInfo := make(map[int64]*querypb.JsonStatsInfo)
 	if !paramtable.Get().CommonCfg.EnabledJSONKeyStats.GetAsBool() {
 		log.Ctx(ctx).Warn("skip sync json key stats, json key stats is not enabled", zap.Int64("segmentID", s.ID()))
 		s.fieldJSONStatsMu.Lock()
-		s.fieldJSONStats = jsonStatsInfo
+		s.fieldJSONStats = make(map[int64]*querypb.JsonStatsInfo)
 		s.fieldJSONStatsMu.Unlock()
 		return
 	}
 
 	if !s.hasJSONKeyStatsField() {
 		s.fieldJSONStatsMu.Lock()
-		s.fieldJSONStats = jsonStatsInfo
+		s.fieldJSONStats = make(map[int64]*querypb.JsonStatsInfo)
+		s.fieldJSONStatsMu.Unlock()
+		return
+	}
+
+	if segcore.CanUseLazyManifestMetadataRead(loadInfo, s.collection.Schema()) {
+		log.Ctx(ctx).Debug("skip load-time json key stats manifest read",
+			zap.Int64("segmentID", loadInfo.GetSegmentID()),
+			zap.String("manifestPath", loadInfo.GetManifestPath()))
+		s.fieldJSONStatsMu.Lock()
+		s.fieldJSONStats = make(map[int64]*querypb.JsonStatsInfo)
 		s.fieldJSONStatsMu.Unlock()
 		return
 	}
@@ -1871,6 +2153,11 @@ func (s *LocalSegment) syncFieldJSONStatsFromLoadInfo(ctx context.Context, loadI
 		jsonKeyStats = loadInfo.GetJsonKeyStatsLogs()
 	}
 
+	s.syncFieldJSONStats(ctx, loadInfo, jsonKeyStats)
+}
+
+func (s *LocalSegment) syncFieldJSONStats(ctx context.Context, loadInfo *querypb.SegmentLoadInfo, jsonKeyStats map[int64]*datapb.JsonKeyStats) {
+	jsonStatsInfo := make(map[int64]*querypb.JsonStatsInfo)
 	for fieldID, stats := range jsonKeyStats {
 		if stats == nil {
 			continue
@@ -1930,7 +2217,7 @@ func (s *LocalSegment) Reopen(ctx context.Context, newLoadInfo *querypb.SegmentL
 	if err != nil {
 		return err
 	}
-	s.loadInfo.Store(newLoadInfo)
+	s.SetLoadInfo(newLoadInfo)
 	s.syncFieldJSONStatsFromLoadInfo(ctx, newLoadInfo)
 	s.compactLoadInfoForRuntime()
 	return nil

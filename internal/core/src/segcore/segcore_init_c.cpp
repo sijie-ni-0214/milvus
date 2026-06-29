@@ -78,6 +78,13 @@ SegcoreSetLazyManifestReaderEnabled(const bool value) {
 }
 
 extern "C" void
+SegcoreSetLazyManifestMetadataReadEnabled(const bool value) {
+    milvus::segcore::SegcoreConfig& config =
+        milvus::segcore::SegcoreConfig::default_config();
+    config.set_lazy_manifest_metadata_read_enabled(value);
+}
+
+extern "C" void
 SegcoreSetNlist(const int64_t value) {
     milvus::segcore::SegcoreConfig& config =
         milvus::segcore::SegcoreConfig::default_config();

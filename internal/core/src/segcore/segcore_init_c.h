@@ -95,6 +95,9 @@ void
 SegcoreSetLazyManifestReaderEnabled(const bool value);
 
 void
+SegcoreSetLazyManifestMetadataReadEnabled(const bool value);
+
+void
 SegcoreCloseGlog();
 
 int32_t

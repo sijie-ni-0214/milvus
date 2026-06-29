@@ -25,6 +25,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bytedance/mockey"
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
@@ -34,7 +35,9 @@ import (
 	"github.com/milvus-io/milvus-proto/go-api/v3/schemapb"
 	"github.com/milvus-io/milvus/internal/mocks"
 	"github.com/milvus-io/milvus/internal/storage"
+	"github.com/milvus-io/milvus/internal/storagev2/packed"
 	"github.com/milvus-io/milvus/pkg/v3/proto/datapb"
+	"github.com/milvus-io/milvus/pkg/v3/proto/indexpb"
 	"github.com/milvus-io/milvus/pkg/v3/proto/querypb"
 	"github.com/milvus-io/milvus/pkg/v3/util/paramtable"
 	"github.com/milvus-io/milvus/pkg/v3/util/typeutil"
@@ -72,6 +75,7 @@ func (suite *IDFOracleSuite) SetupSuite() {
 }
 
 func (suite *IDFOracleSuite) SetupTest() {
+	suite.resetIDFConfig()
 	suite.idfOracle = NewIDFOracle(suite.channel, suite.collectionSchema.GetFunctions()).(*idfOracle)
 	suite.idfOracle.dirPath = suite.T().TempDir()
 	suite.idfOracle.Start()
@@ -83,6 +87,22 @@ func (suite *IDFOracleSuite) SetupTest() {
 
 func (suite *IDFOracleSuite) TearDownTest() {
 	suite.idfOracle.Close()
+}
+
+func (suite *IDFOracleSuite) resetIDFConfig() {
+	suite.setParam(&paramtable.Get().QueryNodeCfg.IDFPreload, "true")
+	suite.setParam(&paramtable.Get().QueryNodeCfg.IDFRemoteFetchOnly, "false")
+	suite.setParam(&paramtable.Get().QueryNodeCfg.IDFPartitionLevel, "false")
+	suite.setParam(&paramtable.Get().QueryNodeCfg.IDFPartitionLazyLoad, "false")
+	suite.setParam(&paramtable.Get().QueryNodeCfg.TieredLazyManifestMetadataReadEnabled, "false")
+}
+
+func (suite *IDFOracleSuite) setParam(item *paramtable.ParamItem, value string) {
+	old := item.GetValue()
+	suite.Require().NoError(paramtable.Get().Save(item.Key, value))
+	suite.T().Cleanup(func() {
+		_ = paramtable.Get().Save(item.Key, old)
+	})
 }
 
 func (s *IDFOracleSuite) waitTargetVersion(targetVersion int64) {
@@ -105,30 +125,15 @@ func (suite *IDFOracleSuite) genStats(start uint32, end uint32) map[int64]*stora
 }
 
 func (suite *IDFOracleSuite) setIDFRemoteFetchOnly(enabled bool) {
-	item := &paramtable.Get().QueryNodeCfg.IDFRemoteFetchOnly
-	old := item.GetValue()
-	suite.Require().NoError(paramtable.Get().Save(item.Key, fmt.Sprintf("%t", enabled)))
-	suite.T().Cleanup(func() {
-		_ = paramtable.Get().Save(item.Key, old)
-	})
+	suite.setParam(&paramtable.Get().QueryNodeCfg.IDFRemoteFetchOnly, fmt.Sprintf("%t", enabled))
 }
 
 func (suite *IDFOracleSuite) setIDFPartitionLevel(enabled bool) {
-	item := &paramtable.Get().QueryNodeCfg.IDFPartitionLevel
-	old := item.GetValue()
-	suite.Require().NoError(paramtable.Get().Save(item.Key, fmt.Sprintf("%t", enabled)))
-	suite.T().Cleanup(func() {
-		_ = paramtable.Get().Save(item.Key, old)
-	})
+	suite.setParam(&paramtable.Get().QueryNodeCfg.IDFPartitionLevel, fmt.Sprintf("%t", enabled))
 }
 
 func (suite *IDFOracleSuite) setIDFPartitionLazyLoad(enabled bool) {
-	item := &paramtable.Get().QueryNodeCfg.IDFPartitionLazyLoad
-	old := item.GetValue()
-	suite.Require().NoError(paramtable.Get().Save(item.Key, fmt.Sprintf("%t", enabled)))
-	suite.T().Cleanup(func() {
-		_ = paramtable.Get().Save(item.Key, old)
-	})
+	suite.setParam(&paramtable.Get().QueryNodeCfg.IDFPartitionLazyLoad, fmt.Sprintf("%t", enabled))
 }
 
 // registerSealed loads BM25 stats via LoadSealed with a mock ChunkManager.
@@ -471,6 +476,64 @@ func (suite *IDFOracleSuite) TestLoadSealedNoParse() {
 	suite.Equal(int64(4), fetched[102].NumRow())
 }
 
+func (suite *IDFOracleSuite) TestLoadSealedLazyManifestDefersBM25ManifestUntilBuildIDF() {
+	suite.setIDFPartitionLevel(false)
+
+	item := &paramtable.Get().QueryNodeCfg.TieredLazyManifestMetadataReadEnabled
+	old := item.GetValue()
+	suite.Require().NoError(paramtable.Get().Save(item.Key, "true"))
+	suite.T().Cleanup(func() {
+		_ = paramtable.Get().Save(item.Key, old)
+	})
+
+	stats := suite.genStats(1, 2)
+	data, err := stats[102].Serialize()
+	suite.Require().NoError(err)
+
+	remotePath := "bm25stats/seg_1/field_102/0"
+	cm := mocks.NewChunkManager(suite.T())
+	cm.EXPECT().Reader(mock.Anything, remotePath).Return(
+		&bytesFileReader{bytes.NewReader(data)}, nil,
+	).Once()
+
+	manifestCalled := atomic.NewInt32(0)
+	patchManifest := mockey.Mock(packed.GetManifestStats).To(
+		func(manifestPath string, storageConfig *indexpb.StorageConfig) (map[string]packed.ManifestStat, error) {
+			manifestCalled.Inc()
+			return map[string]packed.ManifestStat{
+				"bm25.102": {Paths: []string{remotePath}},
+			}, nil
+		},
+	).Build()
+	defer patchManifest.UnPatch()
+
+	err = suite.idfOracle.LoadSealed(context.Background(), 1, &querypb.SegmentLoadInfo{
+		SegmentID:      1,
+		PartitionID:    1,
+		StorageVersion: storage.StorageV3,
+		ManifestPath:   `{"base_path":"/tmp/lazy-bm25","ver":1}`,
+	}, cm)
+	suite.Require().NoError(err)
+	suite.EqualValues(0, manifestCalled.Load(),
+		"lazy manifest BM25 must not read manifest during LoadSealed")
+
+	suite.updateSnapshot([]int64{1}, nil, nil)
+	suite.idfOracle.SetNext(suite.snapshot)
+	suite.waitTargetVersion(suite.targetVersion)
+	suite.EqualValues(0, manifestCalled.Load(),
+		"lazy manifest BM25 must not read manifest during target sync")
+
+	sparse := typeutil.CreateAndSortSparseFloatRow(map[uint32]float32{1: 1})
+	_, avgdl, err := suite.idfOracle.BuildIDF(context.Background(), 102, &schemapb.SparseFloatArray{
+		Contents: [][]byte{sparse},
+		Dim:      1,
+	})
+	suite.Require().NoError(err)
+	suite.Equal(float64(1), avgdl)
+	suite.EqualValues(1, manifestCalled.Load(),
+		"first BM25 BuildIDF must resolve deferred manifest stats")
+}
+
 func (suite *IDFOracleSuite) TestLoadSealedRemoteFetchOnlyPreload() {
 	suite.setIDFRemoteFetchOnly(true)
 
@@ -676,6 +739,79 @@ func (suite *IDFOracleSuite) TestPartitionLevelNonLazyLoadSealedStats() {
 	suite.Require().NoError(err)
 	suite.Equal(float64(1), avgdl)
 	suite.Equal(int32(1), readerCalls.Load())
+}
+
+func (suite *IDFOracleSuite) TestPartitionLevelLazyManifestDefersBM25ManifestWhenPartitionLazyLoadDisabled() {
+	suite.setIDFPartitionLevel(true)
+	suite.setIDFPartitionLazyLoad(false)
+	suite.setIDFRemoteFetchOnly(true)
+	suite.setParam(&paramtable.Get().QueryNodeCfg.TieredLazyManifestMetadataReadEnabled, "true")
+
+	stats := suite.genStats(1, 2)
+	data, err := stats[102].Serialize()
+	suite.Require().NoError(err)
+
+	readerCalls := atomic.NewInt32(0)
+	cm := mocks.NewChunkManager(suite.T())
+	remotePath := "bm25stats/seg_1/field_102/0"
+	cm.EXPECT().Reader(mock.Anything, remotePath).RunAndReturn(
+		func(context.Context, string) (storage.FileReader, error) {
+			readerCalls.Inc()
+			return &bytesFileReader{bytes.NewReader(data)}, nil
+		},
+	).Once()
+
+	manifestCalls := atomic.NewInt32(0)
+	patchManifest := mockey.Mock(packed.GetManifestStats).To(
+		func(manifestPath string, storageConfig *indexpb.StorageConfig) (map[string]packed.ManifestStat, error) {
+			manifestCalls.Inc()
+			return map[string]packed.ManifestStat{
+				"bm25.102": {Paths: []string{remotePath}},
+			}, nil
+		},
+	).Build()
+	defer patchManifest.UnPatch()
+
+	err = suite.idfOracle.LoadSealed(context.Background(), 1, &querypb.SegmentLoadInfo{
+		SegmentID:      1,
+		PartitionID:    10,
+		StorageVersion: storage.StorageV3,
+		ManifestPath:   `{"base_path":"/tmp/lazy-bm25-partition","ver":1}`,
+	}, cm)
+	suite.Require().NoError(err)
+	suite.EqualValues(0, manifestCalls.Load())
+	suite.EqualValues(0, readerCalls.Load())
+
+	sealedStats, ok := suite.idfOracle.sealed.Get(1)
+	suite.Require().True(ok)
+	sealedStats.RLock()
+	suite.False(sealedStats.pathsResolved)
+	sealedStats.RUnlock()
+
+	snapshot := &snapshot{
+		dist: []SnapshotItem{{NodeID: 1, Segments: []SegmentEntry{
+			{NodeID: 1, SegmentID: 1, PartitionID: 10, TargetVersion: 100},
+		}}},
+		targetVersion: 100,
+	}
+	suite.idfOracle.SetNext(snapshot)
+	suite.waitTargetVersion(snapshot.targetVersion)
+	suite.EqualValues(0, manifestCalls.Load())
+	suite.EqualValues(0, readerCalls.Load())
+	suite.Equal(int64(0), suite.idfOracle.current.NumRow())
+
+	sparse := typeutil.CreateAndSortSparseFloatRow(map[uint32]float32{1: 1})
+	_, avgdl, err := suite.idfOracle.BuildIDF(context.Background(), 102, &schemapb.SparseFloatArray{Contents: [][]byte{sparse}, Dim: 1}, 10)
+	suite.Require().NoError(err)
+	suite.Equal(float64(1), avgdl)
+	suite.EqualValues(1, manifestCalls.Load())
+	suite.EqualValues(1, readerCalls.Load())
+
+	_, avgdl, err = suite.idfOracle.BuildIDF(context.Background(), 102, &schemapb.SparseFloatArray{Contents: [][]byte{sparse}, Dim: 1}, 10)
+	suite.Require().NoError(err)
+	suite.Equal(float64(1), avgdl)
+	suite.EqualValues(1, manifestCalls.Load())
+	suite.EqualValues(1, readerCalls.Load())
 }
 
 func (suite *IDFOracleSuite) TestPartitionLazyLoadLocalCache() {

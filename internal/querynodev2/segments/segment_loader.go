@@ -48,6 +48,7 @@ import (
 	"github.com/milvus-io/milvus/internal/storagecommon"
 	"github.com/milvus-io/milvus/internal/storagev2/packed"
 	"github.com/milvus-io/milvus/internal/util/indexparamcheck"
+	segcoreutil "github.com/milvus-io/milvus/internal/util/segcore"
 	"github.com/milvus-io/milvus/internal/util/vecindexmgr"
 	"github.com/milvus-io/milvus/pkg/v3/common"
 	"github.com/milvus-io/milvus/pkg/v3/log"
@@ -1836,18 +1837,24 @@ func separateLoadInfoV2(loadInfo *querypb.SegmentLoadInfo, schema *schemapb.Coll
 		}
 	}
 
-	statsResult := packed.NewStatsResolverFromLoadInfo(loadInfo).TextAndJSONIndexStatsWithBasePaths()
-	textIndexedInfo := statsResult.TextIndexStats
-	jsonKeyIndexInfo := statsResult.JSONKeyStats
-	textBasePaths := statsResult.TextBasePaths
-	jsonBasePaths := statsResult.JSONBasePaths
-	if statsResult.Err() != nil {
-		log.Warn("failed to load text/json stats from manifest",
-			zap.String("manifestPath", loadInfo.GetManifestPath()), zap.Error(statsResult.Err()))
-		textIndexedInfo = make(map[int64]*datapb.TextIndexStats)
-		jsonKeyIndexInfo = make(map[int64]*datapb.JsonKeyStats)
-		textBasePaths = make(map[int64]string)
-		jsonBasePaths = make(map[int64]string)
+	textIndexedInfo := make(map[int64]*datapb.TextIndexStats)
+	jsonKeyIndexInfo := make(map[int64]*datapb.JsonKeyStats)
+	textBasePaths := make(map[int64]string)
+	jsonBasePaths := make(map[int64]string)
+	if !segcoreutil.CanUseLazyManifestMetadataRead(loadInfo, schema) {
+		statsResult := packed.NewStatsResolverFromLoadInfo(loadInfo).TextAndJSONIndexStatsWithBasePaths()
+		textIndexedInfo = statsResult.TextIndexStats
+		jsonKeyIndexInfo = statsResult.JSONKeyStats
+		textBasePaths = statsResult.TextBasePaths
+		jsonBasePaths = statsResult.JSONBasePaths
+		if statsResult.Err() != nil {
+			log.Warn("failed to load text/json stats from manifest",
+				zap.String("manifestPath", loadInfo.GetManifestPath()), zap.Error(statsResult.Err()))
+			textIndexedInfo = make(map[int64]*datapb.TextIndexStats)
+			jsonKeyIndexInfo = make(map[int64]*datapb.JsonKeyStats)
+			textBasePaths = make(map[int64]string)
+			jsonBasePaths = make(map[int64]string)
+		}
 	}
 
 	if textBasePaths == nil {
@@ -2286,6 +2293,15 @@ func (loader *segmentLoader) loadDeltalogs(ctx context.Context, segment Segment,
 	var paths []string
 	var opts []storage.RwOption
 	if manifestPath := loadInfo.GetManifestPath(); manifestPath != "" {
+		if segcoreutil.CanUseLazyManifestMetadataRead(loadInfo, collection.Schema()) {
+			log.Debug("skip load-time v3 delta manifest read")
+			if localSegment, ok := segment.(*LocalSegment); ok {
+				localSegment.deferManifestDeltas(loadInfo)
+				localSegment.syncFieldJSONStatsFromLoadInfo(ctx, loadInfo)
+				localSegment.compactLoadInfoForRuntime()
+			}
+			return nil
+		}
 		// V3: delta data lives in manifest
 		paths, err = packed.GetDeltaLogPathsFromManifest(manifestPath, createStorageConfig())
 		if err != nil {

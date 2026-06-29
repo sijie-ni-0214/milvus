@@ -34,6 +34,7 @@ import (
 	"github.com/milvus-io/milvus/internal/querycoordv2/session"
 	"github.com/milvus-io/milvus/internal/querycoordv2/task"
 	"github.com/milvus-io/milvus/internal/querycoordv2/utils"
+	"github.com/milvus-io/milvus/internal/storage"
 	"github.com/milvus-io/milvus/pkg/v3/kv"
 	"github.com/milvus-io/milvus/pkg/v3/proto/datapb"
 	"github.com/milvus-io/milvus/pkg/v3/proto/indexpb"
@@ -524,6 +525,43 @@ func (suite *IndexCheckerSuite) TestLoadJsonIndex() {
 	utils.RecoverAllCollection(suite.meta)
 	tasks = checker.Check(context.Background())
 	suite.Require().Len(tasks, 0)
+}
+
+func (suite *IndexCheckerSuite) TestLazyManifestSkipsJsonStatsUpdate() {
+	oldJSONStats := paramtable.Get().CommonCfg.EnabledJSONKeyStats.SwapTempValue("true")
+	defer paramtable.Get().CommonCfg.EnabledJSONKeyStats.SwapTempValue(oldJSONStats)
+	oldLazyManifest := paramtable.Get().QueryNodeCfg.TieredLazyManifestMetadataReadEnabled.SwapTempValue("true")
+	defer paramtable.Get().QueryNodeCfg.TieredLazyManifestMetadataReadEnabled.SwapTempValue(oldLazyManifest)
+
+	schema := &schemapb.CollectionSchema{
+		Name: "test_lazy_manifest_json_stats",
+		Fields: []*schemapb.FieldSchema{
+			{FieldID: 101, DataType: schemapb.DataType_JSON, Name: "JSON"},
+		},
+	}
+	segment := &meta.Segment{
+		SegmentInfo: &datapb.SegmentInfo{
+			ID:             2,
+			CollectionID:   1,
+			Level:          datapb.SegmentLevel_L1,
+			StorageVersion: storage.StorageV3,
+			ManifestPath:   "manifest/path",
+		},
+		JSONStatsField: map[int64]*querypb.JsonStatsInfo{},
+	}
+
+	suite.Empty(suite.checker.checkSegmentStats(segment, schema, []int64{101}))
+
+	externalSchema := &schemapb.CollectionSchema{
+		Name: "test_lazy_manifest_external_json_stats",
+		Fields: []*schemapb.FieldSchema{
+			{FieldID: 101, DataType: schemapb.DataType_JSON, Name: "JSON", ExternalField: "json"},
+		},
+	}
+	suite.Equal([]int64{101}, suite.checker.checkSegmentStats(segment, externalSchema, []int64{101}))
+
+	paramtable.Get().QueryNodeCfg.TieredLazyManifestMetadataReadEnabled.SwapTempValue("false")
+	suite.Equal([]int64{101}, suite.checker.checkSegmentStats(segment, schema, []int64{101}))
 }
 
 func (suite *IndexCheckerSuite) TestJsonIndexNotMatch() {

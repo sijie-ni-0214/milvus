@@ -300,6 +300,15 @@ class SegmentInterface {
            SchemaPtr new_schema) = 0;
 
     virtual void
+    Reopen(milvus::OpContext* op_ctx,
+           const milvus::proto::segcore::SegmentLoadInfo& new_load_info,
+           SchemaPtr new_schema,
+           bool stats_only) {
+        (void)stats_only;
+        Reopen(op_ctx, new_load_info, std::move(new_schema));
+    }
+
+    virtual void
     SetLoadInfo(milvus::proto::segcore::SegmentLoadInfo load_info) = 0;
 
     virtual void
@@ -325,6 +334,10 @@ class SegmentInterface {
 // only for implementation
 class SegmentInternalInterface : public SegmentInterface {
  public:
+    virtual void
+    PrepareForQuery(milvus::OpContext* op_ctx) const {
+    }
+
     virtual void
     prefetch_chunks(milvus::OpContext* op_ctx,
                     FieldId field_id,

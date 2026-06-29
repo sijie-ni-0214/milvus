@@ -1301,6 +1301,7 @@ cancel_and_clear_json_indices(std::vector<JsonIndexT>& json_indices) {
 
 PinWrapper<const storagev2translator::TimestampIndexCell*>
 ChunkedSegmentSealedImpl::PinTimestampIndex(milvus::OpContext* op_ctx) const {
+    EnsureDeferredManifestColumnGroups(op_ctx);
     auto slot = *timestamp_index_slot_.rlock();
     if (!slot) {
         return PinWrapper<const storagev2translator::TimestampIndexCell*>(
@@ -1315,6 +1316,7 @@ ChunkedSegmentSealedImpl::PinTimestampIndex(milvus::OpContext* op_ctx) const {
 
 PinWrapper<const storagev2translator::PkIndexCell*>
 ChunkedSegmentSealedImpl::PinPkIndex(milvus::OpContext* op_ctx) const {
+    EnsureDeferredManifestColumnGroups(op_ctx);
     auto slot = *pk_index_slot_.rlock();
     if (!slot) {
         return PinWrapper<const storagev2translator::PkIndexCell*>(nullptr);
@@ -5537,6 +5539,7 @@ ChunkedSegmentSealedImpl::Reopen(milvus::OpContext* op_ctx, SchemaPtr sch) {
     }
 
     std::lock_guard<std::mutex> reopen_guard(reopen_mutex_);
+
     SchemaPtr current_schema;
     {
         std::shared_lock lck(mutex_);
@@ -5585,6 +5588,15 @@ ChunkedSegmentSealedImpl::Reopen(
     milvus::OpContext* op_ctx,
     const milvus::proto::segcore::SegmentLoadInfo& new_load_info,
     SchemaPtr new_schema) {
+    Reopen(op_ctx, new_load_info, std::move(new_schema), false);
+}
+
+void
+ChunkedSegmentSealedImpl::Reopen(
+    milvus::OpContext* op_ctx,
+    const milvus::proto::segcore::SegmentLoadInfo& new_load_info,
+    SchemaPtr new_schema,
+    bool stats_only) {
     // reopen_mutex_ serializes top-level writers of segment_load_info_.
     // It is held across ApplyLoadDiff so two Reopens never interleave their
     // resource mutations. Readers are unaffected — they snapshot via
@@ -5616,10 +5628,34 @@ ChunkedSegmentSealedImpl::Reopen(
         new_local.SetTextIndexCreated(fid);
     }
 
+    if (stats_only) {
+        auto diff = current_mutable.ComputeStatsOnlyDiff(new_local);
+        new_local.SetFieldsFilledWithDefault(
+            current_mutable.GetFieldsFilledWithDefault());
+        new_local.CompactRuntimeInfoForManifest();
+        LOG_DEBUG("Reopen segment {} with diff {}, stats_only={}",
+                  id_,
+                  diff.ToString(),
+                  stats_only);
+
+        auto published = std::make_shared<const SegmentLoadInfo>(new_local);
+        std::atomic_store(&segment_load_info_, published);
+        use_take_for_output_.store(published->GetUseTakeForOutput(),
+                                   std::memory_order_relaxed);
+
+        ApplyLoadDiff(op_ctx, new_local, diff);
+
+        LOG_DEBUG("Reopen segment {} done", id_);
+        return;
+    }
+
     auto diff = current_mutable.ComputeDiff(new_local);
     new_local.SetFieldsFilledWithDefault(
         current_mutable.GetDefaultFilledFieldsForNewInfo(new_local));
-    LOG_DEBUG("Reopen segment {} with diff {}", id_, diff.ToString());
+    LOG_DEBUG("Reopen segment {} with diff {}, stats_only={}",
+              id_,
+              diff.ToString(),
+              stats_only);
 
     auto published = std::make_shared<const SegmentLoadInfo>(new_local);
     std::atomic_store(&segment_load_info_, published);
@@ -5724,7 +5760,15 @@ ChunkedSegmentSealedImpl::ApplyLoadDiff(milvus::OpContext* op_ctx,
 
     // load column groups
     stage_start = std::chrono::steady_clock::now();
-    if (diff.load_external_manifest) {
+    if (diff.defer_manifest_column_groups) {
+        {
+            std::unique_lock lck(mutex_);
+            update_row_count(segment_load_info.GetNumOfRows());
+        }
+        deferred_manifest_column_groups_.store(true, std::memory_order_release);
+    } else if (diff.load_external_manifest) {
+        deferred_manifest_column_groups_.store(false,
+                                               std::memory_order_release);
         // External collections: load via manifest path
         LoadColumnGroups(segment_load_info.GetManifestPath(), op_ctx);
     } else {
@@ -5783,6 +5827,10 @@ ChunkedSegmentSealedImpl::ApplyLoadDiff(milvus::OpContext* op_ctx,
                                  true,
                                  &lazy_match_fields);
             }
+        }
+        if (has_cg_changes) {
+            deferred_manifest_column_groups_.store(false,
+                                                   std::memory_order_release);
         }
     }
     column_group_ns = DurationSinceNs(stage_start);
@@ -6151,6 +6199,140 @@ ChunkedSegmentSealedImpl::InitTextLobPaths(const std::string& manifest_path) {
                  field_id.get(),
                  lob_base_path.string());
     }
+}
+
+void
+ChunkedSegmentSealedImpl::EnsureDeferredManifestColumnGroups(
+    milvus::OpContext* op_ctx) const {
+    if (!deferred_manifest_column_groups_.load(std::memory_order_acquire)) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> guard(deferred_manifest_mutex_);
+    if (!deferred_manifest_column_groups_.load(std::memory_order_relaxed)) {
+        return;
+    }
+
+    auto load_info = std::atomic_load(&segment_load_info_);
+    if (!load_info || !load_info->HasManifestPath() ||
+        load_info->GetStorageVersion() != STORAGE_V3 ||
+        schema_->is_external_collection()) {
+        deferred_manifest_column_groups_.store(false,
+                                               std::memory_order_release);
+        return;
+    }
+
+    auto column_groups = load_info->GetColumnGroups();
+    if (column_groups == nullptr) {
+        deferred_manifest_column_groups_.store(false,
+                                               std::memory_order_release);
+        return;
+    }
+
+    auto properties = milvus::storage::LoonFFIPropertiesSingleton::GetInstance()
+                          .GetProperties();
+    std::vector<std::pair<int, std::vector<FieldId>>> cg_field_ids;
+    std::unordered_set<FieldId> manifest_field_ids;
+    cg_field_ids.reserve(column_groups->size());
+    for (size_t i = 0; i < column_groups->size(); ++i) {
+        auto cg = column_groups->at(i);
+        if (!cg) {
+            continue;
+        }
+
+        std::vector<FieldId> field_ids;
+        field_ids.reserve(cg->columns.size());
+        for (const auto& column : cg->columns) {
+            int64_t raw_field_id = 0;
+            try {
+                raw_field_id = std::stoll(column);
+            } catch (const std::exception&) {
+                continue;
+            }
+
+            FieldId field_id(raw_field_id);
+            if (!field_exists_in_schema(schema_, field_id)) {
+                continue;
+            }
+            manifest_field_ids.emplace(field_id);
+            if (get_column(field_id) != nullptr) {
+                continue;
+            }
+            field_ids.emplace_back(field_id);
+        }
+
+        if (!field_ids.empty()) {
+            cg_field_ids.emplace_back(static_cast<int>(i),
+                                      std::move(field_ids));
+        }
+    }
+
+    std::vector<FieldId> fields_to_fill_default;
+    for (const auto& [field_id, field_meta] : schema_->get_fields()) {
+        if (field_id.get() < START_USER_FIELDID) {
+            continue;
+        }
+        if (manifest_field_ids.find(field_id) != manifest_field_ids.end()) {
+            continue;
+        }
+        if (get_column(field_id) != nullptr) {
+            continue;
+        }
+        if (load_info->HasFieldIndexWithRawData(field_id)) {
+            continue;
+        }
+        fields_to_fill_default.emplace_back(field_id);
+    }
+
+    {
+        std::unique_lock lck(mutex_);
+        const_cast<ChunkedSegmentSealedImpl*>(this)->update_row_count(
+            load_info->GetNumOfRows());
+    }
+
+    if (!cg_field_ids.empty()) {
+        const_cast<ChunkedSegmentSealedImpl*>(this)->LoadColumnGroups(
+            column_groups,
+            properties,
+            cg_field_ids,
+            /*eager_load=*/false,
+            op_ctx);
+    }
+
+    if (!fields_to_fill_default.empty()) {
+        auto mutable_this = const_cast<ChunkedSegmentSealedImpl*>(this);
+        mutable_this->FillDefaultValueFields(fields_to_fill_default);
+        mutable_this->RecordDefaultFieldsFilled(fields_to_fill_default);
+    }
+
+    std::vector<FieldId> text_indexes_to_create;
+    {
+        std::shared_lock lck(mutex_);
+        for (const auto& [field_id, field_meta] : schema_->get_fields()) {
+            if (field_id.get() < START_USER_FIELDID ||
+                !field_meta.enable_match()) {
+                continue;
+            }
+            if (text_indexes_.find(field_id) != text_indexes_.end()) {
+                continue;
+            }
+            text_indexes_to_create.emplace_back(field_id);
+        }
+    }
+    for (auto field_id : text_indexes_to_create) {
+        const_cast<ChunkedSegmentSealedImpl*>(this)->CreateTextIndex(field_id,
+                                                                     op_ctx);
+    }
+
+    deferred_manifest_column_groups_.store(false, std::memory_order_release);
+    LOG_INFO(
+        "[StorageV3] deferred manifest column groups installed, segment {}, "
+        "columnGroups {}, tasks {}, defaultFields {}, textIndexesCreated {}",
+        get_segment_id(),
+        column_groups->size(),
+        cg_field_ids.size(),
+        fields_to_fill_default.size(),
+        text_indexes_to_create.size());
 }
 
 void
@@ -6946,6 +7128,7 @@ void
 ChunkedSegmentSealedImpl::FillTargetEntry(const query::Plan* plan,
                                           SearchResult& results,
                                           milvus::OpContext* op_ctx) const {
+    PrepareForQuery(op_ctx);
     std::shared_lock lck(mutex_);
     AssertInfo(plan, "empty plan");
     auto size = results.distances_.size();
@@ -6998,6 +7181,11 @@ ChunkedSegmentSealedImpl::FillTargetEntry(const query::Plan* plan,
         local_ctx.storage_usage.scanned_cold_bytes.load();
     results.search_storage_cost_.scanned_total_bytes +=
         local_ctx.storage_usage.scanned_total_bytes.load();
+}
+
+void
+ChunkedSegmentSealedImpl::PrepareForQuery(milvus::OpContext* op_ctx) const {
+    EnsureDeferredManifestColumnGroups(op_ctx);
 }
 
 // ---- Shared helpers for TryTakeForRetrieve / TryTakeForSearch ----

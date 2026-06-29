@@ -24,6 +24,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/apache/arrow/go/v17/arrow"
+	"github.com/apache/arrow/go/v17/arrow/array"
+	"github.com/apache/arrow/go/v17/arrow/memory"
 	"github.com/bytedance/mockey"
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/assert"
@@ -38,6 +41,7 @@ import (
 	"github.com/milvus-io/milvus/internal/storagev2/packed"
 	"github.com/milvus-io/milvus/internal/util/indexparamcheck"
 	"github.com/milvus-io/milvus/internal/util/initcore"
+	segcoreutil "github.com/milvus-io/milvus/internal/util/segcore"
 	"github.com/milvus-io/milvus/pkg/v3/common"
 	"github.com/milvus-io/milvus/pkg/v3/proto/datapb"
 	"github.com/milvus-io/milvus/pkg/v3/proto/indexpb"
@@ -47,6 +51,69 @@ import (
 	"github.com/milvus-io/milvus/pkg/v3/util/metric"
 	"github.com/milvus-io/milvus/pkg/v3/util/paramtable"
 )
+
+type testDeltalogReader struct {
+	records []storage.Record
+	next    int
+}
+
+func (r *testDeltalogReader) Next() (storage.Record, error) {
+	if r.next >= len(r.records) {
+		return nil, io.EOF
+	}
+	record := r.records[r.next]
+	r.next++
+	return record, nil
+}
+
+func (r *testDeltalogReader) Close() error {
+	return nil
+}
+
+type testDeltaRecord struct {
+	pks *array.Int64
+	tss *array.Int64
+}
+
+func newTestDeltaRecord(pks []int64, tss []int64) *testDeltaRecord {
+	pkBuilder := array.NewInt64Builder(memory.DefaultAllocator)
+	defer pkBuilder.Release()
+	pkBuilder.AppendValues(pks, nil)
+
+	tsBuilder := array.NewInt64Builder(memory.DefaultAllocator)
+	defer tsBuilder.Release()
+	tsBuilder.AppendValues(tss, nil)
+
+	return &testDeltaRecord{
+		pks: pkBuilder.NewInt64Array(),
+		tss: tsBuilder.NewInt64Array(),
+	}
+}
+
+func (r *testDeltaRecord) Column(i storage.FieldID) arrow.Array {
+	switch i {
+	case 0:
+		return r.pks
+	case common.TimeStampField:
+		return r.tss
+	default:
+		panic(fmt.Sprintf("unexpected field id %d", i))
+	}
+}
+
+func (r *testDeltaRecord) Len() int {
+	return r.pks.Len()
+}
+
+func (r *testDeltaRecord) Release() {
+	r.pks.Release()
+	r.tss.Release()
+}
+
+func (r *testDeltaRecord) Retain() {
+	r.pks.Retain()
+	r.tss.Retain()
+}
 
 type SegmentLoaderSuite struct {
 	suite.Suite
@@ -683,7 +750,7 @@ func (suite *SegmentLoaderSuite) TestLoadDeltaLogsV3PlaceholderSkipsPathRead() {
 	})
 	suite.Require().NoError(err)
 	suite.Require().Len(segs, 1)
-	segment := segs[0]
+	segment := segs[0].(*LocalSegment)
 
 	readerCalled := atomic.NewInt32(0)
 	manifestCalled := atomic.NewInt32(0)
@@ -728,6 +795,409 @@ func (suite *SegmentLoaderSuite) TestLoadDeltaLogsV3PlaceholderSkipsPathRead() {
 		"GetDeltaLogPathsFromManifest must be called for V3 segments")
 	suite.EqualValues(0, readerCalled.Load(),
 		"NewDeltalogReader must not be called when manifest returns no paths")
+}
+
+func (suite *SegmentLoaderSuite) TestLoadDeltaLogsV3LazyManifestSkipsLoadTimePathRead() {
+	ctx := context.Background()
+	oldLazyManifest := paramtable.Get().QueryNodeCfg.TieredLazyManifestMetadataReadEnabled.SwapTempValue("true")
+	defer paramtable.Get().QueryNodeCfg.TieredLazyManifestMetadataReadEnabled.SwapTempValue(oldLazyManifest)
+
+	collectionID := rand.Int63()
+	partitionID := rand.Int63()
+	segmentID := rand.Int63()
+	schema := mock_segcore.GenTestCollectionSchema("lazy-manifest-safe", schemapb.DataType_Int64, false)
+	fields := schema.GetFields()[:0]
+	for _, field := range schema.GetFields() {
+		if field.GetDataType() != schemapb.DataType_JSON {
+			fields = append(fields, field)
+		}
+	}
+	schema.Fields = fields
+	indexMeta := mock_segcore.GenTestIndexMeta(collectionID, schema)
+	loadMeta := &querypb.LoadMetaInfo{
+		LoadType:     querypb.LoadType_LoadCollection,
+		CollectionID: collectionID,
+		PartitionIDs: []int64{partitionID},
+	}
+	suite.Require().NoError(suite.manager.Collection.PutOrRef(collectionID, schema, indexMeta, loadMeta))
+	defer suite.manager.Segment.Remove(ctx, segmentID, querypb.DataScope_All)
+
+	msgLength := 4
+	binlogs, statsLogs, err := mock_segcore.SaveBinLog(ctx,
+		collectionID,
+		partitionID,
+		segmentID,
+		msgLength,
+		schema,
+		suite.chunkManager,
+	)
+	suite.Require().NoError(err)
+
+	segs, err := suite.loader.Load(ctx, collectionID, SegmentTypeSealed, 0, &querypb.SegmentLoadInfo{
+		SegmentID:     segmentID,
+		PartitionID:   partitionID,
+		CollectionID:  collectionID,
+		BinlogPaths:   binlogs,
+		Statslogs:     statsLogs,
+		NumOfRows:     int64(msgLength),
+		InsertChannel: fmt.Sprintf("by-dev-rootcoord-dml_0_%dv0", collectionID),
+	})
+	suite.Require().NoError(err)
+	suite.Require().Len(segs, 1)
+	segment := segs[0].(*LocalSegment)
+
+	readerCalled := atomic.NewInt32(0)
+	manifestCalled := atomic.NewInt32(0)
+
+	patchManifest := mockey.Mock(packed.GetDeltaLogPathsFromManifest).To(
+		func(manifestPath string, storageConfig *indexpb.StorageConfig) ([]string, error) {
+			manifestCalled.Inc()
+			return nil, nil
+		},
+	).Build()
+	defer patchManifest.UnPatch()
+
+	patchReader := mockey.Mock(storage.NewDeltalogReader).To(
+		func(pkType schemapb.DataType, paths []string, option ...storage.RwOption) (storage.RecordReader, error) {
+			readerCalled.Inc()
+			return nil, errors.New("should not be called when manifest returns no paths")
+		},
+	).Build()
+	defer patchReader.UnPatch()
+
+	v3LoadInfo := &querypb.SegmentLoadInfo{
+		SegmentID:      segmentID,
+		PartitionID:    partitionID,
+		CollectionID:   collectionID,
+		StorageVersion: storage.StorageV3,
+		ManifestPath:   "/tmp/fake/manifest.json?version=0",
+		Deltalogs:      []*datapb.FieldBinlog{{Binlogs: []*datapb.Binlog{{LogID: 1234, EntriesNum: 10, MemorySize: 1024}}}},
+		NumOfRows:      int64(msgLength),
+		InsertChannel:  fmt.Sprintf("by-dev-rootcoord-dml_0_%dv0", collectionID),
+	}
+
+	loader := suite.loader.(*segmentLoader)
+	err = loader.loadDeltalogs(ctx, segment, v3LoadInfo)
+	suite.NoError(err)
+	suite.Equal(v3LoadInfo.GetManifestPath(), segment.LoadInfo().GetManifestPath(),
+		"lazy LoadDeltaLogs must publish the latest load info before ACK")
+	suite.EqualValues(0, manifestCalled.Load(),
+		"lazy manifest must not read V3 delta manifest during load")
+	suite.EqualValues(0, readerCalled.Load(),
+		"lazy manifest must not create a deltalog reader during load")
+
+	paramtable.Get().QueryNodeCfg.TieredLazyManifestMetadataReadEnabled.SwapTempValue("false")
+	suite.NoError(segment.ensureManifestDeltasLoaded(ctx))
+	suite.EqualValues(1, manifestCalled.Load(),
+		"query-time ensure must read the deferred V3 delta manifest even if the global switch is later disabled")
+	suite.EqualValues(0, readerCalled.Load(),
+		"no reader is needed when the manifest has no delta paths")
+
+	suite.NoError(segment.ensureManifestDeltasLoaded(ctx))
+	suite.EqualValues(1, manifestCalled.Load(),
+		"query-time V3 delta manifest read should be cached")
+
+	paramtable.Get().QueryNodeCfg.TieredLazyManifestMetadataReadEnabled.SwapTempValue("true")
+	v3LoadInfo2 := &querypb.SegmentLoadInfo{
+		SegmentID:      segmentID,
+		PartitionID:    partitionID,
+		CollectionID:   collectionID,
+		StorageVersion: storage.StorageV3,
+		ManifestPath:   "/tmp/fake/manifest.json?version=1",
+		DataVersion:    1,
+		Deltalogs:      []*datapb.FieldBinlog{{Binlogs: []*datapb.Binlog{{LogID: 5678, EntriesNum: 10, MemorySize: 1024}}}},
+		NumOfRows:      int64(msgLength),
+		InsertChannel:  fmt.Sprintf("by-dev-rootcoord-dml_0_%dv0", collectionID),
+	}
+	err = loader.loadDeltalogs(ctx, segment, v3LoadInfo2)
+	suite.NoError(err)
+	suite.Equal(v3LoadInfo2.GetManifestPath(), segment.LoadInfo().GetManifestPath(),
+		"lazy LoadDeltaLogs must replace stale manifest path")
+	suite.EqualValues(1, manifestCalled.Load(),
+		"lazy manifest must still skip the second load-time V3 delta manifest read")
+
+	suite.NoError(segment.ensureManifestDeltasLoaded(ctx))
+	suite.EqualValues(2, manifestCalled.Load(),
+		"query-time ensure must read again after LoadDeltaLogs publishes a new manifest")
+}
+
+func (suite *SegmentLoaderSuite) TestLazyManifestDeltaAppliesHistoryBelowWatermark() {
+	ctx := context.Background()
+	oldLazyManifest := paramtable.Get().QueryNodeCfg.TieredLazyManifestMetadataReadEnabled.SwapTempValue("true")
+	defer paramtable.Get().QueryNodeCfg.TieredLazyManifestMetadataReadEnabled.SwapTempValue(oldLazyManifest)
+
+	collectionID := rand.Int63()
+	partitionID := rand.Int63()
+	segmentID := rand.Int63()
+	schema := mock_segcore.GenTestCollectionSchema("lazy-manifest-safe", schemapb.DataType_Int64, false)
+	fields := schema.GetFields()[:0]
+	for _, field := range schema.GetFields() {
+		if field.GetDataType() != schemapb.DataType_JSON {
+			fields = append(fields, field)
+		}
+	}
+	schema.Fields = fields
+	indexMeta := mock_segcore.GenTestIndexMeta(collectionID, schema)
+	loadMeta := &querypb.LoadMetaInfo{
+		LoadType:     querypb.LoadType_LoadCollection,
+		CollectionID: collectionID,
+		PartitionIDs: []int64{partitionID},
+	}
+	suite.Require().NoError(suite.manager.Collection.PutOrRef(collectionID, schema, indexMeta, loadMeta))
+	defer suite.manager.Segment.Remove(ctx, segmentID, querypb.DataScope_All)
+
+	msgLength := 4
+	binlogs, statsLogs, err := mock_segcore.SaveBinLog(ctx,
+		collectionID,
+		partitionID,
+		segmentID,
+		msgLength,
+		schema,
+		suite.chunkManager,
+	)
+	suite.Require().NoError(err)
+
+	segs, err := suite.loader.Load(ctx, collectionID, SegmentTypeSealed, 0, &querypb.SegmentLoadInfo{
+		SegmentID:     segmentID,
+		PartitionID:   partitionID,
+		CollectionID:  collectionID,
+		BinlogPaths:   binlogs,
+		Statslogs:     statsLogs,
+		NumOfRows:     int64(msgLength),
+		InsertChannel: fmt.Sprintf("by-dev-rootcoord-dml_0_%dv0", collectionID),
+	})
+	suite.Require().NoError(err)
+	suite.Require().Len(segs, 1)
+	segment := segs[0].(*LocalSegment)
+	segment.lastDeltaTimestamp.Store(5000)
+
+	patchManifest := mockey.Mock(packed.GetDeltaLogPathsFromManifest).To(
+		func(manifestPath string, storageConfig *indexpb.StorageConfig) ([]string, error) {
+			return []string{"/tmp/fake/delta"}, nil
+		},
+	).Build()
+	defer patchManifest.UnPatch()
+
+	record := newTestDeltaRecord([]int64{100}, []int64{1000})
+	defer record.Release()
+	patchReader := mockey.Mock(storage.NewDeltalogReader).To(
+		func(pkType schemapb.DataType, paths []string, option ...storage.RwOption) (storage.RecordReader, error) {
+			return &testDeltalogReader{records: []storage.Record{record}}, nil
+		},
+	).Build()
+	defer patchReader.UnPatch()
+
+	loadedRows := atomic.NewInt64(0)
+	patchLoadDelta := mockey.Mock((*LocalSegment).LoadDeltaData).To(
+		func(segment *LocalSegment, ctx context.Context, deltaData *storage.DeltaData) error {
+			loadedRows.Store(deltaData.DeleteRowCount())
+			return nil
+		},
+	).Build()
+	defer patchLoadDelta.UnPatch()
+
+	v3LoadInfo := &querypb.SegmentLoadInfo{
+		SegmentID:      segmentID,
+		PartitionID:    partitionID,
+		CollectionID:   collectionID,
+		StorageVersion: storage.StorageV3,
+		ManifestPath:   "/tmp/fake/manifest.json?version=0",
+		Deltalogs: []*datapb.FieldBinlog{{Binlogs: []*datapb.Binlog{{
+			LogID:       1234,
+			EntriesNum:  1,
+			MemorySize:  1024,
+			TimestampTo: 1000,
+		}}}},
+		NumOfRows:     int64(msgLength),
+		InsertChannel: fmt.Sprintf("by-dev-rootcoord-dml_0_%dv0", collectionID),
+	}
+
+	loader := suite.loader.(*segmentLoader)
+	suite.Require().NoError(loader.loadDeltalogs(ctx, segment, v3LoadInfo))
+	suite.Require().NoError(segment.ensureManifestDeltasLoaded(ctx))
+	suite.EqualValues(1, loadedRows.Load(),
+		"lazy manifest delta materialization must apply historical deletes even when their timestamp is below the current live-delete watermark")
+}
+
+func (suite *SegmentLoaderSuite) TestLazyManifestStatsDeferredUntilQueryTimeEnsure() {
+	ctx := context.Background()
+	oldLazyManifest := paramtable.Get().QueryNodeCfg.TieredLazyManifestMetadataReadEnabled.SwapTempValue("true")
+	defer paramtable.Get().QueryNodeCfg.TieredLazyManifestMetadataReadEnabled.SwapTempValue(oldLazyManifest)
+
+	msgLength := 4
+	binlogs, statsLogs, err := mock_segcore.SaveBinLog(ctx,
+		suite.collectionID,
+		suite.partitionID,
+		suite.segmentID,
+		msgLength,
+		suite.schema,
+		suite.chunkManager,
+	)
+	suite.Require().NoError(err)
+
+	segs, err := suite.loader.Load(ctx, suite.collectionID, SegmentTypeSealed, 0, &querypb.SegmentLoadInfo{
+		SegmentID:     suite.segmentID,
+		PartitionID:   suite.partitionID,
+		CollectionID:  suite.collectionID,
+		BinlogPaths:   binlogs,
+		Statslogs:     statsLogs,
+		NumOfRows:     int64(msgLength),
+		InsertChannel: fmt.Sprintf("by-dev-rootcoord-dml_0_%dv0", suite.collectionID),
+	})
+	suite.Require().NoError(err)
+	suite.Require().Len(segs, 1)
+	segment := segs[0].(*LocalSegment)
+	jsonFieldID := int64(0)
+	for _, field := range suite.schema.GetFields() {
+		if field.GetDataType() == schemapb.DataType_JSON {
+			jsonFieldID = field.GetFieldID()
+			break
+		}
+	}
+	suite.Require().NotZero(jsonFieldID)
+
+	statsResolverCalled := atomic.NewInt32(0)
+	patchStatsResolver := mockey.Mock(packed.NewStatsResolverFromLoadInfo).To(
+		func(loadInfo *querypb.SegmentLoadInfo) *packed.StatsResolver {
+			statsResolverCalled.Inc()
+			return packed.NewStatsResolver("", nil)
+		},
+	).Build()
+	defer patchStatsResolver.UnPatch()
+	patchStatsResolve := mockey.Mock((*packed.StatsResolver).TextAndJSONIndexStatsWithBasePaths).To(
+		func(resolver *packed.StatsResolver) *packed.StatsResultWithErr {
+			return &packed.StatsResultWithErr{
+				StatsResult: packed.StatsResult{
+					JSONKeyStats: map[int64]*datapb.JsonKeyStats{
+						jsonFieldID: {
+							FieldID:                jsonFieldID,
+							BuildID:                10001,
+							Version:                7,
+							JsonKeyStatsDataFormat: common.JSONStatsDataFormatVersion,
+						},
+					},
+					JSONBasePaths: map[int64]string{
+						jsonFieldID: "/tmp/fake/_stats/json_stats",
+					},
+				},
+			}
+		},
+	).Build()
+	defer patchStatsResolve.UnPatch()
+
+	reopenCalled := atomic.NewInt32(0)
+	mockCSegment := mock_segcore.NewMockCSegment(suite.T())
+	mockCSegment.EXPECT().Reopen(mock.Anything, mock.Anything).Run(
+		func(_ context.Context, request *segcoreutil.ReopenRequest) {
+			reopenCalled.Inc()
+			suite.True(request.StatsOnly,
+				"query-time manifest stats ensure must use stats-only reopen")
+			suite.NotNil(request.PreResolvedStats)
+			suite.Contains(request.PreResolvedStats.JSONKeyStats, jsonFieldID)
+			suite.Equal("/tmp/fake/manifest.json?version=0", request.LoadInfo.GetManifestPath())
+		},
+	).Return(nil)
+	segment.csegment = mockCSegment
+
+	v3LoadInfo := &querypb.SegmentLoadInfo{
+		SegmentID:      suite.segmentID,
+		PartitionID:    suite.partitionID,
+		CollectionID:   suite.collectionID,
+		StorageVersion: storage.StorageV3,
+		ManifestPath:   "/tmp/fake/manifest.json?version=0",
+		Deltalogs:      []*datapb.FieldBinlog{{Binlogs: []*datapb.Binlog{{LogID: 1234, EntriesNum: 10, MemorySize: 1024}}}},
+		NumOfRows:      int64(msgLength),
+		InsertChannel:  fmt.Sprintf("by-dev-rootcoord-dml_0_%dv0", suite.collectionID),
+	}
+
+	loader := suite.loader.(*segmentLoader)
+	suite.Require().NoError(loader.loadDeltalogs(ctx, segment, v3LoadInfo))
+	suite.EqualValues(0, statsResolverCalled.Load(),
+		"lazy manifest stats must not be resolved during load-time deltalog handling")
+
+	suite.Require().NoError(segment.ensureManifestStatsLoaded(ctx))
+	suite.EqualValues(1, statsResolverCalled.Load(),
+		"query-time ensure must resolve deferred manifest stats")
+	suite.EqualValues(1, reopenCalled.Load(),
+		"query-time ensure must reopen segcore once for resolved manifest stats")
+
+	suite.Require().NoError(segment.ensureManifestStatsLoaded(ctx))
+	suite.EqualValues(1, statsResolverCalled.Load(),
+		"query-time manifest stats resolution should be cached")
+	suite.EqualValues(1, reopenCalled.Load(),
+		"cached manifest stats must not reopen segcore again")
+}
+
+func (suite *SegmentLoaderSuite) TestLoadDeltaLogsV3LazyManifestJSONSchemaDefersManifestRead() {
+	ctx := context.Background()
+	oldLazyManifest := paramtable.Get().QueryNodeCfg.TieredLazyManifestMetadataReadEnabled.SwapTempValue("true")
+	defer paramtable.Get().QueryNodeCfg.TieredLazyManifestMetadataReadEnabled.SwapTempValue(oldLazyManifest)
+
+	msgLength := 4
+	binlogs, statsLogs, err := mock_segcore.SaveBinLog(ctx,
+		suite.collectionID,
+		suite.partitionID,
+		suite.segmentID,
+		msgLength,
+		suite.schema,
+		suite.chunkManager,
+	)
+	suite.Require().NoError(err)
+
+	segs, err := suite.loader.Load(ctx, suite.collectionID, SegmentTypeSealed, 0, &querypb.SegmentLoadInfo{
+		SegmentID:     suite.segmentID,
+		PartitionID:   suite.partitionID,
+		CollectionID:  suite.collectionID,
+		BinlogPaths:   binlogs,
+		Statslogs:     statsLogs,
+		NumOfRows:     int64(msgLength),
+		InsertChannel: fmt.Sprintf("by-dev-rootcoord-dml_0_%dv0", suite.collectionID),
+	})
+	suite.Require().NoError(err)
+	suite.Require().Len(segs, 1)
+	segment := segs[0].(*LocalSegment)
+
+	readerCalled := atomic.NewInt32(0)
+	manifestCalled := atomic.NewInt32(0)
+
+	patchManifest := mockey.Mock(packed.GetDeltaLogPathsFromManifest).To(
+		func(manifestPath string, storageConfig *indexpb.StorageConfig) ([]string, error) {
+			manifestCalled.Inc()
+			return nil, nil
+		},
+	).Build()
+	defer patchManifest.UnPatch()
+
+	patchReader := mockey.Mock(storage.NewDeltalogReader).To(
+		func(pkType schemapb.DataType, paths []string, option ...storage.RwOption) (storage.RecordReader, error) {
+			readerCalled.Inc()
+			return nil, errors.New("should not be called when manifest returns no paths")
+		},
+	).Build()
+	defer patchReader.UnPatch()
+
+	v3LoadInfo := &querypb.SegmentLoadInfo{
+		SegmentID:      suite.segmentID,
+		PartitionID:    suite.partitionID,
+		CollectionID:   suite.collectionID,
+		StorageVersion: storage.StorageV3,
+		ManifestPath:   "/tmp/fake/manifest.json?version=0",
+		Deltalogs:      []*datapb.FieldBinlog{{Binlogs: []*datapb.Binlog{{LogID: 1234, EntriesNum: 10, MemorySize: 1024}}}},
+		NumOfRows:      int64(msgLength),
+		InsertChannel:  fmt.Sprintf("by-dev-rootcoord-dml_0_%dv0", suite.collectionID),
+	}
+
+	loader := suite.loader.(*segmentLoader)
+	err = loader.loadDeltalogs(ctx, segment, v3LoadInfo)
+	suite.NoError(err)
+	suite.EqualValues(0, manifestCalled.Load(),
+		"JSON schemas must not read V3 delta manifest during load when lazy manifest is enabled")
+	suite.EqualValues(0, readerCalled.Load(),
+		"lazy manifest must not create a deltalog reader during load")
+
+	suite.NoError(segment.ensureManifestDeltasLoaded(ctx))
+	suite.EqualValues(1, manifestCalled.Load(),
+		"query-time ensure must read deferred V3 delta manifest")
 }
 
 // TestLoadDeltaLogsV1StillUsesPathRead ensures the skip logic does not break
@@ -909,6 +1379,18 @@ func (suite *SegmentLoaderSuite) TestLoadWithMmap() {
 
 func (suite *SegmentLoaderSuite) TestRunOutMemory() {
 	ctx := context.Background()
+	oldLazyManifestReader := paramtable.Get().QueryNodeCfg.TieredLazyManifestReaderEnabled.SwapTempValue("false")
+	defer paramtable.Get().QueryNodeCfg.TieredLazyManifestReaderEnabled.SwapTempValue(oldLazyManifestReader)
+	oldScalarWarmup := paramtable.Get().QueryNodeCfg.TieredWarmupScalarField.SwapTempValue(common.WarmupSync)
+	defer paramtable.Get().QueryNodeCfg.TieredWarmupScalarField.SwapTempValue(oldScalarWarmup)
+	oldVectorWarmup := paramtable.Get().QueryNodeCfg.TieredWarmupVectorField.SwapTempValue(common.WarmupSync)
+	defer paramtable.Get().QueryNodeCfg.TieredWarmupVectorField.SwapTempValue(oldVectorWarmup)
+	oldMmapScalarField := paramtable.Get().QueryNodeCfg.MmapScalarField.SwapTempValue("false")
+	defer paramtable.Get().QueryNodeCfg.MmapScalarField.SwapTempValue(oldMmapScalarField)
+	oldMmapVectorField := paramtable.Get().QueryNodeCfg.MmapVectorField.SwapTempValue("false")
+	defer paramtable.Get().QueryNodeCfg.MmapVectorField.SwapTempValue(oldMmapVectorField)
+	oldGrowingMmap := paramtable.Get().QueryNodeCfg.GrowingMmapEnabled.SwapTempValue("false")
+	defer paramtable.Get().QueryNodeCfg.GrowingMmapEnabled.SwapTempValue(oldGrowingMmap)
 	paramtable.Get().Save(paramtable.Get().QueryNodeCfg.OverloadedMemoryThresholdPercentage.Key, "0")
 	defer paramtable.Get().Reset(paramtable.Get().QueryNodeCfg.OverloadedMemoryThresholdPercentage.Key)
 
@@ -1735,6 +2217,15 @@ func (suite *ExternalSegmentEstimateSuite) TestEstimatedBytesPerRow() {
 }
 
 func (suite *ExternalSegmentEstimateSuite) TestExternalRawDataFactor() {
+	oldScalarWarmup := paramtable.Get().QueryNodeCfg.TieredWarmupScalarField.SwapTempValue(common.WarmupSync)
+	defer paramtable.Get().QueryNodeCfg.TieredWarmupScalarField.SwapTempValue(oldScalarWarmup)
+	oldVectorWarmup := paramtable.Get().QueryNodeCfg.TieredWarmupVectorField.SwapTempValue(common.WarmupSync)
+	defer paramtable.Get().QueryNodeCfg.TieredWarmupVectorField.SwapTempValue(oldVectorWarmup)
+	oldMmapScalarField := paramtable.Get().QueryNodeCfg.MmapScalarField.SwapTempValue("false")
+	defer paramtable.Get().QueryNodeCfg.MmapScalarField.SwapTempValue(oldMmapScalarField)
+	oldMmapVectorField := paramtable.Get().QueryNodeCfg.MmapVectorField.SwapTempValue("false")
+	defer paramtable.Get().QueryNodeCfg.MmapVectorField.SwapTempValue(oldMmapVectorField)
+
 	loadInfo := suite.externalLoadInfo(1000, 100000)
 	factor := resourceEstimateFactor{externalRawDataFactor: 1.5}
 
@@ -1746,6 +2237,15 @@ func (suite *ExternalSegmentEstimateSuite) TestExternalRawDataFactor() {
 }
 
 func (suite *ExternalSegmentEstimateSuite) TestExternalRawDataFactor_NoExtraWhenFactorLe1() {
+	oldScalarWarmup := paramtable.Get().QueryNodeCfg.TieredWarmupScalarField.SwapTempValue(common.WarmupSync)
+	defer paramtable.Get().QueryNodeCfg.TieredWarmupScalarField.SwapTempValue(oldScalarWarmup)
+	oldVectorWarmup := paramtable.Get().QueryNodeCfg.TieredWarmupVectorField.SwapTempValue(common.WarmupSync)
+	defer paramtable.Get().QueryNodeCfg.TieredWarmupVectorField.SwapTempValue(oldVectorWarmup)
+	oldMmapScalarField := paramtable.Get().QueryNodeCfg.MmapScalarField.SwapTempValue("false")
+	defer paramtable.Get().QueryNodeCfg.MmapScalarField.SwapTempValue(oldMmapScalarField)
+	oldMmapVectorField := paramtable.Get().QueryNodeCfg.MmapVectorField.SwapTempValue("false")
+	defer paramtable.Get().QueryNodeCfg.MmapVectorField.SwapTempValue(oldMmapVectorField)
+
 	loadInfo := suite.externalLoadInfo(1000, 100000)
 	factor := resourceEstimateFactor{externalRawDataFactor: 0.8}
 

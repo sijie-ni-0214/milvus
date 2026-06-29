@@ -97,6 +97,24 @@ class LazyManifestReaderGuard {
     bool previous_;
 };
 
+class LazyManifestMetadataReadGuard {
+ public:
+    explicit LazyManifestMetadataReadGuard(bool enabled)
+        : previous_(SegcoreConfig::default_config()
+                        .get_lazy_manifest_metadata_read_enabled()) {
+        SegcoreConfig::default_config().set_lazy_manifest_metadata_read_enabled(
+            enabled);
+    }
+
+    ~LazyManifestMetadataReadGuard() {
+        SegcoreConfig::default_config().set_lazy_manifest_metadata_read_enabled(
+            previous_);
+    }
+
+ private:
+    bool previous_;
+};
+
 class CacheWarmupPolicyGuard {
  public:
     explicit CacheWarmupPolicyGuard(
@@ -766,6 +784,50 @@ TEST_P(TestChunkSegmentStorageV2,
                                 base_path);
 }
 
+TEST_P(TestChunkSegmentStorageV2,
+       TestLazyManifestStatsOnlyReopenDoesNotReadManifestColumnGroups) {
+    LazyManifestMetadataReadGuard metadata_guard(true);
+    LazyManifestReaderGuard reader_guard(true);
+
+    const int64_t segment_id = 3600 + (GetParam() ? 100 : 0);
+    auto base_path = std::string("metadata_lazy_manifest_stats_only_reopen_") +
+                     (GetParam() ? "varchar" : "int64");
+    std::filesystem::remove_all(std::filesystem::path(TestLocalPath) /
+                                base_path);
+    milvus::test::V3SegmentTestData test_data(
+        schema_, 1, 16, 128, TestLocalPath, base_path);
+
+    auto manifest_segment = segcore::CreateSealedSegment(
+        schema_, nullptr, segment_id, segcore::SegcoreConfig::default_config());
+    auto* segment_impl =
+        dynamic_cast<ChunkedSegmentSealedImpl*>(manifest_segment.get());
+    ASSERT_NE(segment_impl, nullptr);
+
+    proto::segcore::SegmentLoadInfo load_info;
+    load_info.set_segmentid(segment_id);
+    load_info.set_partitionid(1);
+    load_info.set_collectionid(1);
+    load_info.set_num_of_rows(test_data.TotalRows());
+    load_info.set_storageversion(STORAGE_V3);
+    load_info.set_manifest_path(test_data.ManifestPath());
+    load_info.set_priority(proto::common::LoadPriority::LOW);
+
+    segment_impl->SetLoadInfo(load_info);
+    milvus::tracer::TraceContext trace_ctx;
+    segment_impl->Load(trace_ctx, nullptr);
+
+    std::filesystem::remove_all(std::filesystem::path(TestLocalPath) /
+                                base_path);
+
+    auto reopened_load_info = load_info;
+    reopened_load_info.set_readableversion(1);
+    milvus::OpContext op_ctx;
+    EXPECT_NO_THROW(
+        segment_impl->Reopen(&op_ctx, reopened_load_info, nullptr, true));
+
+    manifest_segment.reset();
+}
+
 TEST_P(TestChunkSegmentStorageV2, TestLazyManifestTimestampMaxUsesLazyIndex) {
     LazyManifestReaderGuard guard(true);
 
@@ -804,6 +866,73 @@ TEST_P(TestChunkSegmentStorageV2, TestLazyManifestTimestampMaxUsesLazyIndex) {
 
     EXPECT_EQ(segment_impl->get_max_timestamp(), test_data.TotalRows() - 1);
     EXPECT_GT(ts_column->DataByteSize(), 0);
+
+    manifest_segment.reset();
+    std::filesystem::remove_all(std::filesystem::path(TestLocalPath) /
+                                base_path);
+}
+
+TEST_P(TestChunkSegmentStorageV2,
+       TestLazyManifestMetadataReopenDefersUntilQuery) {
+    LazyManifestMetadataReadGuard metadata_guard(true);
+    LazyManifestReaderGuard reader_guard(true);
+
+    const int64_t segment_id = 3400 + (GetParam() ? 100 : 0);
+    auto base_path = std::string("metadata_lazy_manifest_reopen_") +
+                     (GetParam() ? "varchar" : "int64");
+    std::filesystem::remove_all(std::filesystem::path(TestLocalPath) /
+                                base_path);
+    milvus::test::V3SegmentTestData test_data(
+        schema_, 1, 16, 128, TestLocalPath, base_path);
+
+    auto manifest_segment = segcore::CreateSealedSegment(
+        schema_, nullptr, segment_id, segcore::SegcoreConfig::default_config());
+    auto* segment_impl =
+        dynamic_cast<ChunkedSegmentSealedImpl*>(manifest_segment.get());
+    auto* segment_internal =
+        dynamic_cast<SegmentInternalInterface*>(manifest_segment.get());
+    ASSERT_NE(segment_impl, nullptr);
+    ASSERT_NE(segment_internal, nullptr);
+
+    proto::segcore::SegmentLoadInfo load_info;
+    load_info.set_segmentid(segment_id);
+    load_info.set_partitionid(1);
+    load_info.set_collectionid(1);
+    load_info.set_num_of_rows(test_data.TotalRows());
+    load_info.set_storageversion(STORAGE_V3);
+    load_info.set_manifest_path(test_data.ManifestPath());
+    load_info.set_priority(proto::common::LoadPriority::LOW);
+
+    segment_impl->SetLoadInfo(load_info);
+    milvus::tracer::TraceContext trace_ctx;
+    segment_impl->Load(trace_ctx, nullptr);
+
+    auto [before_column, before_exists] =
+        segment_impl->GetFieldDataIfExist(fields.at("int64"));
+    EXPECT_FALSE(before_exists);
+    EXPECT_EQ(before_column, nullptr);
+
+    auto reopened_load_info = load_info;
+    reopened_load_info.set_readableversion(1);
+    milvus::OpContext op_ctx;
+    segment_impl->Reopen(&op_ctx, reopened_load_info);
+
+    auto [after_reopen_column, after_reopen_exists] =
+        segment_impl->GetFieldDataIfExist(fields.at("int64"));
+    EXPECT_FALSE(after_reopen_exists);
+    EXPECT_EQ(after_reopen_column, nullptr);
+
+    segment_internal->PrepareForQuery(&op_ctx);
+
+    auto [int64_column, exists] =
+        segment_impl->GetFieldDataIfExist(fields.at("int64"));
+    ASSERT_TRUE(exists);
+    ASSERT_NE(int64_column, nullptr);
+
+    int64_t offsets[] = {0, 7};
+    auto result = manifest_segment->bulk_subscript(
+        nullptr, fields.at("int64"), offsets, 2);
+    ASSERT_EQ(result->scalars().long_data().data_size(), 2);
 
     manifest_segment.reset();
     std::filesystem::remove_all(std::filesystem::path(TestLocalPath) /

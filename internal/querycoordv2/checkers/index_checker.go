@@ -30,8 +30,10 @@ import (
 	"github.com/milvus-io/milvus/internal/querycoordv2/session"
 	"github.com/milvus-io/milvus/internal/querycoordv2/task"
 	"github.com/milvus-io/milvus/internal/querycoordv2/utils"
+	"github.com/milvus-io/milvus/internal/storage"
 	"github.com/milvus-io/milvus/pkg/v3/common"
 	"github.com/milvus-io/milvus/pkg/v3/log"
+	"github.com/milvus-io/milvus/pkg/v3/proto/datapb"
 	"github.com/milvus-io/milvus/pkg/v3/proto/indexpb"
 	"github.com/milvus-io/milvus/pkg/v3/proto/querypb"
 	"github.com/milvus-io/milvus/pkg/v3/util/paramtable"
@@ -267,6 +269,19 @@ func (c *IndexChecker) checkSegmentStats(segment *meta.Segment, schema *schemapb
 			log.Warn("schema released during check index", zap.Int64("collection", segment.GetCollectionID()))
 			return result
 		}
+
+		manifestPath := segment.ManifestPath
+		if manifestPath == "" {
+			manifestPath = segment.GetManifestPath()
+		}
+		if paramtable.Get().QueryNodeCfg.TieredLazyManifestMetadataReadEnabled.GetAsBool() &&
+			segment.GetStorageVersion() == storage.StorageV3 &&
+			manifestPath != "" &&
+			segment.GetLevel() != datapb.SegmentLevel_L0 &&
+			!typeutil.IsExternalCollection(schema) {
+			return result
+		}
+
 		loadFieldMap := make(map[int64]struct{})
 		for _, v := range loadField {
 			loadFieldMap[v] = struct{}{}

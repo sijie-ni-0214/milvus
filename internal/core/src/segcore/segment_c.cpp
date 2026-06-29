@@ -320,7 +320,8 @@ AsyncReopenSegment(CTraceContext c_trace,
                    const int64_t load_info_length,
                    const void* schema_blob,
                    const int64_t schema_length,
-                   const uint64_t schema_version) {
+                   const uint64_t schema_version,
+                   const bool stats_only) {
     try {
         AssertInfo(load_info_blob, "load info is null");
         milvus::proto::segcore::SegmentLoadInfo load_info;
@@ -338,10 +339,10 @@ AsyncReopenSegment(CTraceContext c_trace,
             [c_trace,
              segment,
              load_info = std::move(load_info),
-             schema = std::move(schema)](
-                folly::CancellationToken cancel_token) -> bool* {
+             schema = std::move(schema),
+             stats_only](folly::CancellationToken cancel_token) -> bool* {
                 milvus::OpContext op_ctx(cancel_token);
-                segment->Reopen(&op_ctx, load_info, schema);
+                segment->Reopen(&op_ctx, load_info, schema, stats_only);
                 return nullptr;
             },
             milvus::futures::PoolType::kLoad);

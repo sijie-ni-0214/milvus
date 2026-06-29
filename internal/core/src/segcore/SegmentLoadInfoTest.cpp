@@ -36,6 +36,7 @@
 #include "pb/common.pb.h"
 #include "pb/index_cgo_msg.pb.h"
 #include "pb/segcore.pb.h"
+#include "segcore/SegcoreConfig.h"
 #include "segcore/SegmentLoadInfo.h"
 #include "segcore/Types.h"
 
@@ -2829,6 +2830,24 @@ TEST_F(SegmentLoadInfoTest,
 
 namespace {
 
+class LazyManifestMetadataConfigGuard {
+ public:
+    explicit LazyManifestMetadataConfigGuard(bool value)
+        : old_(SegcoreConfig::default_config()
+                   .get_lazy_manifest_metadata_read_enabled()) {
+        SegcoreConfig::default_config()
+            .set_lazy_manifest_metadata_read_enabled(value);
+    }
+
+    ~LazyManifestMetadataConfigGuard() {
+        SegcoreConfig::default_config()
+            .set_lazy_manifest_metadata_read_enabled(old_);
+    }
+
+ private:
+    bool old_;
+};
+
 // Build a ColumnGroups payload from a list of (fields, files) pairs so
 // tests can exercise ComputeDiffColumnGroups without a real manifest.
 std::shared_ptr<milvus_storage::api::ColumnGroups>
@@ -3164,6 +3183,124 @@ TEST_F(SegmentLoadInfoTest,
             current_info.GetDefaultFilledFieldsForNewInfo(new_info);
     });
     EXPECT_TRUE(default_fields.empty());
+}
+
+TEST_F(SegmentLoadInfoTest, GetLoadDiffDefersStorageV3ManifestColumnGroups) {
+    LazyManifestMetadataConfigGuard guard(true);
+
+    auto proto = MakeManifestProto("/manifest/lazy");
+    proto.set_storageversion(STORAGE_V3);
+    SegmentLoadInfo info(proto, MakeSchemaWithFieldIds({100, 101}));
+
+    auto diff = info.GetLoadDiff();
+
+    EXPECT_TRUE(diff.defer_manifest_column_groups);
+    EXPECT_TRUE(diff.column_groups_to_load.empty());
+    EXPECT_TRUE(diff.column_groups_to_lazyload.empty());
+    EXPECT_TRUE(diff.column_groups_to_replace.empty());
+    EXPECT_TRUE(diff.column_groups_to_lazyreplace.empty());
+    EXPECT_TRUE(diff.fields_to_fill_default.empty());
+    EXPECT_TRUE(diff.HasChanges());
+}
+
+TEST_F(SegmentLoadInfoTest,
+       GetLoadDiffDefersTextMatchSchemaWithoutPreResolvedStats) {
+    LazyManifestMetadataConfigGuard guard(true);
+
+    auto proto = MakeManifestProto("/manifest/lazy");
+    proto.set_storageversion(STORAGE_V3);
+    SegmentLoadInfo info(proto, CreateSchemaWithTextMatchField());
+
+    auto diff = info.GetLoadDiff();
+
+    EXPECT_TRUE(info.CanDeferManifestMetadataRead());
+    EXPECT_TRUE(diff.defer_manifest_column_groups);
+    EXPECT_TRUE(diff.text_indexes_to_load.empty());
+    EXPECT_TRUE(diff.text_indexes_to_create.empty());
+}
+
+TEST_F(SegmentLoadInfoTest,
+       GetLoadDiffLoadsPreResolvedTextStatsWithLazyManifest) {
+    LazyManifestMetadataConfigGuard guard(true);
+
+    auto proto = MakeManifestProto("/manifest/lazy");
+    proto.set_storageversion(STORAGE_V3);
+    auto& text_stats = (*proto.mutable_textstatslogs())[102];
+    text_stats.set_fieldid(102);
+    text_stats.set_version(1);
+    text_stats.set_buildid(5001);
+    text_stats.set_memory_size(1024);
+    text_stats.set_current_scalar_index_version(3);
+    text_stats.add_files("text_index_file");
+
+    SegmentLoadInfo info(proto, CreateSchemaWithTextMatchField());
+    auto diff = info.GetLoadDiff();
+
+    EXPECT_TRUE(info.CanDeferManifestMetadataRead());
+    EXPECT_TRUE(diff.defer_manifest_column_groups);
+    EXPECT_EQ(diff.text_indexes_to_load.size(), 1);
+    EXPECT_TRUE(diff.text_indexes_to_load.count(FieldId(102)) > 0);
+    EXPECT_TRUE(diff.text_indexes_to_create.empty());
+}
+
+TEST_F(SegmentLoadInfoTest, ComputeStatsOnlyDiffSkipsIndexesAndTextCreate) {
+    LazyManifestMetadataConfigGuard guard(true);
+
+    auto current_proto = MakeManifestProto("/manifest/lazy");
+    current_proto.set_storageversion(STORAGE_V3);
+    SegmentLoadInfo current_info(current_proto, CreateSchemaWithTextMatchField());
+
+    auto new_proto = MakeManifestProto("/manifest/lazy");
+    new_proto.set_storageversion(STORAGE_V3);
+    auto* vector_index = new_proto.add_index_infos();
+    vector_index->set_fieldid(101);
+    vector_index->set_indexid(1001);
+    vector_index->set_buildid(2001);
+    vector_index->set_index_version(1);
+    vector_index->add_index_file_paths("/path/to/vector_index");
+    auto* index_param = vector_index->add_index_params();
+    index_param->set_key("index_type");
+    index_param->set_value(knowhere::IndexEnum::INDEX_FAISS_IVFSQ8);
+    auto& text_stats = (*new_proto.mutable_textstatslogs())[102];
+    text_stats.set_fieldid(102);
+    text_stats.set_version(1);
+    text_stats.set_buildid(5001);
+    text_stats.set_memory_size(1024);
+    text_stats.set_current_scalar_index_version(3);
+    text_stats.add_files("text_index_file");
+
+    SegmentLoadInfo new_info(new_proto, CreateSchemaWithTextMatchField());
+    auto diff = current_info.ComputeStatsOnlyDiff(new_info);
+
+    EXPECT_TRUE(diff.indexes_to_load.empty());
+    EXPECT_TRUE(diff.indexes_to_replace.empty());
+    EXPECT_TRUE(diff.indexes_to_drop.empty());
+    EXPECT_TRUE(diff.column_groups_to_load.empty());
+    EXPECT_TRUE(diff.column_groups_to_replace.empty());
+    EXPECT_TRUE(diff.column_groups_to_lazyload.empty());
+    EXPECT_TRUE(diff.column_groups_to_lazyreplace.empty());
+    EXPECT_FALSE(diff.defer_manifest_column_groups);
+    EXPECT_TRUE(diff.text_indexes_to_create.empty());
+    EXPECT_EQ(diff.text_indexes_to_load.size(), 1);
+    EXPECT_TRUE(diff.text_indexes_to_load.count(FieldId(102)) > 0);
+
+    auto no_stats_proto = new_proto;
+    no_stats_proto.clear_textstatslogs();
+    SegmentLoadInfo no_stats_info(no_stats_proto, CreateSchemaWithTextMatchField());
+    auto no_stats_diff = current_info.ComputeStatsOnlyDiff(no_stats_info);
+    EXPECT_TRUE(no_stats_diff.text_indexes_to_load.empty());
+    EXPECT_TRUE(no_stats_diff.text_indexes_to_create.empty());
+    EXPECT_TRUE(no_stats_diff.indexes_to_load.empty());
+}
+
+TEST_F(SegmentLoadInfoTest, LazyManifestMetadataReadEnabledForJsonSchema) {
+    LazyManifestMetadataConfigGuard guard(true);
+
+    auto proto = MakeManifestProto("/manifest/lazy");
+    proto.set_storageversion(STORAGE_V3);
+    SegmentLoadInfo info(proto, schema_);
+
+    EXPECT_TRUE(info.CanDeferManifestMetadataRead());
 }
 
 TEST_F(SegmentLoadInfoTest,

@@ -16,6 +16,7 @@
 #include <cstdint>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <set>
 #include <sstream>
 #include <string>
@@ -125,6 +126,10 @@ struct LoadDiff {
     // New manifest path (valid when manifest_updated is true)
     std::string new_manifest_path;
 
+    // Initial StorageV3 manifest load may defer column-group metadata parsing
+    // to the first query path.
+    bool defer_manifest_column_groups = false;
+
     [[nodiscard]] bool
     HasChanges() const {
         return !indexes_to_load.empty() || !indexes_to_replace.empty() ||
@@ -138,7 +143,7 @@ struct LoadDiff {
                !text_indexes_to_load.empty() || !json_stats_to_load.empty() ||
                !json_stats_to_replace.empty() || !json_stats_to_drop.empty() ||
                !text_indexes_to_create.empty() || manifest_updated ||
-               load_external_manifest;
+               load_external_manifest || defer_manifest_column_groups;
     }
 
     [[nodiscard]] bool
@@ -374,6 +379,9 @@ struct LoadDiff {
         if (load_external_manifest) {
             oss << ", load_external_manifest=true";
         }
+        if (defer_manifest_column_groups) {
+            oss << ", defer_manifest_column_groups=true";
+        }
 
         oss << "}";
         return oss.str();
@@ -423,9 +431,9 @@ class SegmentLoadInfo {
           converted_field_index_cache_(other.converted_field_index_cache_),
           field_index_id_cache_(other.field_index_id_cache_),
           field_index_has_raw_data_(other.field_index_has_raw_data_),
-          column_groups_(other.column_groups_),
           fields_filled_with_default_(other.fields_filled_with_default_),
           created_text_indexes_(other.created_text_indexes_) {
+        column_groups_ = other.CopyColumnGroupsCache();
         BuildFieldBinlogCache();
     }
 
@@ -459,7 +467,7 @@ class SegmentLoadInfo {
             converted_field_index_cache_ = other.converted_field_index_cache_;
             field_index_id_cache_ = other.field_index_id_cache_;
             field_index_has_raw_data_ = other.field_index_has_raw_data_;
-            column_groups_ = other.column_groups_;
+            column_groups_ = other.CopyColumnGroupsCache();
             fields_filled_with_default_ = other.fields_filled_with_default_;
             created_text_indexes_ = other.created_text_indexes_;
             BuildFieldBinlogCache();
@@ -666,6 +674,12 @@ class SegmentLoadInfo {
         return result;
     }
 
+    [[nodiscard]] bool
+    HasFieldIndexWithRawData(FieldId field_id) const {
+        return field_index_has_raw_data_.find(field_id) !=
+               field_index_has_raw_data_.end();
+    }
+
     // ==================== Binlog Info ====================
 
     [[nodiscard]] int
@@ -778,13 +792,11 @@ class SegmentLoadInfo {
     // ==================== Column Groups Cache ====================
 
     /**
-     * @brief Get column groups from manifest (lazy-cached, thread-compatible)
+     * @brief Get column groups from manifest (lazy-cached, thread-safe)
      * @return Shared pointer to ColumnGroups, nullptr if manifest is empty
      *
-     * The cache is populated on first access. Callers are responsible for
-     * serializing concurrent first-time calls on the same instance; in
-     * ChunkedSegmentSealedImpl this is guaranteed by `reopen_mutex_` since
-     * GetColumnGroups is only invoked from Load/Reopen/SetLoadInfo chains.
+     * The cache is populated on first access. Load may defer this call to the
+     * query path, so concurrent first-time calls are serialized internally.
      */
     [[nodiscard]] std::shared_ptr<milvus_storage::api::ColumnGroups>
     GetColumnGroups() const;
@@ -797,6 +809,7 @@ class SegmentLoadInfo {
     void
     SetColumnGroupsForTesting(
         std::shared_ptr<milvus_storage::api::ColumnGroups> cg) {
+        std::lock_guard<std::mutex> lock(*column_groups_mutex_);
         column_groups_ = std::move(cg);
     }
 
@@ -983,6 +996,9 @@ class SegmentLoadInfo {
     [[nodiscard]] LoadDiff
     ComputeDiff(SegmentLoadInfo& new_info);
 
+    [[nodiscard]] LoadDiff
+    ComputeStatsOnlyDiff(SegmentLoadInfo& new_info);
+
     /**
      * @brief Get the LoadDiff from the current SegmentLoadInfo
      *
@@ -993,6 +1009,9 @@ class SegmentLoadInfo {
      */
     [[nodiscard]] LoadDiff
     GetLoadDiff();
+
+    [[nodiscard]] bool
+    CanDeferManifestMetadataRead() const;
 
     // ==================== Underlying Proto Access ====================
 
@@ -1212,6 +1231,14 @@ class SegmentLoadInfo {
     // GetColumnGroups() can be const — the cache is a memoization of an
     // immutable manifest path.
     mutable std::shared_ptr<milvus_storage::api::ColumnGroups> column_groups_;
+    mutable std::shared_ptr<std::mutex> column_groups_mutex_ =
+        std::make_shared<std::mutex>();
+
+    std::shared_ptr<milvus_storage::api::ColumnGroups>
+    CopyColumnGroupsCache() const {
+        std::lock_guard<std::mutex> lock(*column_groups_mutex_);
+        return column_groups_;
+    }
 
     // Field IDs where text indexes were created from raw data (not loaded from files)
     // These should NOT be re-loaded in diff computation
