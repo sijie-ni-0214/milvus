@@ -261,6 +261,17 @@ func NewLoadPartitionsTask(ctx context.Context, node taskmodel.TaskNode, request
 	}
 }
 
+// NewPrewarmTask constructs a PrewarmTask.
+func NewPrewarmTask(ctx context.Context, node taskmodel.TaskNode, request *milvuspb.PrewarmRequest) *PrewarmTask {
+	return &PrewarmTask{
+		baseTask:       baseTask{MetaCache: node.GetMetaCache()},
+		ctx:            ctx,
+		Condition:      NewTaskCondition(ctx),
+		PrewarmRequest: request,
+		mixCoord:       node.MixCoord(),
+	}
+}
+
 // NewReleasePartitionsTask constructs a ReleasePartitionsTask.
 func NewReleasePartitionsTask(ctx context.Context, node taskmodel.TaskNode, request *milvuspb.ReleasePartitionsRequest) *ReleasePartitionsTask {
 	return &ReleasePartitionsTask{
@@ -667,16 +678,19 @@ func (t *AddCollectionStructFieldTask) OldSchema() *schemapb.CollectionSchema { 
 func (t *AddCollectionStructFieldTask) SetOldSchema(schema *schemapb.CollectionSchema) {
 	t.oldSchema = schema
 }
-func (t *AlterCollectionTask) Result() *commonpb.Status                              { return t.result }
-func (t *AlterCollectionFunctionTask) Result() *commonpb.Status                      { return t.result }
-func (t *AlterCollectionFieldTask) Result() *commonpb.Status                         { return t.result }
-func (t *CreatePartitionTask) Result() *commonpb.Status                              { return t.result }
-func (t *DropPartitionTask) Result() *commonpb.Status                                { return t.result }
-func (t *HasPartitionTask) Result() *milvuspb.BoolResponse                           { return t.result }
-func (t *ShowPartitionsTask) Result() *milvuspb.ShowPartitionsResponse               { return t.result }
-func (t *LoadCollectionTask) Result() *commonpb.Status                               { return t.result }
-func (t *ReleaseCollectionTask) Result() *commonpb.Status                            { return t.result }
-func (t *LoadPartitionsTask) Result() *commonpb.Status                               { return t.result }
+func (t *AlterCollectionTask) Result() *commonpb.Status                { return t.result }
+func (t *AlterCollectionFunctionTask) Result() *commonpb.Status        { return t.result }
+func (t *AlterCollectionFieldTask) Result() *commonpb.Status           { return t.result }
+func (t *CreatePartitionTask) Result() *commonpb.Status                { return t.result }
+func (t *DropPartitionTask) Result() *commonpb.Status                  { return t.result }
+func (t *HasPartitionTask) Result() *milvuspb.BoolResponse             { return t.result }
+func (t *ShowPartitionsTask) Result() *milvuspb.ShowPartitionsResponse { return t.result }
+func (t *LoadCollectionTask) Result() *commonpb.Status                 { return t.result }
+func (t *ReleaseCollectionTask) Result() *commonpb.Status              { return t.result }
+func (t *LoadPartitionsTask) Result() *commonpb.Status                 { return t.result }
+func (t *PrewarmTask) Result() *milvuspb.PrewarmResponse {
+	return &milvuspb.PrewarmResponse{Status: t.result}
+}
 func (t *ReleasePartitionsTask) Result() *commonpb.Status                            { return t.result }
 func (t *CreateResourceGroupTask) Result() *commonpb.Status                          { return t.result }
 func (t *UpdateResourceGroupsTask) Result() *commonpb.Status                         { return t.result }

@@ -169,6 +169,28 @@ func ValidateCollectionAlias(collAlias string) error {
 	return validateCollectionNameOrAlias(collAlias, "alias")
 }
 
+func namespacePartitionModeEnabled(schema *schemapb.CollectionSchema) bool {
+	return schema != nil && schema.GetEnableNamespace() && common.IsNamespaceModePartition(schema.GetProperties()...)
+}
+
+func resolveNamespacePartitionName(schema *schemapb.CollectionSchema, namespace *string, partitionName string) (string, bool, error) {
+	if err := common.CheckNamespace(schema, namespace); err != nil {
+		return "", false, err
+	}
+	if !namespacePartitionModeEnabled(schema) {
+		return partitionName, false, nil
+	}
+
+	namespacePartitionName := *namespace
+	if err := validatePartitionTag(namespacePartitionName, true); err != nil {
+		return "", true, err
+	}
+	if partitionName != "" && partitionName != namespacePartitionName {
+		return "", true, merr.WrapErrParameterInvalidMsg("partition name %q mismatches namespace %q", partitionName, namespacePartitionName)
+	}
+	return namespacePartitionName, true, nil
+}
+
 func validatePartitionTag(partitionTag string, strictCheck bool) error {
 	return common.ValidatePartitionName(partitionTag, paramtable.Get().ProxyCfg.MaxNameLength.GetAsInt(), paramtable.Get().ProxyCfg.MaxNameLength.GetValue(), strictCheck)
 }
