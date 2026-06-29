@@ -63,6 +63,7 @@ type (
 	loadCollectionTask           = ddl.LoadCollectionTask
 	releaseCollectionTask        = ddl.ReleaseCollectionTask
 	loadPartitionsTask           = ddl.LoadPartitionsTask
+	prewarmTask                  = ddl.PrewarmTask
 	releasePartitionsTask        = ddl.ReleasePartitionsTask
 	createNamespaceTask          = ddl.CreateNamespaceTask
 	describeNamespaceTask        = ddl.DescribeNamespaceTask
@@ -191,6 +192,7 @@ var (
 	NewLoadCollectionTask           = ddl.NewLoadCollectionTask
 	NewReleaseCollectionTask        = ddl.NewReleaseCollectionTask
 	NewLoadPartitionsTask           = ddl.NewLoadPartitionsTask
+	NewPrewarmTask                  = ddl.NewPrewarmTask
 	NewReleasePartitionsTask        = ddl.NewReleasePartitionsTask
 	NewCreateNamespaceTask          = ddl.NewCreateNamespaceTask
 	NewDescribeNamespaceTask        = ddl.NewDescribeNamespaceTask
