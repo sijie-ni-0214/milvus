@@ -3659,11 +3659,6 @@ func (t *PrewarmTask) Execute(ctx context.Context) error {
 		return err
 	}
 
-	loadFields, fieldIndexIDs, err := preparePartitionLoadInfo(ctx, t.mixCoord, t.GetCollectionName(), collID, collSchema, t.GetLoadFields(), t.GetSkipLoadDynamicField())
-	if err != nil {
-		return err
-	}
-
 	request := &querypb.PrewarmRequest{
 		Base:           commonpbutil.UpdateMsgBase(t.Base),
 		DbID:           0,
@@ -3672,8 +3667,6 @@ func (t *PrewarmTask) Execute(ctx context.Context) error {
 		Schema:         collSchema.CollectionSchema,
 		Namespace:      t.Namespace,
 		Priority:       t.GetLoadPriority(),
-		FieldIndexID:   fieldIndexIDs,
-		LoadFields:     loadFields,
 		ReplicaNumber:  t.GetReplicaNumber(),
 		ResourceGroups: t.GetResourceGroups(),
 	}
