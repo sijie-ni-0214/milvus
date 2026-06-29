@@ -1576,6 +1576,52 @@ func (node *Proxy) LoadPartitions(ctx context.Context, request *milvuspb.LoadPar
 	return lpt.Result(), nil
 }
 
+// Prewarm preloads namespace partition data into query node memory/cache.
+func (node *Proxy) Prewarm(ctx context.Context, request *milvuspb.PrewarmRequest) (*milvuspb.PrewarmResponse, error) {
+	if err := merr.CheckHealthy(node.GetStateCode()); err != nil {
+		return &milvuspb.PrewarmResponse{Status: merr.Status(err)}, nil
+	}
+
+	ctx, sp := otel.Tracer(typeutil.ProxyRole).Start(ctx, "Proxy-Prewarm")
+	defer sp.End()
+	method := "Prewarm"
+	tr := timerecord.NewTimeRecorder(method)
+	pt := NewPrewarmTask(ctx, node, request)
+
+	mlog.Debug(ctx, rpcReceived(method))
+
+	if err := node.sched.DdQueue.Enqueue(pt); err != nil {
+		mlog.Warn(ctx,
+			rpcFailedToEnqueue(method),
+			mlog.Err(err))
+
+		return &milvuspb.PrewarmResponse{Status: merr.Status(err)}, nil
+	}
+
+	mlog.Debug(ctx,
+		rpcEnqueued(method),
+		mlog.Uint64("BeginTS", pt.BeginTs()),
+		mlog.Uint64("EndTS", pt.EndTs()))
+
+	if err := pt.WaitToFinish(); err != nil {
+		mlog.Warn(ctx,
+			rpcFailedToWaitToFinish(method),
+			mlog.Err(err),
+			mlog.Uint64("BeginTS", pt.BeginTs()),
+			mlog.Uint64("EndTS", pt.EndTs()))
+
+		return &milvuspb.PrewarmResponse{Status: merr.Status(err)}, nil
+	}
+
+	mlog.Debug(ctx,
+		rpcDone(method),
+		mlog.Uint64("BeginTS", pt.BeginTs()),
+		mlog.Uint64("EndTS", pt.EndTs()))
+
+	metrics.ProxyReqLatency.WithLabelValues(strconv.FormatInt(paramtable.GetNodeID(), 10), method).Observe(float64(tr.ElapseSpan().Milliseconds()))
+	return pt.Result(), nil
+}
+
 // ReleasePartitions release specific partitions from query nodes.
 func (node *Proxy) ReleasePartitions(ctx context.Context, request *milvuspb.ReleasePartitionsRequest) (*commonpb.Status, error) {
 	if err := merr.CheckHealthy(node.GetStateCode()); err != nil {

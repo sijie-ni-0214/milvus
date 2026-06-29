@@ -490,6 +490,8 @@ func (s *Server) ensurePrewarmPartitionLoaded(ctx context.Context, req *querypb.
 			LoadFields:      req.GetLoadFields(),
 			Priority:        req.GetPriority(),
 			ForceSyncWarmup: true,
+			ReplicaNumber:   req.GetReplicaNumber(),
+			ResourceGroups:  req.GetResourceGroups(),
 		}
 		if err := s.broadcastAlterLoadConfigCollectionV2ForLoadPartitions(ctx, loadReq); err != nil {
 			return err
