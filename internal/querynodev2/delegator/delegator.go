@@ -1369,6 +1369,8 @@ func NewShardDelegator(ctx context.Context, collectionID UniqueID, replicaID Uni
 		}
 	})
 
+	distribution := NewDistribution(channel, queryView)
+	distribution.collectionID = collectionID
 	sd := &shardDelegator{
 		collectionID:   collectionID,
 		replicaID:      replicaID,
@@ -1378,7 +1380,7 @@ func NewShardDelegator(ctx context.Context, collectionID UniqueID, replicaID Uni
 		segmentManager: manager.Segment,
 		workerManager:  workerManager,
 		lifetime:       lifetime.NewLifetime(lifetime.Initializing),
-		distribution:   NewDistribution(channel, queryView),
+		distribution:   distribution,
 		deleteBuffer: deletebuffer.NewListDeleteBuffer[*deletebuffer.Item](startTs, sizePerBlock,
 			[]string{paramtable.GetStringNodeID(), channel}),
 		latestTsafe:                atomic.NewUint64(startTs),

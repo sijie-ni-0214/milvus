@@ -397,6 +397,26 @@ class DeletedRecord {
         return mem_size_.load();
     }
 
+    size_t
+    runtime_memory_size() const {
+        size_t bytes = sizeof(SortedDeleteList) + 2 * sizeof(void*);
+        bytes += deleted_mask_.size_in_bytes();
+        std::shared_lock<std::shared_mutex> lock(snap_lock_);
+        bytes +=
+            snapshots_.capacity() * sizeof(std::pair<Timestamp, BitsetType>);
+        for (const auto& [ts, bitset] : snapshots_) {
+            (void)ts;
+            bytes += bitset.size_in_bytes();
+        }
+        bytes +=
+            snap_next_pos_.capacity() * sizeof(std::pair<Timestamp, Offset>);
+        if (latest_snapshot_ != nullptr) {
+            bytes += sizeof(DeleteSnapshot) +
+                     latest_snapshot_->bitset.size_in_bytes();
+        }
+        return bytes;
+    }
+
     void
     set_sealed_row_count(size_t row_count) {
         sealed_row_count_ = row_count;

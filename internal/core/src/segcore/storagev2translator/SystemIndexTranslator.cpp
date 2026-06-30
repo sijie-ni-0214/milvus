@@ -23,6 +23,7 @@
 
 #include "common/Chunk.h"
 #include "common/EasyAssert.h"
+#include "monitor/segcore_memory_stats_c.h"
 #include "segcore/Utils.h"
 
 namespace milvus::segcore::storagev2translator {
@@ -101,6 +102,13 @@ TimestampIndexCell::TimestampIndexCell(TimestampIndex timestamp_index,
                                        int64_t num_rows)
     : timestamp_index_(std::move(timestamp_index)),
       byte_size_{estimate_timestamp_index_bytes(num_rows, 1), 0} {
+    milvus::monitor::UpdateSegcoreTimestampIndexCell(1,
+                                                     byte_size_.memory_bytes);
+}
+
+TimestampIndexCell::~TimestampIndexCell() {
+    milvus::monitor::UpdateSegcoreTimestampIndexCell(-1,
+                                                     -byte_size_.memory_bytes);
 }
 
 PkIndexCell::PkIndexCell(std::unique_ptr<OffsetMap> pk2offset,
@@ -113,6 +121,11 @@ PkIndexCell::PkIndexCell(std::unique_ptr<OffsetMap> pk2offset,
           static_cast<int64_t>((pk2offset_ ? pk2offset_->memory_size() : 0) +
                                (offset2pk_ ? offset2pk_->memory_size() : 0)),
           0} {
+    milvus::monitor::UpdateSegcorePkIndexCell(1, byte_size_.memory_bytes);
+}
+
+PkIndexCell::~PkIndexCell() {
+    milvus::monitor::UpdateSegcorePkIndexCell(-1, -byte_size_.memory_bytes);
 }
 
 void
@@ -140,6 +153,13 @@ TimestampIndexTranslator::TimestampIndexTranslator(
                                                   /* is_vector */ false,
                                                   /* is_index */ false),
             /* support_eviction */ true) {
+    milvus::monitor::UpdateSegcoreTimestampIndexTranslator(
+        1, static_cast<int64_t>(sizeof(TimestampIndexTranslator)));
+}
+
+TimestampIndexTranslator::~TimestampIndexTranslator() {
+    milvus::monitor::UpdateSegcoreTimestampIndexTranslator(
+        -1, -static_cast<int64_t>(sizeof(TimestampIndexTranslator)));
 }
 
 size_t
@@ -238,6 +258,13 @@ PkIndexTranslator::PkIndexTranslator(
                                                   /* is_vector */ false,
                                                   /* is_index */ true),
             /* support_eviction */ true) {
+    milvus::monitor::UpdateSegcorePkIndexTranslator(
+        1, static_cast<int64_t>(sizeof(PkIndexTranslator)));
+}
+
+PkIndexTranslator::~PkIndexTranslator() {
+    milvus::monitor::UpdateSegcorePkIndexTranslator(
+        -1, -static_cast<int64_t>(sizeof(PkIndexTranslator)));
 }
 
 size_t

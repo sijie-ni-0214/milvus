@@ -152,6 +152,15 @@ class TimestampData {
         return is_constant_;
     }
 
+    size_t
+    dynamic_memory_size() const {
+        return chunk_data_.capacity() * sizeof(const Timestamp*) +
+               num_rows_until_chunk_.capacity() * sizeof(int64_t) +
+               vcid_to_cid_arr_.capacity() * sizeof(int64_t) +
+               pins_.capacity() * sizeof(cachinglayer::PinWrapper<Chunk*>) +
+               owned_.capacity() * sizeof(Timestamp);
+    }
+
     void
     clear() {
         chunk_data_.clear();

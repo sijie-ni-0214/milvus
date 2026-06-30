@@ -42,6 +42,8 @@ const (
 	MetricsDefaultPath = "/metrics_default"
 )
 
+const JemallocProfileDumpPath = "/debug/jemalloc/profile"
+
 // for every component, register it's own api to trigger stop and check ready
 const (
 	RouteTriggerStopPath     = "/management/stop"

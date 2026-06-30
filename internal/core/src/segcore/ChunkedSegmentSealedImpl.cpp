@@ -116,6 +116,7 @@
 #include "common/VirtualPK.h"
 #include "monitor/Monitor.h"
 #include "monitor/scope_metric.h"
+#include "monitor/segcore_memory_stats_c.h"
 #include "parquet/metadata.h"
 #include "pb/index_cgo_msg.pb.h"
 #include "pb/schema.pb.h"
@@ -206,10 +207,142 @@ struct LazyManifestColumnGroupContext {
     std::string cache_key_suffix;
 };
 
+int64_t
+ToMetricDelta(size_t value) {
+    return value > static_cast<size_t>(std::numeric_limits<int64_t>::max())
+               ? std::numeric_limits<int64_t>::max()
+               : static_cast<int64_t>(value);
+}
+
+size_t
+ApproxStringDynamicBytes(const std::string& value) {
+    return value.capacity() + 1;
+}
+
+size_t
+ApproxStringVectorBytes(
+    const std::shared_ptr<std::vector<std::string>>& values) {
+    if (values == nullptr) {
+        return 0;
+    }
+    size_t bytes = sizeof(std::vector<std::string>) +
+                   values->capacity() * sizeof(std::string);
+    for (const auto& value : *values) {
+        bytes += ApproxStringDynamicBytes(value);
+    }
+    return bytes;
+}
+
+size_t
+ApproxStringVectorBytes(const std::vector<std::string>& values) {
+    size_t bytes = values.capacity() * sizeof(std::string);
+    for (const auto& value : values) {
+        bytes += ApproxStringDynamicBytes(value);
+    }
+    return bytes;
+}
+
+size_t
+ApproxInt64VectorBytes(const std::vector<int64_t>& values) {
+    return values.capacity() * sizeof(int64_t);
+}
+
+size_t
+ApproxFieldMetaMapBytes(const std::unordered_map<FieldId, FieldMeta>& values) {
+    return values.bucket_count() * sizeof(void*) +
+           values.size() * sizeof(std::pair<const FieldId, FieldMeta>);
+}
+
+template <typename Key, typename Value>
+size_t
+ApproxUnorderedMapBytes(const std::unordered_map<Key, Value>& values) {
+    if (values.empty()) {
+        return 0;
+    }
+    return values.bucket_count() * sizeof(void*) +
+           values.size() *
+               (sizeof(typename std::unordered_map<Key, Value>::value_type) +
+                sizeof(void*));
+}
+
+template <typename Value>
+size_t
+ApproxUnorderedSetBytes(const std::unordered_set<Value>& values) {
+    if (values.empty()) {
+        return 0;
+    }
+    return values.bucket_count() * sizeof(void*) +
+           values.size() *
+               (sizeof(typename std::unordered_set<Value>::value_type) +
+                sizeof(void*));
+}
+
+size_t
+ApproxSharedPtrControlBlockBytes(size_t count) {
+    return count * (2 * sizeof(void*) + 2 * sizeof(long));
+}
+
+size_t
+ApproxFieldBinlogInfoBytes(const FieldBinlogInfo& info) {
+    return sizeof(FieldBinlogInfo) + ApproxInt64VectorBytes(info.entries_nums) +
+           ApproxInt64VectorBytes(info.memory_sizes) +
+           ApproxStringDynamicBytes(info.warmup_policy) +
+           ApproxStringVectorBytes(info.insert_files) +
+           ApproxInt64VectorBytes(info.child_field_ids);
+}
+
+size_t
+ApproxLoadFieldDataInfoBytes(const LoadFieldDataInfo& info) {
+    if (info.field_infos.empty() && info.child_field_ids.empty()) {
+        return 0;
+    }
+    size_t bytes = sizeof(LoadFieldDataInfo) +
+                   ApproxInt64VectorBytes(info.child_field_ids);
+    for (const auto& [field_id, field_info] : info.field_infos) {
+        (void)field_id;
+        bytes += sizeof(std::pair<const int64_t, FieldBinlogInfo>) +
+                 3 * sizeof(void*) + sizeof(bool) +
+                 ApproxFieldBinlogInfoBytes(field_info);
+    }
+    return bytes;
+}
+
+int64_t
+MetricDelta(size_t current, size_t previous) {
+    return ToMetricDelta(current) - ToMetricDelta(previous);
+}
+
+size_t
+ApproxLazyManifestColumnGroupBytes(
+    const LazyManifestColumnGroupContext& context) {
+    return ApproxStringVectorBytes(context.needed_columns) +
+           ApproxFieldMetaMapBytes(context.field_metas) +
+           ApproxStringDynamicBytes(context.mmap_dir_path) +
+           ApproxStringDynamicBytes(context.warmup_policy) +
+           ApproxStringDynamicBytes(context.cache_key_suffix);
+}
+
 class LazyManifestColumnGroup {
  public:
     explicit LazyManifestColumnGroup(LazyManifestColumnGroupContext context)
         : context_(std::move(context)) {
+        milvus::monitor::UpdateSegcoreLazyManifestGroup(
+            1,
+            ToMetricDelta(sizeof(LazyManifestColumnGroup) +
+                          ApproxLazyManifestColumnGroupBytes(context_)),
+            static_cast<int64_t>(context_.needed_columns == nullptr
+                                     ? 0
+                                     : context_.needed_columns->size()));
+    }
+
+    ~LazyManifestColumnGroup() {
+        milvus::monitor::UpdateSegcoreLazyManifestGroup(
+            -1,
+            -ToMetricDelta(sizeof(LazyManifestColumnGroup) +
+                           ApproxLazyManifestColumnGroupBytes(context_)),
+            -static_cast<int64_t>(context_.needed_columns == nullptr
+                                      ? 0
+                                      : context_.needed_columns->size()));
     }
 
     std::shared_ptr<ChunkedColumnGroup>
@@ -305,9 +438,13 @@ class LazyManifestProxyColumn : public ChunkedColumnInterface {
           field_id_(field_id),
           field_meta_(field_meta),
           num_rows_(num_rows) {
+        milvus::monitor::UpdateSegcoreLazyManifestProxy(
+            1, ToMetricDelta(sizeof(LazyManifestProxyColumn)));
     }
 
     ~LazyManifestProxyColumn() override {
+        milvus::monitor::UpdateSegcoreLazyManifestProxy(
+            -1, -ToMetricDelta(sizeof(LazyManifestProxyColumn)));
         CancelWarmup();
     }
 
@@ -1408,6 +1545,7 @@ ChunkedSegmentSealedImpl::init_storage_v2_timestamp_index(
                 id_, column, num_rows, warmup_policy);
     *timestamp_index_slot_.wlock() =
         Manager::GetInstance().CreateCacheSlot(std::move(translator));
+    TrackTimestampIndexSlot();
 
     // Provide a callback so DeletedRecord can read insert timestamps
     // from the column even when insert_record_.timestamps_ is empty
@@ -1455,6 +1593,7 @@ ChunkedSegmentSealedImpl::init_storage_v1_pk_index(
             insert_record_.seal_pks();
         }
     }
+    TrackSealedSegmentRuntimeMemory(EstimateSealedSegmentRuntimeMemory());
 }
 
 void
@@ -1471,6 +1610,7 @@ ChunkedSegmentSealedImpl::init_storage_v2_pk_index(
             id_, column, data_type, is_sorted_by_pk_, warmup_policy);
     *pk_index_slot_.wlock() =
         Manager::GetInstance().CreateCacheSlot(std::move(translator));
+    TrackPkIndexSlot();
 }
 
 void
@@ -1866,6 +2006,7 @@ ChunkedSegmentSealedImpl::SynthesizeExternalSystemFields() {
         update_row_count(0);
         // Initialize empty timestamps so is_system_field_ready() returns true
         insert_record_.init_timestamps_from_owned({}, TimestampIndex());
+        TrackSealedSegmentRuntimeMemory(EstimateSealedSegmentRuntimeMemory());
         return;
     }
 
@@ -1874,6 +2015,8 @@ ChunkedSegmentSealedImpl::SynthesizeExternalSystemFields() {
     auto pk_field_id = schema_->get_primary_field_id().value();
     auto virtual_pk = std::make_shared<VirtualPKChunkedColumn>(id_, num_rows);
     fields_.wlock()->emplace(pk_field_id, virtual_pk);
+    TrackFieldEntryCount(fields_.rlock()->size());
+    TrackFieldRuntimeMemory(EstimateFieldRuntimeMemory());
     set_bit(field_data_ready_bitset_, pk_field_id, true);
 
     // 2. PK→offset index using VirtualPKOffsetMap (zero storage).
@@ -1885,6 +2028,7 @@ ChunkedSegmentSealedImpl::SynthesizeExternalSystemFields() {
     // 3. Synthetic timestamps: constant mode (all 0 — rows always visible).
     //    No data is materialized, saving ~8 GB for 1B-row external tables.
     insert_record_.init_timestamps_constant(num_rows, 0);
+    TrackSealedSegmentRuntimeMemory(EstimateSealedSegmentRuntimeMemory());
 
     // 4. Row count + readiness
     {
@@ -2319,6 +2463,7 @@ ChunkedSegmentSealedImpl::AddFieldDataInfoForSealed(
     const LoadFieldDataInfo& field_data_info) {
     // copy assignment
     field_data_info_ = field_data_info;
+    TrackSealedSegmentRuntimeMemory(EstimateSealedSegmentRuntimeMemory());
 }
 
 int64_t
@@ -2900,8 +3045,11 @@ ChunkedSegmentSealedImpl::DropFieldData(const FieldId field_id) {
     }
     if (column) {
         column->CancelWarmup();
-        fields_.wlock()->erase(field_id);
+        auto fields = fields_.wlock();
+        fields->erase(field_id);
+        TrackFieldEntryCount(fields->size());
     }
+    TrackFieldRuntimeMemory(EstimateFieldRuntimeMemory());
     clear_bit_if_present(field_data_ready_bitset_, field_id);
     if (has_bit_position(binlog_index_bitset_, field_id) &&
         get_bit(binlog_index_bitset_, field_id)) {
@@ -3471,12 +3619,18 @@ ChunkedSegmentSealedImpl::ChunkedSegmentSealedImpl(
                   callback);
           },
           segment_id) {
-    std::atomic_store(&segment_load_info_,
-                      std::make_shared<const SegmentLoadInfo>(
-                          milvus::proto::segcore::SegmentLoadInfo(), schema));
+    auto load_info = std::make_shared<const SegmentLoadInfo>(
+        milvus::proto::segcore::SegmentLoadInfo(), schema);
+    std::atomic_store(&segment_load_info_, load_info);
+    milvus::monitor::UpdateSegcoreSealedSegment(
+        1, ToMetricDelta(sizeof(ChunkedSegmentSealedImpl)));
+    TrackSegmentLoadInfoMemory(load_info->MemoryUsage());
+    TrackSealedSegmentRuntimeMemory(EstimateSealedSegmentRuntimeMemory());
 }
 
 ChunkedSegmentSealedImpl::~ChunkedSegmentSealedImpl() {
+    UntrackRuntimeMemoryStats();
+
     // Clean up geometry cache for all fields in this segment
     auto& cache_manager = milvus::exec::SimpleGeometryCacheManager::Instance();
     cache_manager.RemoveSegmentCaches(ctx_, get_segment_id());
@@ -3490,6 +3644,171 @@ ChunkedSegmentSealedImpl::~ChunkedSegmentSealedImpl() {
         auto mm = storage::MmapManager::GetInstance().GetMmapChunkManager();
         mm->UnRegister(mmap_descriptor_);
     }
+}
+
+void
+ChunkedSegmentSealedImpl::TrackSegmentLoadInfoMemory(
+    const SegmentLoadInfoMemoryUsage& usage) {
+    auto old = tracked_segment_load_info_memory_;
+    tracked_segment_load_info_memory_ = usage;
+    milvus::monitor::UpdateSegcoreSegmentLoadInfoBytes(
+        MetricDelta(usage.proto_bytes, old.proto_bytes));
+    milvus::monitor::UpdateSegcoreSegmentLoadInfoBreakdown(
+        MetricDelta(usage.TotalEstimatedBytes(), old.TotalEstimatedBytes()),
+        MetricDelta(usage.object_bytes, old.object_bytes),
+        MetricDelta(usage.proto_bytes, old.proto_bytes),
+        MetricDelta(usage.converted_index_cache_bytes,
+                    old.converted_index_cache_bytes),
+        MetricDelta(usage.field_index_id_cache_bytes,
+                    old.field_index_id_cache_bytes),
+        MetricDelta(usage.field_index_has_raw_data_bytes,
+                    old.field_index_has_raw_data_bytes),
+        MetricDelta(usage.fields_filled_with_default_bytes,
+                    old.fields_filled_with_default_bytes),
+        MetricDelta(usage.field_binlog_cache_bytes,
+                    old.field_binlog_cache_bytes),
+        MetricDelta(usage.column_group_cache_bytes,
+                    old.column_group_cache_bytes),
+        MetricDelta(usage.column_group_cache_deep_bytes,
+                    old.column_group_cache_deep_bytes),
+        MetricDelta(usage.column_group_cache_path_bytes,
+                    old.column_group_cache_path_bytes),
+        MetricDelta(usage.column_group_cache_property_bytes,
+                    old.column_group_cache_property_bytes),
+        MetricDelta(usage.column_group_cache_column_bytes,
+                    old.column_group_cache_column_bytes),
+        MetricDelta(usage.column_group_cache_format_bytes,
+                    old.column_group_cache_format_bytes),
+        MetricDelta(usage.column_group_cache_group_count,
+                    old.column_group_cache_group_count),
+        MetricDelta(usage.column_group_cache_file_count,
+                    old.column_group_cache_file_count),
+        MetricDelta(usage.created_text_indexes_bytes,
+                    old.created_text_indexes_bytes));
+}
+
+void
+ChunkedSegmentSealedImpl::TrackSealedSegmentRuntimeMemory(
+    const SealedSegmentRuntimeMemoryUsage& usage) {
+    auto old = tracked_sealed_segment_runtime_memory_;
+    tracked_sealed_segment_runtime_memory_ = usage;
+    milvus::monitor::UpdateSegcoreSealedSegmentRuntime(
+        MetricDelta(usage.TotalEstimatedBytes(), old.TotalEstimatedBytes()),
+        MetricDelta(usage.mmap_descriptor_bytes, old.mmap_descriptor_bytes),
+        MetricDelta(usage.empty_indexing_container_bytes,
+                    old.empty_indexing_container_bytes),
+        MetricDelta(usage.insert_record_bytes, old.insert_record_bytes),
+        MetricDelta(usage.deleted_record_bytes, old.deleted_record_bytes),
+        MetricDelta(usage.load_field_data_info_bytes,
+                    old.load_field_data_info_bytes));
+}
+
+SealedSegmentRuntimeMemoryUsage
+ChunkedSegmentSealedImpl::EstimateSealedSegmentRuntimeMemory() const {
+    SealedSegmentRuntimeMemoryUsage usage;
+    if (mmap_descriptor_ != nullptr) {
+        usage.mmap_descriptor_bytes =
+            sizeof(storage::MmapChunkDescriptor) +
+            sizeof(std::pair<const storage::MmapChunkDescriptor::ID,
+                             std::vector<storage::MmapBlockPtr>>) +
+            3 * sizeof(void*) + sizeof(bool) + 2 * sizeof(void*);
+    }
+    ngram_fields_.withRLock([&](const auto& ngram_fields) {
+        usage.empty_indexing_container_bytes +=
+            ngram_fields.bucket_count() * sizeof(void*);
+    });
+    scalar_indexings_.withRLock([&](const auto& scalar_indexings) {
+        usage.empty_indexing_container_bytes +=
+            scalar_indexings.bucket_count() * sizeof(void*);
+    });
+    usage.insert_record_bytes = insert_record_.runtime_memory_size();
+    usage.deleted_record_bytes = deleted_record_.runtime_memory_size();
+    usage.load_field_data_info_bytes =
+        ApproxLoadFieldDataInfoBytes(field_data_info_);
+    return usage;
+}
+
+void
+ChunkedSegmentSealedImpl::TrackFieldRuntimeMemory(
+    const FieldRuntimeMemoryUsage& usage) {
+    auto old = tracked_field_runtime_memory_;
+    tracked_field_runtime_memory_ = usage;
+    milvus::monitor::UpdateSegcoreSealedSegmentFieldRuntime(
+        MetricDelta(usage.field_map_bytes, old.field_map_bytes),
+        MetricDelta(usage.field_shared_ptr_control_block_bytes,
+                    old.field_shared_ptr_control_block_bytes),
+        MetricDelta(usage.field_data_accounted_map_bytes,
+                    old.field_data_accounted_map_bytes),
+        MetricDelta(usage.mmap_field_ids_bytes, old.mmap_field_ids_bytes));
+}
+
+FieldRuntimeMemoryUsage
+ChunkedSegmentSealedImpl::EstimateFieldRuntimeMemory() const {
+    FieldRuntimeMemoryUsage usage;
+    size_t field_count = 0;
+    fields_.withRLock([&](const auto& fields) {
+        usage.field_map_bytes = ApproxUnorderedMapBytes(fields);
+        field_count = fields.size();
+    });
+    usage.field_shared_ptr_control_block_bytes =
+        ApproxSharedPtrControlBlockBytes(field_count);
+    usage.field_data_accounted_map_bytes =
+        ApproxUnorderedMapBytes(field_data_accounted_bytes_);
+    usage.mmap_field_ids_bytes = ApproxUnorderedSetBytes(mmap_field_ids_);
+    return usage;
+}
+
+void
+ChunkedSegmentSealedImpl::TrackFieldEntryCount(size_t count) {
+    auto old =
+        tracked_field_entry_count_.exchange(count, std::memory_order_relaxed);
+    milvus::monitor::UpdateSegcoreFieldEntryCount(static_cast<int64_t>(count) -
+                                                  static_cast<int64_t>(old));
+}
+
+void
+ChunkedSegmentSealedImpl::TrackPkIndexSlot() {
+    bool expected = false;
+    if (tracked_pk_index_slot_.compare_exchange_strong(
+            expected, true, std::memory_order_relaxed)) {
+        milvus::monitor::UpdateSegcorePkIndexSlot(1);
+    }
+}
+
+void
+ChunkedSegmentSealedImpl::TrackTimestampIndexSlot() {
+    bool expected = false;
+    if (tracked_timestamp_index_slot_.compare_exchange_strong(
+            expected, true, std::memory_order_relaxed)) {
+        milvus::monitor::UpdateSegcoreTimestampIndexSlot(1);
+    }
+}
+
+void
+ChunkedSegmentSealedImpl::UntrackPkIndexSlot() {
+    if (tracked_pk_index_slot_.exchange(false, std::memory_order_relaxed)) {
+        milvus::monitor::UpdateSegcorePkIndexSlot(-1);
+    }
+}
+
+void
+ChunkedSegmentSealedImpl::UntrackTimestampIndexSlot() {
+    if (tracked_timestamp_index_slot_.exchange(false,
+                                               std::memory_order_relaxed)) {
+        milvus::monitor::UpdateSegcoreTimestampIndexSlot(-1);
+    }
+}
+
+void
+ChunkedSegmentSealedImpl::UntrackRuntimeMemoryStats() {
+    TrackSegmentLoadInfoMemory({});
+    TrackSealedSegmentRuntimeMemory({});
+    TrackFieldRuntimeMemory({});
+    TrackFieldEntryCount(0);
+    UntrackPkIndexSlot();
+    UntrackTimestampIndexSlot();
+    milvus::monitor::UpdateSegcoreSealedSegment(
+        -1, -ToMetricDelta(sizeof(ChunkedSegmentSealedImpl)));
 }
 
 void
@@ -3900,9 +4219,13 @@ ChunkedSegmentSealedImpl::ClearData() {
             cancel_and_clear_json_indices(json_indexings);
         });
         insert_record_.clear();
+        UntrackTimestampIndexSlot();
+        UntrackPkIndexSlot();
         timestamp_index_slot_.wlock()->reset();
         pk_index_slot_.wlock()->reset();
         fields_.wlock()->clear();
+        TrackFieldEntryCount(0);
+        TrackFieldRuntimeMemory({});
         variable_fields_avg_size_.clear();
         field_data_accounted_bytes_.clear();
         stats_.mem_size = 0;
@@ -4050,6 +4373,7 @@ ChunkedSegmentSealedImpl::RecordDefaultFieldsFilled(
         next = std::const_pointer_cast<const SegmentLoadInfo>(copy);
     } while (!std::atomic_compare_exchange_weak(
         &segment_load_info_, &current, next));
+    TrackSegmentLoadInfoMemory(next->MemoryUsage());
 }
 
 void
@@ -4062,6 +4386,7 @@ ChunkedSegmentSealedImpl::RecordTextIndexCreated(FieldId field_id) {
         next = std::const_pointer_cast<const SegmentLoadInfo>(copy);
     } while (!std::atomic_compare_exchange_weak(
         &segment_load_info_, &current, next));
+    TrackSegmentLoadInfoMemory(next->MemoryUsage());
 }
 
 void
@@ -5334,6 +5659,7 @@ ChunkedSegmentSealedImpl::load_field_data_common(
         }
     }
 
+    size_t field_entry_count = 0;
     {
         std::unique_lock lck(mutex_);
         if (is_replace) {
@@ -5345,7 +5671,9 @@ ChunkedSegmentSealedImpl::load_field_data_common(
                 stats_.mem_size -= it->second;
                 field_data_accounted_bytes_.erase(it);
             }
-            fields_.wlock()->insert_or_assign(field_id, column);
+            auto fields = fields_.wlock();
+            fields->insert_or_assign(field_id, column);
+            field_entry_count = fields->size();
             LOG_INFO(
                 "Replacing field {} data in segment {}", field_id.get(), id_);
         } else {
@@ -5360,14 +5688,18 @@ ChunkedSegmentSealedImpl::load_field_data_common(
             AssertInfo(!already_exists,
                        "field {} column already exists",
                        field_id.get());
-            fields_.wlock()->emplace(field_id, column);
+            auto fields = fields_.wlock();
+            fields->emplace(field_id, column);
+            field_entry_count = fields->size();
         }
         if (enable_mmap) {
             mmap_field_ids_.insert(field_id);
         }
     }
+    TrackFieldEntryCount(field_entry_count);
     // system field only needs to emplace column to fields_ map
     if (is_system_field) {
+        TrackFieldRuntimeMemory(EstimateFieldRuntimeMemory());
         return;
     }
 
@@ -5410,6 +5742,7 @@ ChunkedSegmentSealedImpl::load_field_data_common(
         std::unique_lock lck(mutex_);
         field_data_accounted_bytes_[field_id] = accounted_bytes;
     }
+    TrackFieldRuntimeMemory(EstimateFieldRuntimeMemory());
     // Skip index construction: for proxy columns (external tables) with no
     // statistics, skip building the skip index during load to avoid triggering
     // S3 data fetches when warmup=disable. The skip index will be unavailable
@@ -5506,6 +5839,7 @@ ChunkedSegmentSealedImpl::init_storage_v1_timestamp_index(
     AssertInfo(insert_record_.timestamps_.empty(), "already exists");
     insert_record_.init_timestamps_from_owned(std::move(timestamps),
                                               std::move(index));
+    TrackSealedSegmentRuntimeMemory(EstimateSealedSegmentRuntimeMemory());
     stats_.mem_size += sizeof(Timestamp) * num_rows;
 }
 
@@ -5567,6 +5901,7 @@ ChunkedSegmentSealedImpl::Reopen(milvus::OpContext* op_ctx, SchemaPtr sch) {
 
     auto published = std::make_shared<const SegmentLoadInfo>(new_local);
     std::atomic_store(&segment_load_info_, published);
+    TrackSegmentLoadInfoMemory(published->MemoryUsage());
     use_take_for_output_.store(published->GetUseTakeForOutput(),
                                std::memory_order_relaxed);
 
@@ -5640,6 +5975,7 @@ ChunkedSegmentSealedImpl::Reopen(
 
         auto published = std::make_shared<const SegmentLoadInfo>(new_local);
         std::atomic_store(&segment_load_info_, published);
+        TrackSegmentLoadInfoMemory(published->MemoryUsage());
         use_take_for_output_.store(published->GetUseTakeForOutput(),
                                    std::memory_order_relaxed);
 
@@ -5659,6 +5995,7 @@ ChunkedSegmentSealedImpl::Reopen(
 
     auto published = std::make_shared<const SegmentLoadInfo>(new_local);
     std::atomic_store(&segment_load_info_, published);
+    TrackSegmentLoadInfoMemory(published->MemoryUsage());
     use_take_for_output_.store(published->GetUseTakeForOutput(),
                                std::memory_order_relaxed);
 
@@ -5994,6 +6331,8 @@ ChunkedSegmentSealedImpl::fill_empty_field(const FieldMeta& field_meta) {
     }
 
     fields_.wlock()->emplace(field_id, column);
+    TrackFieldEntryCount(fields_.rlock()->size());
+    TrackFieldRuntimeMemory(EstimateFieldRuntimeMemory());
     set_bit(field_data_ready_bitset_, field_id, true);
     LOG_INFO(
         "fill empty field {} (data type {}) for growing segment {} "
@@ -6118,6 +6457,7 @@ ChunkedSegmentSealedImpl::SetLoadInfo(
     auto published =
         std::make_shared<const SegmentLoadInfo>(std::move(load_info), schema_);
     std::atomic_store(&segment_load_info_, published);
+    TrackSegmentLoadInfoMemory(published->MemoryUsage());
     use_take_for_output_.store(published->GetUseTakeForOutput(),
                                std::memory_order_relaxed);
     LOG_DEBUG(
@@ -7120,6 +7460,7 @@ ChunkedSegmentSealedImpl::Load(milvus::tracer::TraceContext& trace_ctx,
     auto published =
         std::make_shared<const SegmentLoadInfo>(std::move(mutable_copy));
     std::atomic_store(&segment_load_info_, published);
+    TrackSegmentLoadInfoMemory(published->MemoryUsage());
     use_take_for_output_.store(published->GetUseTakeForOutput(),
                                std::memory_order_relaxed);
 }

@@ -305,13 +305,15 @@ type segmentManager struct {
 }
 
 func NewSegmentManager() *segmentManager {
-	return &segmentManager{
+	mgr := &segmentManager{
 		globalSegments:             newSegments(),
 		secondaryIndex:             newSecondarySegmentIndex(),
 		growingOnReleasingSegments: typeutil.NewConcurrentSet[int64](),
 		sealedOnReleasingSegments:  typeutil.NewConcurrentSet[int64](),
 		logicalResourceLock:        sync.Mutex{},
 	}
+	metrics.SetQueryNodeGoSegmentRuntimeMemoryCollectFn(paramtable.GetStringNodeID(), mgr.collectGoSegmentRuntimeMemoryStats)
+	return mgr
 }
 
 func (mgr *segmentManager) AddLogicalResource(usage ResourceUsage) {

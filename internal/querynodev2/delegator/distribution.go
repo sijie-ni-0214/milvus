@@ -17,8 +17,10 @@
 package delegator
 
 import (
+	"fmt"
 	"sync"
 	"time"
+	"unsafe"
 
 	"github.com/samber/lo"
 	"go.uber.org/atomic"
@@ -28,6 +30,7 @@ import (
 	"github.com/milvus-io/milvus/internal/storage"
 	"github.com/milvus-io/milvus/pkg/v3/common"
 	"github.com/milvus-io/milvus/pkg/v3/log"
+	"github.com/milvus-io/milvus/pkg/v3/metrics"
 	"github.com/milvus-io/milvus/pkg/v3/proto/datapb"
 	"github.com/milvus-io/milvus/pkg/v3/proto/querypb"
 	"github.com/milvus-io/milvus/pkg/v3/util/merr"
@@ -342,8 +345,9 @@ type distribution struct {
 	closeOnce        sync.Once
 
 	// distribution info
-	channelName string
-	queryView   *channelQueryView
+	channelName  string
+	collectionID UniqueID
+	queryView    *channelQueryView
 }
 
 type snapshotDelta struct {
@@ -1265,6 +1269,7 @@ func (d *distribution) genSnapshot() chan struct{} {
 	d.snapshotSegments = snapshotSegments
 	d.snapshotGrowings = snapshotGrowings
 	d.resetSnapshotDeltaLocked()
+	d.updateGoDistributionRuntimeMemoryMetrics(newSnapShot)
 
 	// first snapshot, return closed chan
 	if last == nil {
@@ -1276,6 +1281,74 @@ func (d *distribution) genSnapshot() chan struct{} {
 	last.Expire(d.getCleanup(last.version))
 
 	return last.cleared
+}
+
+const (
+	goDistPartLiveEntryObject      = "distribution_live_entry_object"
+	goDistPartSnapshotObject       = "distribution_snapshot_object"
+	goDistPartSnapshotItemBacking  = "distribution_snapshot_item_backing"
+	goDistPartSnapshotEntryBacking = "distribution_snapshot_entry_backing"
+	goDistPartSnapshotMapPayload   = "distribution_snapshot_map_payload"
+)
+
+func (d *distribution) updateGoDistributionRuntimeMemoryMetrics(snap *snapshot) {
+	if d.collectionID == 0 || snap == nil {
+		return
+	}
+	nodeID := paramtable.GetStringNodeID()
+	collectionID := fmt.Sprint(d.collectionID)
+	parts := map[string]struct {
+		count int64
+		bytes int64
+	}{
+		goDistPartLiveEntryObject: {
+			count: int64(len(d.sealedSegments) + len(d.growingSegments)),
+			bytes: int64(len(d.sealedSegments)+len(d.growingSegments)) * int64(unsafe.Sizeof(SegmentEntry{})),
+		},
+		goDistPartSnapshotObject: {
+			count: 1,
+			bytes: int64(unsafe.Sizeof(snapshot{})),
+		},
+		goDistPartSnapshotItemBacking: {
+			count: int64(len(snap.dist)),
+			bytes: int64(cap(snap.dist)) * int64(unsafe.Sizeof(SnapshotItem{})),
+		},
+		goDistPartSnapshotEntryBacking: {
+			count: int64(snapshotEntryCount(snap)),
+			bytes: snapshotEntryBackingBytes(snap),
+		},
+		goDistPartSnapshotMapPayload: {
+			count: int64(len(d.snapshotSegmentPosition) + len(d.snapshotSegments) + len(d.snapshotGrowings)),
+			bytes: int64(len(d.snapshotSegmentPosition))*int64(unsafe.Sizeof(snapshotSegmentPosition{})) +
+				int64(len(d.snapshotSegments)+len(d.snapshotGrowings))*int64(unsafe.Sizeof(SegmentEntry{})),
+		},
+	}
+	for part, value := range parts {
+		metrics.QueryNodeGoDistributionRuntimeEstimatedBytes.WithLabelValues(nodeID, collectionID, part).Set(float64(value.bytes))
+		metrics.QueryNodeGoDistributionRuntimeCount.WithLabelValues(nodeID, collectionID, part).Set(float64(value.count))
+	}
+}
+
+func snapshotEntryCount(snapshot *snapshot) int {
+	if snapshot == nil {
+		return 0
+	}
+	count := len(snapshot.growing)
+	for _, item := range snapshot.dist {
+		count += len(item.Segments)
+	}
+	return count
+}
+
+func snapshotEntryBackingBytes(snapshot *snapshot) int64 {
+	if snapshot == nil {
+		return 0
+	}
+	bytes := int64(cap(snapshot.growing)) * int64(unsafe.Sizeof(SegmentEntry{}))
+	for _, item := range snapshot.dist {
+		bytes += int64(cap(item.Segments)) * int64(unsafe.Sizeof(SegmentEntry{}))
+	}
+	return bytes
 }
 
 func (d *distribution) readableFilter(targetVersion int64) func(entry SegmentEntry, _ int) bool {

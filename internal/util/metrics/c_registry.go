@@ -25,6 +25,7 @@ package metrics
 #include "segcore/metrics_c.h"
 #include "monitor/monitor_c.h"
 #include "monitor/jemalloc_stats_c.h"
+#include "monitor/segcore_memory_stats_c.h"
 
 */
 import "C"
@@ -171,6 +172,11 @@ func (r *CRegistry) Gather() (res []*dto.MetricFamily, err error) {
 		out[name] = mf
 	}
 
+	segcoreMemoryMetrics := gatherSegcoreMemoryMetrics()
+	for name, mf := range segcoreMemoryMetrics {
+		out[name] = mf
+	}
+
 	res = NormalizeMetricFamilies(out)
 	return
 }
@@ -249,4 +255,198 @@ func gatherJemallocMetrics() map[string]*dto.MetricFamily {
 		zap.Int("num_metrics", len(result)))
 
 	return result
+}
+
+func gatherSegcoreMemoryMetrics() map[string]*dto.MetricFamily {
+	result := make(map[string]*dto.MetricFamily)
+	cStats := C.GetSegcoreMemoryStats()
+	gaugeType := dto.MetricType_GAUGE
+
+	createGaugeFamily := func(name, help string, value float64) *dto.MetricFamily {
+		return &dto.MetricFamily{
+			Name: proto.String(name),
+			Help: proto.String(help),
+			Type: &gaugeType,
+			Metric: []*dto.Metric{
+				{
+					Gauge: &dto.Gauge{
+						Value: proto.Float64(value),
+					},
+				},
+			},
+		}
+	}
+
+	metrics := []struct {
+		name  string
+		help  string
+		value uint64
+	}{
+		{"milvus_segcore_sealed_segment_count", "Live sealed segment objects in segcore", uint64(cStats.sealed_segment_count)},
+		{"milvus_segcore_sealed_segment_object_bytes", "Live sealed segment object bytes estimated by sizeof(ChunkedSegmentSealedImpl)", uint64(cStats.sealed_segment_object_bytes)},
+		{"milvus_segcore_sealed_segment_runtime_estimated_bytes", "Live sealed segment runtime bytes estimated from mmap descriptor, empty containers, InsertRecord, DeletedRecord, and LoadFieldDataInfo", uint64(cStats.sealed_segment_runtime_estimated_bytes)},
+		{"milvus_segcore_sealed_segment_mmap_descriptor_bytes", "Live sealed segment mmap descriptor and manager-entry bytes estimated from object and container shells", uint64(cStats.sealed_segment_mmap_descriptor_bytes)},
+		{"milvus_segcore_sealed_segment_empty_indexing_container_bytes", "Live sealed segment empty indexing container bytes estimated from bucket arrays", uint64(cStats.sealed_segment_empty_indexing_container_bytes)},
+		{"milvus_segcore_sealed_segment_insert_record_bytes", "Live sealed segment InsertRecord runtime bytes estimated from PK/timestamp helper containers", uint64(cStats.sealed_segment_insert_record_bytes)},
+		{"milvus_segcore_sealed_segment_deleted_record_bytes", "Live sealed segment DeletedRecord runtime bytes estimated from skiplist shell, bitset, and snapshots", uint64(cStats.sealed_segment_deleted_record_bytes)},
+		{"milvus_segcore_sealed_segment_load_field_data_info_bytes", "Live sealed segment LoadFieldDataInfo bytes estimated from field metadata and path containers", uint64(cStats.sealed_segment_load_field_data_info_bytes)},
+		{"milvus_segcore_sealed_segment_field_map_bytes", "Live sealed segment fields_ unordered_map bytes estimated from buckets and nodes", uint64(cStats.sealed_segment_field_map_bytes)},
+		{"milvus_segcore_sealed_segment_field_shared_ptr_control_block_bytes", "Live sealed segment field column shared_ptr control block bytes estimated per field entry", uint64(cStats.sealed_segment_field_shared_ptr_control_block_bytes)},
+		{"milvus_segcore_sealed_segment_field_data_accounted_map_bytes", "Live sealed segment field_data_accounted_bytes_ unordered_map bytes estimated from buckets and nodes", uint64(cStats.sealed_segment_field_data_accounted_map_bytes)},
+		{"milvus_segcore_sealed_segment_mmap_field_ids_bytes", "Live sealed segment mmap_field_ids_ unordered_set bytes estimated from buckets and nodes", uint64(cStats.sealed_segment_mmap_field_ids_bytes)},
+		{"milvus_segcore_segment_load_info_bytes", "Live SegmentLoadInfo protobuf bytes estimated by SpaceUsedLong", uint64(cStats.segment_load_info_bytes)},
+		{"milvus_segcore_segment_load_info_estimated_bytes", "Live SegmentLoadInfo bytes estimated by object size, protobuf SpaceUsedLong, and runtime cache containers", uint64(cStats.segment_load_info_estimated_bytes)},
+		{"milvus_segcore_segment_load_info_object_bytes", "Live SegmentLoadInfo object bytes estimated by sizeof(SegmentLoadInfo)", uint64(cStats.segment_load_info_object_bytes)},
+		{"milvus_segcore_segment_load_info_proto_bytes", "Live SegmentLoadInfo protobuf bytes estimated by SpaceUsedLong", uint64(cStats.segment_load_info_proto_bytes)},
+		{"milvus_segcore_segment_load_info_converted_index_cache_bytes", "Live SegmentLoadInfo converted index cache bytes estimated from container capacity", uint64(cStats.segment_load_info_converted_index_cache_bytes)},
+		{"milvus_segcore_segment_load_info_field_index_id_cache_bytes", "Live SegmentLoadInfo field index id cache bytes estimated from container capacity", uint64(cStats.segment_load_info_field_index_id_cache_bytes)},
+		{"milvus_segcore_segment_load_info_field_index_has_raw_data_bytes", "Live SegmentLoadInfo raw-data field set bytes estimated from container nodes", uint64(cStats.segment_load_info_field_index_has_raw_data_bytes)},
+		{"milvus_segcore_segment_load_info_fields_filled_with_default_bytes", "Live SegmentLoadInfo default-filled field set bytes estimated from container nodes", uint64(cStats.segment_load_info_fields_filled_with_default_bytes)},
+		{"milvus_segcore_segment_load_info_field_binlog_cache_bytes", "Live SegmentLoadInfo field binlog cache bytes estimated from container nodes", uint64(cStats.segment_load_info_field_binlog_cache_bytes)},
+		{"milvus_segcore_segment_load_info_column_group_cache_bytes", "Live SegmentLoadInfo column group cache shell bytes estimated from mutex/shared-pointer/object shells", uint64(cStats.segment_load_info_column_group_cache_bytes)},
+		{"milvus_segcore_segment_load_info_column_group_cache_deep_bytes", "Live SegmentLoadInfo column group cache deep bytes estimated from vector, ColumnGroup, ColumnGroupFile, strings, properties, and shared_ptr control blocks", uint64(cStats.segment_load_info_column_group_cache_deep_bytes)},
+		{"milvus_segcore_segment_load_info_column_group_cache_path_bytes", "Live SegmentLoadInfo column group file path dynamic string bytes", uint64(cStats.segment_load_info_column_group_cache_path_bytes)},
+		{"milvus_segcore_segment_load_info_column_group_cache_property_bytes", "Live SegmentLoadInfo column group file property map bytes including key/value strings", uint64(cStats.segment_load_info_column_group_cache_property_bytes)},
+		{"milvus_segcore_segment_load_info_column_group_cache_column_bytes", "Live SegmentLoadInfo column group column-name vector bytes", uint64(cStats.segment_load_info_column_group_cache_column_bytes)},
+		{"milvus_segcore_segment_load_info_column_group_cache_format_bytes", "Live SegmentLoadInfo column group format string dynamic bytes", uint64(cStats.segment_load_info_column_group_cache_format_bytes)},
+		{"milvus_segcore_segment_load_info_column_group_cache_group_count", "Live SegmentLoadInfo cached column group count", uint64(cStats.segment_load_info_column_group_cache_group_count)},
+		{"milvus_segcore_segment_load_info_column_group_cache_file_count", "Live SegmentLoadInfo cached column group file count", uint64(cStats.segment_load_info_column_group_cache_file_count)},
+		{"milvus_segcore_segment_load_info_created_text_indexes_bytes", "Live SegmentLoadInfo created text index set bytes estimated from container nodes", uint64(cStats.segment_load_info_created_text_indexes_bytes)},
+		{"milvus_segcore_field_entry_count", "Live segcore field map entries across sealed segments", uint64(cStats.field_entry_count)},
+		{"milvus_segcore_lazy_manifest_group_count", "Live lazy manifest column group shells", uint64(cStats.lazy_manifest_group_count)},
+		{"milvus_segcore_lazy_manifest_group_estimated_bytes", "Live lazy manifest column group shell bytes including estimated dynamic metadata", uint64(cStats.lazy_manifest_group_estimated_bytes)},
+		{"milvus_segcore_lazy_manifest_proxy_count", "Live lazy manifest proxy columns", uint64(cStats.lazy_manifest_proxy_count)},
+		{"milvus_segcore_lazy_manifest_proxy_object_bytes", "Live lazy manifest proxy column object bytes estimated by sizeof(LazyManifestProxyColumn)", uint64(cStats.lazy_manifest_proxy_object_bytes)},
+		{"milvus_segcore_lazy_manifest_projected_column_count", "Projected columns referenced by live lazy manifest group shells", uint64(cStats.lazy_manifest_projected_column_count)},
+		{"milvus_segcore_pk_index_slot_count", "Live primary-key index cache slots attached to sealed segments", uint64(cStats.pk_index_slot_count)},
+		{"milvus_segcore_timestamp_index_slot_count", "Live timestamp index cache slots attached to sealed segments", uint64(cStats.timestamp_index_slot_count)},
+		{"milvus_segcore_pk_index_translator_count", "Live primary-key index translators", uint64(cStats.pk_index_translator_count)},
+		{"milvus_segcore_pk_index_translator_object_bytes", "Live primary-key index translator object bytes estimated by sizeof(PkIndexTranslator)", uint64(cStats.pk_index_translator_object_bytes)},
+		{"milvus_segcore_timestamp_index_translator_count", "Live timestamp index translators", uint64(cStats.timestamp_index_translator_count)},
+		{"milvus_segcore_timestamp_index_translator_object_bytes", "Live timestamp index translator object bytes estimated by sizeof(TimestampIndexTranslator)", uint64(cStats.timestamp_index_translator_object_bytes)},
+		{"milvus_segcore_pk_index_cell_count", "Live materialized primary-key index cells", uint64(cStats.pk_index_cell_count)},
+		{"milvus_segcore_pk_index_cell_bytes", "Live materialized primary-key index cell bytes reported by the cell", uint64(cStats.pk_index_cell_bytes)},
+		{"milvus_segcore_timestamp_index_cell_count", "Live materialized timestamp index cells", uint64(cStats.timestamp_index_cell_count)},
+		{"milvus_segcore_timestamp_index_cell_bytes", "Live materialized timestamp index cell bytes reported by the cell", uint64(cStats.timestamp_index_cell_bytes)},
+	}
+
+	for _, m := range metrics {
+		result[m.name] = createGaugeFamily(m.name, m.help, float64(m.value))
+	}
+
+	indexMetrics := gatherSegcoreIndexMemoryMetrics()
+	for name, mf := range indexMetrics {
+		result[name] = mf
+	}
+
+	return result
+}
+
+type segcoreIndexMemoryRecord struct {
+	dataType                       string
+	indexType                      string
+	count                          uint64
+	estimatedBytes                 uint64
+	objectBytes                    uint64
+	indexInfoDynamicBytes          uint64
+	fileManagerContextDynamicBytes uint64
+	configEstimatedBytes           uint64
+	indexLoadInfoDynamicBytes      uint64
+	indexParamDynamicBytes         uint64
+	schemaProtoBytes               uint64
+	stringDynamicBytes             uint64
+}
+
+func gatherSegcoreIndexMemoryMetrics() map[string]*dto.MetricFamily {
+	cStats := C.GetSegcoreIndexMemoryStats()
+	records := make([]segcoreIndexMemoryRecord, 0, int(cStats.entry_count))
+	for i := 0; i < int(cStats.entry_count); i++ {
+		entry := cStats.entries[i]
+		records = append(records, segcoreIndexMemoryRecord{
+			dataType:                       C.GoString((*C.char)(unsafe.Pointer(&entry.data_type[0]))),
+			indexType:                      C.GoString((*C.char)(unsafe.Pointer(&entry.index_type[0]))),
+			count:                          uint64(entry.count),
+			estimatedBytes:                 uint64(entry.estimated_bytes),
+			objectBytes:                    uint64(entry.object_bytes),
+			indexInfoDynamicBytes:          uint64(entry.index_info_dynamic_bytes),
+			fileManagerContextDynamicBytes: uint64(entry.file_manager_context_dynamic_bytes),
+			configEstimatedBytes:           uint64(entry.config_estimated_bytes),
+			indexLoadInfoDynamicBytes:      uint64(entry.index_load_info_dynamic_bytes),
+			indexParamDynamicBytes:         uint64(entry.index_param_dynamic_bytes),
+			schemaProtoBytes:               uint64(entry.schema_proto_bytes),
+			stringDynamicBytes:             uint64(entry.string_dynamic_bytes),
+		})
+	}
+
+	gaugeType := dto.MetricType_GAUGE
+	createFamily := func(name, help string, value func(segcoreIndexMemoryRecord) uint64) *dto.MetricFamily {
+		family := &dto.MetricFamily{
+			Name: proto.String(name),
+			Help: proto.String(help),
+			Type: &gaugeType,
+		}
+		for _, record := range records {
+			family.Metric = append(family.Metric, &dto.Metric{
+				Label: []*dto.LabelPair{
+					{Name: proto.String("data_type"), Value: proto.String(record.dataType)},
+					{Name: proto.String("index_type"), Value: proto.String(record.indexType)},
+				},
+				Gauge: &dto.Gauge{Value: proto.Float64(float64(value(record)))},
+			})
+		}
+		return family
+	}
+
+	return map[string]*dto.MetricFamily{
+		"milvus_segcore_sealed_index_translator_count": createFamily(
+			"milvus_segcore_sealed_index_translator_count",
+			"Live sealed index translators grouped by index data type and index type",
+			func(record segcoreIndexMemoryRecord) uint64 { return record.count },
+		),
+		"milvus_segcore_sealed_index_translator_estimated_bytes": createFamily(
+			"milvus_segcore_sealed_index_translator_estimated_bytes",
+			"Live sealed index translator bytes estimated from object size and copied metadata",
+			func(record segcoreIndexMemoryRecord) uint64 { return record.estimatedBytes },
+		),
+		"milvus_segcore_sealed_index_translator_object_bytes": createFamily(
+			"milvus_segcore_sealed_index_translator_object_bytes",
+			"Live sealed index translator object bytes estimated by sizeof(SealedIndexTranslator)",
+			func(record segcoreIndexMemoryRecord) uint64 { return record.objectBytes },
+		),
+		"milvus_segcore_sealed_index_translator_index_info_dynamic_bytes": createFamily(
+			"milvus_segcore_sealed_index_translator_index_info_dynamic_bytes",
+			"Live sealed index translator dynamic bytes copied in CreateIndexInfo",
+			func(record segcoreIndexMemoryRecord) uint64 { return record.indexInfoDynamicBytes },
+		),
+		"milvus_segcore_sealed_index_translator_file_manager_context_dynamic_bytes": createFamily(
+			"milvus_segcore_sealed_index_translator_file_manager_context_dynamic_bytes",
+			"Live sealed index translator dynamic bytes copied in FileManagerContext",
+			func(record segcoreIndexMemoryRecord) uint64 { return record.fileManagerContextDynamicBytes },
+		),
+		"milvus_segcore_sealed_index_translator_config_estimated_bytes": createFamily(
+			"milvus_segcore_sealed_index_translator_config_estimated_bytes",
+			"Live sealed index translator nlohmann json config bytes estimated recursively",
+			func(record segcoreIndexMemoryRecord) uint64 { return record.configEstimatedBytes },
+		),
+		"milvus_segcore_sealed_index_translator_index_load_info_dynamic_bytes": createFamily(
+			"milvus_segcore_sealed_index_translator_index_load_info_dynamic_bytes",
+			"Live sealed index translator dynamic bytes copied in IndexLoadInfo",
+			func(record segcoreIndexMemoryRecord) uint64 { return record.indexLoadInfoDynamicBytes },
+		),
+		"milvus_segcore_sealed_index_translator_index_param_dynamic_bytes": createFamily(
+			"milvus_segcore_sealed_index_translator_index_param_dynamic_bytes",
+			"Live sealed index translator index_params map bytes; subset of IndexLoadInfo dynamic bytes",
+			func(record segcoreIndexMemoryRecord) uint64 { return record.indexParamDynamicBytes },
+		),
+		"milvus_segcore_sealed_index_translator_schema_proto_bytes": createFamily(
+			"milvus_segcore_sealed_index_translator_schema_proto_bytes",
+			"Live sealed index translator FieldSchema protobuf bytes; subset of FileManagerContext dynamic bytes",
+			func(record segcoreIndexMemoryRecord) uint64 { return record.schemaProtoBytes },
+		),
+		"milvus_segcore_sealed_index_translator_string_dynamic_bytes": createFamily(
+			"milvus_segcore_sealed_index_translator_string_dynamic_bytes",
+			"Live sealed index translator string dynamic bytes across copied metadata; explanatory subset",
+			func(record segcoreIndexMemoryRecord) uint64 { return record.stringDynamicBytes },
+		),
+	}
 }

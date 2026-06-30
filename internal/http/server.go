@@ -31,6 +31,7 @@ import (
 
 	"github.com/milvus-io/milvus/internal/http/healthz"
 	"github.com/milvus-io/milvus/internal/json"
+	"github.com/milvus-io/milvus/internal/util/segcore"
 	"github.com/milvus-io/milvus/pkg/v3/eventlog"
 	"github.com/milvus-io/milvus/pkg/v3/log"
 	"github.com/milvus-io/milvus/pkg/v3/util/expr"
@@ -141,6 +142,31 @@ func registerDefaults() {
 		Path:    StaticPath,
 		Handler: GetStaticHandler(),
 	})
+	if os.Getenv("MILVUS_ENABLE_JEMALLOC_PROFILE_DUMP") == "1" {
+		Register(&Handler{
+			Path: JemallocProfileDumpPath,
+			HandlerFunc: func(w http.ResponseWriter, req *http.Request) {
+				if req.Method != http.MethodPost {
+					w.WriteHeader(http.StatusMethodNotAllowed)
+					w.Write([]byte(`{"msg":"method not allowed"}`))
+					return
+				}
+				path := req.URL.Query().Get("path")
+				if path == "" {
+					w.WriteHeader(http.StatusBadRequest)
+					w.Write([]byte(`{"msg":"path is required"}`))
+					return
+				}
+				if err := segcore.DumpJemallocProfile(path); err != nil {
+					w.WriteHeader(http.StatusInternalServerError)
+					fmt.Fprintf(w, `{"msg":"%s"}`, err.Error())
+					return
+				}
+				w.WriteHeader(http.StatusOK)
+				fmt.Fprintf(w, `{"path":"%s"}`, path)
+			},
+		})
+	}
 
 	if paramtable.Get().HTTPCfg.EnableWebUI.GetAsBool() {
 		RegisterWebUIHandler()

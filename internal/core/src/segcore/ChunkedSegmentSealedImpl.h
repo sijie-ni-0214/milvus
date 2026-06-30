@@ -97,6 +97,34 @@ class PkIndexCell;
 
 using namespace milvus::cachinglayer;
 
+struct SealedSegmentRuntimeMemoryUsage {
+    size_t mmap_descriptor_bytes = 0;
+    size_t empty_indexing_container_bytes = 0;
+    size_t insert_record_bytes = 0;
+    size_t deleted_record_bytes = 0;
+    size_t load_field_data_info_bytes = 0;
+
+    [[nodiscard]] size_t
+    TotalEstimatedBytes() const {
+        return mmap_descriptor_bytes + empty_indexing_container_bytes +
+               insert_record_bytes + deleted_record_bytes +
+               load_field_data_info_bytes;
+    }
+};
+
+struct FieldRuntimeMemoryUsage {
+    size_t field_map_bytes = 0;
+    size_t field_shared_ptr_control_block_bytes = 0;
+    size_t field_data_accounted_map_bytes = 0;
+    size_t mmap_field_ids_bytes = 0;
+
+    [[nodiscard]] size_t
+    TotalEstimatedBytes() const {
+        return field_map_bytes + field_shared_ptr_control_block_bytes +
+               field_data_accounted_map_bytes + mmap_field_ids_bytes;
+    }
+};
+
 // Test-only accessor that pokes private members to simulate v2/v3 segment
 // state (raw timestamp column emplaced into fields_ alongside an overwritten
 // timestamp index). Defined in internal/core/unittest/test_commit_timestamp.cpp.
@@ -1157,6 +1185,7 @@ class ChunkedSegmentSealedImpl : public SegmentSealed {
     update_row_count(int64_t row_count) {
         num_rows_ = row_count;
         deleted_record_.set_sealed_row_count(row_count);
+        TrackSealedSegmentRuntimeMemory(EstimateSealedSegmentRuntimeMemory());
     }
 
     void
@@ -1381,6 +1410,40 @@ class ChunkedSegmentSealedImpl : public SegmentSealed {
     RecordTextIndexCreated(FieldId field_id);
 
     void
+    TrackSegmentLoadInfoMemory(const SegmentLoadInfoMemoryUsage& usage);
+
+    void
+    TrackSealedSegmentRuntimeMemory(
+        const SealedSegmentRuntimeMemoryUsage& usage);
+
+    SealedSegmentRuntimeMemoryUsage
+    EstimateSealedSegmentRuntimeMemory() const;
+
+    void
+    TrackFieldRuntimeMemory(const FieldRuntimeMemoryUsage& usage);
+
+    FieldRuntimeMemoryUsage
+    EstimateFieldRuntimeMemory() const;
+
+    void
+    TrackFieldEntryCount(size_t count);
+
+    void
+    TrackPkIndexSlot();
+
+    void
+    TrackTimestampIndexSlot();
+
+    void
+    UntrackPkIndexSlot();
+
+    void
+    UntrackTimestampIndexSlot();
+
+    void
+    UntrackRuntimeMemoryStats();
+
+    void
     load_field_data_common(
         FieldId field_id,
         const std::shared_ptr<ChunkedColumnInterface>& column,
@@ -1439,8 +1502,7 @@ class ChunkedSegmentSealedImpl : public SegmentSealed {
     // Test-only: inject a mock Reader for unit testing take() paths.
     void
     SetReaderForTesting(std::unique_ptr<milvus_storage::api::Reader> r) {
-        reader_ =
-            std::shared_ptr<milvus_storage::api::Reader>(std::move(r));
+        reader_ = std::shared_ptr<milvus_storage::api::Reader>(std::move(r));
     }
 
     // Wrappers for protected methods to enable direct unit testing.
@@ -1601,6 +1663,13 @@ class ChunkedSegmentSealedImpl : public SegmentSealed {
     // LOB base paths for TEXT fields
     // field_id -> lob_base_path mapping (e.g., {partition_path}/lobs/{field_id})
     std::unordered_map<FieldId, std::string> text_lob_paths_;
+
+    SegmentLoadInfoMemoryUsage tracked_segment_load_info_memory_{};
+    SealedSegmentRuntimeMemoryUsage tracked_sealed_segment_runtime_memory_{};
+    FieldRuntimeMemoryUsage tracked_field_runtime_memory_{};
+    std::atomic<size_t> tracked_field_entry_count_{0};
+    std::atomic<bool> tracked_pk_index_slot_{false};
+    std::atomic<bool> tracked_timestamp_index_slot_{false};
 };
 
 inline SegmentSealedUPtr

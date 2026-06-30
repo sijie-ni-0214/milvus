@@ -21,6 +21,11 @@ package segcore
 */
 import "C"
 
+import (
+	"fmt"
+	"unsafe"
+)
+
 // JemallocStats represents comprehensive jemalloc memory statistics
 // All sizes are in bytes
 type JemallocStats struct {
@@ -57,4 +62,16 @@ func GetJemallocStats() JemallocStats {
 		Overhead:      uint64(cStats.overhead),
 		Success:       bool(cStats.success),
 	}
+}
+
+// DumpJemallocProfile writes a jemalloc heap profile to path.
+func DumpJemallocProfile(path string) error {
+	cPath := C.CString(path)
+	defer C.free(unsafe.Pointer(cPath))
+
+	code := C.DumpJemallocProfile(cPath)
+	if code != 0 {
+		return fmt.Errorf("jemalloc prof.dump failed with code %d", int(code))
+	}
+	return nil
 }

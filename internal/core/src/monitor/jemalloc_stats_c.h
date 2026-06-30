@@ -44,6 +44,9 @@ typedef struct {
 JemallocStats
 GetJemallocStats();
 
+int
+DumpJemallocProfile(const char* path);
+
 #ifdef __cplusplus
 }
 #endif

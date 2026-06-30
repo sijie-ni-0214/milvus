@@ -32,6 +32,8 @@ class TimestampIndexCell {
     explicit TimestampIndexCell(TimestampIndex timestamp_index,
                                 int64_t num_rows);
 
+    ~TimestampIndexCell();
+
     const TimestampIndex&
     timestamp_index() const {
         return timestamp_index_;
@@ -52,6 +54,8 @@ class PkIndexCell {
     PkIndexCell(std::unique_ptr<OffsetMap> pk2offset,
                 std::unique_ptr<CompressedInt64PkArray> offset2pk,
                 bool is_int64_pk);
+
+    ~PkIndexCell();
 
     bool
     has_pk2offset() const {
@@ -108,7 +112,7 @@ class TimestampIndexTranslator
                              int64_t num_rows,
                              const std::string& warmup_policy = "");
 
-    ~TimestampIndexTranslator() override = default;
+    ~TimestampIndexTranslator() override;
 
     size_t
     num_cells() const override;
@@ -153,7 +157,7 @@ class PkIndexTranslator : public milvus::cachinglayer::Translator<PkIndexCell> {
                       bool is_sorted_by_pk,
                       const std::string& warmup_policy = "");
 
-    ~PkIndexTranslator() override = default;
+    ~PkIndexTranslator() override;
 
     size_t
     num_cells() const override;

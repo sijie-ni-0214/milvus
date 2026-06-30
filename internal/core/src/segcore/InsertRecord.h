@@ -1290,6 +1290,27 @@ class InsertRecordSealed {
         return timestamps_;
     }
 
+    size_t
+    runtime_memory_size() const {
+        std::shared_lock lck(shared_mutex_);
+        size_t bytes = timestamps_.dynamic_memory_size();
+        if (timestamp_index_.memory_size() > sizeof(TimestampIndex)) {
+            bytes += timestamp_index_.memory_size() - sizeof(TimestampIndex);
+        }
+        if (pk2offset_ != nullptr) {
+            bytes += pk2offset_->memory_size();
+            if (dynamic_cast<VirtualPKOffsetMap*>(pk2offset_.get()) ==
+                nullptr) {
+                bytes += is_int64_pk_ ? sizeof(OffsetOrderedArray<int64_t>)
+                                      : sizeof(OffsetOrderedArray<std::string>);
+            }
+        }
+        if (offset2pk_ != nullptr) {
+            bytes += offset2pk_->memory_size();
+        }
+        return bytes;
+    }
+
     void
     clear() {
         timestamps_.clear();

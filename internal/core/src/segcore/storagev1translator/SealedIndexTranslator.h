@@ -10,6 +10,7 @@
 // or implied. See the License for the specific language governing permissions and limitations under the License
 
 #include <cstdint>
+#include <cstddef>
 #include "cachinglayer/Translator.h"
 #include "common/resource_c.h"
 #include "index/Index.h"
@@ -26,7 +27,7 @@ class SealedIndexTranslator
         milvus::tracer::TraceContext ctx,
         milvus::storage::FileManagerContext file_manager_context,
         Config config);
-    ~SealedIndexTranslator() override = default;
+    ~SealedIndexTranslator() override;
     size_t
     num_cells() const override;
     milvus::cachinglayer::cid_t
@@ -58,6 +59,18 @@ class SealedIndexTranslator
     }
 
  private:
+    struct MemoryUsage {
+        size_t estimated_bytes = 0;
+        size_t object_bytes = 0;
+        size_t index_info_dynamic_bytes = 0;
+        size_t file_manager_context_dynamic_bytes = 0;
+        size_t config_estimated_bytes = 0;
+        size_t index_load_info_dynamic_bytes = 0;
+        size_t index_param_dynamic_bytes = 0;
+        size_t schema_proto_bytes = 0;
+        size_t string_dynamic_bytes = 0;
+    };
+
     struct IndexLoadInfo {
         bool enable_mmap;
         std::string mmap_dir_path;
@@ -84,5 +97,8 @@ class SealedIndexTranslator
     std::string index_key_;
     IndexLoadInfo index_load_info_;
     milvus::cachinglayer::Meta meta_;
+    std::string memory_data_type_;
+    std::string memory_index_type_;
+    MemoryUsage memory_usage_;
 };
 }  // namespace milvus::segcore::storagev1translator

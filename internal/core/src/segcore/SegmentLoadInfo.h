@@ -39,6 +39,34 @@
 
 namespace milvus::segcore {
 
+struct SegmentLoadInfoMemoryUsage {
+    size_t object_bytes = 0;
+    size_t proto_bytes = 0;
+    size_t converted_index_cache_bytes = 0;
+    size_t field_index_id_cache_bytes = 0;
+    size_t field_index_has_raw_data_bytes = 0;
+    size_t fields_filled_with_default_bytes = 0;
+    size_t field_binlog_cache_bytes = 0;
+    size_t column_group_cache_bytes = 0;
+    size_t column_group_cache_deep_bytes = 0;
+    size_t column_group_cache_path_bytes = 0;
+    size_t column_group_cache_property_bytes = 0;
+    size_t column_group_cache_column_bytes = 0;
+    size_t column_group_cache_format_bytes = 0;
+    size_t column_group_cache_group_count = 0;
+    size_t column_group_cache_file_count = 0;
+    size_t created_text_indexes_bytes = 0;
+
+    [[nodiscard]] size_t
+    TotalEstimatedBytes() const {
+        return object_bytes + proto_bytes + converted_index_cache_bytes +
+               field_index_id_cache_bytes + field_index_has_raw_data_bytes +
+               fields_filled_with_default_bytes + field_binlog_cache_bytes +
+               column_group_cache_bytes + column_group_cache_deep_bytes +
+               created_text_indexes_bytes;
+    }
+};
+
 /**
  * @brief Structure representing the difference between two SegmentLoadInfos,
  *       used for reopening segments.
@@ -1086,6 +1114,41 @@ class SegmentLoadInfo {
         return info_.segmentid() == 0 && info_.num_of_rows() == 0;
     }
 
+    [[nodiscard]] size_t
+    SpaceUsedLong() const {
+        return info_.SpaceUsedLong();
+    }
+
+    [[nodiscard]] SegmentLoadInfoMemoryUsage
+    MemoryUsage() const {
+        SegmentLoadInfoMemoryUsage usage;
+        usage.object_bytes = sizeof(SegmentLoadInfo);
+        usage.proto_bytes = SpaceUsedLong();
+        usage.converted_index_cache_bytes =
+            ApproxConvertedFieldIndexCacheBytes(converted_field_index_cache_);
+        usage.field_index_id_cache_bytes =
+            ApproxFieldIndexIdCacheBytes(field_index_id_cache_);
+        usage.field_index_has_raw_data_bytes =
+            ApproxSetBytes(field_index_has_raw_data_);
+        usage.fields_filled_with_default_bytes =
+            ApproxSetBytes(fields_filled_with_default_);
+        usage.field_binlog_cache_bytes = ApproxMapBytes(field_binlog_cache_);
+        usage.column_group_cache_bytes = ApproxColumnGroupCacheShellBytes();
+        usage.column_group_cache_deep_bytes = ApproxColumnGroupCacheDeepBytes();
+        usage.column_group_cache_path_bytes = ApproxColumnGroupCachePathBytes();
+        usage.column_group_cache_property_bytes =
+            ApproxColumnGroupCachePropertyBytes();
+        usage.column_group_cache_column_bytes =
+            ApproxColumnGroupCacheColumnBytes();
+        usage.column_group_cache_format_bytes =
+            ApproxColumnGroupCacheFormatBytes();
+        usage.column_group_cache_group_count = ColumnGroupCacheGroupCount();
+        usage.column_group_cache_file_count = ColumnGroupCacheFileCount();
+        usage.created_text_indexes_bytes =
+            ApproxUnorderedSetBytes(created_text_indexes_);
+        return usage;
+    }
+
     // ==================== LoadIndexInfo Conversion ====================
 
     /**
@@ -1204,6 +1267,302 @@ class SegmentLoadInfo {
 
     [[nodiscard]] std::set<FieldId>
     CollectDataFields() const;
+
+    [[nodiscard]] static size_t
+    ApproxStringDynamicBytes(const std::string& value) {
+        return value.capacity() + 1;
+    }
+
+    template <typename T, typename DynamicBytesFn>
+    [[nodiscard]] static size_t
+    ApproxVectorBytes(const std::vector<T>& values,
+                      DynamicBytesFn dynamic_bytes_fn) {
+        size_t bytes = values.capacity() * sizeof(T);
+        for (const auto& value : values) {
+            bytes += dynamic_bytes_fn(value);
+        }
+        return bytes;
+    }
+
+    template <typename Key, typename Value, typename DynamicBytesFn>
+    [[nodiscard]] static size_t
+    ApproxUnorderedMapBytes(const std::unordered_map<Key, Value>& values,
+                            DynamicBytesFn dynamic_bytes_fn) {
+        if (values.empty()) {
+            return 0;
+        }
+        size_t bytes = values.bucket_count() * sizeof(void*);
+        for (const auto& [key, value] : values) {
+            (void)key;
+            bytes +=
+                sizeof(typename std::unordered_map<Key, Value>::value_type) +
+                sizeof(void*) + dynamic_bytes_fn(value);
+        }
+        return bytes;
+    }
+
+    template <typename Value>
+    [[nodiscard]] static size_t
+    ApproxUnorderedSetBytes(const std::unordered_set<Value>& values) {
+        if (values.empty()) {
+            return 0;
+        }
+        return values.bucket_count() * sizeof(void*) +
+               values.size() *
+                   (sizeof(typename std::unordered_set<Value>::value_type) +
+                    sizeof(void*));
+    }
+
+    template <typename Value>
+    [[nodiscard]] static size_t
+    ApproxSetBytes(const std::set<Value>& values) {
+        if (values.empty()) {
+            return 0;
+        }
+        return values.size() * (sizeof(typename std::set<Value>::value_type) +
+                                3 * sizeof(void*) + sizeof(bool));
+    }
+
+    template <typename Key, typename Value>
+    [[nodiscard]] static size_t
+    ApproxMapBytes(const std::map<Key, Value>& values) {
+        if (values.empty()) {
+            return 0;
+        }
+        return values.size() *
+               (sizeof(typename std::map<Key, Value>::value_type) +
+                3 * sizeof(void*) + sizeof(bool));
+    }
+
+    [[nodiscard]] static size_t
+    ApproxStringMapBytes(const std::map<std::string, std::string>& values) {
+        if (values.empty()) {
+            return 0;
+        }
+        size_t bytes =
+            values.size() * (sizeof(std::pair<const std::string, std::string>) +
+                             3 * sizeof(void*) + sizeof(bool));
+        for (const auto& [key, value] : values) {
+            bytes += ApproxStringDynamicBytes(key);
+            bytes += ApproxStringDynamicBytes(value);
+        }
+        return bytes;
+    }
+
+    [[nodiscard]] static size_t
+    ApproxStringUnorderedMapBytes(
+        const std::unordered_map<std::string, std::string>& values) {
+        if (values.empty()) {
+            return 0;
+        }
+        size_t bytes = values.bucket_count() * sizeof(void*);
+        for (const auto& [key, value] : values) {
+            bytes +=
+                sizeof(typename std::unordered_map<std::string,
+                                                   std::string>::value_type) +
+                sizeof(void*) + ApproxStringDynamicBytes(key) +
+                ApproxStringDynamicBytes(value);
+        }
+        return bytes;
+    }
+
+    [[nodiscard]] static size_t
+    ApproxStringVectorBytes(const std::vector<std::string>& values) {
+        return ApproxVectorBytes(values, [](const std::string& value) {
+            return ApproxStringDynamicBytes(value);
+        });
+    }
+
+    [[nodiscard]] static size_t
+    ApproxLoadIndexInfoDynamicBytes(const LoadIndexInfo& info) {
+        return ApproxStringDynamicBytes(info.mmap_dir_path) +
+               ApproxStringMapBytes(info.index_params) +
+               ApproxStringVectorBytes(info.index_files) +
+               ApproxStringDynamicBytes(info.uri) +
+               info.schema.SpaceUsedLong() +
+               ApproxStringDynamicBytes(info.warmup_policy);
+    }
+
+    [[nodiscard]] static size_t
+    ApproxConvertedFieldIndexCacheBytes(
+        const std::unordered_map<FieldId, std::vector<LoadIndexInfo>>& values) {
+        return ApproxUnorderedMapBytes(
+            values, [](const std::vector<LoadIndexInfo>& infos) {
+                return ApproxVectorBytes(infos, [](const LoadIndexInfo& info) {
+                    return ApproxLoadIndexInfoDynamicBytes(info);
+                });
+            });
+    }
+
+    [[nodiscard]] static size_t
+    ApproxFieldIndexIdCacheBytes(
+        const std::unordered_map<FieldId, std::vector<int64_t>>& values) {
+        return ApproxUnorderedMapBytes(
+            values, [](const std::vector<int64_t>& index_ids) {
+                return index_ids.capacity() * sizeof(int64_t);
+            });
+    }
+
+    [[nodiscard]] size_t
+    ApproxColumnGroupCacheShellBytes() const {
+        size_t bytes = sizeof(std::mutex) + 2 * sizeof(void*);
+        std::lock_guard<std::mutex> lock(*column_groups_mutex_);
+        if (column_groups_ != nullptr) {
+            bytes +=
+                sizeof(milvus_storage::api::ColumnGroups) + 2 * sizeof(void*);
+        }
+        return bytes;
+    }
+
+    [[nodiscard]] static size_t
+    ApproxColumnGroupFilePathBytes(
+        const milvus_storage::api::ColumnGroupFile& file) {
+        return ApproxStringDynamicBytes(file.path);
+    }
+
+    [[nodiscard]] static size_t
+    ApproxColumnGroupFilePropertyBytes(
+        const milvus_storage::api::ColumnGroupFile& file) {
+        return ApproxStringUnorderedMapBytes(file.properties);
+    }
+
+    [[nodiscard]] static size_t
+    ApproxColumnGroupColumnBytes(
+        const milvus_storage::api::ColumnGroup& group) {
+        return ApproxStringVectorBytes(group.columns);
+    }
+
+    [[nodiscard]] static size_t
+    ApproxColumnGroupFormatBytes(
+        const milvus_storage::api::ColumnGroup& group) {
+        return ApproxStringDynamicBytes(group.format);
+    }
+
+    [[nodiscard]] static size_t
+    ApproxSharedPtrControlBlockBytes() {
+        return 2 * sizeof(void*) + 2 * sizeof(long);
+    }
+
+    [[nodiscard]] static size_t
+    ApproxColumnGroupDeepBytes(
+        const std::shared_ptr<milvus_storage::api::ColumnGroup>& group) {
+        if (group == nullptr) {
+            return 0;
+        }
+        size_t bytes =
+            ApproxSharedPtrControlBlockBytes() +
+            sizeof(milvus_storage::api::ColumnGroup) +
+            ApproxColumnGroupColumnBytes(*group) +
+            ApproxColumnGroupFormatBytes(*group) +
+            group->files.capacity() *
+                sizeof(milvus_storage::api::ColumnGroupFile);
+        for (const auto& file : group->files) {
+            bytes += ApproxColumnGroupFilePathBytes(file);
+            bytes += ApproxColumnGroupFilePropertyBytes(file);
+        }
+        return bytes;
+    }
+
+    [[nodiscard]] size_t
+    ApproxColumnGroupCacheDeepBytes() const {
+        std::lock_guard<std::mutex> lock(*column_groups_mutex_);
+        if (column_groups_ == nullptr) {
+            return 0;
+        }
+        size_t bytes = column_groups_->capacity() *
+                       sizeof(std::shared_ptr<milvus_storage::api::ColumnGroup>);
+        for (const auto& group : *column_groups_) {
+            bytes += ApproxColumnGroupDeepBytes(group);
+        }
+        return bytes;
+    }
+
+    [[nodiscard]] size_t
+    ApproxColumnGroupCachePathBytes() const {
+        std::lock_guard<std::mutex> lock(*column_groups_mutex_);
+        if (column_groups_ == nullptr) {
+            return 0;
+        }
+        size_t bytes = 0;
+        for (const auto& group : *column_groups_) {
+            if (group == nullptr) {
+                continue;
+            }
+            for (const auto& file : group->files) {
+                bytes += ApproxColumnGroupFilePathBytes(file);
+            }
+        }
+        return bytes;
+    }
+
+    [[nodiscard]] size_t
+    ApproxColumnGroupCachePropertyBytes() const {
+        std::lock_guard<std::mutex> lock(*column_groups_mutex_);
+        if (column_groups_ == nullptr) {
+            return 0;
+        }
+        size_t bytes = 0;
+        for (const auto& group : *column_groups_) {
+            if (group == nullptr) {
+                continue;
+            }
+            for (const auto& file : group->files) {
+                bytes += ApproxColumnGroupFilePropertyBytes(file);
+            }
+        }
+        return bytes;
+    }
+
+    [[nodiscard]] size_t
+    ApproxColumnGroupCacheColumnBytes() const {
+        std::lock_guard<std::mutex> lock(*column_groups_mutex_);
+        if (column_groups_ == nullptr) {
+            return 0;
+        }
+        size_t bytes = 0;
+        for (const auto& group : *column_groups_) {
+            if (group != nullptr) {
+                bytes += ApproxColumnGroupColumnBytes(*group);
+            }
+        }
+        return bytes;
+    }
+
+    [[nodiscard]] size_t
+    ApproxColumnGroupCacheFormatBytes() const {
+        std::lock_guard<std::mutex> lock(*column_groups_mutex_);
+        if (column_groups_ == nullptr) {
+            return 0;
+        }
+        size_t bytes = 0;
+        for (const auto& group : *column_groups_) {
+            if (group != nullptr) {
+                bytes += ApproxColumnGroupFormatBytes(*group);
+            }
+        }
+        return bytes;
+    }
+
+    [[nodiscard]] size_t
+    ColumnGroupCacheGroupCount() const {
+        std::lock_guard<std::mutex> lock(*column_groups_mutex_);
+        return column_groups_ == nullptr ? 0 : column_groups_->size();
+    }
+
+    [[nodiscard]] size_t
+    ColumnGroupCacheFileCount() const {
+        std::lock_guard<std::mutex> lock(*column_groups_mutex_);
+        if (column_groups_ == nullptr) {
+            return 0;
+        }
+        size_t count = 0;
+        for (const auto& group : *column_groups_) {
+            if (group != nullptr) {
+                count += group->files.size();
+            }
+        }
+        return count;
+    }
 
     ProtoType info_;
 

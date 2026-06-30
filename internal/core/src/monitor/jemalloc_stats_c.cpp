@@ -111,3 +111,18 @@ GetJemallocStats() {
 
     return stats;
 }
+
+int
+DumpJemallocProfile(const char* path) {
+    mallctl_t mallctl_fn = get_mallctl();
+    if (mallctl_fn == nullptr) {
+        return -1;
+    }
+
+    if (path != nullptr && path[0] != '\0') {
+        const char* dump_path = path;
+        return mallctl_fn(
+            "prof.dump", nullptr, nullptr, &dump_path, sizeof(dump_path));
+    }
+    return mallctl_fn("prof.dump", nullptr, nullptr, nullptr, 0);
+}
