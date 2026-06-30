@@ -217,6 +217,13 @@ func TestRateLimitInterceptor(t *testing.T) {
 		assert.Equal(t, 1, len(col2part))
 		assert.Equal(t, 0, len(col2part[1]))
 
+		database, col2part, rt, size, err = GetRequestInfo(context.Background(), mockCache, &milvuspb.DescribePrewarmTaskRequest{})
+		assert.NoError(t, err)
+		assert.Equal(t, 1, size)
+		assert.Equal(t, internalpb.RateType_DDLPartition, rt)
+		assert.Equal(t, util.InvalidDBID, database)
+		assert.Empty(t, col2part)
+
 		database, col2part, rt, size, err = GetRequestInfo(context.Background(), mockCache, &milvuspb.ReleasePartitionsRequest{})
 		assert.NoError(t, err)
 		assert.Equal(t, 1, size)
@@ -356,6 +363,8 @@ func TestRateLimitInterceptor(t *testing.T) {
 		testGetFailedResponse(&milvuspb.CreateCollectionRequest{}, internalpb.RateType_DDLCollection, merr.ErrServiceRateLimit, "createCollection")
 		assert.NotNil(t, GetFailedResponse(&milvuspb.RestoreExternalSnapshotRequest{}, merr.ErrServiceRateLimit))
 		assert.NotNil(t, GetFailedResponse(&milvuspb.ExportSnapshotRequest{}, merr.ErrServiceRateLimit))
+		assert.IsType(t, &milvuspb.PrewarmResponse{}, GetFailedResponse(&milvuspb.PrewarmRequest{}, merr.ErrServiceRateLimit))
+		assert.IsType(t, &milvuspb.DescribePrewarmTaskResponse{}, GetFailedResponse(&milvuspb.DescribePrewarmTaskRequest{}, merr.ErrServiceRateLimit))
 		testGetFailedResponse(&milvuspb.FlushRequest{}, internalpb.RateType_DDLFlush, merr.ErrServiceRateLimit, "flush")
 		testGetFailedResponse(&milvuspb.ManualCompactionRequest{}, internalpb.RateType_DDLCompaction, merr.ErrServiceRateLimit, "compaction")
 		testGetFailedResponse(&milvuspb.AddFileResourceRequest{}, internalpb.RateType_DDLCollection, merr.ErrServiceRateLimit, "addFileResource")
