@@ -103,6 +103,8 @@ type Server struct {
 
 	// Schedulers
 	taskScheduler task.Scheduler
+	prewarmTaskMu sync.Mutex
+	prewarmTasks  *prewarmTaskStore
 
 	// HeartBeat
 	distController dist.Controller
