@@ -64,6 +64,12 @@ type (
 	releaseCollectionTask        = ddl.ReleaseCollectionTask
 	loadPartitionsTask           = ddl.LoadPartitionsTask
 	releasePartitionsTask        = ddl.ReleasePartitionsTask
+	createNamespaceTask          = ddl.CreateNamespaceTask
+	describeNamespaceTask        = ddl.DescribeNamespaceTask
+	listNamespacesTask           = ddl.ListNamespacesTask
+	dropNamespaceTask            = ddl.DropNamespaceTask
+	hasNamespaceTask             = ddl.HasNamespaceTask
+	getNamespaceStatsTask        = ddl.GetNamespaceStatsTask
 	flushTask                    = ddl.FlushTask
 	flushAllTask                 = ddl.FlushAllTask
 	importTask                   = ddl.ImportTask
@@ -186,6 +192,12 @@ var (
 	NewReleaseCollectionTask        = ddl.NewReleaseCollectionTask
 	NewLoadPartitionsTask           = ddl.NewLoadPartitionsTask
 	NewReleasePartitionsTask        = ddl.NewReleasePartitionsTask
+	NewCreateNamespaceTask          = ddl.NewCreateNamespaceTask
+	NewDescribeNamespaceTask        = ddl.NewDescribeNamespaceTask
+	NewListNamespacesTask           = ddl.NewListNamespacesTask
+	NewDropNamespaceTask            = ddl.NewDropNamespaceTask
+	NewHasNamespaceTask             = ddl.NewHasNamespaceTask
+	NewGetNamespaceStatsTask        = ddl.NewGetNamespaceStatsTask
 	NewCreateResourceGroupTask      = ddl.NewCreateResourceGroupTask
 	NewUpdateResourceGroupsTask     = ddl.NewUpdateResourceGroupsTask
 	NewDropResourceGroupTask        = ddl.NewDropResourceGroupTask
