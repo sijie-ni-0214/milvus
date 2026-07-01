@@ -170,36 +170,7 @@ func ValidateCollectionAlias(collAlias string) error {
 }
 
 func validatePartitionTag(partitionTag string, strictCheck bool) error {
-	partitionTag = strings.TrimSpace(partitionTag)
-
-	invalidMsg := "Invalid partition name: " + partitionTag + ". "
-	if partitionTag == "" {
-		msg := invalidMsg + "Partition name should not be empty."
-		return merr.WrapErrParameterInvalidMsg("%s", msg)
-	}
-	if len(partitionTag) > paramtable.Get().ProxyCfg.MaxNameLength.GetAsInt() {
-		msg := invalidMsg + "The length of a partition name must be less than " + paramtable.Get().ProxyCfg.MaxNameLength.GetValue() + " characters."
-		return merr.WrapErrParameterInvalidMsg("%s", msg)
-	}
-
-	if strictCheck {
-		firstChar := partitionTag[0]
-		if firstChar != '_' && !isAlpha(firstChar) && !isNumber(firstChar) {
-			msg := invalidMsg + "The first character of a partition name must be an underscore or letter."
-			return merr.WrapErrParameterInvalidMsg("%s", msg)
-		}
-
-		tagSize := len(partitionTag)
-		for i := 1; i < tagSize; i++ {
-			c := partitionTag[i]
-			if c != '_' && !isAlpha(c) && !isNumber(c) && c != '-' {
-				msg := invalidMsg + "Partition name can only contain numbers, letters and underscores."
-				return merr.WrapErrParameterInvalidMsg("%s", msg)
-			}
-		}
-	}
-
-	return nil
+	return common.ValidatePartitionName(partitionTag, paramtable.Get().ProxyCfg.MaxNameLength.GetAsInt(), paramtable.Get().ProxyCfg.MaxNameLength.GetValue(), strictCheck)
 }
 
 func validateFieldName(fieldName string) error {
