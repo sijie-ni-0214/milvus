@@ -105,6 +105,34 @@ func (suite *ChannelDistManagerSuite) TestVersion() {
 	suite.Greater(v2, v1)
 }
 
+func (suite *ChannelDistManagerSuite) TestPatchEmptyDelta() {
+	dist := suite.dist
+	v1 := dist.GetVersion()
+	before := dist.GetByFilter(WithNodeID2Channel(suite.nodes[0]))
+
+	newServiceableChannels := dist.Patch(suite.nodes[0], nil, nil)
+
+	v2 := dist.GetVersion()
+	after := dist.GetByFilter(WithNodeID2Channel(suite.nodes[0]))
+	suite.Empty(newServiceableChannels)
+	suite.Equal(v1, v2)
+	suite.Equal(before, after)
+}
+
+func (suite *ChannelDistManagerSuite) TestPatchRemovedChannel() {
+	dist := suite.dist
+	v1 := dist.GetVersion()
+
+	newServiceableChannels := dist.Patch(suite.nodes[1], nil, []string{"dmc0"})
+
+	v2 := dist.GetVersion()
+	after := dist.GetByFilter(WithNodeID2Channel(suite.nodes[1]))
+	suite.Empty(newServiceableChannels)
+	suite.Greater(v2, v1)
+	suite.Len(after, 1)
+	suite.Equal("dmc1", after[0].GetChannelName())
+}
+
 func (suite *ChannelDistManagerSuite) TestNodeOffline() {
 	dist := suite.dist
 

@@ -180,6 +180,7 @@ func (segment *Segment) Clone() *Segment {
 
 type SegmentDistManagerInterface interface {
 	Update(nodeID typeutil.UniqueID, segments ...*Segment)
+	Patch(nodeID typeutil.UniqueID, upserts []*Segment, removedSegmentIDs []int64)
 	GetByFilter(filters ...SegmentDistFilter) []*Segment
 	GetSegmentDist(collectionID int64) []*metricsinfo.Segment
 	GetVersion() int64
@@ -258,6 +259,45 @@ func (m *SegmentDistManager) Update(nodeID typeutil.UniqueID, segments ...*Segme
 
 	for _, segment := range segments {
 		segment.Node = nodeID
+	}
+	m.segments[nodeID] = composeNodeSegments(segments)
+	m.version++
+}
+
+func (m *SegmentDistManager) Patch(nodeID typeutil.UniqueID, upserts []*Segment, removedSegmentIDs []int64) {
+	if len(upserts) == 0 && len(removedSegmentIDs) == 0 {
+		return
+	}
+
+	m.rwmutex.Lock()
+	defer m.rwmutex.Unlock()
+
+	removedSegments := make(map[int64]struct{}, len(removedSegmentIDs))
+	for _, segmentID := range removedSegmentIDs {
+		removedSegments[segmentID] = struct{}{}
+	}
+	upsertSegments := make(map[int64]*Segment, len(upserts))
+	for _, segment := range upserts {
+		segment.Node = nodeID
+		upsertSegments[segment.GetID()] = segment
+	}
+
+	existing := m.segments[nodeID].segments
+	segments := make([]*Segment, 0, len(existing)+len(upserts))
+	for _, segment := range existing {
+		segmentID := segment.GetID()
+		if _, ok := removedSegments[segmentID]; ok {
+			continue
+		}
+		if upsert, ok := upsertSegments[segmentID]; ok {
+			segments = append(segments, upsert)
+			delete(upsertSegments, segmentID)
+			continue
+		}
+		segments = append(segments, segment)
+	}
+	for _, segment := range upsertSegments {
+		segments = append(segments, segment)
 	}
 	m.segments[nodeID] = composeNodeSegments(segments)
 	m.version++

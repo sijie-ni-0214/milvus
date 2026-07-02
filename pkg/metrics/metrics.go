@@ -143,6 +143,7 @@ const (
 	queueTypeLabelName             = `queue_type`
 	poolNameLabelName              = "pool_name"
 	outcomeLabelName               = "outcome"
+	reportTypeLabelName            = "report_type"
 
 	// model function/UDF labels
 	functionTypeName = "function_type_name"

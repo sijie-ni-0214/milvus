@@ -820,6 +820,18 @@ func (suite *ServiceSuite) TestLoadIndex_Success() {
 		suite.Equal(0, len(suite.node.manager.Segment.Get(segmentID).Indexes()))
 	}
 
+	fullResp, err := suite.node.GetDataDistribution(ctx, &querypb.GetDataDistributionRequest{
+		Base: &commonpb.MsgBase{
+			MsgID:    rand.Int63(),
+			TargetID: suite.node.session.ServerID,
+		},
+		SupportDelta: true,
+	})
+	suite.Require().NoError(err)
+	suite.Require().Equal(commonpb.ErrorCode_Success, fullResp.GetStatus().GetErrorCode())
+	suite.Require().False(fullResp.GetIsDelta())
+	suite.Require().NotEmpty(fullResp.GetSegments())
+
 	req = &querypb.LoadSegmentsRequest{
 		Base: &commonpb.MsgBase{
 			MsgID:    rand.Int63(),
@@ -838,6 +850,22 @@ func (suite *ServiceSuite) TestLoadIndex_Success() {
 	status, err = suite.node.LoadSegments(ctx, req)
 	suite.Require().NoError(err)
 	suite.Require().Equal(commonpb.ErrorCode_Success, status.GetErrorCode())
+
+	distResp, err := suite.node.GetDataDistribution(ctx, &querypb.GetDataDistributionRequest{
+		Base: &commonpb.MsgBase{
+			MsgID:    rand.Int63(),
+			TargetID: suite.node.session.ServerID,
+		},
+		LastUpdateTs: fullResp.GetLastModifyTs(),
+		SupportDelta: true,
+	})
+	suite.Require().NoError(err)
+	suite.Require().Equal(commonpb.ErrorCode_Success, distResp.GetStatus().GetErrorCode())
+	suite.Require().True(distResp.GetIsDelta())
+	suite.Require().NotEmpty(distResp.GetSegments())
+	suite.Require().True(lo.SomeBy(distResp.GetSegments(), func(info *querypb.SegmentVersionInfo) bool {
+		return len(info.GetIndexInfo()) > 0
+	}))
 
 	for _, segmentID := range lo.Map(infos, func(info *querypb.SegmentLoadInfo, _ int) int64 {
 		return info.GetSegmentID()
@@ -1992,6 +2020,191 @@ func (suite *ServiceSuite) TestGetDataDistribution_LeaderViewStatus() {
 		suite.True(leaderView.Status.CatchingUpStreamingData,
 			"New delegator should be catching up streaming data")
 	}
+}
+
+func (suite *ServiceSuite) TestGetDataDistribution_DeltaSkipsUnchangedSealedPayload() {
+	ctx := context.Background()
+	suite.TestWatchDmChannelsInt64()
+	suite.TestLoadSegments_Int64()
+
+	fullResp, err := suite.node.GetDataDistribution(ctx, &querypb.GetDataDistributionRequest{
+		Base: &commonpb.MsgBase{
+			MsgID:    rand.Int63(),
+			TargetID: suite.node.session.ServerID,
+		},
+		SupportDelta: true,
+	})
+	suite.NoError(err)
+	suite.Equal(commonpb.ErrorCode_Success, fullResp.GetStatus().GetErrorCode())
+	suite.False(fullResp.GetIsDelta())
+	suite.NotEmpty(fullResp.GetSegments())
+	suite.NotEmpty(fullResp.GetLeaderViews())
+	suite.NotEmpty(fullResp.GetLeaderViews()[0].GetSegmentDist())
+
+	suite.node.updateDistributionModifyTS()
+	deltaResp, err := suite.node.GetDataDistribution(ctx, &querypb.GetDataDistributionRequest{
+		Base: &commonpb.MsgBase{
+			MsgID:    rand.Int63(),
+			TargetID: suite.node.session.ServerID,
+		},
+		LastUpdateTs: fullResp.GetLastModifyTs(),
+		SupportDelta: true,
+	})
+	suite.NoError(err)
+	suite.Equal(commonpb.ErrorCode_Success, deltaResp.GetStatus().GetErrorCode())
+	suite.True(deltaResp.GetIsDelta())
+	suite.Empty(deltaResp.GetSegments())
+	suite.Empty(deltaResp.GetRemovedSegmentIds())
+	suite.Equal(fullResp.GetTotalSegmentCount(), deltaResp.GetTotalSegmentCount())
+	suite.Equal(fullResp.GetTotalChannelCount(), deltaResp.GetTotalChannelCount())
+	suite.Empty(deltaResp.GetChannels())
+	suite.Empty(deltaResp.GetLeaderViews())
+	suite.Empty(deltaResp.GetRemovedChannelNames())
+}
+
+func (suite *ServiceSuite) TestGetDataDistribution_DeltaMismatchFallsBackToFull() {
+	ctx := context.Background()
+	suite.TestWatchDmChannelsInt64()
+	suite.TestLoadSegments_Int64()
+
+	fullResp, err := suite.node.GetDataDistribution(ctx, &querypb.GetDataDistributionRequest{
+		Base: &commonpb.MsgBase{
+			MsgID:    rand.Int63(),
+			TargetID: suite.node.session.ServerID,
+		},
+		SupportDelta: true,
+	})
+	suite.NoError(err)
+	suite.False(fullResp.GetIsDelta())
+
+	suite.node.updateDistributionModifyTS()
+	resp, err := suite.node.GetDataDistribution(ctx, &querypb.GetDataDistributionRequest{
+		Base: &commonpb.MsgBase{
+			MsgID:    rand.Int63(),
+			TargetID: suite.node.session.ServerID,
+		},
+		LastUpdateTs: fullResp.GetLastModifyTs() - 1,
+		SupportDelta: true,
+	})
+	suite.NoError(err)
+	suite.Equal(commonpb.ErrorCode_Success, resp.GetStatus().GetErrorCode())
+	suite.False(resp.GetIsDelta())
+	suite.NotEmpty(resp.GetSegments())
+	suite.NotEmpty(resp.GetLeaderViews()[0].GetSegmentDist())
+}
+
+func (suite *ServiceSuite) TestGetDataDistribution_DeltaReportsReleasedSealedSegment() {
+	ctx := context.Background()
+	suite.TestWatchDmChannelsInt64()
+	suite.TestLoadSegments_Int64()
+
+	fullResp, err := suite.node.GetDataDistribution(ctx, &querypb.GetDataDistributionRequest{
+		Base: &commonpb.MsgBase{
+			MsgID:    rand.Int63(),
+			TargetID: suite.node.session.ServerID,
+		},
+		SupportDelta: true,
+	})
+	suite.Require().NoError(err)
+	suite.Require().Equal(commonpb.ErrorCode_Success, fullResp.GetStatus().GetErrorCode())
+	suite.Require().False(fullResp.GetIsDelta())
+	suite.Require().NotEmpty(fullResp.GetSegments())
+
+	suite.Require().GreaterOrEqual(len(fullResp.GetSegments()), 2)
+	removedSegmentIDs := lo.Map(fullResp.GetSegments()[:2], func(info *querypb.SegmentVersionInfo, _ int) int64 {
+		return info.GetID()
+	})
+	status, err := suite.node.ReleaseSegments(ctx, &querypb.ReleaseSegmentsRequest{
+		Base: &commonpb.MsgBase{
+			MsgID:    rand.Int63(),
+			TargetID: suite.node.session.ServerID,
+		},
+		CollectionID: suite.collectionID,
+		SegmentIDs:   removedSegmentIDs,
+		Scope:        querypb.DataScope_Historical,
+	})
+	suite.Require().NoError(err)
+	suite.Require().Equal(commonpb.ErrorCode_Success, status.GetErrorCode())
+
+	deltaResp, err := suite.node.GetDataDistribution(ctx, &querypb.GetDataDistributionRequest{
+		Base: &commonpb.MsgBase{
+			MsgID:    rand.Int63(),
+			TargetID: suite.node.session.ServerID,
+		},
+		LastUpdateTs: fullResp.GetLastModifyTs(),
+		SupportDelta: true,
+	})
+	suite.Require().NoError(err)
+	suite.Require().Equal(commonpb.ErrorCode_Success, deltaResp.GetStatus().GetErrorCode())
+	suite.Require().True(deltaResp.GetIsDelta())
+	suite.Empty(deltaResp.GetSegments())
+	suite.ElementsMatch(removedSegmentIDs, deltaResp.GetRemovedSegmentIds())
+	suite.Equal(fullResp.GetTotalSegmentCount()-int64(len(removedSegmentIDs)), deltaResp.GetTotalSegmentCount())
+}
+
+func (suite *ServiceSuite) TestGetDataDistribution_DeltaReportsLeaderSegmentRemove() {
+	ctx := context.Background()
+	suite.TestWatchDmChannelsInt64()
+	suite.TestLoadSegments_Int64()
+
+	fullResp, err := suite.node.GetDataDistribution(ctx, &querypb.GetDataDistributionRequest{
+		Base: &commonpb.MsgBase{
+			MsgID:    rand.Int63(),
+			TargetID: suite.node.session.ServerID,
+		},
+		SupportDelta: true,
+	})
+	suite.Require().NoError(err)
+	suite.Require().Equal(commonpb.ErrorCode_Success, fullResp.GetStatus().GetErrorCode())
+	suite.Require().False(fullResp.GetIsDelta())
+	suite.Require().NotEmpty(fullResp.GetLeaderViews())
+	suite.Require().NotEmpty(fullResp.GetLeaderViews()[0].GetSegmentDist())
+
+	leaderView := fullResp.GetLeaderViews()[0]
+	removedSegmentIDs := make([]int64, 0, 2)
+	for segmentID := range leaderView.GetSegmentDist() {
+		removedSegmentIDs = append(removedSegmentIDs, segmentID)
+		if len(removedSegmentIDs) == 2 {
+			break
+		}
+	}
+	suite.Require().Len(removedSegmentIDs, 2)
+	status, err := suite.node.ReleaseSegments(ctx, &querypb.ReleaseSegmentsRequest{
+		Base: &commonpb.MsgBase{
+			MsgID:    rand.Int63(),
+			TargetID: suite.node.session.ServerID,
+		},
+		Shard:        leaderView.GetChannel(),
+		CollectionID: leaderView.GetCollection(),
+		SegmentIDs:   removedSegmentIDs,
+		NeedTransfer: true,
+		Scope:        querypb.DataScope_Historical,
+		NodeID:       suite.node.GetNodeID(),
+	})
+	suite.Require().NoError(err)
+	suite.Require().Equal(commonpb.ErrorCode_Success, status.GetErrorCode())
+
+	deltaResp, err := suite.node.GetDataDistribution(ctx, &querypb.GetDataDistributionRequest{
+		Base: &commonpb.MsgBase{
+			MsgID:    rand.Int63(),
+			TargetID: suite.node.session.ServerID,
+		},
+		LastUpdateTs: fullResp.GetLastModifyTs(),
+		SupportDelta: true,
+	})
+	suite.Require().NoError(err)
+	suite.Require().Equal(commonpb.ErrorCode_Success, deltaResp.GetStatus().GetErrorCode())
+	suite.Require().True(deltaResp.GetIsDelta())
+	suite.Require().Len(deltaResp.GetLeaderViews(), 1)
+	suite.Empty(deltaResp.GetSegments())
+	deltaLeaderView := deltaResp.GetLeaderViews()[0]
+	suite.Equal(leaderView.GetChannel(), deltaLeaderView.GetChannel())
+	suite.Len(deltaLeaderView.GetSegmentDist(), len(leaderView.GetSegmentDist())-len(removedSegmentIDs))
+	for _, segmentID := range removedSegmentIDs {
+		suite.NotContains(deltaLeaderView.GetSegmentDist(), segmentID)
+	}
+	suite.ElementsMatch(removedSegmentIDs, deltaResp.GetRemovedSegmentIds())
+	suite.Equal(fullResp.GetTotalSegmentCount()-int64(len(removedSegmentIDs)), deltaResp.GetTotalSegmentCount())
 }
 
 func (suite *ServiceSuite) TestSyncDistribution_Normal() {

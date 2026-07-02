@@ -987,6 +987,61 @@ var (
 			collectionIDLabelName,
 			"part",
 		})
+
+	QueryNodeDataDistributionReportTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: milvusNamespace,
+			Subsystem: typeutil.QueryNodeRole,
+			Name:      "data_distribution_report_total",
+			Help:      "total number of GetDataDistribution reports by report type",
+		}, []string{
+			nodeIDLabelName,
+			reportTypeLabelName,
+		})
+
+	QueryNodeDataDistributionReportBytes = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: milvusNamespace,
+			Subsystem: typeutil.QueryNodeRole,
+			Name:      "data_distribution_report_bytes_total",
+			Help:      "total protobuf response bytes of GetDataDistribution reports by report type",
+		}, []string{
+			nodeIDLabelName,
+			reportTypeLabelName,
+		})
+
+	QueryNodeDataDistributionReportSegmentTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: milvusNamespace,
+			Subsystem: typeutil.QueryNodeRole,
+			Name:      "data_distribution_report_segment_total",
+			Help:      "total number of segment version entries carried by GetDataDistribution reports",
+		}, []string{
+			nodeIDLabelName,
+			reportTypeLabelName,
+		})
+
+	QueryNodeDataDistributionReportLeaderSegmentTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: milvusNamespace,
+			Subsystem: typeutil.QueryNodeRole,
+			Name:      "data_distribution_report_leader_segment_total",
+			Help:      "total number of leader view sealed segment distribution entries carried by GetDataDistribution reports",
+		}, []string{
+			nodeIDLabelName,
+			reportTypeLabelName,
+		})
+
+	QueryNodeDataDistributionReportRemovedSegmentTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: milvusNamespace,
+			Subsystem: typeutil.QueryNodeRole,
+			Name:      "data_distribution_report_removed_segment_total",
+			Help:      "total number of removed segment entries carried by GetDataDistribution reports",
+		}, []string{
+			nodeIDLabelName,
+			reportTypeLabelName,
+		})
 )
 
 // RegisterQueryNode registers QueryNode metrics
@@ -1070,6 +1125,11 @@ func RegisterQueryNode(registry *prometheus.Registry) {
 	registry.MustRegister(QueryNodeGlobalRefineCount)
 	registry.MustRegister(QueryNodeGoDistributionRuntimeEstimatedBytes)
 	registry.MustRegister(QueryNodeGoDistributionRuntimeCount)
+	registry.MustRegister(QueryNodeDataDistributionReportTotal)
+	registry.MustRegister(QueryNodeDataDistributionReportBytes)
+	registry.MustRegister(QueryNodeDataDistributionReportSegmentTotal)
+	registry.MustRegister(QueryNodeDataDistributionReportLeaderSegmentTotal)
+	registry.MustRegister(QueryNodeDataDistributionReportRemovedSegmentTotal)
 	// Pool metrics collector (pull model — collectFn set later via SetPoolCollectFn)
 	registry.MustRegister(&poolMetricsCollector{})
 	registry.MustRegister(&queryNodeGoSegmentRuntimeMemoryCollector{})

@@ -99,6 +99,19 @@ func (suite *SegmentDistManagerSuite) TestVersion() {
 	suite.Greater(v2, v1)
 }
 
+func (suite *SegmentDistManagerSuite) TestPatchEmptyDelta() {
+	dist := suite.dist
+	v1 := dist.GetVersion()
+	before := dist.GetByFilter(WithNodeID(suite.nodes[0]))
+
+	dist.Patch(suite.nodes[0], nil, nil)
+
+	v2 := dist.GetVersion()
+	after := dist.GetByFilter(WithNodeID(suite.nodes[0]))
+	suite.Equal(v1, v2)
+	suite.Equal(before, after)
+}
+
 func (suite *SegmentDistManagerSuite) TestNodeOffline() {
 	dist := suite.dist
 
