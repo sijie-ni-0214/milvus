@@ -215,9 +215,15 @@ func (dh *distHandler) handleDistResp(ctx context.Context, resp *querypb.GetData
 	} else {
 		dh.lastUpdateTs = resp.GetLastModifyTs()
 
+		segmentCnt := len(resp.GetSegments())
+		channelCnt := len(resp.GetChannels())
+		if resp.GetIsDelta() {
+			segmentCnt = int(resp.GetTotalSegmentCount())
+			channelCnt = int(resp.GetTotalChannelCount())
+		}
 		node.UpdateStats(
-			session.WithSegmentCnt(len(resp.GetSegments())),
-			session.WithChannelCnt(len(resp.GetChannels())),
+			session.WithSegmentCnt(segmentCnt),
+			session.WithChannelCnt(channelCnt),
 			session.WithMemCapacity(resp.GetMemCapacityInMB()),
 			session.WithCPUNum(resp.GetCpuNum()),
 		)
@@ -276,6 +282,10 @@ func (dh *distHandler) updateSegmentsDistribution(ctx context.Context, resp *que
 		})
 	}
 
+	if resp.GetIsDelta() {
+		dh.dist.SegmentDistManager.Patch(resp.GetNodeID(), updates, resp.GetRemovedSegmentIds())
+		return
+	}
 	dh.dist.SegmentDistManager.Update(resp.GetNodeID(), updates...)
 }
 
@@ -351,7 +361,12 @@ func (dh *distHandler) updateChannelsDistribution(ctx context.Context, resp *que
 		}
 	}
 
-	newLeaderOnNode := dh.dist.ChannelDistManager.Update(resp.GetNodeID(), updates...)
+	var newLeaderOnNode []*meta.DmChannel
+	if resp.GetIsDelta() {
+		newLeaderOnNode = dh.dist.ChannelDistManager.Patch(resp.GetNodeID(), updates, resp.GetRemovedChannelNames())
+	} else {
+		newLeaderOnNode = dh.dist.ChannelDistManager.Update(resp.GetNodeID(), updates...)
+	}
 	if dh.notifyFunc != nil {
 		collectionIDs := typeutil.NewUniqueSet()
 		for _, ch := range newLeaderOnNode {
@@ -430,6 +445,7 @@ func (dh *distHandler) getDistribution(ctx context.Context) (*querypb.GetDataDis
 			commonpbutil.WithMsgType(commonpb.MsgType_GetDistribution),
 		),
 		LastUpdateTs: dh.lastUpdateTs,
+		SupportDelta: true,
 	})
 	if err != nil {
 		return nil, err
