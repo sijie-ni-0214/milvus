@@ -633,7 +633,6 @@ func (ob *TargetObserver) genSyncAction(ctx context.Context, leaderView *meta.Le
 	action := &querypb.SyncAction{
 		Type:                  querypb.SyncType_UpdateVersion,
 		GrowingInTarget:       growingSegments.Collect(),
-		SealedInTarget:        lo.Keys(sealedSegmentRowCount),
 		DroppedInTarget:       droppedSegments,
 		TargetVersion:         targetVersion,
 		SealedSegmentRowCount: sealedSegmentRowCount,

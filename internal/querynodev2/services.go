@@ -1749,10 +1749,10 @@ func (node *QueryNode) SyncDistribution(ctx context.Context, req *querypb.SyncDi
 				})
 			})
 		case querypb.SyncType_UpdateVersion:
-			// Version compatibility check: reject messages with inconsistent sealed segment fields
-			// In v2.6, SealedInTarget and SealedSegmentRowCount have consistent keys (same length)
-			// A mismatch indicates the message is from v2.5 which lacks SealedSegmentRowCount
-			if len(action.GetSealedInTarget()) != len(action.GetSealedSegmentRowCount()) {
+			// Reject legacy messages that only carry SealedInTarget without row counts.
+			// New coordinators may omit SealedInTarget because SealedSegmentRowCount
+			// already carries the same segment IDs as map keys.
+			if len(action.GetSealedInTarget()) > 0 && len(action.GetSealedInTarget()) != len(action.GetSealedSegmentRowCount()) {
 				log.Warn("Reject syncTargetVersion from older version Coordinator",
 					zap.String("channel", req.GetChannel()),
 					zap.Int("sealedInTarget", len(action.GetSealedInTarget())),
@@ -1773,12 +1773,14 @@ func (node *QueryNode) SyncDistribution(ctx context.Context, req *querypb.SyncDi
 				return id, action.GetCheckpoint().Timestamp
 			})
 			shardDelegator.AddExcludedSegments(droppedInfos)
-			flushedInfo := lo.SliceToMap(action.GetSealedInTarget(), func(id int64) (int64, uint64) {
+			flushedInfo := make(map[int64]uint64, len(action.GetSealedSegmentRowCount()))
+			for id := range action.GetSealedSegmentRowCount() {
 				if action.GetCheckpoint() == nil {
-					return id, typeutil.MaxTimestamp
+					flushedInfo[id] = typeutil.MaxTimestamp
+					continue
 				}
-				return id, action.GetCheckpoint().Timestamp
-			})
+				flushedInfo[id] = action.GetCheckpoint().Timestamp
+			}
 			shardDelegator.AddExcludedSegments(flushedInfo)
 			shardDelegator.SyncTargetVersion(action, req.GetLoadMeta().GetPartitionIDs())
 		case querypb.SyncType_UpdatePartitionStats:
