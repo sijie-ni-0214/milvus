@@ -65,9 +65,85 @@ import (
 	"github.com/milvus-io/milvus/pkg/v3/util/typeutil"
 )
 
-const queryNodeLoadSegmentsTimingLogInterval = 5 * time.Second
+const (
+	queryNodeLoadSegmentsTimingLogInterval = 5 * time.Second
+	queryNodeSealedLoadProgressLogInterval = 5 * time.Second
+)
 
 var queryNodeLoadSegmentsTiming = newQueryNodeLoadSegmentsTimingStats()
+
+func (node *QueryNode) markSealedLoadStart(segmentNum int) {
+	if segmentNum == 0 {
+		return
+	}
+	node.sealedLoadInFlight.Add(int64(segmentNum))
+	node.sealedLoadLastActivityUnixNano.Store(time.Now().UnixNano())
+}
+
+func (node *QueryNode) markSealedLoadDone(segmentNum int) {
+	if segmentNum == 0 {
+		return
+	}
+	node.sealedLoadInFlight.Sub(int64(segmentNum))
+	node.sealedLoadLastActivityUnixNano.Store(time.Now().UnixNano())
+}
+
+func (node *QueryNode) startSealedLoadProgressReporter(ctx context.Context, nodeID int64, countLoaded func() int) {
+	ticker := time.NewTicker(queryNodeSealedLoadProgressLogInterval)
+	go func() {
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				node.reportSealedLoadProgress(nodeID, countLoaded)
+			}
+		}
+	}()
+}
+
+func (node *QueryNode) reportSealedLoadProgress(nodeID int64, countLoaded func() int) {
+	lastActivity := node.sealedLoadLastActivityUnixNano.Load()
+	if lastActivity == 0 {
+		return
+	}
+
+	loaded := int64(countLoaded())
+	loading := node.sealedLoadInFlight.Load()
+	expected := loaded + loading
+	lastLogged := node.sealedLoadLastLoggedLoaded.Load()
+	if loading == 0 {
+		log.Warn("[SN recovery] sealed load complete",
+			zap.String("phase", "querynode.sealed_load_complete"),
+			zap.Int64("currentNodeID", nodeID),
+			zap.Int64("expected", loaded),
+			zap.Int64("loaded", loaded),
+			zap.Int64("loading", loading))
+		node.sealedLoadLastActivityUnixNano.Store(0)
+		node.sealedLoadLastLoggedLoaded.Store(loaded)
+		return
+	}
+
+	node.sealedLoadLastLoggedLoaded.Store(loaded)
+	log.Warn("[SN recovery] sealed load progress",
+		zap.String("phase", "querynode.sealed_load_progress"),
+		zap.Int64("currentNodeID", nodeID),
+		zap.Int64("expected", expected),
+		zap.Int64("loaded", loaded),
+		zap.Int64("loading", loading),
+		zap.Int64("loadedDelta", loaded-lastLogged))
+}
+
+func countSealedNonL0LoadInfos(infos []*querypb.SegmentLoadInfo) int {
+	count := 0
+	for _, info := range infos {
+		if info.GetLevel() != datapb.SegmentLevel_L0 {
+			count++
+		}
+	}
+	return count
+}
 
 type queryNodeLoadSegmentsTimingPhase struct {
 	healthCheckDur        time.Duration
@@ -851,6 +927,9 @@ func (node *QueryNode) LoadSegments(ctx context.Context, req *querypb.LoadSegmen
 	} else {
 		log.Debug("start to load segments...")
 	}
+	sealedNonL0SegmentNum := countSealedNonL0LoadInfos(req.GetInfos())
+	node.markSealedLoadStart(sealedNonL0SegmentNum)
+	defer node.markSealedLoadDone(sealedNonL0SegmentNum)
 	loaderStart := time.Now()
 	loaded, err := node.loader.Load(ctx,
 		req.GetCollectionID(),

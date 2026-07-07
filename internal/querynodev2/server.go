@@ -42,6 +42,7 @@ import (
 	"github.com/samber/lo"
 	"github.com/tidwall/gjson"
 	clientv3 "go.etcd.io/etcd/client/v3"
+	"go.uber.org/atomic"
 	"go.uber.org/zap"
 
 	"github.com/milvus-io/milvus-proto/go-api/v3/commonpb"
@@ -146,7 +147,10 @@ type QueryNode struct {
 	lastModifyTs     int64
 	distDeltaTracker *dataDistributionDeltaTracker
 
-	metricsRequest *metricsinfo.MetricsRequest
+	metricsRequest                 *metricsinfo.MetricsRequest
+	sealedLoadInFlight             atomic.Int64
+	sealedLoadLastActivityUnixNano atomic.Int64
+	sealedLoadLastLoggedLoaded     atomic.Int64
 
 	// binlogSaver for TEXT collection growing segment flush
 	binlogSaver segments.BinlogSaver
@@ -484,6 +488,15 @@ func (node *QueryNode) Start() error {
 			fmt.Sprint(node.GetNodeID()),
 			segments.CollectPoolStats,
 		)
+		node.startSealedLoadProgressReporter(node.ctx, node.GetNodeID(), func() int {
+			if node.manager == nil {
+				return 0
+			}
+			return node.manager.Segment.CountBy(
+				segments.WithType(segments.SegmentTypeSealed),
+				segments.WithoutLevel(datapb.SegmentLevel_L0),
+			)
+		})
 
 		registry.GetInMemoryResolver().RegisterQueryNode(node.GetNodeID(), node)
 		log.Info("query node start successfully",

@@ -74,6 +74,20 @@ type targetUpdateRequest struct {
 
 type initRequest struct{}
 
+type currentTargetReadyStats struct {
+	mut              sync.Mutex
+	readyGenerations map[int64]uint64
+	generation       uint64
+	readyCount       int
+	collectionCount  int
+}
+
+func newCurrentTargetReadyStats() *currentTargetReadyStats {
+	return &currentTargetReadyStats{
+		readyGenerations: make(map[int64]uint64),
+	}
+}
+
 type TargetObserver struct {
 	cancel    context.CancelFunc
 	wg        sync.WaitGroup
@@ -95,6 +109,7 @@ type TargetObserver struct {
 	loadingDispatcher *taskDispatcher[int64]
 	// loadedDispatcher updates targets for loaded collections.
 	loadedDispatcher *taskDispatcher[int64]
+	readyStats       *currentTargetReadyStats
 
 	keylocks *lock.KeyLock[int64]
 
@@ -121,6 +136,7 @@ func NewTargetObserver(
 		updateChan:           make(chan targetUpdateRequest, 10),
 		readyNotifiers:       make(map[int64][]chan struct{}),
 		initChan:             make(chan initRequest),
+		readyStats:           newCurrentTargetReadyStats(),
 		keylocks:             lock.NewKeyLock[int64](),
 	}
 
@@ -173,7 +189,9 @@ func (ob *TargetObserver) schedule(ctx context.Context) {
 			return
 
 		case <-ob.initChan:
-			for _, collectionID := range ob.meta.GetAll(ctx) {
+			collectionIDs := ob.meta.GetAll(ctx)
+			ob.startCurrentTargetReadyRound(len(collectionIDs))
+			for _, collectionID := range collectionIDs {
 				ob.init(ctx, collectionID)
 			}
 			log.Info("target observer init done")
@@ -190,6 +208,7 @@ func (ob *TargetObserver) schedule(ctx context.Context) {
 					loadingIDs = append(loadingIDs, c.GetCollectionID())
 				}
 			}
+			ob.startCurrentTargetReadyRound(len(loadedIDs))
 
 			ob.loadedDispatcher.AddTask(loadedIDs...)
 			ob.loadingDispatcher.AddTask(loadingIDs...)
@@ -415,6 +434,54 @@ func (ob *TargetObserver) clean() {
 			delete(ob.readyNotifiers, collectionID)
 		}
 	}
+	ob.pruneCurrentTargetReadyStats(collectionSet)
+}
+
+func (ob *TargetObserver) pruneCurrentTargetReadyStats(collectionSet typeutil.Set[int64]) {
+	ob.readyStats.mut.Lock()
+	defer ob.readyStats.mut.Unlock()
+	for collectionID := range ob.readyStats.readyGenerations {
+		if !collectionSet.Contain(collectionID) {
+			delete(ob.readyStats.readyGenerations, collectionID)
+		}
+	}
+}
+
+func (ob *TargetObserver) startCurrentTargetReadyRound(collectionCount int) {
+	ob.readyStats.mut.Lock()
+	defer ob.readyStats.mut.Unlock()
+	ob.readyStats.generation++
+	ob.readyStats.readyCount = 0
+	ob.readyStats.collectionCount = collectionCount
+}
+
+func (ob *TargetObserver) recordCurrentTargetReady(ctx context.Context, collectionID int64) {
+	ob.readyStats.mut.Lock()
+	if ob.readyStats.generation == 0 {
+		ob.readyStats.generation = 1
+	}
+	newReady := ob.readyStats.readyGenerations[collectionID] != ob.readyStats.generation
+	if newReady {
+		ob.readyStats.readyGenerations[collectionID] = ob.readyStats.generation
+		ob.readyStats.readyCount++
+	}
+	readyCollections := ob.readyStats.readyCount
+	totalCollections := ob.readyStats.collectionCount
+	if totalCollections == 0 {
+		totalCollections = len(ob.meta.GetAll(ctx))
+		ob.readyStats.collectionCount = totalCollections
+	}
+	complete := newReady && totalCollections > 0 && readyCollections >= totalCollections
+	ob.readyStats.mut.Unlock()
+
+	if !complete {
+		return
+	}
+
+	log.Ctx(ctx).Warn("[QC recovery] current target ready",
+		zap.String("phase", "querycoord.current_target_ready_aggregate"),
+		zap.Int("readyCollectionCount", readyCollections),
+		zap.Int("collectionCount", totalCollections))
 }
 
 func (ob *TargetObserver) shouldUpdateNextTarget(ctx context.Context, collectionID int64) bool {
@@ -703,6 +770,7 @@ func (ob *TargetObserver) updateCurrentTarget(ctx context.Context, collectionID 
 			zap.Int("channelCount", len(channels)),
 			zap.Int("sealedSegmentCount", len(segments)),
 			zap.Int("replicaCount", len(replicas)))
+		ob.recordCurrentTargetReady(ctx, collectionID)
 
 		ob.mut.Lock()
 		defer ob.mut.Unlock()
