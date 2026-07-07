@@ -66,11 +66,13 @@ import (
 )
 
 const (
-	queryNodeLoadSegmentsTimingLogInterval = 5 * time.Second
-	queryNodeSealedLoadProgressLogInterval = 5 * time.Second
+	queryNodeLoadSegmentsTimingLogInterval    = 5 * time.Second
+	queryNodeWatchDmChannelsTimingLogInterval = 5 * time.Second
+	queryNodeSealedLoadProgressLogInterval    = 5 * time.Second
 )
 
 var queryNodeLoadSegmentsTiming = newQueryNodeLoadSegmentsTimingStats()
+var queryNodeWatchDmChannelsTiming = newQueryNodeWatchDmChannelsTimingStats()
 
 func (node *QueryNode) markSealedLoadStart(segmentNum int) {
 	if segmentNum == 0 {
@@ -193,6 +195,82 @@ type queryNodeLoadSegmentsTimingStats struct {
 	lastLogUnixNano    *atomic.Int64
 }
 
+type queryNodeWatchDmChannelsTimingPhase struct {
+	putOrRefCollectionDur        time.Duration
+	newShardDelegatorDur         time.Duration
+	addPipelineDur               time.Duration
+	addExcludedSegmentsDur       time.Duration
+	loadL0SegmentsDur            time.Duration
+	loadGrowingSegmentsDur       time.Duration
+	consumeMsgStreamDur          time.Duration
+	startPipelineAndDelegatorDur time.Duration
+	totalDur                     time.Duration
+}
+
+type queryNodeWatchDmChannelsTimingStats struct {
+	count                          *atomic.Int64
+	channelCount                   *atomic.Int64
+	successCount                   *atomic.Int64
+	failureCount                   *atomic.Int64
+	flushedSegmentCount            *atomic.Int64
+	unflushedSegmentCount          *atomic.Int64
+	droppedSegmentCount            *atomic.Int64
+	levelZeroSegmentCount          *atomic.Int64
+	sealedSegmentRowCount          *atomic.Int64
+	totalPutOrRefCollection        *atomic.Int64
+	totalNewShardDelegator         *atomic.Int64
+	totalAddPipeline               *atomic.Int64
+	totalAddExcludedSegments       *atomic.Int64
+	totalLoadL0Segments            *atomic.Int64
+	totalLoadGrowingSegments       *atomic.Int64
+	totalConsumeMsgStream          *atomic.Int64
+	totalStartPipelineAndDelegator *atomic.Int64
+	totalRequest                   *atomic.Int64
+	maxPutOrRefCollection          *atomic.Int64
+	maxNewShardDelegator           *atomic.Int64
+	maxAddPipeline                 *atomic.Int64
+	maxAddExcludedSegments         *atomic.Int64
+	maxLoadL0Segments              *atomic.Int64
+	maxLoadGrowingSegments         *atomic.Int64
+	maxConsumeMsgStream            *atomic.Int64
+	maxStartPipelineAndDelegator   *atomic.Int64
+	maxRequest                     *atomic.Int64
+	lastLogUnixNano                *atomic.Int64
+}
+
+func newQueryNodeWatchDmChannelsTimingStats() *queryNodeWatchDmChannelsTimingStats {
+	return &queryNodeWatchDmChannelsTimingStats{
+		count:                          atomic.NewInt64(0),
+		channelCount:                   atomic.NewInt64(0),
+		successCount:                   atomic.NewInt64(0),
+		failureCount:                   atomic.NewInt64(0),
+		flushedSegmentCount:            atomic.NewInt64(0),
+		unflushedSegmentCount:          atomic.NewInt64(0),
+		droppedSegmentCount:            atomic.NewInt64(0),
+		levelZeroSegmentCount:          atomic.NewInt64(0),
+		sealedSegmentRowCount:          atomic.NewInt64(0),
+		totalPutOrRefCollection:        atomic.NewInt64(0),
+		totalNewShardDelegator:         atomic.NewInt64(0),
+		totalAddPipeline:               atomic.NewInt64(0),
+		totalAddExcludedSegments:       atomic.NewInt64(0),
+		totalLoadL0Segments:            atomic.NewInt64(0),
+		totalLoadGrowingSegments:       atomic.NewInt64(0),
+		totalConsumeMsgStream:          atomic.NewInt64(0),
+		totalStartPipelineAndDelegator: atomic.NewInt64(0),
+		totalRequest:                   atomic.NewInt64(0),
+		maxPutOrRefCollection:          atomic.NewInt64(0),
+		maxNewShardDelegator:           atomic.NewInt64(0),
+		maxAddPipeline:                 atomic.NewInt64(0),
+		maxAddExcludedSegments:         atomic.NewInt64(0),
+		maxLoadL0Segments:              atomic.NewInt64(0),
+		maxLoadGrowingSegments:         atomic.NewInt64(0),
+		maxConsumeMsgStream:            atomic.NewInt64(0),
+		maxStartPipelineAndDelegator:   atomic.NewInt64(0),
+		maxRequest:                     atomic.NewInt64(0),
+		lastLogUnixNano:                atomic.NewInt64(time.Now().UnixNano()),
+	}
+}
+
 func newQueryNodeLoadSegmentsTimingStats() *queryNodeLoadSegmentsTimingStats {
 	return &queryNodeLoadSegmentsTimingStats{
 		count:              atomic.NewInt64(0),
@@ -246,6 +324,115 @@ func avgQueryNodeLoadSegmentsDuration(total int64, count int64) time.Duration {
 		return 0
 	}
 	return time.Duration(total / count)
+}
+
+func (s *queryNodeWatchDmChannelsTimingStats) record(success bool, channelNum int, channelInfo *datapb.VchannelInfo, sealedSegmentRowCountNum int, timing queryNodeWatchDmChannelsTimingPhase) {
+	s.count.Inc()
+	s.channelCount.Add(int64(channelNum))
+	if success {
+		s.successCount.Inc()
+	} else {
+		s.failureCount.Inc()
+	}
+	if channelInfo != nil {
+		s.flushedSegmentCount.Add(int64(len(channelInfo.GetFlushedSegmentIds())))
+		s.unflushedSegmentCount.Add(int64(len(channelInfo.GetUnflushedSegmentIds())))
+		s.droppedSegmentCount.Add(int64(len(channelInfo.GetDroppedSegmentIds())))
+		s.levelZeroSegmentCount.Add(int64(len(channelInfo.GetLevelZeroSegmentIds())))
+	}
+	s.sealedSegmentRowCount.Add(int64(sealedSegmentRowCountNum))
+
+	s.totalPutOrRefCollection.Add(int64(timing.putOrRefCollectionDur))
+	s.totalNewShardDelegator.Add(int64(timing.newShardDelegatorDur))
+	s.totalAddPipeline.Add(int64(timing.addPipelineDur))
+	s.totalAddExcludedSegments.Add(int64(timing.addExcludedSegmentsDur))
+	s.totalLoadL0Segments.Add(int64(timing.loadL0SegmentsDur))
+	s.totalLoadGrowingSegments.Add(int64(timing.loadGrowingSegmentsDur))
+	s.totalConsumeMsgStream.Add(int64(timing.consumeMsgStreamDur))
+	s.totalStartPipelineAndDelegator.Add(int64(timing.startPipelineAndDelegatorDur))
+	s.totalRequest.Add(int64(timing.totalDur))
+	updateQueryNodeLoadSegmentsMaxDuration(s.maxPutOrRefCollection, timing.putOrRefCollectionDur)
+	updateQueryNodeLoadSegmentsMaxDuration(s.maxNewShardDelegator, timing.newShardDelegatorDur)
+	updateQueryNodeLoadSegmentsMaxDuration(s.maxAddPipeline, timing.addPipelineDur)
+	updateQueryNodeLoadSegmentsMaxDuration(s.maxAddExcludedSegments, timing.addExcludedSegmentsDur)
+	updateQueryNodeLoadSegmentsMaxDuration(s.maxLoadL0Segments, timing.loadL0SegmentsDur)
+	updateQueryNodeLoadSegmentsMaxDuration(s.maxLoadGrowingSegments, timing.loadGrowingSegmentsDur)
+	updateQueryNodeLoadSegmentsMaxDuration(s.maxConsumeMsgStream, timing.consumeMsgStreamDur)
+	updateQueryNodeLoadSegmentsMaxDuration(s.maxStartPipelineAndDelegator, timing.startPipelineAndDelegatorDur)
+	updateQueryNodeLoadSegmentsMaxDuration(s.maxRequest, timing.totalDur)
+
+	now := time.Now()
+	last := s.lastLogUnixNano.Load()
+	if now.UnixNano()-last < int64(queryNodeWatchDmChannelsTimingLogInterval) {
+		return
+	}
+	if !s.lastLogUnixNano.CompareAndSwap(last, now.UnixNano()) {
+		return
+	}
+	windowDur := time.Duration(now.UnixNano() - last)
+
+	count := s.count.Swap(0)
+	channelCount := s.channelCount.Swap(0)
+	successCount := s.successCount.Swap(0)
+	failureCount := s.failureCount.Swap(0)
+	flushedSegmentCount := s.flushedSegmentCount.Swap(0)
+	unflushedSegmentCount := s.unflushedSegmentCount.Swap(0)
+	droppedSegmentCount := s.droppedSegmentCount.Swap(0)
+	levelZeroSegmentCount := s.levelZeroSegmentCount.Swap(0)
+	sealedSegmentRowCount := s.sealedSegmentRowCount.Swap(0)
+	totalPutOrRefCollection := s.totalPutOrRefCollection.Swap(0)
+	totalNewShardDelegator := s.totalNewShardDelegator.Swap(0)
+	totalAddPipeline := s.totalAddPipeline.Swap(0)
+	totalAddExcludedSegments := s.totalAddExcludedSegments.Swap(0)
+	totalLoadL0Segments := s.totalLoadL0Segments.Swap(0)
+	totalLoadGrowingSegments := s.totalLoadGrowingSegments.Swap(0)
+	totalConsumeMsgStream := s.totalConsumeMsgStream.Swap(0)
+	totalStartPipelineAndDelegator := s.totalStartPipelineAndDelegator.Swap(0)
+	totalRequest := s.totalRequest.Swap(0)
+	maxPutOrRefCollection := s.maxPutOrRefCollection.Swap(0)
+	maxNewShardDelegator := s.maxNewShardDelegator.Swap(0)
+	maxAddPipeline := s.maxAddPipeline.Swap(0)
+	maxAddExcludedSegments := s.maxAddExcludedSegments.Swap(0)
+	maxLoadL0Segments := s.maxLoadL0Segments.Swap(0)
+	maxLoadGrowingSegments := s.maxLoadGrowingSegments.Swap(0)
+	maxConsumeMsgStream := s.maxConsumeMsgStream.Swap(0)
+	maxStartPipelineAndDelegator := s.maxStartPipelineAndDelegator.Swap(0)
+	maxRequest := s.maxRequest.Swap(0)
+	if count == 0 {
+		return
+	}
+
+	log.Warn("[SN recovery] watch dm channel timing stats",
+		zap.String("phase", "querynode.watch_dm_channels"),
+		zap.Duration("windowDur", windowDur),
+		zap.Int64("requestCount", count),
+		zap.Int64("channelCount", channelCount),
+		zap.Int64("successCount", successCount),
+		zap.Int64("failureCount", failureCount),
+		zap.Int64("flushedSegmentCount", flushedSegmentCount),
+		zap.Int64("unflushedSegmentCount", unflushedSegmentCount),
+		zap.Int64("droppedSegmentCount", droppedSegmentCount),
+		zap.Int64("levelZeroSegmentCount", levelZeroSegmentCount),
+		zap.Int64("sealedSegmentRowCount", sealedSegmentRowCount),
+		zap.Duration("avgPutOrRefCollectionDur", avgQueryNodeLoadSegmentsDuration(totalPutOrRefCollection, count)),
+		zap.Duration("avgNewShardDelegatorDur", avgQueryNodeLoadSegmentsDuration(totalNewShardDelegator, count)),
+		zap.Duration("avgAddPipelineDur", avgQueryNodeLoadSegmentsDuration(totalAddPipeline, count)),
+		zap.Duration("avgAddExcludedSegmentsDur", avgQueryNodeLoadSegmentsDuration(totalAddExcludedSegments, count)),
+		zap.Duration("avgLoadL0SegmentsDur", avgQueryNodeLoadSegmentsDuration(totalLoadL0Segments, count)),
+		zap.Duration("avgLoadGrowingSegmentsDur", avgQueryNodeLoadSegmentsDuration(totalLoadGrowingSegments, count)),
+		zap.Duration("avgConsumeMsgStreamDur", avgQueryNodeLoadSegmentsDuration(totalConsumeMsgStream, count)),
+		zap.Duration("avgStartPipelineAndDelegatorDur", avgQueryNodeLoadSegmentsDuration(totalStartPipelineAndDelegator, count)),
+		zap.Duration("avgTotalDur", avgQueryNodeLoadSegmentsDuration(totalRequest, count)),
+		zap.Duration("maxPutOrRefCollectionDur", time.Duration(maxPutOrRefCollection)),
+		zap.Duration("maxNewShardDelegatorDur", time.Duration(maxNewShardDelegator)),
+		zap.Duration("maxAddPipelineDur", time.Duration(maxAddPipeline)),
+		zap.Duration("maxAddExcludedSegmentsDur", time.Duration(maxAddExcludedSegments)),
+		zap.Duration("maxLoadL0SegmentsDur", time.Duration(maxLoadL0Segments)),
+		zap.Duration("maxLoadGrowingSegmentsDur", time.Duration(maxLoadGrowingSegments)),
+		zap.Duration("maxConsumeMsgStreamDur", time.Duration(maxConsumeMsgStream)),
+		zap.Duration("maxStartPipelineAndDelegatorDur", time.Duration(maxStartPipelineAndDelegator)),
+		zap.Duration("maxTotalDur", time.Duration(maxRequest)),
+	)
 }
 
 func (s *queryNodeLoadSegmentsTimingStats) record(loadScope querypb.LoadScope, needTransfer bool, segmentNum int, timing queryNodeLoadSegmentsTimingPhase) {
@@ -528,11 +715,23 @@ func (node *QueryNode) WatchDmChannels(ctx context.Context, req *querypb.WatchDm
 		zap.Int64("version", req.GetVersion()),
 	)
 	watchStart := time.Now()
+	timing := queryNodeWatchDmChannelsTimingPhase{}
+	defer func() {
+		timing.totalDur = time.Since(watchStart)
+		queryNodeWatchDmChannelsTiming.record(
+			merr.Ok(status),
+			len(req.GetInfos()),
+			channel,
+			len(req.GetSealedSegmentRowCount()),
+			timing,
+		)
+	}()
 	stageStart := watchStart
-	logWatchStage := func(stage string, startedAt time.Time) {
+	logWatchStage := func(stage string, startedAt time.Time) time.Duration {
+		stageDur := time.Since(startedAt)
 		log.Warn("watch dm channel timing",
 			zap.String("stage", stage),
-			zap.Duration("stageDur", time.Since(startedAt)),
+			zap.Duration("stageDur", stageDur),
 			zap.Duration("totalDur", time.Since(watchStart)),
 			zap.Int("flushedSegmentNum", len(channel.GetFlushedSegmentIds())),
 			zap.Int("unflushedSegmentNum", len(channel.GetUnflushedSegmentIds())),
@@ -540,6 +739,7 @@ func (node *QueryNode) WatchDmChannels(ctx context.Context, req *querypb.WatchDm
 			zap.Int("levelZeroSegmentNum", len(channel.GetLevelZeroSegmentIds())),
 			zap.Int("sealedSegmentRowCountNum", len(req.GetSealedSegmentRowCount())),
 		)
+		return stageDur
 	}
 
 	// check node healthy
@@ -580,7 +780,7 @@ func (node *QueryNode) WatchDmChannels(ctx context.Context, req *querypb.WatchDm
 		log.Warn("failed to ref collection", zap.Error(err))
 		return merr.Status(err), nil
 	}
-	logWatchStage("put_or_ref_collection", stageStart)
+	timing.putOrRefCollectionDur = logWatchStage("put_or_ref_collection", stageStart)
 	stageStart = time.Now()
 	defer func() {
 		if !merr.Ok(status) {
@@ -615,7 +815,7 @@ func (node *QueryNode) WatchDmChannels(ctx context.Context, req *querypb.WatchDm
 		return merr.Status(err), nil
 	}
 	node.delegators.Insert(channel.GetChannelName(), delegator)
-	logWatchStage("new_shard_delegator", stageStart)
+	timing.newShardDelegatorDur = logWatchStage("new_shard_delegator", stageStart)
 	stageStart = time.Now()
 	defer func() {
 		if err != nil {
@@ -630,7 +830,7 @@ func (node *QueryNode) WatchDmChannels(ctx context.Context, req *querypb.WatchDm
 		log.Warn(msg, zap.Error(err))
 		return merr.Status(err), nil
 	}
-	logWatchStage("add_pipeline", stageStart)
+	timing.addPipelineDur = logWatchStage("add_pipeline", stageStart)
 	stageStart = time.Now()
 	defer func() {
 		if err != nil {
@@ -653,7 +853,7 @@ func (node *QueryNode) WatchDmChannels(ctx context.Context, req *querypb.WatchDm
 		return id, typeutil.MaxTimestamp
 	})
 	delegator.AddExcludedSegments(droppedInfo)
-	logWatchStage("add_excluded_segments", stageStart)
+	timing.addExcludedSegmentsDur = logWatchStage("add_excluded_segments", stageStart)
 	stageStart = time.Now()
 
 	defer func() {
@@ -669,7 +869,7 @@ func (node *QueryNode) WatchDmChannels(ctx context.Context, req *querypb.WatchDm
 		log.Warn("failed to load l0 segments", zap.Error(err))
 		return merr.Status(err), nil
 	}
-	logWatchStage("load_l0_segments", stageStart)
+	timing.loadL0SegmentsDur = logWatchStage("load_l0_segments", stageStart)
 	stageStart = time.Now()
 	err = loadGrowingSegments(ctx, delegator, req)
 	if err != nil {
@@ -677,7 +877,7 @@ func (node *QueryNode) WatchDmChannels(ctx context.Context, req *querypb.WatchDm
 		log.Warn(msg, zap.Error(err))
 		return merr.Status(err), nil
 	}
-	logWatchStage("load_growing_segments", stageStart)
+	timing.loadGrowingSegmentsDur = logWatchStage("load_growing_segments", stageStart)
 	stageStart = time.Now()
 
 	// Use seekPosition directly to start consuming the message stream.
@@ -707,14 +907,14 @@ func (node *QueryNode) WatchDmChannels(ctx context.Context, req *querypb.WatchDm
 		)
 		return merr.Status(err), nil
 	}
-	logWatchStage("consume_msg_stream", stageStart)
+	timing.consumeMsgStreamDur = logWatchStage("consume_msg_stream", stageStart)
 	stageStart = time.Now()
 
 	// start pipeline
 	pipeline.Start()
 	// delegator after all steps done
 	delegator.Start()
-	logWatchStage("start_pipeline_and_delegator", stageStart)
+	timing.startPipelineAndDelegatorDur = logWatchStage("start_pipeline_and_delegator", stageStart)
 	node.distDeltaTracker.markChannelViewUpsert(channel.GetChannelName())
 	log.Info("watch dml channel success")
 	return merr.Success(), nil
