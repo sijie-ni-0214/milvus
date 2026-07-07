@@ -17,7 +17,6 @@
 package segments
 
 import (
-	"fmt"
 	"sort"
 	"sync"
 	"unsafe"
@@ -81,8 +80,7 @@ const (
 )
 
 type goSegmentRuntimeMetricKey struct {
-	collectionID string
-	part         string
+	part string
 }
 
 type goSegmentRuntimeMetricValue struct {
@@ -106,55 +104,49 @@ func (mgr *segmentManager) collectGoSegmentRuntimeMemoryStats() []metrics.QueryN
 	stats := make([]metrics.QueryNodeGoSegmentRuntimeMemoryStats, 0, len(aggregates))
 	for key, value := range aggregates {
 		stats = append(stats, metrics.QueryNodeGoSegmentRuntimeMemoryStats{
-			CollectionID: key.collectionID,
-			Part:         key.part,
-			Count:        float64(value.count),
-			Bytes:        float64(value.bytes),
+			Part:  key.part,
+			Count: float64(value.count),
+			Bytes: float64(value.bytes),
 		})
 	}
 	sort.Slice(stats, func(i, j int) bool {
-		if stats[i].CollectionID != stats[j].CollectionID {
-			return stats[i].CollectionID < stats[j].CollectionID
-		}
 		return stats[i].Part < stats[j].Part
 	})
 	return stats
 }
 
 func collectLocalSegmentRuntimeMemoryStats(aggregates map[goSegmentRuntimeMetricKey]goSegmentRuntimeMetricValue, segment *LocalSegment) {
-	collectionID := fmt.Sprint(segment.Collection())
-
-	addGoSegmentRuntimeMetric(aggregates, collectionID, goMemPartSegmentCount, 1, 0)
-	addGoSegmentRuntimeMetric(aggregates, collectionID, goMemPartBaseSegmentObject, 1, int64(unsafe.Sizeof(baseSegment{})))
-	addGoSegmentRuntimeMetric(aggregates, collectionID, goMemPartLocalSegmentObjectExtra, 1, int64(unsafe.Sizeof(LocalSegment{})-unsafe.Sizeof(baseSegment{})))
-	addGoSegmentRuntimeMetric(aggregates, collectionID, goMemPartLoadStateLockObject, 1, loadStateLockRuntimeBytes())
-	addGoSegmentRuntimeMetric(aggregates, collectionID, goMemPartSegmentAtomicObject, 9, segmentAtomicRuntimeBytes())
-	addGoSegmentRuntimeMetric(aggregates, collectionID, goMemPartSegmentContainerShell, 1, segmentContainerShellRuntimeBytes())
-	addGoSegmentRuntimeMetric(aggregates, collectionID, goMemPartSegmentManagerReference, 2, segmentManagerReferenceRuntimeBytes(2))
-	collectBM25StatsRuntimeMemoryStats(aggregates, collectionID, segment)
-	collectResourceUsageCacheRuntimeMemoryStats(aggregates, collectionID, segment)
+	addGoSegmentRuntimeMetric(aggregates, goMemPartSegmentCount, 1, 0)
+	addGoSegmentRuntimeMetric(aggregates, goMemPartBaseSegmentObject, 1, int64(unsafe.Sizeof(baseSegment{})))
+	addGoSegmentRuntimeMetric(aggregates, goMemPartLocalSegmentObjectExtra, 1, int64(unsafe.Sizeof(LocalSegment{})-unsafe.Sizeof(baseSegment{})))
+	addGoSegmentRuntimeMetric(aggregates, goMemPartLoadStateLockObject, 1, loadStateLockRuntimeBytes())
+	addGoSegmentRuntimeMetric(aggregates, goMemPartSegmentAtomicObject, 9, segmentAtomicRuntimeBytes())
+	addGoSegmentRuntimeMetric(aggregates, goMemPartSegmentContainerShell, 1, segmentContainerShellRuntimeBytes())
+	addGoSegmentRuntimeMetric(aggregates, goMemPartSegmentManagerReference, 2, segmentManagerReferenceRuntimeBytes(2))
+	collectBM25StatsRuntimeMemoryStats(aggregates, segment)
+	collectResourceUsageCacheRuntimeMemoryStats(aggregates, segment)
 
 	if _, ok := segment.pkCandidate.(*pkoracle.BloomFilterSet); ok {
-		addGoSegmentRuntimeMetric(aggregates, collectionID, goMemPartPKCandidateObject, 1, int64(unsafe.Sizeof(pkoracle.BloomFilterSet{})))
+		addGoSegmentRuntimeMetric(aggregates, goMemPartPKCandidateObject, 1, int64(unsafe.Sizeof(pkoracle.BloomFilterSet{})))
 	}
 
-	collectLoadInfoRuntimeMemoryStats(aggregates, collectionID, segment.LoadInfo())
-	collectFieldRuntimeMemoryStats(aggregates, collectionID, segment)
-	collectManifestLazyKeyRuntimeMemoryStats(aggregates, collectionID, segment)
+	collectLoadInfoRuntimeMemoryStats(aggregates, segment.LoadInfo())
+	collectFieldRuntimeMemoryStats(aggregates, segment)
+	collectManifestLazyKeyRuntimeMemoryStats(aggregates, segment)
 }
 
-func collectLoadInfoRuntimeMemoryStats(aggregates map[goSegmentRuntimeMetricKey]goSegmentRuntimeMetricValue, collectionID string, loadInfo *querypb.SegmentLoadInfo) {
+func collectLoadInfoRuntimeMemoryStats(aggregates map[goSegmentRuntimeMetricKey]goSegmentRuntimeMetricValue, loadInfo *querypb.SegmentLoadInfo) {
 	if loadInfo == nil {
 		return
 	}
-	addGoSegmentRuntimeMetric(aggregates, collectionID, goMemPartCompactLoadInfoObject, 1, int64(unsafe.Sizeof(querypb.SegmentLoadInfo{})))
-	addGoSegmentRuntimeMetric(aggregates, collectionID, goMemPartCompactLoadInfoString, 2, int64(len(loadInfo.GetInsertChannel())+len(loadInfo.GetManifestPath())))
-	addGoSegmentRuntimeMetric(aggregates, collectionID, goMemPartCompactLoadInfoCompactionSlice, int64(len(loadInfo.GetCompactionFrom())), int64(cap(loadInfo.GetCompactionFrom()))*int64(unsafe.Sizeof(int64(0))))
-	addGoSegmentRuntimeMetric(aggregates, collectionID, goMemPartCompactLoadInfoDeltalogSlice, int64(len(loadInfo.GetDeltalogs())), slicePointerBackingBytes(cap(loadInfo.GetDeltalogs())))
-	collectMsgPositionRuntimeMemoryStats(aggregates, collectionID, loadInfo.GetStartPosition())
-	collectMsgPositionRuntimeMemoryStats(aggregates, collectionID, loadInfo.GetDeltaPosition())
+	addGoSegmentRuntimeMetric(aggregates, goMemPartCompactLoadInfoObject, 1, int64(unsafe.Sizeof(querypb.SegmentLoadInfo{})))
+	addGoSegmentRuntimeMetric(aggregates, goMemPartCompactLoadInfoString, 2, int64(len(loadInfo.GetInsertChannel())+len(loadInfo.GetManifestPath())))
+	addGoSegmentRuntimeMetric(aggregates, goMemPartCompactLoadInfoCompactionSlice, int64(len(loadInfo.GetCompactionFrom())), int64(cap(loadInfo.GetCompactionFrom()))*int64(unsafe.Sizeof(int64(0))))
+	addGoSegmentRuntimeMetric(aggregates, goMemPartCompactLoadInfoDeltalogSlice, int64(len(loadInfo.GetDeltalogs())), slicePointerBackingBytes(cap(loadInfo.GetDeltalogs())))
+	collectMsgPositionRuntimeMemoryStats(aggregates, loadInfo.GetStartPosition())
+	collectMsgPositionRuntimeMemoryStats(aggregates, loadInfo.GetDeltaPosition())
 	for _, fieldBinlog := range loadInfo.GetDeltalogs() {
-		collectFieldBinlogRuntimeMemoryStats(aggregates, collectionID, fieldBinlog, fieldBinlogRuntimeParts{
+		collectFieldBinlogRuntimeMemoryStats(aggregates, fieldBinlog, fieldBinlogRuntimeParts{
 			object:          goMemPartLoadInfoDeltalogObject,
 			binlogSlice:     goMemPartLoadInfoDeltalogBinlogSlice,
 			childFieldSlice: goMemPartLoadInfoDeltalogChildFieldSlice,
@@ -165,22 +157,22 @@ func collectLoadInfoRuntimeMemoryStats(aggregates map[goSegmentRuntimeMetricKey]
 	}
 }
 
-func collectMsgPositionRuntimeMemoryStats(aggregates map[goSegmentRuntimeMetricKey]goSegmentRuntimeMetricValue, collectionID string, position *msgpb.MsgPosition) {
+func collectMsgPositionRuntimeMemoryStats(aggregates map[goSegmentRuntimeMetricKey]goSegmentRuntimeMetricValue, position *msgpb.MsgPosition) {
 	if position == nil {
 		return
 	}
-	addGoSegmentRuntimeMetric(aggregates, collectionID, goMemPartCompactLoadInfoPositionObject, 1, int64(unsafe.Sizeof(msgpb.MsgPosition{})))
-	addGoSegmentRuntimeMetric(aggregates, collectionID, goMemPartCompactLoadInfoPositionString, 2, int64(len(position.GetChannelName())+len(position.GetMsgGroup())))
-	addGoSegmentRuntimeMetric(aggregates, collectionID, goMemPartCompactLoadInfoPositionMsgID, 1, int64(len(position.GetMsgID())))
+	addGoSegmentRuntimeMetric(aggregates, goMemPartCompactLoadInfoPositionObject, 1, int64(unsafe.Sizeof(msgpb.MsgPosition{})))
+	addGoSegmentRuntimeMetric(aggregates, goMemPartCompactLoadInfoPositionString, 2, int64(len(position.GetChannelName())+len(position.GetMsgGroup())))
+	addGoSegmentRuntimeMetric(aggregates, goMemPartCompactLoadInfoPositionMsgID, 1, int64(len(position.GetMsgID())))
 }
 
-func collectFieldRuntimeMemoryStats(aggregates map[goSegmentRuntimeMetricKey]goSegmentRuntimeMetricValue, collectionID string, segment *LocalSegment) {
+func collectFieldRuntimeMemoryStats(aggregates map[goSegmentRuntimeMetricKey]goSegmentRuntimeMetricValue, segment *LocalSegment) {
 	segment.fields.Range(func(_ int64, info *FieldInfo) bool {
 		if info == nil {
 			return true
 		}
-		addGoSegmentRuntimeMetric(aggregates, collectionID, goMemPartFieldInfoObject, 1, int64(unsafe.Sizeof(FieldInfo{})))
-		collectFieldBinlogRuntimeMemoryStats(aggregates, collectionID, info.FieldBinlog, fieldBinlogRuntimeParts{
+		addGoSegmentRuntimeMetric(aggregates, goMemPartFieldInfoObject, 1, int64(unsafe.Sizeof(FieldInfo{})))
+		collectFieldBinlogRuntimeMemoryStats(aggregates, info.FieldBinlog, fieldBinlogRuntimeParts{
 			object:          goMemPartFieldBinlogObject,
 			binlogSlice:     goMemPartFieldBinlogBinlogSlice,
 			childFieldSlice: goMemPartFieldBinlogChildFieldSlice,
@@ -195,8 +187,8 @@ func collectFieldRuntimeMemoryStats(aggregates map[goSegmentRuntimeMetricKey]goS
 		if info == nil {
 			return true
 		}
-		addGoSegmentRuntimeMetric(aggregates, collectionID, goMemPartIndexedFieldInfoObject, 1, int64(unsafe.Sizeof(IndexedFieldInfo{})))
-		collectFieldBinlogRuntimeMemoryStats(aggregates, collectionID, info.FieldBinlog, fieldBinlogRuntimeParts{
+		addGoSegmentRuntimeMetric(aggregates, goMemPartIndexedFieldInfoObject, 1, int64(unsafe.Sizeof(IndexedFieldInfo{})))
+		collectFieldBinlogRuntimeMemoryStats(aggregates, info.FieldBinlog, fieldBinlogRuntimeParts{
 			object:          goMemPartFieldBinlogObject,
 			binlogSlice:     goMemPartFieldBinlogBinlogSlice,
 			childFieldSlice: goMemPartFieldBinlogChildFieldSlice,
@@ -204,38 +196,38 @@ func collectFieldRuntimeMemoryStats(aggregates map[goSegmentRuntimeMetricKey]goS
 			pathString:      goMemPartFieldBinlogPathString,
 			nullCount:       goMemPartFieldBinlogNullCount,
 		})
-		collectFieldIndexInfoRuntimeMemoryStats(aggregates, collectionID, info.IndexInfo)
+		collectFieldIndexInfoRuntimeMemoryStats(aggregates, info.IndexInfo)
 		return true
 	})
 
 	segment.fieldJSONStatsMu.RLock()
-	addGoSegmentRuntimeMetric(aggregates, collectionID, goMemPartFieldJSONStatsMapPayload, int64(len(segment.fieldJSONStats)), int64(len(segment.fieldJSONStats))*(int64(unsafe.Sizeof(int64(0)))+int64(unsafe.Sizeof(uintptr(0)))))
+	addGoSegmentRuntimeMetric(aggregates, goMemPartFieldJSONStatsMapPayload, int64(len(segment.fieldJSONStats)), int64(len(segment.fieldJSONStats))*(int64(unsafe.Sizeof(int64(0)))+int64(unsafe.Sizeof(uintptr(0)))))
 	for _, info := range segment.fieldJSONStats {
 		if info != nil {
-			addGoSegmentRuntimeMetric(aggregates, collectionID, goMemPartFieldJSONStatsObject, 1, int64(unsafe.Sizeof(querypb.JsonStatsInfo{})))
+			addGoSegmentRuntimeMetric(aggregates, goMemPartFieldJSONStatsObject, 1, int64(unsafe.Sizeof(querypb.JsonStatsInfo{})))
 		}
 	}
 	segment.fieldJSONStatsMu.RUnlock()
 }
 
-func collectFieldIndexInfoRuntimeMemoryStats(aggregates map[goSegmentRuntimeMetricKey]goSegmentRuntimeMetricValue, collectionID string, info *querypb.FieldIndexInfo) {
+func collectFieldIndexInfoRuntimeMemoryStats(aggregates map[goSegmentRuntimeMetricKey]goSegmentRuntimeMetricValue, info *querypb.FieldIndexInfo) {
 	if info == nil {
 		return
 	}
-	addGoSegmentRuntimeMetric(aggregates, collectionID, goMemPartFieldIndexInfoObject, 1, int64(unsafe.Sizeof(querypb.FieldIndexInfo{})))
-	addGoSegmentRuntimeMetric(aggregates, collectionID, goMemPartFieldIndexInfoNameString, 1, int64(len(info.GetIndexName())))
-	addGoSegmentRuntimeMetric(aggregates, collectionID, goMemPartFieldIndexInfoParamSlice, int64(len(info.GetIndexParams())), slicePointerBackingBytes(cap(info.GetIndexParams())))
-	addGoSegmentRuntimeMetric(aggregates, collectionID, goMemPartFieldIndexInfoFilePathSlice, int64(len(info.GetIndexFilePaths())), sliceStringBackingBytes(cap(info.GetIndexFilePaths())))
+	addGoSegmentRuntimeMetric(aggregates, goMemPartFieldIndexInfoObject, 1, int64(unsafe.Sizeof(querypb.FieldIndexInfo{})))
+	addGoSegmentRuntimeMetric(aggregates, goMemPartFieldIndexInfoNameString, 1, int64(len(info.GetIndexName())))
+	addGoSegmentRuntimeMetric(aggregates, goMemPartFieldIndexInfoParamSlice, int64(len(info.GetIndexParams())), slicePointerBackingBytes(cap(info.GetIndexParams())))
+	addGoSegmentRuntimeMetric(aggregates, goMemPartFieldIndexInfoFilePathSlice, int64(len(info.GetIndexFilePaths())), sliceStringBackingBytes(cap(info.GetIndexFilePaths())))
 	for _, pair := range info.GetIndexParams() {
 		if pair == nil {
 			continue
 		}
-		addGoSegmentRuntimeMetric(aggregates, collectionID, goMemPartIndexParamKeyValueObject, 1, int64(unsafe.Sizeof(commonpb.KeyValuePair{})))
-		addGoSegmentRuntimeMetric(aggregates, collectionID, goMemPartIndexParamKeyString, 1, int64(len(pair.GetKey())))
-		addGoSegmentRuntimeMetric(aggregates, collectionID, goMemPartIndexParamValueString, 1, int64(len(pair.GetValue())))
+		addGoSegmentRuntimeMetric(aggregates, goMemPartIndexParamKeyValueObject, 1, int64(unsafe.Sizeof(commonpb.KeyValuePair{})))
+		addGoSegmentRuntimeMetric(aggregates, goMemPartIndexParamKeyString, 1, int64(len(pair.GetKey())))
+		addGoSegmentRuntimeMetric(aggregates, goMemPartIndexParamValueString, 1, int64(len(pair.GetValue())))
 	}
 	for _, path := range info.GetIndexFilePaths() {
-		addGoSegmentRuntimeMetric(aggregates, collectionID, goMemPartFieldIndexInfoFilePathString, 1, int64(len(path)))
+		addGoSegmentRuntimeMetric(aggregates, goMemPartFieldIndexInfoFilePathString, 1, int64(len(path)))
 	}
 }
 
@@ -248,38 +240,38 @@ type fieldBinlogRuntimeParts struct {
 	nullCount       string
 }
 
-func collectFieldBinlogRuntimeMemoryStats(aggregates map[goSegmentRuntimeMetricKey]goSegmentRuntimeMetricValue, collectionID string, fieldBinlog *datapb.FieldBinlog, parts fieldBinlogRuntimeParts) {
+func collectFieldBinlogRuntimeMemoryStats(aggregates map[goSegmentRuntimeMetricKey]goSegmentRuntimeMetricValue, fieldBinlog *datapb.FieldBinlog, parts fieldBinlogRuntimeParts) {
 	if fieldBinlog == nil {
 		return
 	}
-	addGoSegmentRuntimeMetric(aggregates, collectionID, parts.object, 1, int64(unsafe.Sizeof(datapb.FieldBinlog{})))
-	addGoSegmentRuntimeMetric(aggregates, collectionID, parts.binlogSlice, int64(len(fieldBinlog.GetBinlogs())), slicePointerBackingBytes(cap(fieldBinlog.GetBinlogs())))
-	addGoSegmentRuntimeMetric(aggregates, collectionID, parts.childFieldSlice, int64(len(fieldBinlog.GetChildFields())), int64(cap(fieldBinlog.GetChildFields()))*int64(unsafe.Sizeof(int64(0))))
+	addGoSegmentRuntimeMetric(aggregates, parts.object, 1, int64(unsafe.Sizeof(datapb.FieldBinlog{})))
+	addGoSegmentRuntimeMetric(aggregates, parts.binlogSlice, int64(len(fieldBinlog.GetBinlogs())), slicePointerBackingBytes(cap(fieldBinlog.GetBinlogs())))
+	addGoSegmentRuntimeMetric(aggregates, parts.childFieldSlice, int64(len(fieldBinlog.GetChildFields())), int64(cap(fieldBinlog.GetChildFields()))*int64(unsafe.Sizeof(int64(0))))
 	for _, binlog := range fieldBinlog.GetBinlogs() {
 		if binlog == nil {
 			continue
 		}
-		addGoSegmentRuntimeMetric(aggregates, collectionID, parts.binlogObject, 1, int64(unsafe.Sizeof(datapb.Binlog{})))
-		addGoSegmentRuntimeMetric(aggregates, collectionID, parts.pathString, 1, int64(len(binlog.GetLogPath())))
+		addGoSegmentRuntimeMetric(aggregates, parts.binlogObject, 1, int64(unsafe.Sizeof(datapb.Binlog{})))
+		addGoSegmentRuntimeMetric(aggregates, parts.pathString, 1, int64(len(binlog.GetLogPath())))
 		// FieldNullCounts map buckets are excluded; count key/value payload only.
-		addGoSegmentRuntimeMetric(aggregates, collectionID, parts.nullCount, int64(len(binlog.GetFieldNullCounts())), int64(len(binlog.GetFieldNullCounts()))*2*int64(unsafe.Sizeof(int64(0))))
+		addGoSegmentRuntimeMetric(aggregates, parts.nullCount, int64(len(binlog.GetFieldNullCounts())), int64(len(binlog.GetFieldNullCounts()))*2*int64(unsafe.Sizeof(int64(0))))
 	}
 }
 
-func collectBM25StatsRuntimeMemoryStats(aggregates map[goSegmentRuntimeMetricKey]goSegmentRuntimeMetricValue, collectionID string, segment *LocalSegment) {
-	addGoSegmentRuntimeMetric(aggregates, collectionID, goMemPartBM25StatsMapPayload, int64(len(segment.bm25Stats)), int64(len(segment.bm25Stats))*(int64(unsafe.Sizeof(int64(0)))+int64(unsafe.Sizeof(uintptr(0)))))
+func collectBM25StatsRuntimeMemoryStats(aggregates map[goSegmentRuntimeMetricKey]goSegmentRuntimeMetricValue, segment *LocalSegment) {
+	addGoSegmentRuntimeMetric(aggregates, goMemPartBM25StatsMapPayload, int64(len(segment.bm25Stats)), int64(len(segment.bm25Stats))*(int64(unsafe.Sizeof(int64(0)))+int64(unsafe.Sizeof(uintptr(0)))))
 }
 
-func collectResourceUsageCacheRuntimeMemoryStats(aggregates map[goSegmentRuntimeMetricKey]goSegmentRuntimeMetricValue, collectionID string, segment *LocalSegment) {
+func collectResourceUsageCacheRuntimeMemoryStats(aggregates map[goSegmentRuntimeMetricKey]goSegmentRuntimeMetricValue, segment *LocalSegment) {
 	usage := segment.resourceUsageCache.Load()
 	if usage == nil {
 		return
 	}
-	addGoSegmentRuntimeMetric(aggregates, collectionID, goMemPartResourceUsageCacheObject, 1, int64(unsafe.Sizeof(ResourceUsage{})))
-	addGoSegmentRuntimeMetric(aggregates, collectionID, goMemPartResourceUsageCacheSlice, int64(len(usage.FieldGpuMemorySize)), int64(cap(usage.FieldGpuMemorySize))*int64(unsafe.Sizeof(uint64(0))))
+	addGoSegmentRuntimeMetric(aggregates, goMemPartResourceUsageCacheObject, 1, int64(unsafe.Sizeof(ResourceUsage{})))
+	addGoSegmentRuntimeMetric(aggregates, goMemPartResourceUsageCacheSlice, int64(len(usage.FieldGpuMemorySize)), int64(cap(usage.FieldGpuMemorySize))*int64(unsafe.Sizeof(uint64(0))))
 }
 
-func collectManifestLazyKeyRuntimeMemoryStats(aggregates map[goSegmentRuntimeMetricKey]goSegmentRuntimeMetricValue, collectionID string, segment *LocalSegment) {
+func collectManifestLazyKeyRuntimeMemoryStats(aggregates map[goSegmentRuntimeMetricKey]goSegmentRuntimeMetricValue, segment *LocalSegment) {
 	bytes := int64(len(segment.manifestDeltaKey) + len(segment.manifestStatsKey))
 	count := int64(0)
 	if segment.manifestDeltaKey != "" {
@@ -288,14 +280,14 @@ func collectManifestLazyKeyRuntimeMemoryStats(aggregates map[goSegmentRuntimeMet
 	if segment.manifestStatsKey != "" {
 		count++
 	}
-	addGoSegmentRuntimeMetric(aggregates, collectionID, goMemPartManifestLazyKeyString, count, bytes)
+	addGoSegmentRuntimeMetric(aggregates, goMemPartManifestLazyKeyString, count, bytes)
 }
 
-func addGoSegmentRuntimeMetric(aggregates map[goSegmentRuntimeMetricKey]goSegmentRuntimeMetricValue, collectionID string, part string, count int64, bytes int64) {
+func addGoSegmentRuntimeMetric(aggregates map[goSegmentRuntimeMetricKey]goSegmentRuntimeMetricValue, part string, count int64, bytes int64) {
 	if count == 0 && bytes == 0 {
 		return
 	}
-	key := goSegmentRuntimeMetricKey{collectionID: collectionID, part: part}
+	key := goSegmentRuntimeMetricKey{part: part}
 	value := aggregates[key]
 	value.count += count
 	value.bytes += bytes

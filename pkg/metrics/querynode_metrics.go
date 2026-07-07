@@ -957,12 +957,12 @@ var (
 	QueryNodeGoSegmentRuntimeEstimatedBytesDesc = prometheus.NewDesc(
 		prometheus.BuildFQName(milvusNamespace, typeutil.QueryNodeRole, "go_segment_runtime_estimated_bytes"),
 		"Estimated Go runtime bytes owned by live querynode segments, grouped by owner part",
-		[]string{nodeIDLabelName, collectionIDLabelName, "part"}, nil)
+		[]string{nodeIDLabelName, "part"}, nil)
 
 	QueryNodeGoSegmentRuntimeCountDesc = prometheus.NewDesc(
 		prometheus.BuildFQName(milvusNamespace, typeutil.QueryNodeRole, "go_segment_runtime_count"),
 		"Live querynode segment runtime owner count, grouped by owner part",
-		[]string{nodeIDLabelName, collectionIDLabelName, "part"}, nil)
+		[]string{nodeIDLabelName, "part"}, nil)
 
 	QueryNodeGoDistributionRuntimeEstimatedBytes = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
@@ -972,7 +972,6 @@ var (
 			Help:      "Estimated Go runtime bytes owned by querynode distribution snapshots, grouped by owner part",
 		}, []string{
 			nodeIDLabelName,
-			collectionIDLabelName,
 			"part",
 		})
 
@@ -984,7 +983,6 @@ var (
 			Help:      "Live querynode distribution owner count, grouped by owner part",
 		}, []string{
 			nodeIDLabelName,
-			collectionIDLabelName,
 			"part",
 		})
 )
@@ -1117,10 +1115,9 @@ type PoolStats struct {
 
 // QueryNodeGoSegmentRuntimeMemoryStats is a pull-model owner attribution sample.
 type QueryNodeGoSegmentRuntimeMemoryStats struct {
-	CollectionID string
-	Part         string
-	Count        float64
-	Bytes        float64
+	Part  string
+	Count float64
+	Bytes float64
 }
 
 // poolCollectFn is the function set later by SetPoolCollectFn.
@@ -1196,7 +1193,7 @@ func (c *queryNodeGoSegmentRuntimeMemoryCollector) Collect(ch chan<- prometheus.
 		return
 	}
 	for _, s := range fn() {
-		ch <- prometheus.MustNewConstMetric(QueryNodeGoSegmentRuntimeEstimatedBytesDesc, prometheus.GaugeValue, s.Bytes, nodeID, s.CollectionID, s.Part)
-		ch <- prometheus.MustNewConstMetric(QueryNodeGoSegmentRuntimeCountDesc, prometheus.GaugeValue, s.Count, nodeID, s.CollectionID, s.Part)
+		ch <- prometheus.MustNewConstMetric(QueryNodeGoSegmentRuntimeEstimatedBytesDesc, prometheus.GaugeValue, s.Bytes, nodeID, s.Part)
+		ch <- prometheus.MustNewConstMetric(QueryNodeGoSegmentRuntimeCountDesc, prometheus.GaugeValue, s.Count, nodeID, s.Part)
 	}
 }

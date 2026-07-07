@@ -17,7 +17,6 @@
 package delegator
 
 import (
-	"fmt"
 	"sync"
 	"time"
 	"unsafe"
@@ -332,6 +331,8 @@ type distribution struct {
 	channelName  string
 	collectionID UniqueID
 	queryView    *channelQueryView
+
+	goRuntimeMetrics map[string]goDistributionRuntimeMetricValue
 }
 
 // SegmentEntry stores the segment meta information.
@@ -960,16 +961,17 @@ const (
 	goDistPartSnapshotMapPayload   = "distribution_snapshot_map_payload"
 )
 
+type goDistributionRuntimeMetricValue struct {
+	count int64
+	bytes int64
+}
+
 func (d *distribution) updateGoDistributionRuntimeMemoryMetrics(snap *snapshot) {
-	if d.collectionID == 0 || snap == nil {
+	if snap == nil {
 		return
 	}
 	nodeID := paramtable.GetStringNodeID()
-	collectionID := fmt.Sprint(d.collectionID)
-	parts := map[string]struct {
-		count int64
-		bytes int64
-	}{
+	parts := map[string]goDistributionRuntimeMetricValue{
 		goDistPartLiveEntryObject: {
 			count: int64(len(d.sealedSegments) + len(d.growingSegments)),
 			bytes: int64(len(d.sealedSegments)+len(d.growingSegments)) * int64(unsafe.Sizeof(SegmentEntry{})),
@@ -992,8 +994,32 @@ func (d *distribution) updateGoDistributionRuntimeMemoryMetrics(snap *snapshot) 
 		},
 	}
 	for part, value := range parts {
-		metrics.QueryNodeGoDistributionRuntimeEstimatedBytes.WithLabelValues(nodeID, collectionID, part).Set(float64(value.bytes))
-		metrics.QueryNodeGoDistributionRuntimeCount.WithLabelValues(nodeID, collectionID, part).Set(float64(value.count))
+		old := d.goRuntimeMetrics[part]
+		addGoDistributionRuntimeMetricDelta(nodeID, part, value.count-old.count, value.bytes-old.bytes)
+	}
+	for part, old := range d.goRuntimeMetrics {
+		if _, ok := parts[part]; ok {
+			continue
+		}
+		addGoDistributionRuntimeMetricDelta(nodeID, part, -old.count, -old.bytes)
+	}
+	d.goRuntimeMetrics = parts
+}
+
+func (d *distribution) clearGoDistributionRuntimeMemoryMetrics() {
+	nodeID := paramtable.GetStringNodeID()
+	for part, old := range d.goRuntimeMetrics {
+		addGoDistributionRuntimeMetricDelta(nodeID, part, -old.count, -old.bytes)
+	}
+	d.goRuntimeMetrics = nil
+}
+
+func addGoDistributionRuntimeMetricDelta(nodeID string, part string, countDelta int64, bytesDelta int64) {
+	if countDelta != 0 {
+		metrics.QueryNodeGoDistributionRuntimeCount.WithLabelValues(nodeID, part).Add(float64(countDelta))
+	}
+	if bytesDelta != 0 {
+		metrics.QueryNodeGoDistributionRuntimeEstimatedBytes.WithLabelValues(nodeID, part).Add(float64(bytesDelta))
 	}
 }
 
@@ -1160,6 +1186,9 @@ func (d *distribution) Close() {
 		close(d.snapshotClose)
 	})
 	<-d.snapshotDone
+	d.mut.Lock()
+	defer d.mut.Unlock()
+	d.clearGoDistributionRuntimeMemoryMetrics()
 }
 
 // RefundAllCandidates refunds resources for all sealed segment candidates.
