@@ -1327,8 +1327,6 @@ func (suite *SegmentCheckerTestSuite) TestReopenOnStaleDataVersion() {
 	addedTasks = nil
 	distSegment.DataVersion = proto.Int32(2)
 	checker.dist.SegmentDistManager.Update(2, distSegment)
-	// invalidate version cache to force re-check
-	delete(checker.versionCache, int64(1))
 	tasks = checker.Check(context.TODO())
 	suite.Len(tasks, 0)
 	suite.Len(addedTasks, 0)
@@ -1338,7 +1336,6 @@ func (suite *SegmentCheckerTestSuite) TestReopenOnStaleDataVersion() {
 	addedTasks = nil
 	distSegment.DataVersion = nil
 	checker.dist.SegmentDistManager.Update(2, distSegment)
-	delete(checker.versionCache, int64(1))
 	tasks = checker.Check(context.TODO())
 	suite.Len(tasks, 0)
 	suite.Len(addedTasks, 0)

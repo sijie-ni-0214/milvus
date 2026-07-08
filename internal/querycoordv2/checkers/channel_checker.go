@@ -46,9 +46,6 @@ type ChannelChecker struct {
 	nodeMgr      *session.NodeManager
 	scheduler    task.Scheduler
 	assignPolicy assign.AssignPolicy
-
-	// version cache for fast skip when nothing changed
-	versionCache map[int64]*collectionVersionCache
 }
 
 func NewChannelChecker(
@@ -70,7 +67,6 @@ func NewChannelChecker(
 		nodeMgr:           nodeMgr,
 		scheduler:         scheduler,
 		assignPolicy:      assignPolicy,
-		versionCache:      make(map[int64]*collectionVersionCache),
 	}
 }
 
@@ -103,7 +99,6 @@ func (c *ChannelChecker) check(ctx context.Context, submit func(task.Task)) []ta
 	}
 
 	collectionIDs := c.meta.GetAll(ctx)
-	currentDistVersion := c.dist.ChannelDistManager.GetVersion()
 	tasks := make([]task.Task, 0)
 	emitTasks := func(newTasks []task.Task) bool {
 		if len(newTasks) == 0 {
@@ -120,31 +115,12 @@ func (c *ChannelChecker) check(ctx context.Context, submit func(task.Task)) []ta
 	}
 	for _, cid := range collectionIDs {
 		if c.readyToCheck(ctx, cid) {
-			// Fast path: skip if target and dist versions unchanged
-			currentTargetVersion := c.targetMgr.GetCollectionTargetVersion(ctx, cid, meta.NextTarget)
-			if c.isCollectionSynced(cid, currentTargetVersion, currentDistVersion) {
-				continue
-			}
-
 			replicas := c.meta.GetByCollection(ctx, cid)
-			hasTask := false
 			for _, r := range replicas {
-				replicaTasks := c.checkReplica(ctx, r)
-				if emitTasks(replicaTasks) {
-					hasTask = true
-				}
-			}
-
-			// Only update version cache if no tasks were generated
-			// If tasks were generated, we need to re-check next time
-			if !hasTask {
-				c.updateVersionCache(cid, currentTargetVersion, currentDistVersion)
+				emitTasks(c.checkReplica(ctx, r))
 			}
 		}
 	}
-
-	// clean up version cache for released collections
-	c.cleanVersionCache(collectionIDs)
 
 	// clean channel which has been released
 	channels := c.dist.ChannelDistManager.GetByFilter()
@@ -168,40 +144,6 @@ func (c *ChannelChecker) check(ctx context.Context, submit func(task.Task)) []ta
 		}
 	}
 	return tasks
-}
-
-// isCollectionSynced checks if target and dist versions are unchanged since last check
-func (c *ChannelChecker) isCollectionSynced(collectionID int64, targetVersion, channelDistVersion int64) bool {
-	cache, ok := c.versionCache[collectionID]
-	if !ok {
-		return false
-	}
-	return cache.targetVersion == targetVersion && cache.channelDistVersion == channelDistVersion
-}
-
-// updateVersionCache updates the version cache for a collection
-func (c *ChannelChecker) updateVersionCache(collectionID int64, targetVersion, channelDistVersion int64) {
-	c.versionCache[collectionID] = &collectionVersionCache{
-		targetVersion:      targetVersion,
-		channelDistVersion: channelDistVersion,
-	}
-}
-
-// cleanVersionCache removes entries for collections that no longer exist.
-// Only runs when cache has more entries than active collections, meaning stale entries exist.
-func (c *ChannelChecker) cleanVersionCache(activeCollections []int64) {
-	if len(c.versionCache) <= len(activeCollections) {
-		return
-	}
-	activeSet := make(map[int64]struct{}, len(activeCollections))
-	for _, cid := range activeCollections {
-		activeSet[cid] = struct{}{}
-	}
-	for cid := range c.versionCache {
-		if _, ok := activeSet[cid]; !ok {
-			delete(c.versionCache, cid)
-		}
-	}
 }
 
 func (c *ChannelChecker) checkReplica(ctx context.Context, replica *meta.Replica) []task.Task {
