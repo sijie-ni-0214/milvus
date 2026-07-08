@@ -152,7 +152,8 @@ func (s *distributionAddTimingStats) record(entryNum int, lockWaitDur, lockHoldD
 		return
 	}
 
-	log.Warn("[SN recovery] load timing stats",
+	log.Warn(
+		"[SN recovery] load timing stats",
 		zap.String("phase", "delegator.distribution_add"),
 		zap.Duration("windowDur", windowDur),
 		zap.Int64("requestCount", count),
@@ -212,7 +213,8 @@ func (s *distributionSnapshotTimingStats) record(sealedNum int, growingNum int, 
 		return
 	}
 
-	log.Warn("[SN recovery] load timing stats",
+	log.Warn(
+		"[SN recovery] load timing stats",
 		zap.String("phase", "delegator.distribution_snapshot"),
 		zap.Duration("windowDur", windowDur),
 		zap.Int64("snapshotCount", count),
@@ -280,6 +282,10 @@ func NewChannelQueryView(growings []int64, sealedSegmentRowCount map[int64]int64
 		version:               version,
 		loadedRatio:           atomic.NewFloat64(0),
 	}
+}
+
+func (q *channelQueryView) MarkSyncedByCoord() {
+	q.syncedByCoord = true
 }
 
 func (q *channelQueryView) GetVersion() int64 {
@@ -440,7 +446,8 @@ func (d *distribution) PinReadableSegments(requiredLoadRatio float64, partitions
 	}
 
 	if !isServiceable {
-		log.Warn("channel distribution is not serviceable",
+		log.Warn(
+			"channel distribution is not serviceable",
 			zap.String("channel", d.channelName),
 			zap.Float64("requiredLoadRatio", requiredLoadRatio),
 			zap.Float64("currentLoadRatio", d.queryView.GetLoadedRatio()),
@@ -663,7 +670,8 @@ func (d *distribution) AddDistributions(entries ...SegmentEntry) {
 	for _, entry := range entries {
 		oldEntry, ok := d.sealedSegments[entry.SegmentID]
 		if ok && oldEntry.Version >= entry.Version {
-			log.Warn("Invalid segment distribution changed, skip it",
+			log.Warn(
+				"Invalid segment distribution changed, skip it",
 				zap.Int64("segmentID", entry.SegmentID),
 				zap.Int64("oldVersion", oldEntry.Version),
 				zap.Int64("oldNode", oldEntry.NodeID),
@@ -773,7 +781,8 @@ func (d *distribution) SyncTargetVersion(action *querypb.SyncAction, partitions 
 		_, sealedInTarget := d.queryView.sealedSegmentRowCount[s.SegmentID]
 		if sealedInTarget || droppedSet.Contain(s.SegmentID) {
 			s.TargetVersion = redundantTargetVersion
-			log.Info("set growing segment redundant, wait for release",
+			log.Info(
+				"set growing segment redundant, wait for release",
 				zap.Int64("segmentID", s.SegmentID),
 				zap.Int64("targetVersion", s.TargetVersion),
 			)
@@ -812,7 +821,8 @@ func (d *distribution) SyncTargetVersion(action *querypb.SyncAction, partitions 
 	}
 	d.updateServiceable("SyncTargetVersion")
 
-	log.Info("Update channel query view",
+	log.Info(
+		"Update channel query view",
 		zap.String("channel", d.channelName),
 		zap.Int64s("partitions", partitions),
 		zap.Int64("oldVersion", oldValue),
@@ -877,7 +887,8 @@ func (d *distribution) RemoveDistributions(sealedSegments []SegmentEntry, growin
 	}
 	d.mut.Unlock()
 
-	log.Info("remove segments from distribution",
+	log.Info(
+		"remove segments from distribution",
 		zap.String("channelName", d.channelName),
 		zap.Int64s("growing", lo.Map(growingSegments, func(s SegmentEntry, _ int) int64 { return s.SegmentID })),
 		zap.Int64s("sealed", lo.Map(sealedSegments, func(s SegmentEntry, _ int) int64 { return s.SegmentID })),

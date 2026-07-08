@@ -363,7 +363,10 @@ func (s *Server) initQueryCoord() error {
 		s.dist,
 		s.targetMgr,
 		s.taskScheduler,
-		s.leaderCacheObserver.RegisterEvent,
+		func(collectionIDs ...int64) {
+			s.leaderCacheObserver.RegisterEvent(collectionIDs...)
+			s.targetObserver.TriggerUpdateCurrentTarget(collectionIDs...)
+		},
 	)
 
 	// Init load status cache

@@ -71,9 +71,11 @@ const (
 	queryNodeSealedLoadProgressLogInterval    = 5 * time.Second
 )
 
-var queryNodeLoadSegmentsTiming = newQueryNodeLoadSegmentsTimingStats()
-var queryNodeWatchDmChannelsTiming = newQueryNodeWatchDmChannelsTimingStats()
-var queryNodeFirstWatchDmChannelsLogged atomic.Bool
+var (
+	queryNodeLoadSegmentsTiming         = newQueryNodeLoadSegmentsTimingStats()
+	queryNodeWatchDmChannelsTiming      = newQueryNodeWatchDmChannelsTimingStats()
+	queryNodeFirstWatchDmChannelsLogged atomic.Bool
+)
 
 func (node *QueryNode) markSealedLoadStart(segmentNum int) {
 	if segmentNum == 0 {
@@ -403,7 +405,8 @@ func (s *queryNodeWatchDmChannelsTimingStats) record(success bool, channelNum in
 		return
 	}
 
-	log.Warn("[SN recovery] watch dm channel timing stats",
+	log.Warn(
+		"[SN recovery] watch dm channel timing stats",
 		zap.String("phase", "querynode.watch_dm_channels"),
 		zap.Duration("windowDur", windowDur),
 		zap.Int64("requestCount", count),
@@ -522,7 +525,8 @@ func (s *queryNodeLoadSegmentsTimingStats) record(loadScope querypb.LoadScope, n
 		return
 	}
 
-	log.Warn("[SN recovery] load timing stats",
+	log.Warn(
+		"[SN recovery] load timing stats",
 		zap.String("phase", "querynode.load_segments"),
 		zap.Duration("windowDur", windowDur),
 		zap.Int64("requestCount", count),
@@ -712,11 +716,13 @@ func (node *QueryNode) WatchDmChannels(ctx context.Context, req *querypb.WatchDm
 		zap.Int64("currentNodeID", node.GetNodeID()),
 	)
 
-	log.Info("received watch channel request",
+	log.Info(
+		"received watch channel request",
 		zap.Int64("version", req.GetVersion()),
 	)
 	if queryNodeFirstWatchDmChannelsLogged.CompareAndSwap(false, true) {
-		log.Warn("[SN recovery] first watch dm channel",
+		log.Warn(
+			"[SN recovery] first watch dm channel",
 			zap.String("phase", "querynode.first_watch_dm_channel"),
 			zap.Int64("version", req.GetVersion()),
 			zap.Int("channelCount", len(req.GetInfos())),
@@ -806,6 +812,9 @@ func (node *QueryNode) WatchDmChannels(ctx context.Context, req *querypb.WatchDm
 		req.GetPartitionIDs(),
 		req.GetTargetVersion(),
 	)
+	if req.GetTargetVersion() > 0 {
+		queryView.MarkSyncedByCoord()
+	}
 
 	delegator, err := delegator.NewShardDelegator(
 		ctx,
@@ -906,14 +915,16 @@ func (node *QueryNode) WatchDmChannels(ctx context.Context, req *querypb.WatchDm
 	// - DataCoord ensures that seekPosition is calculated based on channel checkpoint, which is updated
 	//   after data (including deletes) is flushed, so L0 segments should cover up to seekPosition
 	// - Using seekPosition avoids redundant message consumption when seekPosition > deleteCheckpoint
-	log.Info("use channel seek position to seek",
+	log.Info(
+		"use channel seek position to seek",
 		zap.Time("seekPosition", tsoutil.PhysicalTime(channel.GetSeekPosition().GetTimestamp())),
 		zap.Time("deleteCheckpoint", tsoutil.PhysicalTime(channel.GetDeleteCheckpoint().GetTimestamp())),
 	)
 	err = pipeline.ConsumeMsgStream(ctx, channel.GetSeekPosition())
 	if err != nil {
 		err = merr.WrapErrServiceUnavailable(err.Error(), "InitPipelineFailed")
-		log.Warn(err.Error(),
+		log.Warn(
+			err.Error(),
 			zap.Int64("collectionID", channel.CollectionID),
 			zap.String("channel", channel.ChannelName),
 		)
@@ -1143,7 +1154,8 @@ func (node *QueryNode) LoadSegments(ctx context.Context, req *querypb.LoadSegmen
 	node.markSealedLoadStart(sealedNonL0SegmentNum)
 	defer node.markSealedLoadDone(sealedNonL0SegmentNum)
 	loaderStart := time.Now()
-	loaded, err := node.loader.Load(ctx,
+	loaded, err := node.loader.Load(
+		ctx,
 		req.GetCollectionID(),
 		segments.SegmentTypeSealed,
 		req.GetVersion(),
@@ -1245,7 +1257,8 @@ func (node *QueryNode) ReleaseSegments(ctx context.Context, req *querypb.Release
 		zap.Int64("currentNodeID", node.GetNodeID()),
 	)
 
-	log.Info("received release segment request",
+	log.Info(
+		"received release segment request",
 		zap.String("scope", req.GetScope().String()),
 		zap.Bool("needTransfer", req.GetNeedTransfer()),
 	)
@@ -1391,7 +1404,8 @@ func (node *QueryNode) SearchSegments(ctx context.Context, req *querypb.SearchRe
 		}
 	}()
 
-	log.Debug("start to search segments on worker",
+	log.Debug(
+		"start to search segments on worker",
 		zap.Int64s("segmentIDs", req.GetSegmentIDs()),
 	)
 	searchCtx, cancel := context.WithCancel(ctx)
@@ -1571,7 +1585,8 @@ func (node *QueryNode) QuerySegments(ctx context.Context, req *querypb.QueryRequ
 		return resp, nil
 	}
 
-	tr.CtxElapse(ctx, fmt.Sprintf("do query done, traceID = %s,  vChannel = %s, segmentIDs = %v",
+	tr.CtxElapse(ctx, fmt.Sprintf(
+		"do query done, traceID = %s,  vChannel = %s, segmentIDs = %v",
 		traceID,
 		channel,
 		req.GetSegmentIDs(),
@@ -1593,7 +1608,8 @@ func (node *QueryNode) Query(ctx context.Context, req *querypb.QueryRequest) (*i
 		zap.Int64("collectionID", req.GetReq().GetCollectionID()),
 		zap.Strings("shards", req.GetDmlChannels()),
 	)
-	log.Debug("received query request",
+	log.Debug(
+		"received query request",
 		zap.Int64s("outputFields", req.GetReq().GetOutputFieldsId()),
 		zap.Int64s("segmentIDs", req.GetSegmentIDs()), // should be empty
 		zap.Uint64("guaranteeTimestamp", req.GetReq().GetGuaranteeTimestamp()),
@@ -1623,7 +1639,8 @@ func (node *QueryNode) Query(ctx context.Context, req *querypb.QueryRequest) (*i
 		}, nil
 	}
 	tr := timerecord.NewTimeRecorderWithTrace(ctx, "QueryRequest")
-	defer tr.CtxElapse(ctx, fmt.Sprintf("do query with channel done, vChannel = %s, segmentIDs = %v",
+	defer tr.CtxElapse(ctx, fmt.Sprintf(
+		"do query with channel done, vChannel = %s, segmentIDs = %v",
 		req.GetDmlChannels()[0],
 		req.GetSegmentIDs(),
 	))
@@ -1649,7 +1666,8 @@ func (node *QueryNode) QueryStream(req *querypb.QueryRequest, srv querypb.QueryN
 	)
 	concurrentSrv := streamrpc.NewConcurrentQueryStreamServer(srv)
 
-	log.Debug("received query stream request",
+	log.Debug(
+		"received query stream request",
 		zap.Int64s("outputFields", req.GetReq().GetOutputFieldsId()),
 		zap.Int64s("segmentIDs", req.GetSegmentIDs()),
 		zap.Uint64("guaranteeTimestamp", req.GetReq().GetGuaranteeTimestamp()),
@@ -1739,7 +1757,8 @@ func (node *QueryNode) QueryStreamSegments(req *querypb.QueryRequest, srv queryp
 		return nil
 	}
 
-	tr.CtxElapse(ctx, fmt.Sprintf("do query done, traceID = %s,  vChannel = %s, segmentIDs = %v",
+	tr.CtxElapse(ctx, fmt.Sprintf(
+		"do query done, traceID = %s,  vChannel = %s, segmentIDs = %v",
 		traceID,
 		channel,
 		req.GetSegmentIDs(),
@@ -2044,7 +2063,8 @@ func (node *QueryNode) SyncDistribution(ctx context.Context, req *querypb.SyncDi
 			// New coordinators may omit SealedInTarget because SealedSegmentRowCount
 			// already carries the same segment IDs as map keys.
 			if len(action.GetSealedInTarget()) > 0 && len(action.GetSealedInTarget()) != len(action.GetSealedSegmentRowCount()) {
-				log.Warn("Reject syncTargetVersion from older version Coordinator",
+				log.Warn(
+					"Reject syncTargetVersion from older version Coordinator",
 					zap.String("channel", req.GetChannel()),
 					zap.Int("sealedInTarget", len(action.GetSealedInTarget())),
 					zap.Int("sealedSegmentRowCount", len(action.GetSealedSegmentRowCount())),

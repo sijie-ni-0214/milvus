@@ -109,7 +109,9 @@ type TargetObserver struct {
 	loadingDispatcher *taskDispatcher[int64]
 	// loadedDispatcher updates targets for loaded collections.
 	loadedDispatcher *taskDispatcher[int64]
-	readyStats       *currentTargetReadyStats
+	// serviceableDispatcher handles serviceable distribution changes for collections with an existing current target.
+	serviceableDispatcher *taskDispatcher[int64]
+	readyStats            *currentTargetReadyStats
 
 	keylocks *lock.KeyLock[int64]
 
@@ -142,6 +144,7 @@ func NewTargetObserver(
 
 	result.loadingDispatcher = newTaskDispatcher(result.check)
 	result.loadedDispatcher = newTaskDispatcher(result.check)
+	result.serviceableDispatcher = newTaskDispatcher(result.checkCurrentTargetServiceable)
 	return result
 }
 
@@ -152,6 +155,7 @@ func (ob *TargetObserver) Start() {
 
 		ob.loadingDispatcher.Start()
 		ob.loadedDispatcher.Start()
+		ob.serviceableDispatcher.Start()
 
 		ob.wg.Add(1)
 		go func() {
@@ -173,6 +177,7 @@ func (ob *TargetObserver) Stop() {
 
 		ob.loadingDispatcher.Stop()
 		ob.loadedDispatcher.Stop()
+		ob.serviceableDispatcher.Stop()
 	})
 }
 
@@ -225,7 +230,8 @@ func (ob *TargetObserver) schedule(ctx context.Context) {
 			}
 
 		case req := <-ob.updateChan:
-			log.Info("manually trigger update target",
+			log.Info(
+				"manually trigger update target",
 				zap.Int64("collectionID", req.CollectionID),
 				zap.String("opType", req.opType.String()),
 			)
@@ -314,8 +320,30 @@ func (ob *TargetObserver) Check(ctx context.Context, collectionID int64, partiti
 	return result
 }
 
-func (ob *TargetObserver) TriggerUpdateCurrentTarget(collectionID int64) {
-	ob.loadingDispatcher.AddTask(collectionID)
+func (ob *TargetObserver) TriggerUpdateCurrentTarget(collectionIDs ...int64) {
+	ob.serviceableDispatcher.AddTask(collectionIDs...)
+}
+
+func (ob *TargetObserver) checkCurrentTargetServiceable(ctx context.Context, collectionID int64) {
+	ob.keylocks.Lock(collectionID)
+	defer ob.keylocks.Unlock(collectionID)
+
+	if ob.meta.GetCollection(ctx, collectionID) == nil {
+		return
+	}
+
+	if !ob.targetMgr.IsCurrentTargetExist(ctx, collectionID, -1) {
+		ob.loadingDispatcher.AddTask(collectionID)
+		return
+	}
+
+	if !ob.isCurrentTargetServiceable(ctx, collectionID) {
+		ob.loadingDispatcher.AddTask(collectionID)
+		return
+	}
+
+	ob.markCurrentTargetReady(ctx, collectionID)
+	ob.updateAllReplicasCheckpointMetric(ctx, collectionID)
 }
 
 func (ob *TargetObserver) check(ctx context.Context, collectionID int64) {
@@ -327,18 +355,27 @@ func (ob *TargetObserver) check(ctx context.Context, collectionID int64) {
 		return
 	}
 
+	hadCurrentTarget := ob.targetMgr.IsCurrentTargetExist(ctx, collectionID, -1)
+	updatedCurrentTarget := false
 	if ob.shouldUpdateCurrentTarget(ctx, collectionID) {
 		ob.updateCurrentTarget(ctx, collectionID)
+		updatedCurrentTarget = true
 	}
 
 	if ob.shouldUpdateNextTarget(ctx, collectionID) {
 		// update next target in collection level
-		ob.updateNextTarget(ctx, collectionID)
+		if err := ob.updateNextTarget(ctx, collectionID); err != nil {
+			return
+		}
 
 		// sync next target to delegator if current target not exist, to support partial search
 		if !ob.targetMgr.IsCurrentTargetExist(ctx, collectionID, -1) {
 			newVersion := ob.targetMgr.GetCollectionTargetVersion(ctx, collectionID, meta.NextTarget)
 			ob.syncNextTargetToDelegator(ctx, collectionID, ob.distMgr.ChannelDistManager.GetByFilter(meta.WithCollectionID2Channel(collectionID)), newVersion)
+		}
+
+		if hadCurrentTarget && !updatedCurrentTarget && ob.shouldUpdateCurrentTarget(ctx, collectionID) {
+			ob.updateCurrentTarget(ctx, collectionID)
 		}
 	}
 
@@ -544,7 +581,8 @@ func (ob *TargetObserver) shouldUpdateCurrentTarget(ctx context.Context, collect
 		err := utils.CheckDelegatorDataReady(ob.nodeMgr, ob.targetMgr, channel.View, meta.NextTarget)
 		dataReadyForNextTarget := err == nil
 		if !dataReadyForNextTarget {
-			log.Info("check delegator",
+			log.Info(
+				"check delegator",
 				zap.Int64("collectionID", collectionID),
 				zap.Int64("replicaID", replica.GetID()),
 				zap.Int64("nodeID", channel.Node),
@@ -681,7 +719,8 @@ func (ob *TargetObserver) syncToDelegator(ctx context.Context, replica *meta.Rep
 // 2. if next target is ready to read, we need to sync the next target to delegator to support full search
 func (ob *TargetObserver) genSyncAction(ctx context.Context, leaderView *meta.LeaderView, targetVersion int64) *querypb.SyncAction {
 	log.Ctx(ctx).WithRateGroup("qcv2.LeaderObserver", 1, 60).
-		RatedInfo(10, "Update readable segment version",
+		RatedInfo(
+			10, "Update readable segment version",
 			zap.Int64("collectionID", leaderView.CollectionID),
 			zap.String("channelName", leaderView.Channel),
 			zap.Int64("nodeID", leaderView.ID),
@@ -755,32 +794,69 @@ func (ob *TargetObserver) updateAllReplicasCheckpointMetric(ctx context.Context,
 	}
 }
 
+func (ob *TargetObserver) isCurrentTargetServiceable(ctx context.Context, collectionID int64) bool {
+	channelNames := ob.targetMgr.GetDmChannelsByCollection(ctx, collectionID, meta.CurrentTarget)
+	if len(channelNames) == 0 {
+		return false
+	}
+
+	currentVersion := ob.targetMgr.GetCollectionTargetVersion(ctx, collectionID, meta.CurrentTarget)
+	replicas := ob.meta.GetByCollection(ctx, collectionID)
+	if currentVersion <= 0 || len(replicas) == 0 {
+		return false
+	}
+
+	for channel := range channelNames {
+		for _, replica := range replicas {
+			delegators := ob.distMgr.ChannelDistManager.GetByFilter(
+				meta.WithReplica2Channel(replica),
+				meta.WithChannelName2Channel(channel),
+			)
+			hasServiceableDelegator := lo.ContainsBy(delegators, func(ch *meta.DmChannel) bool {
+				return ch.View != nil &&
+					ch.View.TargetVersion >= currentVersion &&
+					ch.IsServiceable()
+			})
+			if !hasServiceableDelegator {
+				return false
+			}
+		}
+	}
+
+	return !paramtable.Get().QueryCoordCfg.UpdateTargetNeedSegmentDataReady.GetAsBool() ||
+		utils.CheckSegmentDataReady(ctx, collectionID, ob.distMgr, ob.targetMgr, meta.CurrentTarget) == nil
+}
+
+func (ob *TargetObserver) markCurrentTargetReady(ctx context.Context, collectionID int64) {
+	currentVersion := ob.targetMgr.GetCollectionTargetVersion(ctx, collectionID, meta.CurrentTarget)
+	channels := ob.targetMgr.GetDmChannelsByCollection(ctx, collectionID, meta.CurrentTarget)
+	segments := ob.targetMgr.GetSealedSegmentsByCollection(ctx, collectionID, meta.CurrentTarget)
+	replicas := ob.meta.GetByCollection(ctx, collectionID)
+	log.Ctx(ctx).Warn("collection current target ready",
+		zap.String("phase", "querycoord.current_target_ready"),
+		zap.Int64("collectionID", collectionID),
+		zap.Int64("targetVersion", currentVersion),
+		zap.Int("channelCount", len(channels)),
+		zap.Int("sealedSegmentCount", len(segments)),
+		zap.Int("replicaCount", len(replicas)))
+	ob.recordCurrentTargetReady(ctx, collectionID)
+
+	ob.mut.Lock()
+	defer ob.mut.Unlock()
+	notifiers := ob.readyNotifiers[collectionID]
+	for _, notifier := range notifiers {
+		close(notifier)
+	}
+	// Reuse the capacity of notifiers slice.
+	if notifiers != nil {
+		ob.readyNotifiers[collectionID] = notifiers[:0]
+	}
+}
+
 func (ob *TargetObserver) updateCurrentTarget(ctx context.Context, collectionID int64) {
 	log := log.Ctx(ctx).WithRateGroup("qcv2.TargetObserver", 1, 60)
 	log.RatedInfo(10, "observer trigger update current target", zap.Int64("collectionID", collectionID))
 	if ob.targetMgr.UpdateCollectionCurrentTarget(ctx, collectionID) {
-		currentVersion := ob.targetMgr.GetCollectionTargetVersion(ctx, collectionID, meta.CurrentTarget)
-		channels := ob.targetMgr.GetDmChannelsByCollection(ctx, collectionID, meta.CurrentTarget)
-		segments := ob.targetMgr.GetSealedSegmentsByCollection(ctx, collectionID, meta.CurrentTarget)
-		replicas := ob.meta.GetByCollection(ctx, collectionID)
-		log.Warn("collection current target ready",
-			zap.String("phase", "querycoord.current_target_ready"),
-			zap.Int64("collectionID", collectionID),
-			zap.Int64("targetVersion", currentVersion),
-			zap.Int("channelCount", len(channels)),
-			zap.Int("sealedSegmentCount", len(segments)),
-			zap.Int("replicaCount", len(replicas)))
-		ob.recordCurrentTargetReady(ctx, collectionID)
-
-		ob.mut.Lock()
-		defer ob.mut.Unlock()
-		notifiers := ob.readyNotifiers[collectionID]
-		for _, notifier := range notifiers {
-			close(notifier)
-		}
-		// Reuse the capacity of notifiers slice
-		if notifiers != nil {
-			ob.readyNotifiers[collectionID] = notifiers[:0]
-		}
+		ob.markCurrentTargetReady(ctx, collectionID)
 	}
 }

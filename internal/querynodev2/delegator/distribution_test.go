@@ -810,6 +810,20 @@ func TestNewChannelQueryView(t *testing.T) {
 	assert.False(t, view.Serviceable())
 }
 
+func TestChannelQueryViewMarkSyncedByCoord(t *testing.T) {
+	view := NewChannelQueryView(nil, nil, nil, 10)
+	assert.False(t, view.syncedByCoord)
+	assert.False(t, view.Serviceable())
+
+	view.MarkSyncedByCoord()
+	assert.True(t, view.syncedByCoord)
+	assert.False(t, view.Serviceable())
+
+	dist := NewDistribution("test_channel", view)
+	defer dist.Close()
+	assert.True(t, dist.Serviceable())
+}
+
 func TestDistribution_NewDistribution(t *testing.T) {
 	channelName := "test_channel"
 	growings := []int64{1, 2, 3}
@@ -2045,6 +2059,7 @@ func TestDistribution_SealedSegmentExistsOnNode(t *testing.T) {
 		assert.True(t, dist.SealedSegmentExistsOnNode(100, 2))
 	})
 }
+
 func requireSnapshotSegments(t *testing.T, sealed []SnapshotItem, expected map[int64][]int64) {
 	t.Helper()
 

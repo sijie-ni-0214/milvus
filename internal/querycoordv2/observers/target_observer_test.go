@@ -81,7 +81,8 @@ func (suite *TargetObserverSuite) SetupTest() {
 		config.EtcdTLSCert.GetValue(),
 		config.EtcdTLSKey.GetValue(),
 		config.EtcdTLSCACert.GetValue(),
-		config.EtcdTLSMinVersion.GetValue())
+		config.EtcdTLSMinVersion.GetValue(),
+	)
 	suite.Require().NoError(err)
 	suite.kv = etcdkv.NewEtcdKV(cli, config.MetaRootPath.GetValue())
 	suite.ctx = context.Background()
@@ -221,7 +222,8 @@ func (suite *TargetObserverSuite) TestIncrementalUpdate_WithNewSegment() {
 	}, 5*time.Second, 1*time.Second)
 
 	// Add initial segment distribution for CheckSegmentDataReady
-	suite.distMgr.SegmentDistManager.Update(2,
+	suite.distMgr.SegmentDistManager.Update(
+		2,
 		&meta.Segment{
 			SegmentInfo: &datapb.SegmentInfo{
 				ID:            11,
@@ -310,7 +312,8 @@ func (suite *TargetObserverSuite) TestIncrementalUpdate_WithNewSegment() {
 		},
 	})
 	// Add segments to SegmentDistManager for CheckSegmentDataReady
-	suite.distMgr.SegmentDistManager.Update(2,
+	suite.distMgr.SegmentDistManager.Update(
+		2,
 		&meta.Segment{
 			SegmentInfo: &datapb.SegmentInfo{
 				ID:            11,
@@ -362,6 +365,153 @@ func (suite *TargetObserverSuite) TestIncrementalUpdate_WithNewSegment() {
 	suite.Equal(action.GetDeleteCP().Timestamp, uint64(200))
 	suite.Empty(action.GetSealedInTarget())
 	suite.NotEmpty(action.GetSealedSegmentRowCount())
+}
+
+func (suite *TargetObserverSuite) TestCheckPromotesFreshNextTargetWhenCurrentExists() {
+	suite.observer.Stop()
+	ctx := suite.ctx
+	suite.broker.ExpectedCalls = suite.broker.ExpectedCalls[:0]
+	suite.cluster.ExpectedCalls = suite.cluster.ExpectedCalls[:0]
+	suite.broker.EXPECT().GetRecoveryInfoV2(mock.Anything, mock.Anything).Return(suite.nextTargetChannels, suite.nextTargetSegments, nil).Twice()
+	suite.broker.EXPECT().ListIndexes(mock.Anything, mock.Anything).Return(nil, nil).Maybe()
+	suite.cluster.EXPECT().SyncDistribution(mock.Anything, mock.Anything, mock.Anything).Return(merr.Success(), nil).Maybe()
+
+	suite.NoError(suite.targetMgr.UpdateCollectionNextTarget(ctx, suite.collectionID))
+	suite.True(suite.targetMgr.UpdateCollectionCurrentTarget(ctx, suite.collectionID))
+	suite.Empty(suite.targetMgr.GetDmChannelsByCollection(ctx, suite.collectionID, meta.NextTarget))
+
+	suite.distMgr.ChannelDistManager.Update(2, &meta.DmChannel{
+		VchannelInfo: &datapb.VchannelInfo{
+			CollectionID: suite.collectionID,
+			ChannelName:  "channel-1",
+		},
+		Node: 2,
+		View: &meta.LeaderView{
+			ID:           2,
+			CollectionID: suite.collectionID,
+			Channel:      "channel-1",
+			Segments: map[int64]*querypb.SegmentDist{
+				11: {NodeID: 2},
+			},
+		},
+	}, &meta.DmChannel{
+		VchannelInfo: &datapb.VchannelInfo{
+			CollectionID: suite.collectionID,
+			ChannelName:  "channel-2",
+		},
+		Node: 2,
+		View: &meta.LeaderView{
+			ID:           2,
+			CollectionID: suite.collectionID,
+			Channel:      "channel-2",
+			Segments: map[int64]*querypb.SegmentDist{
+				12: {NodeID: 2},
+			},
+		},
+	})
+	suite.distMgr.SegmentDistManager.Update(
+		2,
+		&meta.Segment{
+			SegmentInfo: &datapb.SegmentInfo{
+				ID:            11,
+				CollectionID:  suite.collectionID,
+				PartitionID:   suite.partitionID,
+				InsertChannel: "channel-1",
+			},
+			Node: 2,
+		},
+		&meta.Segment{
+			SegmentInfo: &datapb.SegmentInfo{
+				ID:            12,
+				CollectionID:  suite.collectionID,
+				PartitionID:   suite.partitionID,
+				InsertChannel: "channel-2",
+			},
+			Node: 2,
+		},
+	)
+
+	suite.observer.check(ctx, suite.collectionID)
+	suite.Empty(suite.targetMgr.GetDmChannelsByCollection(ctx, suite.collectionID, meta.NextTarget))
+	suite.Len(suite.targetMgr.GetDmChannelsByCollection(ctx, suite.collectionID, meta.CurrentTarget), 2)
+}
+
+func (suite *TargetObserverSuite) TestCurrentTargetServiceableFastPathSkipsNextTargetRefresh() {
+	suite.observer.Stop()
+	ctx := suite.ctx
+	suite.broker.ExpectedCalls = suite.broker.ExpectedCalls[:0]
+	suite.cluster.ExpectedCalls = suite.cluster.ExpectedCalls[:0]
+	suite.broker.EXPECT().GetRecoveryInfoV2(mock.Anything, mock.Anything).Return(suite.nextTargetChannels, suite.nextTargetSegments, nil).Once()
+
+	suite.NoError(suite.targetMgr.UpdateCollectionNextTarget(ctx, suite.collectionID))
+	suite.True(suite.targetMgr.UpdateCollectionCurrentTarget(ctx, suite.collectionID))
+	currentVersion := suite.targetMgr.GetCollectionTargetVersion(ctx, suite.collectionID, meta.CurrentTarget)
+	suite.Empty(suite.targetMgr.GetDmChannelsByCollection(ctx, suite.collectionID, meta.NextTarget))
+
+	suite.distMgr.ChannelDistManager.Update(2, &meta.DmChannel{
+		VchannelInfo: &datapb.VchannelInfo{
+			CollectionID: suite.collectionID,
+			ChannelName:  "channel-1",
+		},
+		Node: 2,
+		View: &meta.LeaderView{
+			ID:            2,
+			CollectionID:  suite.collectionID,
+			Channel:       "channel-1",
+			TargetVersion: currentVersion,
+			Segments: map[int64]*querypb.SegmentDist{
+				11: {NodeID: 2},
+			},
+			Status: &querypb.LeaderViewStatus{Serviceable: true},
+		},
+	}, &meta.DmChannel{
+		VchannelInfo: &datapb.VchannelInfo{
+			CollectionID: suite.collectionID,
+			ChannelName:  "channel-2",
+		},
+		Node: 2,
+		View: &meta.LeaderView{
+			ID:            2,
+			CollectionID:  suite.collectionID,
+			Channel:       "channel-2",
+			TargetVersion: currentVersion,
+			Segments: map[int64]*querypb.SegmentDist{
+				12: {NodeID: 2},
+			},
+			Status: &querypb.LeaderViewStatus{Serviceable: true},
+		},
+	})
+	suite.distMgr.SegmentDistManager.Update(
+		2,
+		&meta.Segment{
+			SegmentInfo: &datapb.SegmentInfo{
+				ID:            11,
+				CollectionID:  suite.collectionID,
+				PartitionID:   suite.partitionID,
+				InsertChannel: "channel-1",
+			},
+			Node: 2,
+		},
+		&meta.Segment{
+			SegmentInfo: &datapb.SegmentInfo{
+				ID:            12,
+				CollectionID:  suite.collectionID,
+				PartitionID:   suite.partitionID,
+				InsertChannel: "channel-2",
+			},
+			Node: 2,
+		},
+	)
+
+	suite.broker.AssertExpectations(suite.T())
+	suite.broker.ExpectedCalls = suite.broker.ExpectedCalls[:0]
+	suite.broker.Calls = nil
+
+	suite.observer.checkCurrentTargetServiceable(ctx, suite.collectionID)
+	suite.Empty(suite.targetMgr.GetDmChannelsByCollection(ctx, suite.collectionID, meta.NextTarget))
+	suite.Len(suite.targetMgr.GetDmChannelsByCollection(ctx, suite.collectionID, meta.CurrentTarget), 2)
+	suite.broker.AssertNotCalled(suite.T(), "GetRecoveryInfoV2", mock.Anything, mock.Anything)
+	suite.cluster.AssertNotCalled(suite.T(), "SyncDistribution", mock.Anything, mock.Anything, mock.Anything)
 }
 
 func (suite *TargetObserverSuite) TestTriggerRelease() {
@@ -416,7 +566,8 @@ func (suite *TargetObserverCheckSuite) SetupTest() {
 		config.EtcdTLSCert.GetValue(),
 		config.EtcdTLSKey.GetValue(),
 		config.EtcdTLSCACert.GetValue(),
-		config.EtcdTLSMinVersion.GetValue())
+		config.EtcdTLSMinVersion.GetValue(),
+	)
 	suite.Require().NoError(err)
 	suite.kv = etcdkv.NewEtcdKV(cli, config.MetaRootPath.GetValue())
 	suite.ctx = context.Background()
@@ -679,7 +830,8 @@ func TestShouldUpdateCurrentTarget_OnlyReadyDelegatorsSynced(t *testing.T) {
 		func(ctx context.Context, nodeID int64, req *querypb.SyncDistributionRequest) (*commonpb.Status, error) {
 			syncedNodes = append(syncedNodes, nodeID)
 			return merr.Success(), nil
-		}).Maybe()
+		},
+	).Maybe()
 
 	// Node 1: READY delegator
 	// - Has the target segment loaded (segment 100)
@@ -856,7 +1008,8 @@ func TestShouldUpdateCurrentTarget_AllChannelsSynced(t *testing.T) {
 		},
 	})
 	// Add segments to SegmentDistManager for CheckSegmentDataReady
-	distMgr.SegmentDistManager.Update(1,
+	distMgr.SegmentDistManager.Update(
+		1,
 		&meta.Segment{
 			SegmentInfo: &datapb.SegmentInfo{
 				ID:            segmentID1,
