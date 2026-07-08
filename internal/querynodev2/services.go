@@ -73,6 +73,7 @@ const (
 
 var queryNodeLoadSegmentsTiming = newQueryNodeLoadSegmentsTimingStats()
 var queryNodeWatchDmChannelsTiming = newQueryNodeWatchDmChannelsTimingStats()
+var queryNodeFirstWatchDmChannelsLogged atomic.Bool
 
 func (node *QueryNode) markSealedLoadStart(segmentNum int) {
 	if segmentNum == 0 {
@@ -714,6 +715,17 @@ func (node *QueryNode) WatchDmChannels(ctx context.Context, req *querypb.WatchDm
 	log.Info("received watch channel request",
 		zap.Int64("version", req.GetVersion()),
 	)
+	if queryNodeFirstWatchDmChannelsLogged.CompareAndSwap(false, true) {
+		log.Warn("[SN recovery] first watch dm channel",
+			zap.String("phase", "querynode.first_watch_dm_channel"),
+			zap.Int64("version", req.GetVersion()),
+			zap.Int("channelCount", len(req.GetInfos())),
+			zap.Int("flushedSegmentCount", len(channel.GetFlushedSegmentIds())),
+			zap.Int("unflushedSegmentCount", len(channel.GetUnflushedSegmentIds())),
+			zap.Int("droppedSegmentCount", len(channel.GetDroppedSegmentIds())),
+			zap.Int("levelZeroSegmentCount", len(channel.GetLevelZeroSegmentIds())),
+		)
+	}
 	watchStart := time.Now()
 	timing := queryNodeWatchDmChannelsTimingPhase{}
 	defer func() {
