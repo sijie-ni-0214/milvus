@@ -30,6 +30,26 @@ type DistributionManager struct {
 	ChannelDistManager ChannelDistManagerInterface
 }
 
+type CollectionNode struct {
+	CollectionID int64
+	NodeID       int64
+}
+
+type CollectionNodeSet map[CollectionNode]struct{}
+
+func NewCollectionNodeSet() CollectionNodeSet {
+	return make(CollectionNodeSet)
+}
+
+func (s CollectionNodeSet) Insert(collectionID int64, nodeID int64) {
+	s[CollectionNode{CollectionID: collectionID, NodeID: nodeID}] = struct{}{}
+}
+
+func (s CollectionNodeSet) Contain(collectionID int64, nodeID int64) bool {
+	_, ok := s[CollectionNode{CollectionID: collectionID, NodeID: nodeID}]
+	return ok
+}
+
 func NewDistributionManager(nodeManager *session.NodeManager) *DistributionManager {
 	return &DistributionManager{
 		SegmentDistManager: NewSegmentDistManager(),

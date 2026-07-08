@@ -124,11 +124,29 @@ func (ob *ReplicaObserver) checkStreamingQueryNodesInReplica(sqNodeIDsByRG map[s
 	ctx := context.Background()
 	log := log.Ctx(ctx).WithRateGroup("qcv2.checkStreamingQueryNodesInReplica", 1, 60)
 	collections := ob.meta.GetAll(context.Background())
-
-	for _, collectionID := range collections {
-		ob.meta.RecoverSQNodesInCollection(context.Background(), collectionID, sqNodeIDsByRG)
+	roundStart := time.Now()
+	sqNodesByRGForLog := make(map[string][]int64, len(sqNodeIDsByRG))
+	for rgName, nodes := range sqNodeIDsByRG {
+		sqNodesByRGForLog[rgName] = nodes.Collect()
 	}
+	log.Warn("[SQN recovery] replica observer round start",
+		zap.String("phase", "querycoord.sqn_replica_recovery_start"),
+		zap.Int("collectionCount", len(collections)),
+		zap.Any("sqNodesByRG", sqNodesByRGForLog))
 
+	recoverStart := time.Now()
+	firstRecoverErr := ob.meta.RecoverSQNodesInCollections(ctx, collections, sqNodeIDsByRG)
+	recoverDur := time.Since(recoverStart)
+
+	cleanupStart := time.Now()
+	distributionNodes := meta.NewCollectionNodeSet()
+	for node := range ob.distMgr.ChannelDistManager.GetCollectionNodeSet() {
+		distributionNodes[node] = struct{}{}
+	}
+	for node := range ob.distMgr.SegmentDistManager.GetCollectionNodeSet() {
+		distributionNodes[node] = struct{}{}
+	}
+	removals := make([]meta.SQNodeRemoval, 0)
 	for _, collectionID := range collections {
 		replicas := ob.meta.GetByCollection(ctx, collectionID)
 		for _, replica := range replicas {
@@ -139,9 +157,7 @@ func (ob *ReplicaObserver) checkStreamingQueryNodesInReplica(sqNodeIDsByRG map[s
 			}
 			removeNodes := make([]int64, 0, len(roSQNodes))
 			for _, node := range roSQNodes {
-				channels := ob.distMgr.ChannelDistManager.GetByFilter(meta.WithCollectionID2Channel(collectionID), meta.WithNodeID2Channel(node))
-				segments := ob.distMgr.SegmentDistManager.GetByFilter(meta.WithCollectionID(collectionID), meta.WithNodeID(node))
-				if len(channels) == 0 && len(segments) == 0 {
+				if !distributionNodes.Contain(collectionID, node) {
 					removeNodes = append(removeNodes, node)
 				}
 			}
@@ -155,13 +171,23 @@ func (ob *ReplicaObserver) checkStreamingQueryNodesInReplica(sqNodeIDsByRG map[s
 				zap.Int64s("roNodes", roSQNodes),
 				zap.Int64s("rwNodes", rwSQNodes),
 			)
-			if err := ob.meta.RemoveSQNode(ctx, collectionID, replica.GetID(), removeNodes...); err != nil {
-				logger.Warn("fail to remove streaming query node from replica", zap.Error(err))
-				continue
-			}
+			removals = append(removals, meta.SQNodeRemoval{
+				CollectionID: collectionID,
+				ReplicaID:    replica.GetID(),
+				Nodes:        removeNodes,
+			})
 			logger.Info("all segment/channel has been removed from ro streaming query node, remove it from replica")
 		}
 	}
+	firstRemoveErr := ob.meta.RemoveSQNodesInCollections(ctx, removals)
+	log.Warn("[SQN recovery] replica observer round finish",
+		zap.String("phase", "querycoord.sqn_replica_recovery_finish"),
+		zap.Int("collectionCount", len(collections)),
+		zap.NamedError("recoverErr", firstRecoverErr),
+		zap.NamedError("cleanupErr", firstRemoveErr),
+		zap.Duration("recoverDur", recoverDur),
+		zap.Duration("cleanupDur", time.Since(cleanupStart)),
+		zap.Duration("totalDur", time.Since(roundStart)))
 }
 
 func (ob *ReplicaObserver) checkNodesInReplica() {
@@ -220,7 +246,8 @@ func (ob *ReplicaObserver) checkNodesInReplica() {
 				continue
 			}
 			hasNodeRemoved = true
-			logger.Info("all segment/channel has been removed from ro node, remove it from replica",
+			logger.Info(
+				"all segment/channel has been removed from ro node, remove it from replica",
 				zap.Int64s("removedNodes", removeNodes),
 			)
 		}

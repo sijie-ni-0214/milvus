@@ -228,6 +228,7 @@ type ChannelDistManagerInterface interface {
 	GetByFilter(filters ...ChannelDistFilter) []*DmChannel
 	Update(nodeID typeutil.UniqueID, channels ...*DmChannel) []*DmChannel
 	Patch(nodeID typeutil.UniqueID, updates []*DmChannel, removedChannels []string) []*DmChannel
+	GetCollectionNodeSet() CollectionNodeSet
 	GetShardLeader(channelName string, replica *Replica) *DmChannel
 	GetChannelDist(collectionID int64) []*metricsinfo.DmChannel
 	GetLeaderView(collectionID int64) []*metricsinfo.LeaderView
@@ -286,6 +287,19 @@ func (m *ChannelDistManager) GetByFilter(filters ...ChannelDistFilter) []*DmChan
 
 	for _, candidate := range m.channels {
 		ret = append(ret, candidate.Filter(criterion, mergedFilters)...)
+	}
+	return ret
+}
+
+func (m *ChannelDistManager) GetCollectionNodeSet() CollectionNodeSet {
+	m.rwmutex.RLock()
+	defer m.rwmutex.RUnlock()
+
+	ret := NewCollectionNodeSet()
+	for nodeID, nodeChannels := range m.channels {
+		for collectionID := range nodeChannels.collChannels {
+			ret.Insert(collectionID, nodeID)
+		}
 	}
 	return ret
 }
@@ -413,7 +427,8 @@ func (m *ChannelDistManager) GetShardLeader(channelName string, replica *Replica
 			zap.Int64("replicaID", replica.GetID()),
 		).WithRateGroup("ChannelDistManager", 1.0, 60.0)
 		if candidates != nil {
-			logger.RatedDebug(1.0, "final",
+			logger.RatedDebug(
+				1.0, "final",
 				zap.String("candidates", candidates.GetChannelName()),
 				zap.Int64("candidates version", candidates.Version),
 				zap.Int64("candidates node", candidates.Node),

@@ -182,6 +182,7 @@ type SegmentDistManagerInterface interface {
 	Update(nodeID typeutil.UniqueID, segments ...*Segment)
 	Patch(nodeID typeutil.UniqueID, upserts []*Segment, removedSegmentIDs []int64)
 	GetByFilter(filters ...SegmentDistFilter) []*Segment
+	GetCollectionNodeSet() CollectionNodeSet
 	GetSegmentDist(collectionID int64) []*metricsinfo.Segment
 	GetVersion() int64
 }
@@ -334,6 +335,19 @@ func (m *SegmentDistManager) GetByFilter(filters ...SegmentDistFilter) []*Segmen
 
 	for _, nodeSegments := range m.segments {
 		ret = append(ret, nodeSegments.Filter(criterion, mergedFilters)...)
+	}
+	return ret
+}
+
+func (m *SegmentDistManager) GetCollectionNodeSet() CollectionNodeSet {
+	m.rwmutex.RLock()
+	defer m.rwmutex.RUnlock()
+
+	ret := NewCollectionNodeSet()
+	for nodeID, nodeSegments := range m.segments {
+		for collectionID := range nodeSegments.collSegments {
+			ret.Insert(collectionID, nodeID)
+		}
 	}
 	return ret
 }

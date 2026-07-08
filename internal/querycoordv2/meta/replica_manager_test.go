@@ -113,7 +113,8 @@ func (suite *ReplicaManagerSuite) SetupTest() {
 		config.EtcdTLSCert.GetValue(),
 		config.EtcdTLSKey.GetValue(),
 		config.EtcdTLSCACert.GetValue(),
-		config.EtcdTLSMinVersion.GetValue())
+		config.EtcdTLSMinVersion.GetValue(),
+	)
 	suite.Require().NoError(err)
 	suite.kv = etcdkv.NewEtcdKV(cli, config.MetaRootPath.GetValue())
 	suite.catalog = querycoord.NewCatalog(suite.kv)
@@ -446,7 +447,8 @@ func (suite *ReplicaManagerV2Suite) SetupSuite() {
 		config.EtcdTLSCert.GetValue(),
 		config.EtcdTLSKey.GetValue(),
 		config.EtcdTLSCACert.GetValue(),
-		config.EtcdTLSMinVersion.GetValue())
+		config.EtcdTLSMinVersion.GetValue(),
+	)
 	suite.Require().NoError(err)
 	suite.kv = etcdkv.NewEtcdKV(cli, config.MetaRootPath.GetValue())
 	suite.catalog = querycoord.NewCatalog(suite.kv)
@@ -882,6 +884,60 @@ func TestSQNodeRecoveryWithUnrecoverableNodes(t *testing.T) {
 	assert.Contains(t, updatedReplica.GetRWSQNodes(), int64(101))
 	// Node 102 should be added as new RW
 	assert.Contains(t, updatedReplica.GetRWSQNodes(), int64(102))
+}
+
+func TestSQNodeRecoveryBatchSave(t *testing.T) {
+	paramtable.Init()
+	catalog := mocks.NewQueryCoordCatalog(t)
+	catalog.EXPECT().SaveReplica(mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(nil).Once()
+	catalog.EXPECT().SaveReplica(mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(nil).Once()
+
+	mgr := NewReplicaManager(RandomIncrementIDAllocator(), catalog)
+	ctx := context.Background()
+	replicas := []*Replica{
+		newReplica(&querypb.Replica{ID: 1, CollectionID: 100, ResourceGroup: "RG1", RwSqNodes: []int64{101}}),
+		newReplica(&querypb.Replica{ID: 2, CollectionID: 200, ResourceGroup: "RG1", RwSqNodes: []int64{101}}),
+		newReplica(&querypb.Replica{ID: 3, CollectionID: 300, ResourceGroup: "RG1", RwSqNodes: []int64{101}}),
+	}
+	assert.NoError(t, mgr.Put(ctx, replicas...))
+
+	err := mgr.RecoverSQNodesInCollections(ctx, []int64{100, 200, 300}, map[string]typeutil.UniqueSet{
+		"RG1": typeutil.NewUniqueSet(int64(102)),
+	})
+	assert.NoError(t, err)
+	for _, replica := range replicas {
+		updated := mgr.Get(ctx, replica.GetID())
+		assert.ElementsMatch(t, []int64{102}, updated.GetRWSQNodes())
+		assert.ElementsMatch(t, []int64{101}, updated.GetROSQNodes())
+	}
+}
+
+func TestSQNodeCleanupBatchSave(t *testing.T) {
+	paramtable.Init()
+	catalog := mocks.NewQueryCoordCatalog(t)
+	catalog.EXPECT().SaveReplica(mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(nil).Once()
+	catalog.EXPECT().SaveReplica(mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(nil).Once()
+
+	mgr := NewReplicaManager(RandomIncrementIDAllocator(), catalog)
+	ctx := context.Background()
+	replicas := []*Replica{
+		newReplica(&querypb.Replica{ID: 1, CollectionID: 100, ResourceGroup: "RG1", RwSqNodes: []int64{101}, RoSqNodes: []int64{201}}),
+		newReplica(&querypb.Replica{ID: 2, CollectionID: 200, ResourceGroup: "RG1", RwSqNodes: []int64{102}, RoSqNodes: []int64{202}}),
+		newReplica(&querypb.Replica{ID: 3, CollectionID: 300, ResourceGroup: "RG1", RwSqNodes: []int64{103}, RoSqNodes: []int64{203}}),
+	}
+	assert.NoError(t, mgr.Put(ctx, replicas...))
+
+	err := mgr.RemoveSQNodesInCollections(ctx, []SQNodeRemoval{
+		{CollectionID: 100, ReplicaID: 1, Nodes: []int64{201}},
+		{CollectionID: 200, ReplicaID: 2, Nodes: []int64{202}},
+		{CollectionID: 300, ReplicaID: 3, Nodes: []int64{203}},
+	})
+	assert.NoError(t, err)
+	for _, replica := range replicas {
+		updated := mgr.Get(ctx, replica.GetID())
+		assert.Empty(t, updated.GetROSQNodes())
+		assert.ElementsMatch(t, replica.GetRWSQNodes(), updated.GetRWSQNodes())
+	}
 }
 
 func TestReplicaManager(t *testing.T) {
