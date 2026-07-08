@@ -37,6 +37,10 @@ var errTypeNotFound = errors.New("checker type not found")
 
 type GetBalancerFunc = func() balance.Balance
 
+type taskSubmittingChecker interface {
+	CheckAndSubmit(context.Context, func(task.Task))
+}
+
 type CheckerController struct {
 	cancel         context.CancelFunc
 	manualCheckChs map[utils.CheckerType]chan struct{}
@@ -177,14 +181,22 @@ func (controller *CheckerController) Check() {
 // check is the real implementation of Check
 func (controller *CheckerController) check(ctx context.Context, checkType utils.CheckerType) {
 	checker := controller.checkers[checkType]
+	if submittingChecker, ok := checker.(taskSubmittingChecker); ok {
+		submittingChecker.CheckAndSubmit(ctx, controller.submitTask)
+		return
+	}
+
 	tasks := checker.Check(ctx)
 
 	for _, task := range tasks {
-		err := controller.scheduler.Add(task)
-		if err != nil {
-			task.Cancel(err)
-			continue
-		}
+		controller.submitTask(task)
+	}
+}
+
+func (controller *CheckerController) submitTask(task task.Task) {
+	err := controller.scheduler.Add(task)
+	if err != nil {
+		task.Cancel(err)
 	}
 }
 

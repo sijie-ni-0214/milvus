@@ -145,6 +145,43 @@ func (suite *ChannelCheckerTestSuite) TestLoadChannel() {
 	suite.EqualValues("test-insert-channel", action.ChannelName())
 }
 
+func (suite *ChannelCheckerTestSuite) TestLoadChannelWithSubmit() {
+	ctx := context.Background()
+	checker := suite.checker
+	checker.meta.PutCollection(ctx, utils.CreateTestCollection(1, 1))
+	suite.meta.PutPartition(ctx, utils.CreateTestPartition(1, 1))
+	checker.meta.Put(ctx, utils.CreateTestReplica(1, 1, []int64{1}))
+	suite.nodeMgr.Add(session.NewNodeInfo(session.ImmutableNodeInfo{
+		NodeID:   1,
+		Address:  "localhost",
+		Hostname: "localhost",
+	}))
+	checker.meta.HandleNodeUp(ctx, 1)
+
+	channels := []*datapb.VchannelInfo{
+		{
+			CollectionID: 1,
+			ChannelName:  "test-insert-channel",
+		},
+	}
+
+	suite.broker.EXPECT().GetRecoveryInfoV2(mock.Anything, int64(1)).Return(
+		channels, nil, nil)
+	checker.targetMgr.UpdateCollectionNextTarget(ctx, int64(1))
+
+	var submitted []task.Task
+	checker.CheckAndSubmit(context.TODO(), func(t task.Task) {
+		submitted = append(submitted, t)
+	})
+	suite.Len(submitted, 1)
+	suite.EqualValues(1, submitted[0].ReplicaID())
+	suite.Len(submitted[0].Actions(), 1)
+	action := submitted[0].Actions()[0].(*task.ChannelAction)
+	suite.Equal(task.ActionTypeGrow, action.Type())
+	suite.EqualValues(1, action.Node())
+	suite.EqualValues("test-insert-channel", action.ChannelName())
+}
+
 func (suite *ChannelCheckerTestSuite) TestReduceChannel() {
 	ctx := context.Background()
 	checker := suite.checker

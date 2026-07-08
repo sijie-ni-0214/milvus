@@ -90,17 +90,38 @@ func (c *ChannelChecker) readyToCheck(ctx context.Context, collectionID int64) b
 }
 
 func (c *ChannelChecker) Check(ctx context.Context) []task.Task {
+	return c.check(ctx, nil)
+}
+
+func (c *ChannelChecker) CheckAndSubmit(ctx context.Context, submit func(task.Task)) {
+	c.check(ctx, submit)
+}
+
+func (c *ChannelChecker) check(ctx context.Context, submit func(task.Task)) []task.Task {
 	if !c.IsActive() {
 		return nil
 	}
 
 	collectionIDs := c.meta.GetAll(ctx)
+	currentDistVersion := c.dist.ChannelDistManager.GetVersion()
 	tasks := make([]task.Task, 0)
+	emitTasks := func(newTasks []task.Task) bool {
+		if len(newTasks) == 0 {
+			return false
+		}
+		if submit == nil {
+			tasks = append(tasks, newTasks...)
+			return true
+		}
+		for _, t := range newTasks {
+			submit(t)
+		}
+		return true
+	}
 	for _, cid := range collectionIDs {
 		if c.readyToCheck(ctx, cid) {
 			// Fast path: skip if target and dist versions unchanged
 			currentTargetVersion := c.targetMgr.GetCollectionTargetVersion(ctx, cid, meta.NextTarget)
-			currentDistVersion := c.dist.ChannelDistManager.GetVersion()
 			if c.isCollectionSynced(cid, currentTargetVersion, currentDistVersion) {
 				continue
 			}
@@ -109,9 +130,8 @@ func (c *ChannelChecker) Check(ctx context.Context) []task.Task {
 			hasTask := false
 			for _, r := range replicas {
 				replicaTasks := c.checkReplica(ctx, r)
-				if len(replicaTasks) > 0 {
+				if emitTasks(replicaTasks) {
 					hasTask = true
-					tasks = append(tasks, replicaTasks...)
 				}
 			}
 
@@ -131,7 +151,7 @@ func (c *ChannelChecker) Check(ctx context.Context) []task.Task {
 	released := utils.FilterReleased(channels, collectionIDs)
 	releaseTasks := c.createChannelReduceTasks(ctx, released, meta.NilReplica)
 	task.SetReason("collection released", releaseTasks...)
-	tasks = append(tasks, releaseTasks...)
+	emitTasks(releaseTasks)
 
 	// clean node which has been move out from replica
 	for _, nodeInfo := range c.nodeMgr.GetAll() {
@@ -143,7 +163,7 @@ func (c *ChannelChecker) Check(ctx context.Context) []task.Task {
 			if replica == nil {
 				reduceTasks := c.createChannelReduceTasks(ctx, channels, meta.NilReplica)
 				task.SetReason("dirty channel exists", reduceTasks...)
-				tasks = append(tasks, reduceTasks...)
+				emitTasks(reduceTasks)
 			}
 		}
 	}
