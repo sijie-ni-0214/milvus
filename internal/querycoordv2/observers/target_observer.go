@@ -88,6 +88,131 @@ func newCurrentTargetReadyStats() *currentTargetReadyStats {
 	}
 }
 
+const (
+	syncTargetRPCStatsLogInterval = 10 * time.Second
+	syncTargetRPCStatsLogMinCount = 10000
+)
+
+type syncTargetRPCStatsSnapshot struct {
+	reason          string
+	rpcCount        int
+	successCount    int
+	failureCount    int
+	totalDuration   time.Duration
+	maxDuration     time.Duration
+	maxCollectionID int64
+	maxLeaderID     int64
+	maxChannel      string
+}
+
+type syncTargetRPCStats struct {
+	mut             sync.Mutex
+	lastLogTime     time.Time
+	rpcCount        int
+	successCount    int
+	failureCount    int
+	totalDuration   time.Duration
+	maxDuration     time.Duration
+	maxCollectionID int64
+	maxLeaderID     int64
+	maxChannel      string
+}
+
+func newSyncTargetRPCStats() *syncTargetRPCStats {
+	return &syncTargetRPCStats{}
+}
+
+func (s *syncTargetRPCStats) record(ctx context.Context, collectionID, leaderID int64, channel string, duration time.Duration, success bool) {
+	s.mut.Lock()
+	now := time.Now()
+	if s.lastLogTime.IsZero() {
+		s.lastLogTime = now
+	}
+
+	s.rpcCount++
+	if success {
+		s.successCount++
+	} else {
+		s.failureCount++
+	}
+	s.totalDuration += duration
+	if duration > s.maxDuration {
+		s.maxDuration = duration
+		s.maxCollectionID = collectionID
+		s.maxLeaderID = leaderID
+		s.maxChannel = channel
+	}
+
+	if s.rpcCount < syncTargetRPCStatsLogMinCount && now.Sub(s.lastLogTime) < syncTargetRPCStatsLogInterval {
+		s.mut.Unlock()
+		return
+	}
+
+	snapshot := s.snapshotLocked("interval")
+	s.resetLocked(now)
+	s.mut.Unlock()
+	logSyncTargetRPCStats(ctx, snapshot)
+}
+
+func (s *syncTargetRPCStats) flush(ctx context.Context, reason string) {
+	s.mut.Lock()
+	if s.rpcCount == 0 {
+		s.mut.Unlock()
+		return
+	}
+
+	snapshot := s.snapshotLocked(reason)
+	s.resetLocked(time.Now())
+	s.mut.Unlock()
+	logSyncTargetRPCStats(ctx, snapshot)
+}
+
+func (s *syncTargetRPCStats) snapshotLocked(reason string) syncTargetRPCStatsSnapshot {
+	return syncTargetRPCStatsSnapshot{
+		reason:          reason,
+		rpcCount:        s.rpcCount,
+		successCount:    s.successCount,
+		failureCount:    s.failureCount,
+		totalDuration:   s.totalDuration,
+		maxDuration:     s.maxDuration,
+		maxCollectionID: s.maxCollectionID,
+		maxLeaderID:     s.maxLeaderID,
+		maxChannel:      s.maxChannel,
+	}
+}
+
+func (s *syncTargetRPCStats) resetLocked(now time.Time) {
+	s.lastLogTime = now
+	s.rpcCount = 0
+	s.successCount = 0
+	s.failureCount = 0
+	s.totalDuration = 0
+	s.maxDuration = 0
+	s.maxCollectionID = 0
+	s.maxLeaderID = 0
+	s.maxChannel = ""
+}
+
+func logSyncTargetRPCStats(ctx context.Context, snapshot syncTargetRPCStatsSnapshot) {
+	avgDuration := time.Duration(0)
+	if snapshot.rpcCount > 0 {
+		avgDuration = snapshot.totalDuration / time.Duration(snapshot.rpcCount)
+	}
+
+	log.Ctx(ctx).Warn("[QC recovery] sync target rpc aggregate",
+		zap.String("phase", "querycoord.sync_target_rpc_aggregate"),
+		zap.String("reason", snapshot.reason),
+		zap.Int("rpcCount", snapshot.rpcCount),
+		zap.Int("successCount", snapshot.successCount),
+		zap.Int("failureCount", snapshot.failureCount),
+		zap.Duration("totalDuration", snapshot.totalDuration),
+		zap.Duration("avgDuration", avgDuration),
+		zap.Duration("maxDuration", snapshot.maxDuration),
+		zap.Int64("maxCollectionID", snapshot.maxCollectionID),
+		zap.Int64("maxLeaderID", snapshot.maxLeaderID),
+		zap.String("maxChannel", snapshot.maxChannel))
+}
+
 type TargetObserver struct {
 	cancel    context.CancelFunc
 	wg        sync.WaitGroup
@@ -112,6 +237,7 @@ type TargetObserver struct {
 	// serviceableDispatcher handles serviceable distribution changes for collections with an existing current target.
 	serviceableDispatcher *taskDispatcher[int64]
 	readyStats            *currentTargetReadyStats
+	syncTargetRPCStats    *syncTargetRPCStats
 
 	keylocks *lock.KeyLock[int64]
 
@@ -139,6 +265,7 @@ func NewTargetObserver(
 		readyNotifiers:       make(map[int64][]chan struct{}),
 		initChan:             make(chan initRequest),
 		readyStats:           newCurrentTargetReadyStats(),
+		syncTargetRPCStats:   newSyncTargetRPCStats(),
 		keylocks:             lock.NewKeyLock[int64](),
 	}
 
@@ -519,6 +646,7 @@ func (ob *TargetObserver) recordCurrentTargetReady(ctx context.Context, collecti
 		zap.String("phase", "querycoord.current_target_ready_aggregate"),
 		zap.Int("readyCollectionCount", readyCollections),
 		zap.Int("collectionCount", totalCollections))
+	ob.syncTargetRPCStats.flush(ctx, "current_target_ready")
 }
 
 func (ob *TargetObserver) shouldUpdateNextTarget(ctx context.Context, collectionID int64) bool {
@@ -700,6 +828,12 @@ func (ob *TargetObserver) syncToDelegator(ctx context.Context, replica *meta.Rep
 	ctx, cancel := context.WithTimeout(ctx, paramtable.Get().QueryCoordCfg.BrokerTimeout.GetAsDuration(time.Millisecond))
 	defer cancel()
 
+	rpcStart := time.Now()
+	success := false
+	defer func() {
+		ob.syncTargetRPCStats.record(ctx, LeaderView.CollectionID, LeaderView.ID, LeaderView.Channel, time.Since(rpcStart), success)
+	}()
+
 	resp, err := ob.cluster.SyncDistribution(ctx, LeaderView.ID, req)
 	if err != nil {
 		log.Warn("failed to sync distribution", zap.Error(err))
@@ -711,6 +845,7 @@ func (ob *TargetObserver) syncToDelegator(ctx context.Context, replica *meta.Rep
 		return false
 	}
 
+	success = true
 	return true
 }
 
