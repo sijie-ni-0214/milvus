@@ -181,15 +181,28 @@ func (controller *CheckerController) Check() {
 // check is the real implementation of Check
 func (controller *CheckerController) check(ctx context.Context, checkType utils.CheckerType) {
 	checker := controller.checkers[checkType]
+	start := time.Now()
+	taskNum := 0
+	submitTask := func(task task.Task) {
+		taskNum++
+		controller.submitTask(task)
+	}
+	defer func() {
+		log.Warn("checker round finished",
+			zap.String("type", checkType.String()),
+			zap.Duration("duration", time.Since(start)),
+			zap.Int("taskNum", taskNum))
+	}()
+
 	if submittingChecker, ok := checker.(taskSubmittingChecker); ok {
-		submittingChecker.CheckAndSubmit(ctx, controller.submitTask)
+		submittingChecker.CheckAndSubmit(ctx, submitTask)
 		return
 	}
 
 	tasks := checker.Check(ctx)
 
 	for _, task := range tasks {
-		controller.submitTask(task)
+		submitTask(task)
 	}
 }
 
