@@ -20,7 +20,6 @@ package storagev2
 #cgo pkg-config: milvus_core milvus-storage
 
 #include <stdlib.h>
-#include "milvus-storage/diagnostics_c.h"
 #include "milvus-storage/ffi_c.h"
 #include "milvus-storage/ffi_filesystem_c.h"
 #include "milvus-storage/ffi_filesystem_metrics_c.h"
@@ -28,7 +27,6 @@ package storagev2
 import "C"
 
 import (
-	"encoding/json"
 	"fmt"
 	"strconv"
 	"strings"
@@ -52,19 +50,6 @@ type FilesystemMetrics struct {
 	FailedCount             int64
 	MultiPartUploadCreated  int64
 	MultiPartUploadFinished int64
-}
-
-type recoveryIOStatsEntry struct {
-	Op               string `json:"op"`
-	FieldIDs         string `json:"field_ids"`
-	ColumnGroupIndex int64  `json:"column_group_index"`
-	Lazy             bool   `json:"lazy"`
-	PK               bool   `json:"pk"`
-	Format           string `json:"format"`
-	S3ReadCount      int64  `json:"s3_read_count"`
-	S3ReadBytes      int64  `json:"s3_read_bytes"`
-	CacheHits        int64  `json:"cache_hits"`
-	CacheMisses      int64  `json:"cache_misses"`
 }
 
 // getMetricsFromHandle retrieves metrics from a filesystem handle
@@ -258,21 +243,6 @@ func HandleLoonFFIResult(ffiResult C.LoonFFIResult) error {
 	return nil
 }
 
-func getRecoveryIOStats() ([]recoveryIOStatsEntry, error) {
-	cJSON := C.loon_recovery_io_stats_json()
-	if cJSON == nil {
-		return nil, fmt.Errorf("failed to allocate recovery IO stats JSON")
-	}
-	defer C.loon_recovery_io_stats_free(cJSON)
-
-	raw := C.GoString(cJSON)
-	var entries []recoveryIOStatsEntry
-	if err := json.Unmarshal([]byte(raw), &entries); err != nil {
-		return nil, fmt.Errorf("failed to parse recovery IO stats JSON: %w", err)
-	}
-	return entries, nil
-}
-
 // GetFilesystemKeyFromStorageConfig extracts filesystem cache key from StorageConfig.
 func GetFilesystemKeyFromStorageConfig(storageConfig *indexpb.StorageConfig) string {
 	if storageConfig == nil {
@@ -349,29 +319,5 @@ func PublishFilesystemMetricsWithConfig(storageConfig *indexpb.StorageConfig) (*
 		metricSnapshot.MultiPartUploadCreated,
 		metricSnapshot.MultiPartUploadFinished,
 	)
-	PublishRecoveryIOStats()
 	return metricSnapshot, nil
-}
-
-// PublishRecoveryIOStats publishes storage recovery diagnostic IO stats.
-func PublishRecoveryIOStats() {
-	entries, err := getRecoveryIOStats()
-	if err != nil {
-		log.Warn("failed to get recovery IO stats", zap.Error(err))
-		return
-	}
-	for _, entry := range entries {
-		metrics.PublishRecoveryIOStats(
-			entry.Op,
-			entry.FieldIDs,
-			strconv.FormatInt(entry.ColumnGroupIndex, 10),
-			strconv.FormatBool(entry.Lazy),
-			strconv.FormatBool(entry.PK),
-			entry.Format,
-			entry.S3ReadCount,
-			entry.S3ReadBytes,
-			entry.CacheHits,
-			entry.CacheMisses,
-		)
-	}
 }

@@ -27,13 +27,7 @@ const (
 	DataWalkLabel   = "walk"
 	DataStatLabel   = "stat"
 
-	persistentDataOpType          = "persistent_data_op_type"
-	storageIOOpLabelName          = "op"
-	storageIOFieldIDsLabelName    = "field_ids"
-	storageIOColumnGroupLabelName = "column_group"
-	storageIOLazyLabelName        = "lazy"
-	storageIOPKLabelName          = "pk"
-	storageIOFormatLabelName      = "format"
+	persistentDataOpType = "persistent_data_op_type"
 )
 
 var (
@@ -143,66 +137,6 @@ var (
 		}, []string{
 			filesystemKeyLabelName,
 		})
-
-	RecoveryIOReadCount = prometheus.NewGaugeVec(
-		prometheus.GaugeOpts{
-			Namespace: milvusNamespace,
-			Subsystem: "storage",
-			Name:      "recovery_io_read_count",
-			Help:      "number of recovery diagnostic S3 read operations",
-		}, []string{
-			storageIOOpLabelName,
-			storageIOFieldIDsLabelName,
-			storageIOColumnGroupLabelName,
-			storageIOLazyLabelName,
-			storageIOPKLabelName,
-			storageIOFormatLabelName,
-		})
-
-	RecoveryIOReadBytes = prometheus.NewGaugeVec(
-		prometheus.GaugeOpts{
-			Namespace: milvusNamespace,
-			Subsystem: "storage",
-			Name:      "recovery_io_read_bytes",
-			Help:      "bytes read by recovery diagnostic S3 read operations",
-		}, []string{
-			storageIOOpLabelName,
-			storageIOFieldIDsLabelName,
-			storageIOColumnGroupLabelName,
-			storageIOLazyLabelName,
-			storageIOPKLabelName,
-			storageIOFormatLabelName,
-		})
-
-	RecoveryIOCacheHits = prometheus.NewGaugeVec(
-		prometheus.GaugeOpts{
-			Namespace: milvusNamespace,
-			Subsystem: "storage",
-			Name:      "recovery_io_cache_hits",
-			Help:      "number of recovery diagnostic cache hits",
-		}, []string{
-			storageIOOpLabelName,
-			storageIOFieldIDsLabelName,
-			storageIOColumnGroupLabelName,
-			storageIOLazyLabelName,
-			storageIOPKLabelName,
-			storageIOFormatLabelName,
-		})
-
-	RecoveryIOCacheMisses = prometheus.NewGaugeVec(
-		prometheus.GaugeOpts{
-			Namespace: milvusNamespace,
-			Subsystem: "storage",
-			Name:      "recovery_io_cache_misses",
-			Help:      "number of recovery diagnostic cache misses",
-		}, []string{
-			storageIOOpLabelName,
-			storageIOFieldIDsLabelName,
-			storageIOColumnGroupLabelName,
-			storageIOLazyLabelName,
-			storageIOPKLabelName,
-			storageIOFormatLabelName,
-		})
 )
 
 // RegisterStorageMetrics registers storage metrics
@@ -220,10 +154,6 @@ func RegisterStorageMetrics(registry *prometheus.Registry) {
 	registry.MustRegister(FilesystemFailedCount)
 	registry.MustRegister(FilesystemMultiPartUploadCreated)
 	registry.MustRegister(FilesystemMultiPartUploadFinished)
-	registry.MustRegister(RecoveryIOReadCount)
-	registry.MustRegister(RecoveryIOReadBytes)
-	registry.MustRegister(RecoveryIOCacheHits)
-	registry.MustRegister(RecoveryIOCacheMisses)
 }
 
 // PublishFilesystemMetrics publishes filesystem metrics (common across all nodes)
@@ -240,20 +170,4 @@ func PublishFilesystemMetrics(fs string, readCount, writeCount, readBytes, write
 	FilesystemFailedCount.With(labels).Set(float64(failedCount))
 	FilesystemMultiPartUploadCreated.With(labels).Set(float64(multiPartUploadCreated))
 	FilesystemMultiPartUploadFinished.With(labels).Set(float64(multiPartUploadFinished))
-}
-
-// PublishRecoveryIOStats publishes low-cardinality SN recovery diagnostic IO stats.
-func PublishRecoveryIOStats(op, fieldIDs, columnGroup, lazy, pk, format string, readCount, readBytes, cacheHits, cacheMisses int64) {
-	labels := prometheus.Labels{
-		storageIOOpLabelName:          op,
-		storageIOFieldIDsLabelName:    fieldIDs,
-		storageIOColumnGroupLabelName: columnGroup,
-		storageIOLazyLabelName:        lazy,
-		storageIOPKLabelName:          pk,
-		storageIOFormatLabelName:      format,
-	}
-	RecoveryIOReadCount.With(labels).Set(float64(readCount))
-	RecoveryIOReadBytes.With(labels).Set(float64(readBytes))
-	RecoveryIOCacheHits.With(labels).Set(float64(cacheHits))
-	RecoveryIOCacheMisses.With(labels).Set(float64(cacheMisses))
 }
