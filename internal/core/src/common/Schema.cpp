@@ -38,7 +38,7 @@ Schema::Schema(const Schema& other) {
     std::lock_guard<std::mutex> lock(other.arrow_schema_cache_mutex_);
     debug_id = other.debug_id;
     field_ids_ = other.field_ids_;
-    fields_ = other.fields_;
+    fields_.insert(other.fields_.begin(), other.fields_.end());
     name_ids_ = other.name_ids_;
     id_names_ = other.id_names_;
     primary_field_id_opt_ = other.primary_field_id_opt_;
@@ -69,9 +69,10 @@ Schema::operator=(const Schema& other) {
 
     std::scoped_lock lock(arrow_schema_cache_mutex_,
                           other.arrow_schema_cache_mutex_);
+    auto copied_fields = other.fields_;
     debug_id = other.debug_id;
     field_ids_ = other.field_ids_;
-    fields_ = other.fields_;
+    fields_.swap(copied_fields);
     name_ids_ = other.name_ids_;
     id_names_ = other.id_names_;
     primary_field_id_opt_ = other.primary_field_id_opt_;
