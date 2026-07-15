@@ -17,6 +17,7 @@
 #include <stdint.h>
 
 #define SEGCORE_INDEX_MEMORY_STATS_MAX_ENTRIES 64
+#define SEGCORE_COLLECTION_MEMORY_STATS_MAX_ENTRIES 256
 
 #ifdef __cplusplus
 extern "C" {
@@ -95,11 +96,31 @@ typedef struct {
     uint64_t timestamp_index_cell_bytes;
 } SegcoreMemoryStats;
 
+typedef struct {
+    char owner[32];
+    char field_name[96];
+    char data_type[32];
+    char component[80];
+    char accuracy[16];
+    uint64_t count;
+    uint64_t bytes;
+} SegcoreCollectionMemoryStatsEntry;
+
+typedef struct {
+    uint64_t entry_count;
+    uint64_t overflow_count;
+    SegcoreCollectionMemoryStatsEntry
+        entries[SEGCORE_COLLECTION_MEMORY_STATS_MAX_ENTRIES];
+} SegcoreCollectionMemoryStats;
+
 SegcoreMemoryStats
 GetSegcoreMemoryStats();
 
 SegcoreIndexMemoryStats
 GetSegcoreIndexMemoryStats();
+
+SegcoreCollectionMemoryStats
+GetSegcoreCollectionMemoryStats();
 
 #ifdef __cplusplus
 }

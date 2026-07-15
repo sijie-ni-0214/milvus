@@ -23,11 +23,17 @@
 
 namespace milvus::segcore {
 
+struct CollectionMemoryUsage {
+    size_t object_bytes = 0;
+    size_t collection_name_dynamic_bytes = 0;
+};
+
 class Collection {
  public:
     explicit Collection(const milvus::proto::schema::CollectionSchema* schema);
     explicit Collection(const std::string_view schema_proto);
     explicit Collection(const void* collection_proto, const int64_t length);
+    ~Collection();
 
     void
     parseIndexMeta(const void* index_meta_proto_blob, const int64_t length);
@@ -39,7 +45,7 @@ class Collection {
 
  public:
     SchemaPtr
-    get_schema() {
+    get_schema() const {
         std::shared_lock lock(schema_mutex_);
         return schema_;
     }
@@ -64,7 +70,7 @@ class Collection {
     }
 
     IndexMetaPtr
-    get_index_meta() {
+    get_index_meta() const {
         std::shared_lock lock(index_meta_mutex_);
         return index_meta_;
     }
@@ -76,16 +82,19 @@ class Collection {
     }
 
     const std::string_view
-    get_collection_name() {
+    get_collection_name() const {
         return collection_name_;
     }
+
+    CollectionMemoryUsage
+    MemoryUsage() const;
 
  private:
     std::string collection_name_;
     SchemaPtr schema_;
-    std::shared_mutex schema_mutex_;
+    mutable std::shared_mutex schema_mutex_;
     IndexMetaPtr index_meta_;
-    std::shared_mutex index_meta_mutex_;
+    mutable std::shared_mutex index_meta_mutex_;
 };
 
 using CollectionPtr = std::unique_ptr<Collection>;

@@ -25,6 +25,7 @@
 #include "arrow/util/key_value_metadata.h"
 #include "common/Consts.h"
 #include "common/FieldMeta.h"
+#include "common/MemoryUsage.h"
 #include "milvus-storage/common/constants.h"
 #include "pb/common.pb.h"
 #include "protobuf_utils.h"
@@ -33,6 +34,149 @@ namespace milvus {
 
 using std::string;
 const std::string namespace_field_name = "$namespace_id";
+
+SchemaMemoryUsage
+Schema::MemoryUsage() const {
+    SchemaMemoryUsage usage;
+    usage.object_bytes = sizeof(Schema);
+    usage.shared_ptr_control_block_estimated_bytes =
+        memory_usage::SharedPtrControlBlockEstimatedBytes();
+    usage.field_count = fields_.size();
+    usage.field_ids_size = field_ids_.size();
+    usage.field_ids_capacity = field_ids_.capacity();
+    usage.field_ids_capacity_bytes =
+        memory_usage::VectorCapacityBytes(field_ids_);
+
+    usage.fields_bucket_count = fields_.bucket_count();
+    usage.fields_bucket_bytes = memory_usage::UnorderedMapBucketBytes(fields_);
+    usage.fields_key_bytes = fields_.size() * sizeof(FieldId);
+    usage.fields_node_overhead_estimated_bytes =
+        memory_usage::UnorderedMapNodeOverheadEstimatedBytes(fields_);
+
+    usage.name_ids_count = name_ids_.size();
+    usage.name_ids_bucket_count = name_ids_.bucket_count();
+    usage.name_ids_bucket_bytes =
+        memory_usage::UnorderedMapBucketBytes(name_ids_);
+    usage.name_ids_value_bytes =
+        memory_usage::UnorderedMapValueBytes(name_ids_);
+    usage.name_ids_node_overhead_estimated_bytes =
+        memory_usage::UnorderedMapNodeOverheadEstimatedBytes(name_ids_);
+    for (const auto& [name, field_id] : name_ids_) {
+        (void)field_id;
+        usage.name_ids_string_dynamic_bytes +=
+            memory_usage::StringDynamicBytes(name.get());
+    }
+
+    usage.id_names_count = id_names_.size();
+    usage.id_names_bucket_count = id_names_.bucket_count();
+    usage.id_names_bucket_bytes =
+        memory_usage::UnorderedMapBucketBytes(id_names_);
+    usage.id_names_value_bytes =
+        memory_usage::UnorderedMapValueBytes(id_names_);
+    usage.id_names_node_overhead_estimated_bytes =
+        memory_usage::UnorderedMapNodeOverheadEstimatedBytes(id_names_);
+    for (const auto& [field_id, name] : id_names_) {
+        (void)field_id;
+        usage.id_names_string_dynamic_bytes +=
+            memory_usage::StringDynamicBytes(name.get());
+    }
+
+    usage.load_fields_count = load_fields_.size();
+    usage.load_fields_bucket_count = load_fields_.bucket_count();
+    usage.load_fields_bucket_bytes =
+        memory_usage::UnorderedSetBucketBytes(load_fields_);
+    usage.load_fields_value_bytes =
+        memory_usage::UnorderedSetValueBytes(load_fields_);
+    usage.load_fields_node_overhead_estimated_bytes =
+        memory_usage::UnorderedSetNodeOverheadEstimatedBytes(load_fields_);
+
+    usage.bm25_fields_count = bm25_function_output_fields_.size();
+    usage.bm25_fields_bucket_count =
+        bm25_function_output_fields_.bucket_count();
+    usage.bm25_fields_bucket_bytes =
+        memory_usage::UnorderedSetBucketBytes(bm25_function_output_fields_);
+    usage.bm25_fields_value_bytes =
+        memory_usage::UnorderedSetValueBytes(bm25_function_output_fields_);
+    usage.bm25_fields_node_overhead_estimated_bytes =
+        memory_usage::UnorderedSetNodeOverheadEstimatedBytes(
+            bm25_function_output_fields_);
+
+    usage.mmap_fields_count = mmap_fields_.size();
+    usage.mmap_fields_bucket_count = mmap_fields_.bucket_count();
+    usage.mmap_fields_bucket_bytes =
+        memory_usage::UnorderedMapBucketBytes(mmap_fields_);
+    usage.mmap_fields_value_bytes =
+        memory_usage::UnorderedMapValueBytes(mmap_fields_);
+    usage.mmap_fields_node_overhead_estimated_bytes =
+        memory_usage::UnorderedMapNodeOverheadEstimatedBytes(mmap_fields_);
+
+    usage.struct_array_cache_count = struct_array_field_cache_.size();
+    usage.struct_array_cache_bucket_count =
+        struct_array_field_cache_.bucket_count();
+    usage.struct_array_cache_bucket_bytes =
+        memory_usage::UnorderedMapBucketBytes(struct_array_field_cache_);
+    usage.struct_array_cache_value_bytes =
+        memory_usage::UnorderedMapValueBytes(struct_array_field_cache_);
+    usage.struct_array_cache_node_overhead_estimated_bytes =
+        memory_usage::UnorderedMapNodeOverheadEstimatedBytes(
+            struct_array_field_cache_);
+    for (const auto& [name, field_id] : struct_array_field_cache_) {
+        (void)field_id;
+        usage.struct_array_cache_string_dynamic_bytes +=
+            memory_usage::StringDynamicBytes(name);
+    }
+
+    usage.warmup_fields_count = warmup_fields_.size();
+    usage.warmup_fields_bucket_count = warmup_fields_.bucket_count();
+    usage.warmup_fields_bucket_bytes =
+        memory_usage::UnorderedMapBucketBytes(warmup_fields_);
+    usage.warmup_fields_value_bytes =
+        memory_usage::UnorderedMapValueBytes(warmup_fields_);
+    usage.warmup_fields_node_overhead_estimated_bytes =
+        memory_usage::UnorderedMapNodeOverheadEstimatedBytes(warmup_fields_);
+    for (const auto& [field_id, policy] : warmup_fields_) {
+        (void)field_id;
+        usage.warmup_fields_string_dynamic_bytes +=
+            memory_usage::StringDynamicBytes(policy);
+    }
+
+    const auto add_optional_string = [&](const auto& value) {
+        if (value.has_value()) {
+            usage.warmup_policy_string_dynamic_bytes +=
+                memory_usage::StringDynamicBytes(*value);
+        }
+    };
+    add_optional_string(warmup_vector_index_);
+    add_optional_string(warmup_scalar_index_);
+    add_optional_string(warmup_scalar_field_);
+    add_optional_string(warmup_vector_field_);
+    usage.external_string_dynamic_bytes =
+        memory_usage::StringDynamicBytes(external_source_) +
+        memory_usage::StringDynamicBytes(external_spec_);
+
+    std::lock_guard<std::mutex> lock(arrow_schema_cache_mutex_);
+    if (loon_arrow_schema_cache_ != nullptr) {
+        usage.arrow_schema_count = 1;
+        usage.arrow_schema_object_bytes = sizeof(arrow::Schema);
+        usage.arrow_schema_control_block_estimated_bytes =
+            memory_usage::SharedPtrControlBlockEstimatedBytes();
+        const auto& arrow_fields = loon_arrow_schema_cache_->fields();
+        usage.arrow_field_count = arrow_fields.size();
+        usage.arrow_field_vector_capacity = arrow_fields.capacity();
+        usage.arrow_field_vector_capacity_bytes =
+            memory_usage::VectorCapacityBytes(arrow_fields);
+        usage.arrow_field_object_bytes =
+            arrow_fields.size() * sizeof(arrow::Field);
+        usage.arrow_field_control_block_estimated_bytes =
+            arrow_fields.size() *
+            memory_usage::SharedPtrControlBlockEstimatedBytes();
+        for (const auto& field : arrow_fields) {
+            usage.arrow_field_name_dynamic_bytes +=
+                memory_usage::StringDynamicBytes(field->name());
+        }
+    }
+    return usage;
+}
 
 Schema::Schema(const Schema& other) {
     std::lock_guard<std::mutex> lock(other.arrow_schema_cache_mutex_);

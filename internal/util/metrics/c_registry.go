@@ -338,8 +338,84 @@ func gatherSegcoreMemoryMetrics() map[string]*dto.MetricFamily {
 	for name, mf := range indexMetrics {
 		result[name] = mf
 	}
+	collectionMetrics := gatherSegcoreCollectionMemoryMetrics()
+	for name, mf := range collectionMetrics {
+		result[name] = mf
+	}
 
 	return result
+}
+
+type segcoreCollectionMemoryRecord struct {
+	owner     string
+	fieldName string
+	dataType  string
+	component string
+	accuracy  string
+	count     uint64
+	bytes     uint64
+}
+
+func gatherSegcoreCollectionMemoryMetrics() map[string]*dto.MetricFamily {
+	cStats := C.GetSegcoreCollectionMemoryStats()
+	records := make([]segcoreCollectionMemoryRecord, 0, int(cStats.entry_count))
+	for i := 0; i < int(cStats.entry_count); i++ {
+		entry := cStats.entries[i]
+		records = append(records, segcoreCollectionMemoryRecord{
+			owner:     C.GoString((*C.char)(unsafe.Pointer(&entry.owner[0]))),
+			fieldName: C.GoString((*C.char)(unsafe.Pointer(&entry.field_name[0]))),
+			dataType:  C.GoString((*C.char)(unsafe.Pointer(&entry.data_type[0]))),
+			component: C.GoString((*C.char)(unsafe.Pointer(&entry.component[0]))),
+			accuracy:  C.GoString((*C.char)(unsafe.Pointer(&entry.accuracy[0]))),
+			count:     uint64(entry.count),
+			bytes:     uint64(entry.bytes),
+		})
+	}
+
+	gaugeType := dto.MetricType_GAUGE
+	createFamily := func(name, help string, value func(segcoreCollectionMemoryRecord) uint64) *dto.MetricFamily {
+		family := &dto.MetricFamily{
+			Name: proto.String(name),
+			Help: proto.String(help),
+			Type: &gaugeType,
+		}
+		for _, record := range records {
+			family.Metric = append(family.Metric, &dto.Metric{
+				Label: []*dto.LabelPair{
+					{Name: proto.String("owner"), Value: proto.String(record.owner)},
+					{Name: proto.String("field_name"), Value: proto.String(record.fieldName)},
+					{Name: proto.String("data_type"), Value: proto.String(record.dataType)},
+					{Name: proto.String("component"), Value: proto.String(record.component)},
+					{Name: proto.String("accuracy"), Value: proto.String(record.accuracy)},
+				},
+				Gauge: &dto.Gauge{Value: proto.Float64(float64(value(record)))},
+			})
+		}
+		return family
+	}
+
+	overflowFamily := &dto.MetricFamily{
+		Name: proto.String("milvus_segcore_collection_memory_overflow_count"),
+		Help: proto.String("Collection memory statistic entries omitted because the fixed snapshot was full"),
+		Type: &gaugeType,
+		Metric: []*dto.Metric{{
+			Gauge: &dto.Gauge{Value: proto.Float64(float64(cStats.overflow_count))},
+		}},
+	}
+
+	return map[string]*dto.MetricFamily{
+		"milvus_segcore_collection_memory_bytes": createFamily(
+			"milvus_segcore_collection_memory_bytes",
+			"Live collection-owned memory split by object member and measurement accuracy",
+			func(record segcoreCollectionMemoryRecord) uint64 { return record.bytes },
+		),
+		"milvus_segcore_collection_memory_count": createFamily(
+			"milvus_segcore_collection_memory_count",
+			"Live collection-owned object, element, capacity, bucket, or node counts",
+			func(record segcoreCollectionMemoryRecord) uint64 { return record.count },
+		),
+		"milvus_segcore_collection_memory_overflow_count": overflowFamily,
+	}
 }
 
 type segcoreIndexMemoryRecord struct {

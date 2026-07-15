@@ -27,6 +27,30 @@
 #include "pb/segcore.pb.h"
 
 namespace milvus {
+struct FieldIndexMetaMemoryUsage {
+    size_t object_bytes = 0;
+    size_t index_params_count = 0;
+    size_t index_params_value_bytes = 0;
+    size_t index_params_node_overhead_estimated_bytes = 0;
+    size_t index_params_string_dynamic_bytes = 0;
+    size_t type_params_count = 0;
+    size_t type_params_value_bytes = 0;
+    size_t type_params_node_overhead_estimated_bytes = 0;
+    size_t type_params_string_dynamic_bytes = 0;
+    size_t user_index_params_count = 0;
+    size_t user_index_params_value_bytes = 0;
+    size_t user_index_params_node_overhead_estimated_bytes = 0;
+    size_t user_index_params_string_dynamic_bytes = 0;
+};
+
+struct CollectionIndexMetaMemoryUsage {
+    size_t object_bytes = 0;
+    size_t shared_ptr_control_block_estimated_bytes = 0;
+    size_t field_meta_count = 0;
+    size_t field_meta_key_bytes = 0;
+    size_t field_meta_node_overhead_estimated_bytes = 0;
+};
+
 class FieldIndexMeta {
  public:
     //For unittest init
@@ -62,6 +86,9 @@ class FieldIndexMeta {
         return type_params_;
     }
 
+    FieldIndexMetaMemoryUsage
+    MemoryUsage() const;
+
  private:
     FieldId fieldId_;
     std::map<std::string, std::string> index_params_;
@@ -86,6 +113,14 @@ class CollectionIndexMeta {
 
     const FieldIndexMeta&
     GetFieldIndexMeta(FieldId fieldId) const;
+
+    const std::map<FieldId, FieldIndexMeta>&
+    GetFieldIndexMetas() const {
+        return fieldMetas_;
+    }
+
+    CollectionIndexMetaMemoryUsage
+    MemoryUsage() const;
 
     std::string
     ToString();

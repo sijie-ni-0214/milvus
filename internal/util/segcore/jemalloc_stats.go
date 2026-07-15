@@ -75,3 +75,12 @@ func DumpJemallocProfile(path string) error {
 	}
 	return nil
 }
+
+// SetJemallocProfileActive enables or disables allocation sampling.
+func SetJemallocProfileActive(active bool) error {
+	code := C.SetJemallocProfileActive(C.bool(active))
+	if code != 0 {
+		return fmt.Errorf("jemalloc prof.active failed with code %d", int(code))
+	}
+	return nil
+}

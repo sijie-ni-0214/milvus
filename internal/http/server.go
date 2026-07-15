@@ -157,6 +157,13 @@ func registerDefaults() {
 					w.Write([]byte(`{"msg":"path is required"}`))
 					return
 				}
+				if req.URL.Query().Get("activate") == "true" {
+					if err := segcore.SetJemallocProfileActive(true); err != nil {
+						w.WriteHeader(http.StatusInternalServerError)
+						fmt.Fprintf(w, `{"msg":"%s"}`, err.Error())
+						return
+					}
+				}
 				if err := segcore.DumpJemallocProfile(path); err != nil {
 					w.WriteHeader(http.StatusInternalServerError)
 					fmt.Fprintf(w, `{"msg":"%s"}`, err.Error())

@@ -17,7 +17,7 @@
 #include <cstddef>
 #include <cstring>
 
-#ifdef __linux__
+#if defined(__linux__) || defined(__APPLE__)
 #include <dlfcn.h>
 #endif
 
@@ -28,7 +28,7 @@ typedef int (*mallctl_t)(const char*, void*, size_t*, void*, size_t);
 // Returns nullptr if jemalloc is not loaded (e.g., via LD_PRELOAD)
 static mallctl_t
 get_mallctl() {
-#ifdef __linux__
+#if defined(__linux__) || defined(__APPLE__)
     static mallctl_t fn = (mallctl_t)dlsym(RTLD_DEFAULT, "mallctl");
     return fn;
 #else
@@ -125,4 +125,13 @@ DumpJemallocProfile(const char* path) {
             "prof.dump", nullptr, nullptr, &dump_path, sizeof(dump_path));
     }
     return mallctl_fn("prof.dump", nullptr, nullptr, nullptr, 0);
+}
+
+int
+SetJemallocProfileActive(bool active) {
+    mallctl_t mallctl_fn = get_mallctl();
+    if (mallctl_fn == nullptr) {
+        return -1;
+    }
+    return mallctl_fn("prof.active", nullptr, nullptr, &active, sizeof(active));
 }

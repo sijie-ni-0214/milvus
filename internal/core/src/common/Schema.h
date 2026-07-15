@@ -45,6 +45,69 @@ namespace milvus {
 using ArrowSchemaPtr = std::shared_ptr<arrow::Schema>;
 static int64_t debug_id = START_USER_FIELDID;
 
+struct SchemaMemoryUsage {
+    size_t object_bytes = 0;
+    size_t shared_ptr_control_block_estimated_bytes = 0;
+    size_t field_count = 0;
+    size_t field_ids_size = 0;
+    size_t field_ids_capacity = 0;
+    size_t field_ids_capacity_bytes = 0;
+    size_t fields_bucket_count = 0;
+    size_t fields_bucket_bytes = 0;
+    size_t fields_key_bytes = 0;
+    size_t fields_node_overhead_estimated_bytes = 0;
+    size_t name_ids_count = 0;
+    size_t name_ids_bucket_count = 0;
+    size_t name_ids_bucket_bytes = 0;
+    size_t name_ids_value_bytes = 0;
+    size_t name_ids_node_overhead_estimated_bytes = 0;
+    size_t name_ids_string_dynamic_bytes = 0;
+    size_t id_names_count = 0;
+    size_t id_names_bucket_count = 0;
+    size_t id_names_bucket_bytes = 0;
+    size_t id_names_value_bytes = 0;
+    size_t id_names_node_overhead_estimated_bytes = 0;
+    size_t id_names_string_dynamic_bytes = 0;
+    size_t load_fields_count = 0;
+    size_t load_fields_bucket_count = 0;
+    size_t load_fields_bucket_bytes = 0;
+    size_t load_fields_value_bytes = 0;
+    size_t load_fields_node_overhead_estimated_bytes = 0;
+    size_t bm25_fields_count = 0;
+    size_t bm25_fields_bucket_count = 0;
+    size_t bm25_fields_bucket_bytes = 0;
+    size_t bm25_fields_value_bytes = 0;
+    size_t bm25_fields_node_overhead_estimated_bytes = 0;
+    size_t mmap_fields_count = 0;
+    size_t mmap_fields_bucket_count = 0;
+    size_t mmap_fields_bucket_bytes = 0;
+    size_t mmap_fields_value_bytes = 0;
+    size_t mmap_fields_node_overhead_estimated_bytes = 0;
+    size_t struct_array_cache_count = 0;
+    size_t struct_array_cache_bucket_count = 0;
+    size_t struct_array_cache_bucket_bytes = 0;
+    size_t struct_array_cache_value_bytes = 0;
+    size_t struct_array_cache_node_overhead_estimated_bytes = 0;
+    size_t struct_array_cache_string_dynamic_bytes = 0;
+    size_t warmup_fields_count = 0;
+    size_t warmup_fields_bucket_count = 0;
+    size_t warmup_fields_bucket_bytes = 0;
+    size_t warmup_fields_value_bytes = 0;
+    size_t warmup_fields_node_overhead_estimated_bytes = 0;
+    size_t warmup_fields_string_dynamic_bytes = 0;
+    size_t warmup_policy_string_dynamic_bytes = 0;
+    size_t external_string_dynamic_bytes = 0;
+    size_t arrow_schema_count = 0;
+    size_t arrow_schema_object_bytes = 0;
+    size_t arrow_schema_control_block_estimated_bytes = 0;
+    size_t arrow_field_count = 0;
+    size_t arrow_field_vector_capacity = 0;
+    size_t arrow_field_vector_capacity_bytes = 0;
+    size_t arrow_field_object_bytes = 0;
+    size_t arrow_field_control_block_estimated_bytes = 0;
+    size_t arrow_field_name_dynamic_bytes = 0;
+};
+
 inline std::optional<std::string>
 GetStructNameForArrayField(const FieldMeta& field_meta) {
     auto data_type = field_meta.get_data_type();
@@ -473,6 +536,9 @@ class Schema {
  public:
     static std::shared_ptr<Schema>
     ParseFrom(const milvus::proto::schema::CollectionSchema& schema_proto);
+
+    SchemaMemoryUsage
+    MemoryUsage() const;
 
     void
     AddField(FieldMeta&& field_meta) {

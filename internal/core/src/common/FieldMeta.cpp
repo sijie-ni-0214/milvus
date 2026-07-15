@@ -22,6 +22,7 @@
 #include "NamedType/named_type_impl.hpp"
 #include "boost/cstdint.hpp"
 #include "common/Common.h"
+#include "common/MemoryUsage.h"
 #include "common/SystemProperty.h"
 #include "common/Types.h"
 #include "common/protobuf_utils.h"
@@ -29,6 +30,35 @@
 #include "pb/common.pb.h"
 
 namespace milvus {
+
+FieldMetaMemoryUsage
+FieldMeta::MemoryUsage() const {
+    FieldMetaMemoryUsage usage;
+    usage.object_bytes = sizeof(FieldMeta);
+    usage.name_dynamic_bytes = memory_usage::StringDynamicBytes(name_.get());
+    if (default_value_.has_value()) {
+        const auto total = default_value_->SpaceUsedLong();
+        usage.default_value_dynamic_bytes =
+            total > sizeof(DefaultValueType) ? total - sizeof(DefaultValueType)
+                                             : 0;
+    }
+    if (string_info_.has_value()) {
+        const auto& params = string_info_->params;
+        usage.string_params_count = params.size();
+        usage.string_params_value_bytes = memory_usage::MapValueBytes(params);
+        usage.string_params_node_overhead_estimated_bytes =
+            memory_usage::MapNodeOverheadEstimatedBytes(params);
+        for (const auto& [key, value] : params) {
+            usage.string_params_string_dynamic_bytes +=
+                memory_usage::StringDynamicBytes(key) +
+                memory_usage::StringDynamicBytes(value);
+        }
+    }
+    usage.external_field_mapping_dynamic_bytes =
+        memory_usage::StringDynamicBytes(external_field_mapping_);
+    return usage;
+}
+
 TokenizerParams
 ParseTokenizerParams(const TypeParams& params) {
     auto iter = params.find("analyzer_params");

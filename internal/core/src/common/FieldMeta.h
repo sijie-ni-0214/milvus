@@ -33,6 +33,17 @@ namespace milvus {
 using TypeParams = std::map<std::string, std::string>;
 using TokenizerParams = std::string;
 
+struct FieldMetaMemoryUsage {
+    size_t object_bytes = 0;
+    size_t name_dynamic_bytes = 0;
+    size_t default_value_dynamic_bytes = 0;
+    size_t string_params_count = 0;
+    size_t string_params_value_bytes = 0;
+    size_t string_params_node_overhead_estimated_bytes = 0;
+    size_t string_params_string_dynamic_bytes = 0;
+    size_t external_field_mapping_dynamic_bytes = 0;
+};
+
 TokenizerParams
 ParseTokenizerParams(const TypeParams& params);
 
@@ -325,6 +336,9 @@ class FieldMeta {
  public:
     static FieldMeta
     ParseFrom(const milvus::proto::schema::FieldSchema& schema_proto);
+
+    FieldMetaMemoryUsage
+    MemoryUsage() const;
 
  private:
     struct VectorInfo {

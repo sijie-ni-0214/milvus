@@ -47,6 +47,9 @@ GetJemallocStats();
 int
 DumpJemallocProfile(const char* path);
 
+int
+SetJemallocProfileActive(bool active);
+
 #ifdef __cplusplus
 }
 #endif
