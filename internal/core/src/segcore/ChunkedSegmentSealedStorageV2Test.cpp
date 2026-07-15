@@ -26,12 +26,14 @@
 #include <stdlib.h>
 #include <time.h>
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <filesystem>
 #include <map>
 #include <memory>
 #include <numeric>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -57,6 +59,7 @@
 #include "milvus-storage/common/config.h"
 #include "milvus-storage/filesystem/fs.h"
 #include "milvus-storage/packed/writer.h"
+#include "monitor/segcore_memory_stats_c.h"
 #include "pb/plan.pb.h"
 #include "pb/schema.pb.h"
 #include "plan/PlanNode.h"
@@ -707,6 +710,233 @@ TEST_P(TestChunkSegmentStorageV2,
         std::filesystem::remove_all(std::filesystem::path(TestLocalPath) /
                                     base_path);
     }
+}
+
+TEST_P(TestChunkSegmentStorageV2,
+       TestLazyManifestPreservesMultiFieldTaskUnderConcurrentAccess) {
+    LazyManifestReaderGuard guard(true);
+    auto warmup_policies =
+        milvus::cachinglayer::TieredStorageConfig::GetInstance()
+            .warmup_policies();
+    warmup_policies.scalarFieldCacheWarmupPolicy =
+        CacheWarmupPolicy::CacheWarmupPolicy_Disable;
+    CacheWarmupPolicyGuard warmup_guard(warmup_policies);
+
+    const int64_t segment_id = 3150 + (GetParam() ? 100 : 0);
+    auto base_path = std::string("lazy_manifest_shared_group_") +
+                     (GetParam() ? "varchar" : "int64");
+    std::filesystem::remove_all(std::filesystem::path(TestLocalPath) /
+                                base_path);
+    milvus::test::V3SegmentTestData test_data(
+        schema_, 1, 256, 128, TestLocalPath, base_path);
+
+    auto stats_before = GetSegcoreMemoryStats();
+    auto manifest_segment = segcore::CreateSealedSegment(
+        schema_, nullptr, segment_id, segcore::SegcoreConfig::default_config());
+    auto* segment_impl =
+        dynamic_cast<ChunkedSegmentSealedImpl*>(manifest_segment.get());
+    ASSERT_NE(segment_impl, nullptr);
+
+    proto::segcore::SegmentLoadInfo load_info;
+    load_info.set_segmentid(segment_id);
+    load_info.set_partitionid(1);
+    load_info.set_collectionid(1);
+    load_info.set_num_of_rows(test_data.TotalRows());
+    load_info.set_storageversion(STORAGE_V3);
+    load_info.set_manifest_path(test_data.ManifestPath());
+    load_info.set_priority(proto::common::LoadPriority::LOW);
+
+    segment_impl->SetLoadInfo(load_info);
+    milvus::tracer::TraceContext trace_ctx;
+    segment_impl->Load(trace_ctx, nullptr);
+
+    auto stats_after_load = GetSegcoreMemoryStats();
+    ASSERT_GE(stats_after_load.lazy_manifest_group_count,
+              stats_before.lazy_manifest_group_count);
+    ASSERT_GE(stats_after_load.lazy_manifest_proxy_count,
+              stats_before.lazy_manifest_proxy_count);
+    EXPECT_EQ(stats_after_load.lazy_manifest_group_count -
+                  stats_before.lazy_manifest_group_count,
+              1);
+    EXPECT_EQ(stats_after_load.lazy_manifest_proxy_count -
+                  stats_before.lazy_manifest_proxy_count,
+              schema_->get_field_ids().size());
+
+    auto [int64_column, int64_exists] =
+        segment_impl->GetFieldDataIfExist(fields.at("int64"));
+    auto [string_column, string_exists] =
+        segment_impl->GetFieldDataIfExist(fields.at("string1"));
+    auto [pk_column, pk_exists] =
+        segment_impl->GetFieldDataIfExist(fields.at("pk"));
+    ASSERT_TRUE(int64_exists);
+    ASSERT_TRUE(string_exists);
+    ASSERT_TRUE(pk_exists);
+    ASSERT_NE(int64_column, nullptr);
+    ASSERT_NE(string_column, nullptr);
+    ASSERT_NE(pk_column, nullptr);
+    EXPECT_TRUE(int64_column->IsInMultiFieldColumnGroup());
+    EXPECT_TRUE(string_column->IsInMultiFieldColumnGroup());
+    EXPECT_TRUE(pk_column->IsInMultiFieldColumnGroup());
+    EXPECT_TRUE(int64_column->IsNullable());
+    EXPECT_FALSE(pk_column->IsNullable());
+    EXPECT_EQ(int64_column->NumRows(), test_data.TotalRows());
+    EXPECT_EQ(int64_column->DataByteSize(), 0);
+    EXPECT_EQ(string_column->DataByteSize(), 0);
+
+    constexpr int kThreadCount = 16;
+    std::atomic<int> ready{0};
+    std::atomic<bool> start{false};
+    std::atomic<bool> failed{false};
+    std::vector<std::thread> workers;
+    workers.reserve(kThreadCount);
+    for (int i = 0; i < kThreadCount; ++i) {
+        auto column = i % 2 == 0 ? int64_column : string_column;
+        workers.emplace_back([column, &ready, &start, &failed]() {
+            ready.fetch_add(1, std::memory_order_acq_rel);
+            while (!start.load(std::memory_order_acquire)) {
+                std::this_thread::yield();
+            }
+            try {
+                auto data = column->DataOfChunk(nullptr, 0);
+                if (data.get() == nullptr) {
+                    failed.store(true, std::memory_order_release);
+                }
+            } catch (...) {
+                failed.store(true, std::memory_order_release);
+            }
+        });
+    }
+    while (ready.load(std::memory_order_acquire) != kThreadCount) {
+        std::this_thread::yield();
+    }
+    start.store(true, std::memory_order_release);
+    for (auto& worker : workers) {
+        worker.join();
+    }
+
+    EXPECT_FALSE(failed.load(std::memory_order_acquire));
+    EXPECT_GT(int64_column->DataByteSize(), 0);
+    EXPECT_GT(string_column->DataByteSize(), 0);
+
+    int64_column.reset();
+    string_column.reset();
+    pk_column.reset();
+    manifest_segment.reset();
+    auto stats_after_release = GetSegcoreMemoryStats();
+    EXPECT_EQ(stats_after_release.lazy_manifest_group_count,
+              stats_before.lazy_manifest_group_count);
+    EXPECT_EQ(stats_after_release.lazy_manifest_proxy_count,
+              stats_before.lazy_manifest_proxy_count);
+    std::filesystem::remove_all(std::filesystem::path(TestLocalPath) /
+                                base_path);
+}
+
+TEST_P(TestChunkSegmentStorageV2,
+       TestLazyManifestPreservesWarmupBoundaryWithinColumnGroup) {
+    LazyManifestReaderGuard guard(true);
+    auto warmup_policies =
+        milvus::cachinglayer::TieredStorageConfig::GetInstance()
+            .warmup_policies();
+    warmup_policies.scalarFieldCacheWarmupPolicy =
+        CacheWarmupPolicy::CacheWarmupPolicy_Disable;
+    CacheWarmupPolicyGuard warmup_guard(warmup_policies);
+
+    proto::schema::CollectionSchema schema_proto;
+    auto* int64_field = schema_proto.add_fields();
+    int64_field->set_fieldid(100);
+    int64_field->set_name("int64");
+    int64_field->set_data_type(proto::schema::Int64);
+    int64_field->set_nullable(true);
+
+    auto* pk_field = schema_proto.add_fields();
+    pk_field->set_fieldid(101);
+    pk_field->set_name("pk");
+    pk_field->set_data_type(proto::schema::Int64);
+    pk_field->set_is_primary_key(true);
+    auto* pk_warmup = pk_field->add_type_params();
+    pk_warmup->set_key("warmup");
+    pk_warmup->set_value("sync");
+
+    auto* scalar_field = schema_proto.add_fields();
+    scalar_field->set_fieldid(102);
+    scalar_field->set_name("scalar");
+    scalar_field->set_data_type(proto::schema::Int64);
+
+    auto* timestamp_field = schema_proto.add_fields();
+    timestamp_field->set_fieldid(TimestampFieldID.get());
+    timestamp_field->set_name("Timestamp");
+    timestamp_field->set_data_type(proto::schema::Int64);
+
+    auto mixed_schema = Schema::ParseFrom(schema_proto);
+    const int64_t segment_id = 3170 + (GetParam() ? 100 : 0);
+    auto base_path = std::string("lazy_manifest_mixed_warmup_") +
+                     (GetParam() ? "one" : "zero");
+    std::filesystem::remove_all(std::filesystem::path(TestLocalPath) /
+                                base_path);
+    milvus::test::V3SegmentTestData test_data(
+        mixed_schema, 1, 256, 128, TestLocalPath, base_path);
+
+    auto stats_before = GetSegcoreMemoryStats();
+    auto manifest_segment =
+        segcore::CreateSealedSegment(mixed_schema,
+                                     nullptr,
+                                     segment_id,
+                                     segcore::SegcoreConfig::default_config());
+    auto* segment_impl =
+        dynamic_cast<ChunkedSegmentSealedImpl*>(manifest_segment.get());
+    ASSERT_NE(segment_impl, nullptr);
+
+    proto::segcore::SegmentLoadInfo load_info;
+    load_info.set_segmentid(segment_id);
+    load_info.set_partitionid(1);
+    load_info.set_collectionid(1);
+    load_info.set_num_of_rows(test_data.TotalRows());
+    load_info.set_storageversion(STORAGE_V3);
+    load_info.set_manifest_path(test_data.ManifestPath());
+    load_info.set_priority(proto::common::LoadPriority::LOW);
+
+    segment_impl->SetLoadInfo(load_info);
+    milvus::tracer::TraceContext trace_ctx;
+    segment_impl->Load(trace_ctx, nullptr);
+
+    auto stats_after_load = GetSegcoreMemoryStats();
+    EXPECT_EQ(stats_after_load.lazy_manifest_group_count -
+                  stats_before.lazy_manifest_group_count,
+              1);
+    EXPECT_EQ(stats_after_load.lazy_manifest_proxy_count -
+                  stats_before.lazy_manifest_proxy_count,
+              3);
+
+    auto [pk_column, pk_exists] =
+        segment_impl->GetFieldDataIfExist(FieldId(101));
+    auto [int64_column, int64_exists] =
+        segment_impl->GetFieldDataIfExist(FieldId(100));
+    auto [scalar_column, scalar_exists] =
+        segment_impl->GetFieldDataIfExist(FieldId(102));
+    ASSERT_TRUE(pk_exists);
+    ASSERT_TRUE(int64_exists);
+    ASSERT_TRUE(scalar_exists);
+    ASSERT_NE(pk_column, nullptr);
+    ASSERT_NE(int64_column, nullptr);
+    ASSERT_NE(scalar_column, nullptr);
+    EXPECT_FALSE(pk_column->IsInMultiFieldColumnGroup());
+    EXPECT_TRUE(int64_column->IsInMultiFieldColumnGroup());
+    EXPECT_TRUE(scalar_column->IsInMultiFieldColumnGroup());
+    EXPECT_GT(pk_column->DataByteSize(), 0);
+    EXPECT_EQ(int64_column->DataByteSize(), 0);
+    EXPECT_EQ(scalar_column->DataByteSize(), 0);
+
+    int64_column.reset();
+    scalar_column.reset();
+    pk_column.reset();
+    manifest_segment.reset();
+    auto stats_after_release = GetSegcoreMemoryStats();
+    EXPECT_EQ(stats_after_release.lazy_manifest_group_count,
+              stats_before.lazy_manifest_group_count);
+    EXPECT_EQ(stats_after_release.lazy_manifest_proxy_count,
+              stats_before.lazy_manifest_proxy_count);
+    std::filesystem::remove_all(std::filesystem::path(TestLocalPath) /
+                                base_path);
 }
 
 TEST_P(TestChunkSegmentStorageV2,

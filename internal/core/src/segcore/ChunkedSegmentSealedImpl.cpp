@@ -162,7 +162,7 @@ CanUseLazyManifestSystemField(FieldId field_id) {
     return field_id == RowFieldID || field_id == TimestampFieldID;
 }
 
-struct LazyManifestColumnGroupContext {
+struct ManifestColumnGroupBuildContext {
     int64_t segment_id;
     int64_t column_group_index;
     std::shared_ptr<std::vector<std::string>> needed_columns;
@@ -174,9 +174,61 @@ struct LazyManifestColumnGroupContext {
     std::string mmap_dir_path;
     int64_t num_fields;
     milvus::proto::common::LoadPriority load_priority;
+    bool eager_load;
     std::string warmup_policy;
     std::string cache_key_suffix;
+    int64_t fallback_bytes_per_row;
 };
+
+struct ManifestColumnGroupBuildTiming {
+    int64_t reader_ns = 0;
+    int64_t translator_ns = 0;
+    int64_t cache_slot_ns = 0;
+};
+
+std::shared_ptr<ChunkedColumnGroup>
+CreateManifestColumnGroup(const ManifestColumnGroupBuildContext& context,
+                          ManifestColumnGroupBuildTiming* timing = nullptr) {
+    auto stage_start = std::chrono::steady_clock::now();
+    auto chunk_reader = context.chunk_reader_factory();
+    auto reader_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                         std::chrono::steady_clock::now() - stage_start)
+                         .count();
+
+    stage_start = std::chrono::steady_clock::now();
+    auto translator =
+        std::make_unique<storagev2translator::ManifestGroupTranslator>(
+            context.segment_id,
+            GroupChunkType::DEFAULT,
+            context.column_group_index,
+            std::move(chunk_reader),
+            context.field_metas,
+            context.use_mmap,
+            context.mmap_populate,
+            context.mmap_dir_path,
+            context.num_fields,
+            context.load_priority,
+            context.eager_load,
+            context.warmup_policy,
+            context.cache_key_suffix,
+            context.fallback_bytes_per_row);
+    auto translator_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                             std::chrono::steady_clock::now() - stage_start)
+                             .count();
+
+    stage_start = std::chrono::steady_clock::now();
+    auto group = std::make_shared<ChunkedColumnGroup>(std::move(translator));
+    auto cache_slot_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                             std::chrono::steady_clock::now() - stage_start)
+                             .count();
+
+    if (timing != nullptr) {
+        timing->reader_ns = reader_ns;
+        timing->translator_ns = translator_ns;
+        timing->cache_slot_ns = cache_slot_ns;
+    }
+    return group;
+}
 
 int64_t
 ToMetricDelta(size_t value) {
@@ -285,7 +337,7 @@ MetricDelta(size_t current, size_t previous) {
 
 size_t
 ApproxLazyManifestColumnGroupBytes(
-    const LazyManifestColumnGroupContext& context) {
+    const ManifestColumnGroupBuildContext& context) {
     return ApproxStringVectorBytes(context.needed_columns) +
            ApproxFieldMetaMapBytes(context.field_metas) +
            ApproxStringDynamicBytes(context.mmap_dir_path) +
@@ -295,7 +347,7 @@ ApproxLazyManifestColumnGroupBytes(
 
 class LazyManifestColumnGroup {
  public:
-    explicit LazyManifestColumnGroup(LazyManifestColumnGroupContext context)
+    explicit LazyManifestColumnGroup(ManifestColumnGroupBuildContext context)
         : context_(std::move(context)) {
         milvus::monitor::UpdateSegcoreLazyManifestGroup(
             1,
@@ -324,24 +376,7 @@ class LazyManifestColumnGroup {
         }
 
         auto start = std::chrono::steady_clock::now();
-        auto chunk_reader = context_.chunk_reader_factory();
-
-        auto translator =
-            std::make_unique<storagev2translator::ManifestGroupTranslator>(
-                context_.segment_id,
-                GroupChunkType::DEFAULT,
-                context_.column_group_index,
-                std::move(chunk_reader),
-                context_.field_metas,
-                context_.use_mmap,
-                context_.mmap_populate,
-                context_.mmap_dir_path,
-                context_.num_fields,
-                context_.load_priority,
-                /*eager_load=*/false,
-                context_.warmup_policy,
-                context_.cache_key_suffix);
-        group_ = std::make_shared<ChunkedColumnGroup>(std::move(translator));
+        group_ = CreateManifestColumnGroup(context_);
 
         auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                               std::chrono::steady_clock::now() - start)
@@ -364,6 +399,16 @@ class LazyManifestColumnGroup {
                 elapsed_ms);
         }
         return group_;
+    }
+
+    std::shared_ptr<ChunkedColumnInterface>
+    MaterializeColumn(FieldId field_id) {
+        auto it = context_.field_metas.find(field_id);
+        AssertInfo(it != context_.field_metas.end(),
+                   "field {} not found in lazy manifest column group",
+                   field_id.get());
+        return std::make_shared<ProxyChunkColumn>(
+            Materialize(), field_id, it->second);
     }
 
     void
@@ -394,7 +439,7 @@ class LazyManifestColumnGroup {
     }
 
  private:
-    LazyManifestColumnGroupContext context_;
+    ManifestColumnGroupBuildContext context_;
     mutable std::mutex mutex_;
     std::shared_ptr<ChunkedColumnGroup> group_;
 };
@@ -403,11 +448,11 @@ class LazyManifestProxyColumn : public ChunkedColumnInterface {
  public:
     LazyManifestProxyColumn(std::shared_ptr<LazyManifestColumnGroup> group,
                             FieldId field_id,
-                            const FieldMeta& field_meta,
+                            bool nullable,
                             size_t num_rows)
         : group_(std::move(group)),
           field_id_(field_id),
-          field_meta_(field_meta),
+          nullable_(nullable),
           num_rows_(num_rows) {
         milvus::monitor::UpdateSegcoreLazyManifestProxy(
             1, ToMetricDelta(sizeof(LazyManifestProxyColumn)));
@@ -426,14 +471,14 @@ class LazyManifestProxyColumn : public ChunkedColumnInterface {
 
     void
     ManualEvictCache() const override {
-        if (group_->IsMaterialized()) {
+        if (group_->NumFieldsInGroup() == 1 && group_->IsMaterialized()) {
             group_->ManualEvictCache();
         }
     }
 
     void
     CancelWarmup() override {
-        if (group_->IsMaterialized()) {
+        if (group_->NumFieldsInGroup() == 1 && group_->IsMaterialized()) {
             group_->CancelWarmup();
         }
     }
@@ -458,7 +503,7 @@ class LazyManifestProxyColumn : public ChunkedColumnInterface {
 
     bool
     IsNullable() const override {
-        return field_meta_.is_nullable();
+        return nullable_;
     }
 
     size_t
@@ -658,8 +703,7 @@ class LazyManifestProxyColumn : public ChunkedColumnInterface {
     MaterializedColumn() const {
         std::lock_guard<std::mutex> lock(mutex_);
         if (column_ == nullptr) {
-            column_ = std::make_shared<ProxyChunkColumn>(
-                group_->Materialize(), field_id_, field_meta_);
+            column_ = group_->MaterializeColumn(field_id_);
         }
         return column_;
     }
@@ -672,7 +716,7 @@ class LazyManifestProxyColumn : public ChunkedColumnInterface {
 
     std::shared_ptr<LazyManifestColumnGroup> group_;
     FieldId field_id_;
-    FieldMeta field_meta_;
+    bool nullable_;
     size_t num_rows_;
     mutable std::mutex mutex_;
     mutable std::shared_ptr<ChunkedColumnInterface> column_;
@@ -717,7 +761,6 @@ struct SegmentLoadTimingStats {
     std::atomic<int64_t> max_total_ns{0};
     std::atomic<int64_t> last_log_ns{0};
 };
-
 
 struct IndexTaskTimingStats {
     std::atomic<int64_t> count{0};
@@ -790,8 +833,8 @@ DurationSinceNs(std::chrono::steady_clock::time_point start) {
 void
 UpdateMax(std::atomic<int64_t>& target, int64_t value) {
     auto old = target.load(std::memory_order_relaxed);
-    while (value > old &&
-           !target.compare_exchange_weak(old, value, std::memory_order_relaxed)) {
+    while (value > old && !target.compare_exchange_weak(
+                              old, value, std::memory_order_relaxed)) {
     }
 }
 
@@ -830,12 +873,15 @@ RecordApplyLoadDiffTiming(int64_t total_ns,
     stats.count.fetch_add(1, std::memory_order_relaxed);
     stats.total_ns.fetch_add(total_ns, std::memory_order_relaxed);
     stats.index_load_ns.fetch_add(index_load_ns, std::memory_order_relaxed);
-    stats.index_replace_ns.fetch_add(index_replace_ns, std::memory_order_relaxed);
+    stats.index_replace_ns.fetch_add(index_replace_ns,
+                                     std::memory_order_relaxed);
     stats.reload_field_ns.fetch_add(reload_field_ns, std::memory_order_relaxed);
     stats.column_group_ns.fetch_add(column_group_ns, std::memory_order_relaxed);
-    stats.init_text_lob_ns.fetch_add(init_text_lob_ns, std::memory_order_relaxed);
+    stats.init_text_lob_ns.fetch_add(init_text_lob_ns,
+                                     std::memory_order_relaxed);
     stats.binlog_load_ns.fetch_add(binlog_load_ns, std::memory_order_relaxed);
-    stats.binlog_replace_ns.fetch_add(binlog_replace_ns, std::memory_order_relaxed);
+    stats.binlog_replace_ns.fetch_add(binlog_replace_ns,
+                                      std::memory_order_relaxed);
     stats.drop_index_ns.fetch_add(drop_index_ns, std::memory_order_relaxed);
     stats.text_index_ns.fetch_add(text_index_ns, std::memory_order_relaxed);
     stats.json_stats_ns.fetch_add(json_stats_ns, std::memory_order_relaxed);
@@ -848,8 +894,10 @@ RecordApplyLoadDiffTiming(int64_t total_ns,
     stats.column_group_count.fetch_add(column_group_count,
                                        std::memory_order_relaxed);
     stats.binlog_count.fetch_add(binlog_count, std::memory_order_relaxed);
-    stats.text_index_count.fetch_add(text_index_count, std::memory_order_relaxed);
-    stats.json_stats_count.fetch_add(json_stats_count, std::memory_order_relaxed);
+    stats.text_index_count.fetch_add(text_index_count,
+                                     std::memory_order_relaxed);
+    stats.json_stats_count.fetch_add(json_stats_count,
+                                     std::memory_order_relaxed);
     UpdateMax(stats.max_total_ns, total_ns);
 
     auto now_ns = SteadyNowNs();
@@ -868,7 +916,8 @@ RecordApplyLoadDiffTiming(int64_t total_ns,
         return;
     }
     auto total = stats.total_ns.exchange(0, std::memory_order_relaxed);
-    auto index_load = stats.index_load_ns.exchange(0, std::memory_order_relaxed);
+    auto index_load =
+        stats.index_load_ns.exchange(0, std::memory_order_relaxed);
     auto index_replace =
         stats.index_replace_ns.exchange(0, std::memory_order_relaxed);
     auto reload_field =
@@ -877,12 +926,16 @@ RecordApplyLoadDiffTiming(int64_t total_ns,
         stats.column_group_ns.exchange(0, std::memory_order_relaxed);
     auto init_text_lob =
         stats.init_text_lob_ns.exchange(0, std::memory_order_relaxed);
-    auto binlog_load = stats.binlog_load_ns.exchange(0, std::memory_order_relaxed);
+    auto binlog_load =
+        stats.binlog_load_ns.exchange(0, std::memory_order_relaxed);
     auto binlog_replace =
         stats.binlog_replace_ns.exchange(0, std::memory_order_relaxed);
-    auto drop_index = stats.drop_index_ns.exchange(0, std::memory_order_relaxed);
-    auto text_index = stats.text_index_ns.exchange(0, std::memory_order_relaxed);
-    auto json_stats = stats.json_stats_ns.exchange(0, std::memory_order_relaxed);
+    auto drop_index =
+        stats.drop_index_ns.exchange(0, std::memory_order_relaxed);
+    auto text_index =
+        stats.text_index_ns.exchange(0, std::memory_order_relaxed);
+    auto json_stats =
+        stats.json_stats_ns.exchange(0, std::memory_order_relaxed);
     auto default_fill =
         stats.default_fill_ns.exchange(0, std::memory_order_relaxed);
     auto create_text_index =
@@ -954,8 +1007,7 @@ RecordSegmentLoadTiming(int64_t total_ns,
     stats.lock_wait_ns.fetch_add(lock_wait_ns, std::memory_order_relaxed);
     stats.snapshot_ns.fetch_add(snapshot_ns, std::memory_order_relaxed);
     stats.start_log_ns.fetch_add(start_log_ns, std::memory_order_relaxed);
-    stats.prepare_info_ns.fetch_add(prepare_info_ns,
-                                    std::memory_order_relaxed);
+    stats.prepare_info_ns.fetch_add(prepare_info_ns, std::memory_order_relaxed);
     stats.diff_ns.fetch_add(diff_ns, std::memory_order_relaxed);
     stats.diff_log_ns.fetch_add(diff_log_ns, std::memory_order_relaxed);
     stats.apply_ns.fetch_add(apply_ns, std::memory_order_relaxed);
@@ -1012,7 +1064,6 @@ RecordSegmentLoadTiming(int64_t total_ns,
         static_cast<double>(max_total) / 1e6);
 }
 
-
 void
 RecordIndexTaskTiming(DataType data_type,
                       int64_t total_ns,
@@ -1065,17 +1116,25 @@ RecordIndexTaskTiming(DataType data_type,
     auto total = stats.total_ns.exchange(0, std::memory_order_relaxed);
     auto queue = stats.queue_ns.exchange(0, std::memory_order_relaxed);
     auto load_data = stats.load_data_ns.exchange(0, std::memory_order_relaxed);
-    auto load_index = stats.load_index_ns.exchange(0, std::memory_order_relaxed);
-    auto vector_count = stats.vector_count.exchange(0, std::memory_order_relaxed);
-    auto vector_total = stats.vector_total_ns.exchange(0, std::memory_order_relaxed);
+    auto load_index =
+        stats.load_index_ns.exchange(0, std::memory_order_relaxed);
+    auto vector_count =
+        stats.vector_count.exchange(0, std::memory_order_relaxed);
+    auto vector_total =
+        stats.vector_total_ns.exchange(0, std::memory_order_relaxed);
     auto int64_count = stats.int64_count.exchange(0, std::memory_order_relaxed);
-    auto int64_total = stats.int64_total_ns.exchange(0, std::memory_order_relaxed);
-    auto varchar_count = stats.varchar_count.exchange(0, std::memory_order_relaxed);
-    auto varchar_total = stats.varchar_total_ns.exchange(0, std::memory_order_relaxed);
+    auto int64_total =
+        stats.int64_total_ns.exchange(0, std::memory_order_relaxed);
+    auto varchar_count =
+        stats.varchar_count.exchange(0, std::memory_order_relaxed);
+    auto varchar_total =
+        stats.varchar_total_ns.exchange(0, std::memory_order_relaxed);
     auto text_count = stats.text_count.exchange(0, std::memory_order_relaxed);
-    auto text_total = stats.text_total_ns.exchange(0, std::memory_order_relaxed);
+    auto text_total =
+        stats.text_total_ns.exchange(0, std::memory_order_relaxed);
     auto other_count = stats.other_count.exchange(0, std::memory_order_relaxed);
-    auto other_total = stats.other_total_ns.exchange(0, std::memory_order_relaxed);
+    auto other_total =
+        stats.other_total_ns.exchange(0, std::memory_order_relaxed);
     auto max_total = stats.max_total_ns.exchange(0, std::memory_order_relaxed);
 
     LOG_WARN(
@@ -1188,20 +1247,29 @@ RecordColumnGroupTaskTiming(bool has_pk,
     auto queue = stats.queue_ns.exchange(0, std::memory_order_relaxed);
     auto prepare = stats.prepare_ns.exchange(0, std::memory_order_relaxed);
     auto reader = stats.reader_ns.exchange(0, std::memory_order_relaxed);
-    auto translator = stats.translator_ns.exchange(0, std::memory_order_relaxed);
-    auto cache_slot = stats.cache_slot_ns.exchange(0, std::memory_order_relaxed);
+    auto translator =
+        stats.translator_ns.exchange(0, std::memory_order_relaxed);
+    auto cache_slot =
+        stats.cache_slot_ns.exchange(0, std::memory_order_relaxed);
     auto attach = stats.attach_ns.exchange(0, std::memory_order_relaxed);
     auto pk_attach = stats.pk_attach_ns.exchange(0, std::memory_order_relaxed);
     auto pk_count = stats.pk_count.exchange(0, std::memory_order_relaxed);
     auto pk_total = stats.pk_total_ns.exchange(0, std::memory_order_relaxed);
-    auto vector_count = stats.vector_count.exchange(0, std::memory_order_relaxed);
-    auto vector_total = stats.vector_total_ns.exchange(0, std::memory_order_relaxed);
-    auto scalar_count = stats.scalar_count.exchange(0, std::memory_order_relaxed);
-    auto scalar_total = stats.scalar_total_ns.exchange(0, std::memory_order_relaxed);
-    auto varchar_count = stats.varchar_count.exchange(0, std::memory_order_relaxed);
-    auto varchar_total = stats.varchar_total_ns.exchange(0, std::memory_order_relaxed);
+    auto vector_count =
+        stats.vector_count.exchange(0, std::memory_order_relaxed);
+    auto vector_total =
+        stats.vector_total_ns.exchange(0, std::memory_order_relaxed);
+    auto scalar_count =
+        stats.scalar_count.exchange(0, std::memory_order_relaxed);
+    auto scalar_total =
+        stats.scalar_total_ns.exchange(0, std::memory_order_relaxed);
+    auto varchar_count =
+        stats.varchar_count.exchange(0, std::memory_order_relaxed);
+    auto varchar_total =
+        stats.varchar_total_ns.exchange(0, std::memory_order_relaxed);
     auto text_count = stats.text_count.exchange(0, std::memory_order_relaxed);
-    auto text_total = stats.text_total_ns.exchange(0, std::memory_order_relaxed);
+    auto text_total =
+        stats.text_total_ns.exchange(0, std::memory_order_relaxed);
     auto lazy_manifest_count =
         stats.lazy_manifest_count.exchange(0, std::memory_order_relaxed);
     auto lazy_manifest_total =
@@ -1211,7 +1279,8 @@ RecordColumnGroupTaskTiming(bool has_pk,
     auto lazy_manifest_scalar_count =
         stats.lazy_manifest_scalar_count.exchange(0, std::memory_order_relaxed);
     auto lazy_manifest_varchar_count =
-        stats.lazy_manifest_varchar_count.exchange(0, std::memory_order_relaxed);
+        stats.lazy_manifest_varchar_count.exchange(0,
+                                                   std::memory_order_relaxed);
     auto max_total = stats.max_total_ns.exchange(0, std::memory_order_relaxed);
 
     LOG_WARN(
@@ -1828,10 +1897,8 @@ ChunkedSegmentSealedImpl::LoadColumnGroups(const std::string& manifest_path,
         cg_field_ids.emplace_back(static_cast<int>(i), std::move(field_ids));
     }
 
-    // Split each column group's fields by effective warmup policy. True-lazy
-    // fields attach a proxy without creating a reader; warmup-disabled fallback
-    // fields are grouped per column group because they still need load-time
-    // side effects.
+    // External tables keep one projected reader per warmup-disabled field so
+    // accessing one field does not pull sibling columns from object storage.
     struct FieldGroupTask {
         int cg_index;
         std::vector<FieldId> field_ids;
@@ -1842,12 +1909,9 @@ ChunkedSegmentSealedImpl::LoadColumnGroups(const std::string& manifest_path,
     for (const auto& pair : cg_field_ids) {
         auto cg_index = pair.first;
         const auto& all_fields = pair.second;
-        auto lazy_manifest_reader_enabled =
-            segcore_config_.get_lazy_manifest_reader_enabled();
 
         std::vector<FieldId> eager_fields;
-        std::vector<FieldId> lazy_manifest_fields;
-        std::vector<FieldId> fallback_fields;
+        std::vector<FieldId> disabled_fields;
 
         for (const auto& field_id : all_fields) {
             const auto& field_meta = (*schema_)[field_id];
@@ -1861,47 +1925,27 @@ ChunkedSegmentSealedImpl::LoadColumnGroups(const std::string& manifest_path,
                                                  /*in_load_list=*/true);
             if (resolved != CacheWarmupPolicy::CacheWarmupPolicy_Disable) {
                 eager_fields.push_back(field_id);
-            } else if (lazy_manifest_reader_enabled &&
-                       CanUseLazyManifestField(field_id, field_meta)) {
-                lazy_manifest_fields.push_back(field_id);
             } else {
-                auto reason = lazy_manifest_reader_enabled
-                                  ? LazyManifestFieldBlockReason(field_id,
-                                                                 field_meta)
-                                  : "lazy manifest reader disabled";
-                LOG_DEBUG(
-                    "[StorageV2] skip lazy manifest field, segment {}, cg {}, "
-                    "field {}, reason {}",
-                    get_segment_id(),
-                    cg_index,
-                    field_id.get(),
-                    reason);
-                fallback_fields.push_back(field_id);
+                disabled_fields.push_back(field_id);
             }
         }
 
         auto eager_field_count = eager_fields.size();
-        auto lazy_manifest_field_count = lazy_manifest_fields.size();
-        auto fallback_field_count = fallback_fields.size();
+        auto disabled_field_count = disabled_fields.size();
         if (!eager_fields.empty()) {
             tasks.push_back({cg_index, std::move(eager_fields), true});
         }
-        for (const auto& fid : lazy_manifest_fields) {
+        for (const auto& fid : disabled_fields) {
             tasks.push_back({cg_index, {fid}, false});
         }
-        if (!fallback_fields.empty()) {
-            tasks.push_back({cg_index, std::move(fallback_fields), false});
-        }
-        if (eager_field_count > 0 &&
-            (lazy_manifest_field_count > 0 || fallback_field_count > 0)) {
+        if (eager_field_count > 0 && disabled_field_count > 0) {
             LOG_INFO(
-                "[LoadColumnGroups] segment {} cg {} split: {} eager, {} lazy "
-                "manifest, {} fallback",
+                "[LoadColumnGroups] segment {} cg {} split: {} eager, {} "
+                "warmup-disabled",
                 get_segment_id(),
                 cg_index,
                 eager_field_count,
-                lazy_manifest_field_count,
-                fallback_field_count);
+                disabled_field_count);
         }
     }
 
@@ -5453,8 +5497,7 @@ ChunkedSegmentSealedImpl::generate_interim_index(const FieldId field_id,
 
 bool
 ChunkedSegmentSealedImpl::MayGenerateInterimIndex(
-    FieldId field_id,
-    const FieldMeta& field_meta) const {
+    FieldId field_id, const FieldMeta& field_meta) const {
     if (col_index_meta_ == nullptr || !col_index_meta_->HasField(field_id)) {
         return false;
     }
@@ -5586,8 +5629,7 @@ ChunkedSegmentSealedImpl::load_field_data_common(
     const bool should_account_field_data =
         !enable_mmap &&
         (!is_proxy_column ||
-         (is_proxy_column &&
-          field_id.get() != DEFAULT_SHORT_COLUMN_GROUP_ID));
+         (is_proxy_column && field_id.get() != DEFAULT_SHORT_COLUMN_GROUP_ID));
     size_t accounted_bytes = 0;
     if (should_account_field_data) {
         accounted_bytes = memory_accounting_bytes.has_value()
@@ -6672,25 +6714,18 @@ ChunkedSegmentSealedImpl::LoadColumnGroups(
     for (const auto& pair : cg_field_ids) {
         auto cg_index = pair.first;
         const auto& field_ids = pair.second;
-        auto lazy_manifest_reader_enabled =
-            segcore_config_.get_lazy_manifest_reader_enabled();
 
         std::vector<FieldId> warmup_fields;
-        std::vector<FieldId> lazy_manifest_fields;
-        std::vector<FieldId> fallback_fields;
-        std::unordered_set<FieldId> lazy_manifest_match_fields;
+        std::vector<FieldId> disabled_fields;
         warmup_fields.reserve(field_ids.size());
-        lazy_manifest_fields.reserve(field_ids.size());
-        fallback_fields.reserve(field_ids.size());
+        disabled_fields.reserve(field_ids.size());
 
         for (const auto& field_id : field_ids) {
             const auto& field_meta = (*schema_)[field_id];
-            bool field_is_vector = IsVectorDataType(field_meta.get_data_type());
-            bool allow_match_field_lazy =
-                lazy_match_fields != nullptr &&
-                lazy_match_fields->find(field_id) != lazy_match_fields->end();
             bool warmup_disabled = !eager_load;
             if (eager_load) {
+                bool field_is_vector =
+                    IsVectorDataType(field_meta.get_data_type());
                 auto [has_warmup, warmup_str] = schema_->WarmupPolicy(
                     field_id, field_is_vector, /*is_index=*/false);
                 auto resolved =
@@ -6702,65 +6737,38 @@ ChunkedSegmentSealedImpl::LoadColumnGroups(
                     resolved == CacheWarmupPolicy::CacheWarmupPolicy_Disable;
             }
 
-            if (!warmup_disabled) {
-                warmup_fields.emplace_back(field_id);
-            } else if (lazy_manifest_reader_enabled &&
-                       CanUseLazyManifestField(
-                           field_id, field_meta, allow_match_field_lazy)) {
-                lazy_manifest_fields.emplace_back(field_id);
-                if (allow_match_field_lazy) {
-                    lazy_manifest_match_fields.emplace(field_id);
-                }
+            if (warmup_disabled) {
+                disabled_fields.emplace_back(field_id);
             } else {
-                auto reason =
-                    lazy_manifest_reader_enabled
-                        ? LazyManifestFieldBlockReason(
-                              field_id, field_meta, allow_match_field_lazy)
-                        : "lazy manifest reader disabled";
-                LOG_DEBUG(
-                    "[StorageV2] skip lazy manifest field, segment {}, cg {}, "
-                    "field {}, reason {}",
-                    get_segment_id(),
-                    cg_index,
-                    field_id.get(),
-                    reason);
-                fallback_fields.emplace_back(field_id);
+                warmup_fields.emplace_back(field_id);
             }
         }
 
-        auto warmup_field_count = warmup_fields.size();
-        auto lazy_manifest_field_count = lazy_manifest_fields.size();
-        auto fallback_field_count = fallback_fields.size();
         if (!warmup_fields.empty()) {
             submit_load_group(cg_index,
                               std::move(warmup_fields),
-                              true,
+                              /*task_eager_load=*/true,
                               /*allow_match_field_lazy=*/false);
         }
-        for (const auto& field_id : lazy_manifest_fields) {
-            submit_load_group(
-                cg_index,
-                std::vector<FieldId>{field_id},
-                false,
-                lazy_manifest_match_fields.find(field_id) !=
-                    lazy_manifest_match_fields.end());
+
+        bool has_match_field = false;
+        bool all_match_fields_allow_lazy = true;
+        for (const auto& field_id : disabled_fields) {
+            const auto& field_meta = (*schema_)[field_id];
+            if (field_meta.enable_match()) {
+                has_match_field = true;
+                if (lazy_match_fields == nullptr ||
+                    lazy_match_fields->find(field_id) ==
+                        lazy_match_fields->end()) {
+                    all_match_fields_allow_lazy = false;
+                }
+            }
         }
-        if (!fallback_fields.empty()) {
+        if (!disabled_fields.empty()) {
             submit_load_group(cg_index,
-                              std::move(fallback_fields),
-                              false,
-                              /*allow_match_field_lazy=*/false);
-        }
-        if (warmup_field_count > 0 &&
-            (lazy_manifest_field_count > 0 || fallback_field_count > 0)) {
-            LOG_DEBUG(
-                "[StorageV2] segment {} cg {} split by warmup policy: {} "
-                "warmup fields, {} lazy manifest fields, {} fallback fields",
-                get_segment_id(),
-                cg_index,
-                warmup_field_count,
-                lazy_manifest_field_count,
-                fallback_field_count);
+                              std::move(disabled_fields),
+                              /*task_eager_load=*/false,
+                              has_match_field && all_match_fields_allow_lazy);
         }
     }
 
@@ -6790,7 +6798,6 @@ ChunkedSegmentSealedImpl::LoadColumnGroup(
                "load column group index out of range");
     AssertInfo(!milvus_field_ids.empty(),
                "load column group with empty field list");
-    auto column_group = column_groups->at(index);
     auto load_info = std::atomic_load(&segment_load_info_);
 
     auto stage_start = std::chrono::steady_clock::now();
@@ -6845,10 +6852,8 @@ ChunkedSegmentSealedImpl::LoadColumnGroup(
                                      : mmap_config.GetScalarFieldEnableMmap();
     auto use_mmap = has_mmap_setting ? mmap_enabled : global_use_mmap;
 
-    // The set of columns this entry projects is exactly the field_ids the
-    // diff handed us. For lazy entries, SegmentLoadInfo::ComputeDiffColumnGroups
-    // emits one entry per field, so first access materializes only that
-    // single-column projection and does not co-load sibling lazy fields.
+    // The caller defines the loading unit. Lazy materialization preserves this
+    // field set instead of splitting or merging it.
     auto needed_columns = std::make_shared<std::vector<std::string>>();
     needed_columns->reserve(milvus_field_ids.size());
     for (const auto& fid : milvus_field_ids) {
@@ -6878,19 +6883,35 @@ ChunkedSegmentSealedImpl::LoadColumnGroup(
                              is_vector,
                              /*is_index=*/false,
                              /*in_load_list=*/eager_load);
-    auto use_lazy_manifest_column_group =
-        segcore_config_.get_lazy_manifest_reader_enabled() &&
-        effective_warmup_policy ==
-            CacheWarmupPolicy::CacheWarmupPolicy_Disable &&
+    auto lazy_manifest_reader_enabled =
+        segcore_config_.get_lazy_manifest_reader_enabled();
+    auto warmup_disabled =
+        effective_warmup_policy == CacheWarmupPolicy::CacheWarmupPolicy_Disable;
+    auto should_defer =
+        lazy_manifest_reader_enabled && warmup_disabled &&
         CanUseLazyManifestColumnGroup(field_metas, allow_match_field_lazy);
 
+    if (lazy_manifest_reader_enabled && warmup_disabled && !should_defer) {
+        for (const auto& [field_id, field_meta] : field_metas) {
+            auto reason = LazyManifestFieldBlockReason(
+                field_id, field_meta, allow_match_field_lazy);
+            if (reason != nullptr) {
+                LOG_DEBUG(
+                    "[StorageV2] skip lazy manifest field, segment {}, cg {}, "
+                    "field {}, reason {}",
+                    get_segment_id(),
+                    index,
+                    field_id.get(),
+                    reason);
+            }
+        }
+    }
+
     // Multiple warmup-disabled entries can share the same column-group index
-    // (one per field), so the translator cache key must be disambiguated by
-    // the field-id of this entry. Eager warmup entries are still one-per-cg,
-    // so they keep the unsuffixed key.
+    // (for example, external single-field tasks), so non-eager entries use a
+    // field suffix. Eager entries keep the existing unsuffixed key.
     std::string cache_key_suffix;
-    if (!eager_load ||
-        (use_lazy_manifest_column_group && milvus_field_ids.size() == 1)) {
+    if (!eager_load) {
         cache_key_suffix = std::to_string(milvus_field_ids.front().get());
     }
 
@@ -6899,44 +6920,57 @@ ChunkedSegmentSealedImpl::LoadColumnGroup(
         reader_schema = schema_->ConvertToLoonArrowSchema();
     }
 
-    if (use_lazy_manifest_column_group) {
+    bool has_vector = is_vector;
+    bool has_varchar = false;
+    bool has_text = false;
+    bool has_pk = false;
+    auto primary_field_id = schema_->get_primary_field_id();
+    for (const auto& [field_id, field_meta] : field_metas) {
+        has_varchar =
+            has_varchar || field_meta.get_data_type() == DataType::VARCHAR;
+        has_text = has_text || field_meta.get_data_type() == DataType::TEXT;
+        has_pk = has_pk || (primary_field_id.has_value() &&
+                            primary_field_id.value() == field_id);
+    }
+
+    auto chunk_reader_factory = [this,
+                                 column_groups,
+                                 properties,
+                                 reader_schema,
+                                 index,
+                                 needed_columns]()
+        -> std::shared_ptr<milvus_storage::api::ChunkReader> {
+        return GetManifestChunkReader(
+            column_groups, properties, reader_schema, index, needed_columns);
+    };
+    ManifestColumnGroupBuildContext context{
+        get_segment_id(),
+        index,
+        needed_columns,
+        std::move(chunk_reader_factory),
+        std::move(field_metas),
+        use_mmap,
+        mmap_config.GetMmapPopulate(),
+        mmap_dir_path,
+        static_cast<int64_t>(milvus_field_ids.size()),
+        load_info->GetPriority(),
+        eager_load,
+        warmup_policy,
+        cache_key_suffix,
+        load_info->GetEstimatedBytesPerRow(),
+    };
+
+    if (should_defer) {
         stage_start = std::chrono::steady_clock::now();
-        auto chunk_reader_factory = [this,
-                                     column_groups,
-                                     properties,
-                                     reader_schema,
-                                     index,
-                                     needed_columns]()
-            -> std::shared_ptr<milvus_storage::api::ChunkReader> {
-            return GetManifestChunkReader(column_groups,
-                                          properties,
-                                          reader_schema,
-                                          index,
-                                          needed_columns);
-        };
-        LazyManifestColumnGroupContext context{
-            get_segment_id(),
-            index,
-            needed_columns,
-            std::move(chunk_reader_factory),
-            field_metas,
-            use_mmap,
-            mmap_config.GetMmapPopulate(),
-            mmap_dir_path,
-            static_cast<int64_t>(milvus_field_ids.size()),
-            load_info->GetPriority(),
-            warmup_policy,
-            cache_key_suffix,
-        };
         auto lazy_column_group =
             std::make_shared<LazyManifestColumnGroup>(std::move(context));
 
         for (const auto& field_id : milvus_field_ids) {
-            const auto& field_meta = field_metas.at(field_id);
+            const auto& field_meta = (*schema_)[field_id];
             auto column = std::make_shared<LazyManifestProxyColumn>(
                 lazy_column_group,
                 field_id,
-                field_meta,
+                field_meta.is_nullable(),
                 load_info->GetNumOfRows());
             load_field_data_common(field_id,
                                    column,
@@ -6971,18 +7005,6 @@ ChunkedSegmentSealedImpl::LoadColumnGroup(
                 0);
         }
         attach_ns = DurationSinceNs(stage_start);
-        bool has_vector = false;
-        bool has_varchar = false;
-        bool has_text = false;
-        bool has_pk = false;
-        auto primary_field_id = schema_->get_primary_field_id();
-        for (const auto& field_id : milvus_field_ids) {
-            const auto& field_meta = field_metas.at(field_id);
-            has_vector = has_vector || IsVectorDataType(field_meta.get_data_type());
-            has_varchar = has_varchar || field_meta.get_data_type() == DataType::VARCHAR;
-            has_text = has_text || field_meta.get_data_type() == DataType::TEXT;
-            has_pk = has_pk || (primary_field_id.has_value() && primary_field_id.value() == field_id);
-        }
         RecordColumnGroupTaskTiming(has_pk,
                                     has_vector,
                                     has_varchar,
@@ -6999,39 +7021,17 @@ ChunkedSegmentSealedImpl::LoadColumnGroup(
         return;
     }
 
-    stage_start = std::chrono::steady_clock::now();
-    auto chunk_reader = GetManifestChunkReader(
-        column_groups, properties, reader_schema, index, needed_columns);
-    reader_ns = DurationSinceNs(stage_start);
-
-    stage_start = std::chrono::steady_clock::now();
-    auto translator =
-        std::make_unique<storagev2translator::ManifestGroupTranslator>(
-            get_segment_id(),
-            GroupChunkType::DEFAULT,
-            index,
-            std::move(chunk_reader),
-            field_metas,
-            use_mmap,
-            mmap_config.GetMmapPopulate(),
-            mmap_dir_path,
-            milvus_field_ids.size(),
-            load_info->GetPriority(),
-            eager_load,
-            warmup_policy,
-            cache_key_suffix,
-            load_info->GetEstimatedBytesPerRow());
-    translator_ns = DurationSinceNs(stage_start);
-
-    stage_start = std::chrono::steady_clock::now();
+    ManifestColumnGroupBuildTiming build_timing;
     auto chunked_column_group =
-        std::make_shared<ChunkedColumnGroup>(std::move(translator));
-    cache_slot_ns = DurationSinceNs(stage_start);
+        CreateManifestColumnGroup(context, &build_timing);
+    reader_ns = build_timing.reader_ns;
+    translator_ns = build_timing.translator_ns;
+    cache_slot_ns = build_timing.cache_slot_ns;
 
     // Create ProxyChunkColumn for each field
     stage_start = std::chrono::steady_clock::now();
     for (const auto& field_id : milvus_field_ids) {
-        const auto& field_meta = field_metas.at(field_id);
+        const auto& field_meta = context.field_metas.at(field_id);
         auto column = std::make_shared<ProxyChunkColumn>(
             chunked_column_group, field_id, field_meta);
         auto data_type = field_meta.get_data_type();
@@ -7049,7 +7049,8 @@ ChunkedSegmentSealedImpl::LoadColumnGroup(
             is_replace);
         auto field_attach_ns = DurationSinceNs(field_attach_start);
         auto primary_field_id = schema_->get_primary_field_id();
-        if (primary_field_id.has_value() && primary_field_id.value() == field_id) {
+        if (primary_field_id.has_value() &&
+            primary_field_id.value() == field_id) {
             pk_attach_ns += field_attach_ns;
         }
         if (field_id == TimestampFieldID) {
@@ -7064,18 +7065,6 @@ ChunkedSegmentSealedImpl::LoadColumnGroup(
     }
     attach_ns = DurationSinceNs(stage_start);
 
-    bool has_vector = false;
-    bool has_varchar = false;
-    bool has_text = false;
-    bool has_pk = false;
-    auto primary_field_id = schema_->get_primary_field_id();
-    for (const auto& field_id : milvus_field_ids) {
-        const auto& field_meta = field_metas.at(field_id);
-        has_vector = has_vector || IsVectorDataType(field_meta.get_data_type());
-        has_varchar = has_varchar || field_meta.get_data_type() == DataType::VARCHAR;
-        has_text = has_text || field_meta.get_data_type() == DataType::TEXT;
-        has_pk = has_pk || (primary_field_id.has_value() && primary_field_id.value() == field_id);
-    }
     RecordColumnGroupTaskTiming(has_pk,
                                 has_vector,
                                 has_varchar,
@@ -7886,9 +7875,8 @@ ChunkedSegmentSealedImpl::ExecuteTake(
     if (!reader_) {
         auto load_info = std::atomic_load(&segment_load_info_);
         if (load_info == nullptr || !load_info->HasManifestPath()) {
-            LOG_WARN("[TakeAPI] {} reader is null for segment {}",
-                     caller_tag,
-                     id_);
+            LOG_WARN(
+                "[TakeAPI] {} reader is null for segment {}", caller_tag, id_);
             return nullptr;
         }
         reader_ =
