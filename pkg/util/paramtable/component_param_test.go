@@ -32,6 +32,19 @@ func shouldPanic(t *testing.T, name string, f func()) {
 	t.Errorf("%s should have panicked", name)
 }
 
+func TestTieredLazyIndexSlotConfig(t *testing.T) {
+	Init()
+	params := Get()
+	item := &params.QueryNodeCfg.TieredLazyIndexSlotEnabled
+
+	assert.Equal(t, "false", item.DefaultValue)
+	defer params.Reset(item.Key)
+	assert.NoError(t, params.Save(item.Key, "false"))
+	assert.False(t, item.GetAsBool())
+	assert.NoError(t, params.Save(item.Key, "true"))
+	assert.True(t, item.GetAsBool())
+}
+
 func TestComponentParam(t *testing.T) {
 	Init()
 	params := Get()

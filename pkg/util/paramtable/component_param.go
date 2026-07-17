@@ -3519,6 +3519,7 @@ type queryNodeConfig struct {
 	TieredLoadingTimeoutMs                ParamItem `refreshable:"true"`
 	TieredWarmupLoadingTimeoutMs          ParamItem `refreshable:"true"`
 	StorageUsageTrackingEnabled           ParamItem `refreshable:"true"`
+	TieredLazyIndexSlotEnabled            ParamItem `refreshable:"true"`
 	TieredLazyManifestReaderEnabled       ParamItem `refreshable:"true"`
 	TieredLazyManifestMetadataReadEnabled ParamItem `refreshable:"true"`
 
@@ -3803,6 +3804,15 @@ Defaults to "sync".`,
 		Export:       true,
 	}
 	p.TieredWarmupVectorIndex.Init(base.mgr)
+
+	p.TieredLazyIndexSlotEnabled = ParamItem{
+		Key:          "queryNode.segcore.tieredStorage.lazyIndexSlotEnabled",
+		Version:      "3.0.0",
+		DefaultValue: "false",
+		Doc:          "When enabled, sealed scalar and vector index translators and cache slots with warmup=disable are created on first access instead of segment load.",
+		Export:       true,
+	}
+	p.TieredLazyIndexSlotEnabled.Init(base.mgr)
 
 	p.TieredLazyManifestReaderEnabled = ParamItem{
 		Key:          "queryNode.segcore.tieredStorage.lazyManifestReaderEnabled",

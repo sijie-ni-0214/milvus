@@ -92,6 +92,9 @@ void
 SegcoreSetPreferFieldDataWhenIndexHasRawData(const bool value);
 
 void
+SegcoreSetLazyIndexSlotEnabled(const bool value);
+
+void
 SegcoreSetLazyManifestReaderEnabled(const bool value);
 
 void

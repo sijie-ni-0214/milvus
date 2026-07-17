@@ -41,10 +41,12 @@
 #include "glog/logging.h"
 #include "google/protobuf/descriptor.h"
 #include "index/Index.h"
+#include "index/IndexFactory.h"
 #include "index/IndexInfo.h"
 #include "index/Meta.h"
 #include "index/ScalarIndex.h"
 #include "index/Utils.h"
+#include "knowhere/comp/index_param.h"
 #include "knowhere/sparse_utils.h"
 #include "log/Log.h"
 #include "milvus-storage/filesystem/fs.h"
@@ -52,6 +54,7 @@
 #include "parquet/arrow/reader.h"
 #include "pb/schema.pb.h"
 #include "segcore/ConcurrentVector.h"
+#include "segcore/SegcoreConfig.h"
 #include "segcore/SegmentInterface.h"
 #include "segcore/Types.h"
 #include "segcore/storagev1translator/SealedIndexTranslator.h"
@@ -1425,21 +1428,53 @@ getCellDataType(bool is_vector, bool is_index) {
     }
 }
 
-void
-LoadIndexData(milvus::tracer::TraceContext& ctx,
-              milvus::segcore::LoadIndexInfo* load_index_info,
-              milvus::OpContext* op_ctx) {
-    auto& index_params = load_index_info->index_params;
-    auto field_type = load_index_info->field_type;
-    auto engine_version = load_index_info->index_engine_version;
+bool
+CanDeferSealedIndexSlot(const milvus::segcore::LoadIndexInfo& load_index_info) {
+    if (!SegcoreConfig::default_config().get_lazy_index_slot_enabled() ||
+        load_index_info.field_id < START_USER_FIELDID ||
+        load_index_info.field_type == DataType::JSON) {
+        return false;
+    }
+
+    auto index_type_it = load_index_info.index_params.find(index::INDEX_TYPE);
+    if (index_type_it == load_index_info.index_params.end()) {
+        return false;
+    }
+
+    auto is_vector = IsVectorDataType(load_index_info.field_type);
+    const auto& index_type = index_type_it->second;
+    bool supported =
+        is_vector
+            ? index_type == knowhere::IndexEnum::INDEX_HNSW ||
+                  index_type == knowhere::IndexEnum::INDEX_SPARSE_INVERTED_INDEX
+            : index_type == index::ASCENDING_SORT ||
+                  index_type == index::INVERTED_INDEX_TYPE;
+    if (!supported) {
+        return false;
+    }
+
+    return getCacheWarmupPolicy(load_index_info.warmup_policy,
+                                is_vector,
+                                /*is_index=*/true) ==
+           CacheWarmupPolicy::CacheWarmupPolicy_Disable;
+}
+
+namespace {
+
+std::pair<milvus::index::CreateIndexInfo, milvus::Config>
+PrepareSealedIndexLoadInfo(
+    const milvus::segcore::LoadIndexInfo& load_index_info) {
+    auto& index_params = load_index_info.index_params;
+    auto field_type = load_index_info.field_type;
+    auto engine_version = load_index_info.index_engine_version;
 
     milvus::index::CreateIndexInfo index_info;
-    index_info.field_type = load_index_info->field_type;
-    index_info.field_name = load_index_info->schema.name();
+    index_info.field_type = load_index_info.field_type;
+    index_info.field_name = load_index_info.schema.name();
     index_info.index_engine_version = engine_version;
 
-    auto config = milvus::index::ParseConfigFromIndexParams(
-        load_index_info->index_params);
+    auto config =
+        milvus::index::ParseConfigFromIndexParams(load_index_info.index_params);
     auto load_priority_str = config[milvus::LOAD_PRIORITY].get<std::string>();
     auto priority_for_load = milvus::PriorityForLoad(load_priority_str);
     config[milvus::LOAD_PRIORITY] = priority_for_load;
@@ -1460,13 +1495,13 @@ LoadIndexData(milvus::tracer::TraceContext& ctx,
         "[collection={}][segment={}][field={}][enable_mmap={}][load_"
         "priority={}] load index {}, "
         "mmap_dir_path={}",
-        load_index_info->collection_id,
-        load_index_info->segment_id,
-        load_index_info->field_id,
-        load_index_info->enable_mmap,
+        load_index_info.collection_id,
+        load_index_info.segment_id,
+        load_index_info.field_id,
+        load_index_info.enable_mmap,
         load_priority_str,
-        load_index_info->index_id,
-        load_index_info->mmap_dir_path);
+        load_index_info.index_id,
+        load_index_info.mmap_dir_path);
     // get index type
     AssertInfo(index_params.find("index_type") != index_params.end(),
                "index type is empty");
@@ -1501,23 +1536,61 @@ LoadIndexData(milvus::tracer::TraceContext& ctx,
         index_info.ngram_params = std::make_optional(ngram_params);
     }
 
-    // init file manager
-    milvus::storage::FieldDataMeta field_meta{load_index_info->collection_id,
-                                              load_index_info->partition_id,
-                                              load_index_info->segment_id,
-                                              load_index_info->field_id,
-                                              load_index_info->schema};
-    milvus::storage::IndexMeta index_meta{load_index_info->segment_id,
-                                          load_index_info->field_id,
-                                          load_index_info->index_build_id,
-                                          load_index_info->index_version};
-    config[milvus::index::INDEX_FILES] = load_index_info->index_files;
-
-    if (load_index_info->field_type == milvus::DataType::JSON) {
+    if (load_index_info.field_type == milvus::DataType::JSON) {
         index_info.json_cast_type = milvus::JsonCastType::FromString(
             config.at(JSON_CAST_TYPE).get<std::string>());
         index_info.json_path = config.at(JSON_PATH).get<std::string>();
     }
+    return {std::move(index_info), std::move(config)};
+}
+
+}  // namespace
+
+void
+ValidateSealedIndexLoadInfo(
+    const milvus::segcore::LoadIndexInfo& load_index_info) {
+    static_cast<void>(PrepareSealedIndexLoadInfo(load_index_info));
+    AssertInfo(milvus::segcore::GetDefaultArrowFileSystem() != nullptr,
+               "arrow file system is nullptr");
+}
+
+void
+EnsureSealedIndexLoadResource(milvus::segcore::LoadIndexInfo& load_index_info) {
+    if (load_index_info.has_load_resource_request) {
+        return;
+    }
+
+    load_index_info.load_resource_request =
+        milvus::index::IndexFactory::GetInstance().IndexLoadResource(
+            load_index_info.field_type,
+            load_index_info.element_type,
+            load_index_info.index_engine_version,
+            load_index_info.index_size,
+            load_index_info.index_params,
+            load_index_info.enable_mmap,
+            load_index_info.num_rows,
+            load_index_info.dim);
+    load_index_info.has_load_resource_request = true;
+}
+
+milvus::index::CacheIndexBasePtr
+CreateSealedIndexCacheSlot(
+    milvus::tracer::TraceContext& ctx,
+    const milvus::segcore::LoadIndexInfo& load_index_info,
+    milvus::OpContext* op_ctx) {
+    auto [index_info, config] = PrepareSealedIndexLoadInfo(load_index_info);
+
+    milvus::storage::FieldDataMeta field_meta{load_index_info.collection_id,
+                                              load_index_info.partition_id,
+                                              load_index_info.segment_id,
+                                              load_index_info.field_id,
+                                              load_index_info.schema};
+    milvus::storage::IndexMeta index_meta{load_index_info.segment_id,
+                                          load_index_info.field_id,
+                                          load_index_info.index_build_id,
+                                          load_index_info.index_version};
+    config[milvus::index::INDEX_FILES] = load_index_info.index_files;
+
     auto remote_chunk_manager =
         milvus::storage::RemoteChunkManagerSingleton::GetInstance()
             .GetRemoteChunkManager();
@@ -1531,11 +1604,18 @@ LoadIndexData(milvus::tracer::TraceContext& ctx,
     std::unique_ptr<milvus::cachinglayer::Translator<milvus::index::IndexBase>>
         translator = std::make_unique<
             milvus::segcore::storagev1translator::SealedIndexTranslator>(
-            index_info, load_index_info, ctx, file_manager_context, config);
+            index_info, &load_index_info, ctx, file_manager_context, config);
 
+    return milvus::cachinglayer::Manager::GetInstance().CreateCacheSlot(
+        std::move(translator), op_ctx);
+}
+
+void
+LoadIndexData(milvus::tracer::TraceContext& ctx,
+              milvus::segcore::LoadIndexInfo* load_index_info,
+              milvus::OpContext* op_ctx) {
     load_index_info->cache_index =
-        milvus::cachinglayer::Manager::GetInstance().CreateCacheSlot(
-            std::move(translator), op_ctx);
+        CreateSealedIndexCacheSlot(ctx, *load_index_info, op_ctx);
 }
 
 FieldDataPtr

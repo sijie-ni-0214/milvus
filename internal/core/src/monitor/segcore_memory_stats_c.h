@@ -84,6 +84,11 @@ typedef struct {
     uint64_t lazy_manifest_proxy_object_bytes;
     uint64_t lazy_manifest_projected_column_count;
 
+    uint64_t deferred_business_index_count;
+    uint64_t deferred_business_index_estimated_bytes;
+    uint64_t deferred_text_index_count;
+    uint64_t deferred_text_index_estimated_bytes;
+
     uint64_t pk_index_slot_count;
     uint64_t timestamp_index_slot_count;
     uint64_t pk_index_translator_count;
@@ -178,6 +183,14 @@ UpdateSegcoreLazyManifestGroup(int64_t count_delta,
 
 void
 UpdateSegcoreLazyManifestProxy(int64_t count_delta, int64_t object_bytes_delta);
+
+void
+UpdateSegcoreDeferredBusinessIndex(int64_t count_delta,
+                                   int64_t estimated_bytes_delta);
+
+void
+UpdateSegcoreDeferredTextIndex(int64_t count_delta,
+                               int64_t estimated_bytes_delta);
 
 void
 UpdateSegcorePkIndexSlot(int64_t count_delta);

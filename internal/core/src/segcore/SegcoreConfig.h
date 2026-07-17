@@ -178,6 +178,16 @@ class SegcoreConfig {
     }
 
     void
+    set_lazy_index_slot_enabled(bool value) {
+        lazy_index_slot_enabled_.store(value, std::memory_order_relaxed);
+    }
+
+    bool
+    get_lazy_index_slot_enabled() const {
+        return lazy_index_slot_enabled_.load(std::memory_order_relaxed);
+    }
+
+    void
     set_lazy_manifest_reader_enabled(bool value) {
         lazy_manifest_reader_enabled_.store(value, std::memory_order_relaxed);
     }
@@ -242,6 +252,7 @@ class SegcoreConfig {
     inline static bool enable_geometry_cache_ = false;
     inline static bool visibility_filter_enabled_ = true;
     inline static bool prefer_field_data_when_index_has_raw_data_ = false;
+    inline static std::atomic<bool> lazy_index_slot_enabled_ = false;
     inline static std::atomic<bool> lazy_manifest_reader_enabled_ = false;
     inline static std::atomic<bool> lazy_manifest_metadata_read_enabled_ =
         false;

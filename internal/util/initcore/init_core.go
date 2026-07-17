@@ -388,6 +388,7 @@ func InitTieredStorage(params *paramtable.ComponentParam) error {
 	diskMaxBytes := C.int64_t(diskMaxRatio * float64(osDiskBytes))
 
 	storageUsageTrackingEnabled := C.bool(params.QueryNodeCfg.StorageUsageTrackingEnabled.GetAsBool())
+	lazyIndexSlotEnabled := C.bool(params.QueryNodeCfg.TieredLazyIndexSlotEnabled.GetAsBool())
 	lazyManifestReaderEnabled := C.bool(params.QueryNodeCfg.TieredLazyManifestReaderEnabled.GetAsBool())
 	lazyManifestMetadataReadEnabled := C.bool(params.QueryNodeCfg.TieredLazyManifestMetadataReadEnabled.GetAsBool())
 	evictionEnabled := C.bool(params.QueryNodeCfg.TieredEvictionEnabled.GetAsBool())
@@ -405,6 +406,7 @@ func InitTieredStorage(params *paramtable.ComponentParam) error {
 
 	prefetchPoolThreads := C.uint32_t(hardware.GetCPUNum() * params.CommonCfg.LowPriorityThreadCoreCoefficient.GetAsInt())
 
+	C.SegcoreSetLazyIndexSlotEnabled(lazyIndexSlotEnabled)
 	C.SegcoreSetLazyManifestReaderEnabled(lazyManifestReaderEnabled)
 	C.SegcoreSetLazyManifestMetadataReadEnabled(lazyManifestMetadataReadEnabled)
 	C.ConfigureTieredStorage(scalarFieldCacheWarmupPolicy,
@@ -461,9 +463,11 @@ func UpdateTieredStorageConfig(params *paramtable.ComponentParam) error {
 	loadingTimeoutMs := C.int64_t(params.QueryNodeCfg.TieredLoadingTimeoutMs.GetAsInt64())
 	warmupLoadingTimeoutMs := C.int64_t(params.QueryNodeCfg.TieredWarmupLoadingTimeoutMs.GetAsInt64())
 	storageUsageTrackingEnabled := C.bool(params.QueryNodeCfg.StorageUsageTrackingEnabled.GetAsBool())
+	lazyIndexSlotEnabled := C.bool(params.QueryNodeCfg.TieredLazyIndexSlotEnabled.GetAsBool())
 	lazyManifestReaderEnabled := C.bool(params.QueryNodeCfg.TieredLazyManifestReaderEnabled.GetAsBool())
 	lazyManifestMetadataReadEnabled := C.bool(params.QueryNodeCfg.TieredLazyManifestMetadataReadEnabled.GetAsBool())
 
+	C.SegcoreSetLazyIndexSlotEnabled(lazyIndexSlotEnabled)
 	C.SegcoreSetLazyManifestReaderEnabled(lazyManifestReaderEnabled)
 	C.SegcoreSetLazyManifestMetadataReadEnabled(lazyManifestMetadataReadEnabled)
 	C.UpdateTieredStorageConfig(
@@ -695,6 +699,7 @@ func SetupCoreConfigChangelCallback() {
 		paramtable.Get().QueryNodeCfg.TieredWarmupVectorField.RegisterCallback(updateTieredStorageConfigCallback)
 		paramtable.Get().QueryNodeCfg.TieredWarmupScalarIndex.RegisterCallback(updateTieredStorageConfigCallback)
 		paramtable.Get().QueryNodeCfg.TieredWarmupVectorIndex.RegisterCallback(updateTieredStorageConfigCallback)
+		paramtable.Get().QueryNodeCfg.TieredLazyIndexSlotEnabled.RegisterCallback(updateTieredStorageConfigCallback)
 		paramtable.Get().QueryNodeCfg.TieredLazyManifestReaderEnabled.RegisterCallback(updateTieredStorageConfigCallback)
 		paramtable.Get().QueryNodeCfg.TieredLazyManifestMetadataReadEnabled.RegisterCallback(updateTieredStorageConfigCallback)
 	})

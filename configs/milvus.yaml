@@ -510,6 +510,7 @@ queryNode:
         scalarIndex: sync
         vectorField: disable # cache warmup for vector field raw data is by default disabled.
         vectorIndex: sync
+      lazyIndexSlotEnabled: false # Create sealed index translators and cache slots on first access when index warmup is disabled.
       lazyManifestReaderEnabled: false # Skip StorageV2 manifest reader creation during load for warmup=disable fields without load-time side effects.
       # If evictionEnabled is true, a background thread will run every evictionIntervalMs to determine if an
       # eviction is necessary and the amount of data to evict from memory/disk.

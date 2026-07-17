@@ -37,6 +37,7 @@
 #include <shared_mutex>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
 #include <variant>
@@ -268,6 +269,31 @@ ApproxStringVectorBytes(const std::vector<std::string>& values) {
 size_t
 ApproxInt64VectorBytes(const std::vector<int64_t>& values) {
     return values.capacity() * sizeof(int64_t);
+}
+
+size_t
+ApproxStringMapBytes(const std::map<std::string, std::string>& values) {
+    size_t bytes =
+        values.size() * (sizeof(std::pair<const std::string, std::string>) +
+                         3 * sizeof(void*) + sizeof(bool));
+    for (const auto& [key, value] : values) {
+        bytes += ApproxStringDynamicBytes(key);
+        bytes += ApproxStringDynamicBytes(value);
+    }
+    return bytes;
+}
+
+size_t
+ApproxLoadIndexInfoDynamicBytes(const LoadIndexInfo& info) {
+    auto schema_bytes = static_cast<size_t>(info.schema.SpaceUsedLong());
+    auto schema_dynamic_bytes = schema_bytes > sizeof(info.schema)
+                                    ? schema_bytes - sizeof(info.schema)
+                                    : 0;
+    return ApproxStringDynamicBytes(info.mmap_dir_path) +
+           ApproxStringMapBytes(info.index_params) +
+           ApproxStringVectorBytes(info.index_files) +
+           ApproxStringDynamicBytes(info.uri) +
+           ApproxStringDynamicBytes(info.warmup_policy) + schema_dynamic_bytes;
 }
 
 size_t
@@ -1323,7 +1349,56 @@ RecordColumnGroupTaskTiming(bool has_pk,
         static_cast<double>(max_total) / 1e6);
 }
 
+void
+ValidateDeferredTextIndexLoadInfo(
+    const proto::indexcgo::LoadTextIndexInfo& info_proto) {
+    static_cast<void>(FieldMeta::ParseFrom(info_proto.schema()));
+    AssertInfo(GetDefaultArrowFileSystem() != nullptr,
+               "arrow file system is null");
+}
+
 }  // namespace
+
+struct ChunkedSegmentSealedImpl::DeferredBusinessIndex {
+    DeferredBusinessIndex(LoadIndexInfo info,
+                          milvus::tracer::TraceContext trace_ctx,
+                          bool is_vector)
+        : load_info(std::move(info)),
+          trace_ctx(std::move(trace_ctx)),
+          is_vector(is_vector),
+          estimated_bytes(
+              sizeof(DeferredBusinessIndex) +
+              ApproxLoadIndexInfoDynamicBytes(load_info) +
+              ApproxSharedPtrControlBlockBytes(1) +
+              sizeof(std::pair<const FieldId,
+                               std::shared_ptr<DeferredBusinessIndex>>) +
+              sizeof(void*)) {
+    }
+
+    mutable std::mutex materialize_mutex;
+    LoadIndexInfo load_info;
+    milvus::tracer::TraceContext trace_ctx;
+    bool is_vector;
+    size_t estimated_bytes;
+};
+
+struct ChunkedSegmentSealedImpl::DeferredTextIndex {
+    explicit DeferredTextIndex(
+        std::shared_ptr<proto::indexcgo::LoadTextIndexInfo> info)
+        : load_info(std::move(info)),
+          estimated_bytes(
+              sizeof(DeferredTextIndex) +
+              static_cast<size_t>(load_info->SpaceUsedLong()) +
+              ApproxSharedPtrControlBlockBytes(2) +
+              sizeof(std::pair<const FieldId,
+                               std::shared_ptr<DeferredTextIndex>>) +
+              sizeof(void*)) {
+    }
+
+    mutable std::mutex materialize_mutex;
+    std::shared_ptr<proto::indexcgo::LoadTextIndexInfo> load_info;
+    size_t estimated_bytes;
+};
 
 static inline void
 set_bit(BitsetType& bitset, FieldId field_id, bool flag = true) {
@@ -1364,6 +1439,34 @@ cancel_warmup(const index::CacheIndexBasePtr& index) {
     if (index) {
         index->CancelWarmup();
     }
+}
+
+template <typename TextIndexVariant>
+static inline void
+cancel_text_index_warmup(TextIndexVariant& text_index) {
+    std::visit(
+        [](auto& holder) {
+            using Holder = std::decay_t<decltype(holder)>;
+            if constexpr (std::is_same_v<Holder,
+                                         std::shared_ptr<CacheSlot<
+                                             index::TextMatchIndex>>>) {
+                if (holder) {
+                    holder->CancelWarmup();
+                }
+            }
+        },
+        text_index);
+}
+
+template <typename TextIndexMap>
+static inline void
+cancel_and_erase_text_index(TextIndexMap& text_indexes, FieldId field_id) {
+    auto it = text_indexes.find(field_id);
+    if (it == text_indexes.end()) {
+        return;
+    }
+    cancel_text_index_warmup(it->second);
+    text_indexes.erase(it);
 }
 
 static inline void
@@ -1449,6 +1552,26 @@ cancel_and_clear_json_indices(std::vector<JsonIndexT>& json_indices) {
         cancel_warmup(index.index);
     }
     json_indices.clear();
+}
+
+std::vector<PinWrapper<const index::IndexBase*>>
+ChunkedSegmentSealedImpl::PinIndex(milvus::OpContext* op_ctx,
+                                   FieldId field_id,
+                                   bool include_ngram) const {
+    EnsureBusinessIndexSlot(field_id, op_ctx);
+    auto [scalar_indexings, ngram_fields] =
+        lock(folly::rlock(scalar_indexings_), folly::rlock(ngram_fields_));
+    if (!include_ngram && ngram_fields->find(field_id) != ngram_fields->end()) {
+        return {};
+    }
+
+    auto iter = scalar_indexings->find(field_id);
+    if (iter == scalar_indexings->end()) {
+        return {};
+    }
+    auto ca = SemiInlineGet(iter->second->PinCells(op_ctx, {0}));
+    auto index = ca->get_cell_of(0);
+    return {PinWrapper<const index::IndexBase*>(ca, index)};
 }
 
 PinWrapper<const storagev2translator::TimestampIndexCell*>
@@ -1628,8 +1751,306 @@ ChunkedSegmentSealedImpl::init_storage_v2_pk_index(
     TrackPkIndexSlot();
 }
 
+bool
+ChunkedSegmentSealedImpl::CanDeferBusinessIndex(
+    FieldId field_id, const LoadIndexInfo& index_info) const {
+    if (field_id.get() < START_USER_FIELDID ||
+        index_info.field_id != field_id.get()) {
+        return false;
+    }
+
+    const auto& field_meta = schema_->operator[](field_id);
+    if (field_meta.get_data_type() == DataType::JSON ||
+        (schema_->get_primary_field_id() == field_id && is_sorted_by_pk_)) {
+        return false;
+    }
+
+    if (field_meta.is_vector() != IsVectorDataType(index_info.field_type)) {
+        return false;
+    }
+
+    return CanDeferSealedIndexSlot(index_info);
+}
+
+bool
+ChunkedSegmentSealedImpl::CanDeferBusinessIndex(
+    FieldId field_id, const std::vector<LoadIndexInfo>& index_infos) const {
+    return index_infos.size() == 1 &&
+           CanDeferBusinessIndex(field_id, index_infos.front());
+}
+
+void
+ChunkedSegmentSealedImpl::DeferBusinessIndex(
+    LoadIndexInfo&& info,
+    milvus::tracer::TraceContext trace_ctx,
+    bool is_replace) {
+    AssertInfo(info.cache_index == nullptr,
+               "deferred index must not have a cache slot");
+    auto field_id = FieldId(info.field_id);
+    const auto& field_meta = schema_->operator[](field_id);
+    auto is_vector = field_meta.is_vector();
+    auto metric_type =
+        is_vector ? info.index_params.at(knowhere::meta::METRIC_TYPE) : "";
+
+    EnsureSealedIndexLoadResource(info);
+    auto request = info.load_resource_request;
+
+    auto descriptor = std::make_shared<DeferredBusinessIndex>(
+        std::move(info), std::move(trace_ctx), is_vector);
+
+    std::unique_lock lck(mutex_);
+    if (!is_replace) {
+        AssertInfo(!get_bit(index_ready_bitset_, field_id),
+                   "index has already been loaded for field {}",
+                   field_id.get());
+    }
+    auto deferred_indexes = deferred_business_indexes_.wlock();
+    auto old_deferred = deferred_indexes->find(field_id);
+    if (old_deferred != deferred_indexes->end()) {
+        milvus::monitor::UpdateSegcoreDeferredBusinessIndex(
+            -1, -ToMetricDelta(old_deferred->second->estimated_bytes));
+        deferred_indexes->erase(old_deferred);
+    }
+
+    if (is_replace) {
+        if (is_vector) {
+            vector_indexings_.drop_field_indexing(field_id);
+        } else {
+            auto [scalar_indexings, ngram_fields] = lock(
+                folly::wlock(scalar_indexings_), folly::wlock(ngram_fields_));
+            cancel_and_erase_scalar_index(*scalar_indexings, field_id);
+            ngram_fields->erase(field_id);
+        }
+    }
+
+    if (is_vector && get_bit(binlog_index_bitset_, field_id)) {
+        set_bit(binlog_index_bitset_, field_id, false);
+        vector_indexings_.drop_field_indexing(field_id);
+    }
+
+    deferred_indexes->emplace(field_id, descriptor);
+    milvus::monitor::UpdateSegcoreDeferredBusinessIndex(
+        1, ToMetricDelta(descriptor->estimated_bytes));
+    set_bit(index_ready_bitset_, field_id, true);
+    index_has_raw_data_[field_id] = request.has_raw_data;
+
+    LOG_DEBUG("deferred index slot creation for segment {} field {} metric {}",
+              id_,
+              field_id.get(),
+              metric_type);
+}
+
+void
+ChunkedSegmentSealedImpl::EnsureBusinessIndexSlot(
+    FieldId field_id, milvus::OpContext* op_ctx) const {
+    while (true) {
+        auto descriptor = deferred_business_indexes_.withRLock(
+            [&](const auto& indexes) -> std::shared_ptr<DeferredBusinessIndex> {
+                auto it = indexes.find(field_id);
+                return it == indexes.end() ? nullptr : it->second;
+            });
+        if (descriptor == nullptr) {
+            return;
+        }
+
+        std::unique_lock materialize_lock(descriptor->materialize_mutex);
+        auto still_current =
+            deferred_business_indexes_.withRLock([&](const auto& indexes) {
+                auto it = indexes.find(field_id);
+                return it != indexes.end() && it->second == descriptor;
+            });
+        if (!still_current) {
+            continue;
+        }
+
+        auto trace_ctx = descriptor->trace_ctx;
+        auto cache_index = CreateSealedIndexCacheSlot(
+            trace_ctx, descriptor->load_info, op_ctx);
+
+        auto deferred_indexes = deferred_business_indexes_.wlock();
+        auto current = deferred_indexes->find(field_id);
+        if (current == deferred_indexes->end() ||
+            current->second != descriptor) {
+            cache_index->CancelWarmup();
+            continue;
+        }
+
+        // Search and Retrieve hold the segment mutex in shared mode while
+        // calling PinIndex. Publishing only touches the synchronized deferred
+        // and live index registries, so taking the segment mutex here would
+        // attempt an unsupported shared-to-exclusive lock upgrade.
+        if (descriptor->is_vector) {
+            auto metric_type = descriptor->load_info.index_params.at(
+                knowhere::meta::METRIC_TYPE);
+            vector_indexings_.append_field_indexing(
+                field_id, metric_type, std::move(cache_index));
+        } else {
+            (*scalar_indexings_.wlock())[field_id] = std::move(cache_index);
+        }
+
+        milvus::monitor::UpdateSegcoreDeferredBusinessIndex(
+            -1, -ToMetricDelta(descriptor->estimated_bytes));
+        deferred_indexes->erase(current);
+        return;
+    }
+}
+
+bool
+ChunkedSegmentSealedImpl::CanDeferTextIndex(
+    const proto::indexcgo::LoadTextIndexInfo& info_proto) const {
+    return segcore_config_.get_lazy_index_slot_enabled() &&
+           getCacheWarmupPolicy(info_proto.warmup_policy(),
+                                /*is_vector=*/false,
+                                /*is_index=*/true) ==
+               CacheWarmupPolicy::CacheWarmupPolicy_Disable;
+}
+
+void
+ChunkedSegmentSealedImpl::DeferTextIndex(
+    std::shared_ptr<proto::indexcgo::LoadTextIndexInfo> info_proto) {
+    auto field_id = FieldId(info_proto->fieldid());
+    auto descriptor =
+        std::make_shared<DeferredTextIndex>(std::move(info_proto));
+
+    std::unique_lock lock(text_index_mutex_);
+    auto old_deferred = deferred_text_indexes_.find(field_id);
+    if (old_deferred != deferred_text_indexes_.end()) {
+        milvus::monitor::UpdateSegcoreDeferredTextIndex(
+            -1, -ToMetricDelta(old_deferred->second->estimated_bytes));
+        deferred_text_indexes_.erase(old_deferred);
+    }
+    cancel_and_erase_text_index(text_indexes_, field_id);
+    deferred_text_indexes_.emplace(field_id, descriptor);
+    milvus::monitor::UpdateSegcoreDeferredTextIndex(
+        1, ToMetricDelta(descriptor->estimated_bytes));
+
+    LOG_DEBUG("deferred text index slot creation for segment {} field {}",
+              id_,
+              field_id.get());
+}
+
+std::shared_ptr<CacheSlot<index::TextMatchIndex>>
+ChunkedSegmentSealedImpl::CreateTextIndexCacheSlot(
+    const proto::indexcgo::LoadTextIndexInfo& info_proto,
+    milvus::OpContext* op_ctx) const {
+    auto field_id = FieldId(info_proto.fieldid());
+    CheckCancellation(op_ctx,
+                      id_,
+                      field_id.get(),
+                      "ChunkedSegmentSealedImpl::CreateTextIndexCacheSlot()");
+
+    milvus::storage::FieldDataMeta field_data_meta{info_proto.collectionid(),
+                                                   info_proto.partitionid(),
+                                                   get_segment_id(),
+                                                   info_proto.fieldid(),
+                                                   info_proto.schema()};
+    milvus::storage::IndexMeta index_meta{get_segment_id(),
+                                          info_proto.fieldid(),
+                                          info_proto.buildid(),
+                                          info_proto.version()};
+    auto field_meta = milvus::FieldMeta::ParseFrom(info_proto.schema());
+    auto remote_chunk_manager =
+        milvus::storage::RemoteChunkManagerSingleton::GetInstance()
+            .GetRemoteChunkManager();
+    auto fs = milvus::segcore::GetDefaultArrowFileSystem();
+    AssertInfo(fs != nullptr, "arrow file system is null");
+
+    milvus::Config config;
+    std::vector<std::string> files;
+    files.reserve(info_proto.files_size());
+    for (const auto& file : info_proto.files()) {
+        files.push_back(file);
+    }
+    config[milvus::index::INDEX_FILES] = std::move(files);
+    config[milvus::LOAD_PRIORITY] = info_proto.load_priority();
+    config[milvus::index::ENABLE_MMAP] = info_proto.enable_mmap();
+    config[milvus::index::COLLECTION_ID] = info_proto.collectionid();
+    if (!info_proto.warmup_policy().empty()) {
+        config[milvus::index::WARMUP] = info_proto.warmup_policy();
+    }
+    if (!info_proto.base_path().empty()) {
+        config[STATS_BASE_PATH_KEY] = info_proto.base_path();
+    }
+
+    milvus::storage::FileManagerContext file_ctx(
+        field_data_meta, index_meta, remote_chunk_manager, fs);
+    if (!info_proto.base_path().empty()) {
+        file_ctx.set_stats_base_path(info_proto.base_path());
+    }
+
+    milvus::segcore::storagev1translator::TextMatchIndexLoadInfo load_info{
+        info_proto.enable_mmap(),
+        get_segment_id(),
+        info_proto.fieldid(),
+        field_meta.get_analyzer_params(),
+        info_proto.index_size(),
+        info_proto.warmup_policy()};
+    std::unique_ptr<Translator<index::TextMatchIndex>> translator =
+        std::make_unique<
+            milvus::segcore::storagev1translator::TextMatchIndexTranslator>(
+            std::move(load_info), std::move(file_ctx), std::move(config));
+    return milvus::cachinglayer::Manager::GetInstance().CreateCacheSlot(
+        std::move(translator), op_ctx);
+}
+
+void
+ChunkedSegmentSealedImpl::EnsureTextIndexSlot(FieldId field_id,
+                                              milvus::OpContext* op_ctx) const {
+    while (true) {
+        std::shared_ptr<DeferredTextIndex> descriptor;
+        {
+            std::shared_lock lock(text_index_mutex_);
+            auto it = deferred_text_indexes_.find(field_id);
+            if (it == deferred_text_indexes_.end()) {
+                return;
+            }
+            descriptor = it->second;
+        }
+
+        std::unique_lock materialize_lock(descriptor->materialize_mutex);
+        {
+            std::shared_lock lock(text_index_mutex_);
+            auto it = deferred_text_indexes_.find(field_id);
+            if (it == deferred_text_indexes_.end() ||
+                it->second != descriptor) {
+                continue;
+            }
+        }
+
+        auto cache_slot =
+            CreateTextIndexCacheSlot(*descriptor->load_info, op_ctx);
+
+        std::unique_lock lock(text_index_mutex_);
+        auto current = deferred_text_indexes_.find(field_id);
+        if (current == deferred_text_indexes_.end() ||
+            current->second != descriptor) {
+            cache_slot->CancelWarmup();
+            continue;
+        }
+
+        auto* mutable_this = const_cast<ChunkedSegmentSealedImpl*>(this);
+        mutable_this->text_indexes_[field_id] = std::move(cache_slot);
+        milvus::monitor::UpdateSegcoreDeferredTextIndex(
+            -1, -ToMetricDelta(descriptor->estimated_bytes));
+        deferred_text_indexes_.erase(current);
+        return;
+    }
+}
+
 void
 ChunkedSegmentSealedImpl::LoadIndex(LoadIndexInfo& info) {
+    auto field_id = FieldId(info.field_id);
+    if (info.cache_index == nullptr) {
+        if (CanDeferBusinessIndex(field_id, info)) {
+            ValidateSealedIndexLoadInfo(info);
+            DeferBusinessIndex(
+                std::move(info), milvus::tracer::TraceContext{}, false);
+            return;
+        }
+
+        milvus::tracer::TraceContext trace_ctx{};
+        LoadIndexData(trace_ctx, &info);
+    }
     LoadIndex(info, false);
 }
 
@@ -1658,6 +2079,13 @@ ChunkedSegmentSealedImpl::LoadVecIndex(LoadIndexInfo& info, bool is_replace) {
 
     std::unique_lock lck(mutex_);
     if (is_replace) {
+        auto deferred_indexes = deferred_business_indexes_.wlock();
+        auto deferred = deferred_indexes->find(field_id);
+        if (deferred != deferred_indexes->end()) {
+            milvus::monitor::UpdateSegcoreDeferredBusinessIndex(
+                -1, -ToMetricDelta(deferred->second->estimated_bytes));
+            deferred_indexes->erase(deferred);
+        }
         // Drop existing vector indexing for this field before replacing
         if (get_bit(index_ready_bitset_, field_id)) {
             vector_indexings_.drop_field_indexing(field_id);
@@ -1731,6 +2159,13 @@ ChunkedSegmentSealedImpl::LoadScalarIndex(LoadIndexInfo& info,
 
     std::unique_lock lck(mutex_);
     if (is_replace) {
+        auto deferred_indexes = deferred_business_indexes_.wlock();
+        auto deferred = deferred_indexes->find(field_id);
+        if (deferred != deferred_indexes->end()) {
+            milvus::monitor::UpdateSegcoreDeferredBusinessIndex(
+                -1, -ToMetricDelta(deferred->second->estimated_bytes));
+            deferred_indexes->erase(deferred);
+        }
         // Drop existing scalar indexing before replacing
         if (get_bit(index_ready_bitset_, field_id)) {
             auto [scalar_indexings, ngram_fields] = lock(
@@ -2738,6 +3173,7 @@ ChunkedSegmentSealedImpl::vector_search(SearchInfo& search_info,
         milvus::tracer::AddEvent(
             "finish_searching_vector_temperate_binlog_index");
     } else if (get_bit(index_ready_bitset_, field_id)) {
+        EnsureBusinessIndexSlot(field_id, op_context);
         if (search_info.global_refine_enable_ &&
             IsIndexRefineEnabled(field_id)) {
             search_info.topk_ = GetEffectiveSearchTopk(search_info);
@@ -2795,6 +3231,10 @@ ChunkedSegmentSealedImpl::FilterVectorValidOffsets(milvus::OpContext* op_ctx,
                                                    int64_t count) const {
     ValidResult result;
     result.valid_count = count;
+
+    if (get_bit(index_ready_bitset_, field_id)) {
+        EnsureBusinessIndexSlot(field_id, op_ctx);
+    }
 
     bool got_valid_offsets_from_index = false;
     if (vector_indexings_.is_ready(field_id)) {
@@ -2869,6 +3309,7 @@ ChunkedSegmentSealedImpl::get_vector(milvus::OpContext* op_ctx,
         return fill_with_empty(field_id, count);
     }
 
+    EnsureBusinessIndexSlot(field_id, op_ctx);
     AssertInfo(vector_indexings_.is_ready(field_id),
                "vector index is not ready");
     auto field_indexing = vector_indexings_.get_field_indexing(field_id);
@@ -2925,6 +3366,7 @@ ChunkedSegmentSealedImpl::get_emb_list(milvus::OpContext* op_ctx,
         return fill_with_empty(field_id, count);
     }
 
+    EnsureBusinessIndexSlot(field_id, op_ctx);
     AssertInfo(vector_indexings_.is_ready(field_id),
                "vector index is not ready");
     auto field_indexing = vector_indexings_.get_field_indexing(field_id);
@@ -3059,6 +3501,13 @@ ChunkedSegmentSealedImpl::DropIndex(const FieldId field_id) {
     }
 
     std::unique_lock lck(mutex_);
+    auto deferred_indexes = deferred_business_indexes_.wlock();
+    auto deferred = deferred_indexes->find(field_id);
+    if (deferred != deferred_indexes->end()) {
+        milvus::monitor::UpdateSegcoreDeferredBusinessIndex(
+            -1, -ToMetricDelta(deferred->second->estimated_bytes));
+        deferred_indexes->erase(deferred);
+    }
     auto [scalar_indexings, ngram_fields] =
         lock(folly::wlock(scalar_indexings_), folly::wlock(ngram_fields_));
     cancel_and_erase_scalar_index(*scalar_indexings, field_id);
@@ -3066,6 +3515,7 @@ ChunkedSegmentSealedImpl::DropIndex(const FieldId field_id) {
     vector_indexings_.drop_field_indexing(field_id);
 
     clear_bit_if_present(index_ready_bitset_, field_id);
+    index_has_raw_data_.erase(field_id);
 }
 
 void
@@ -3619,6 +4069,21 @@ ChunkedSegmentSealedImpl::ChunkedSegmentSealedImpl(
 }
 
 ChunkedSegmentSealedImpl::~ChunkedSegmentSealedImpl() {
+    deferred_business_indexes_.withWLock([&](auto& indexes) {
+        for (const auto& [_, descriptor] : indexes) {
+            milvus::monitor::UpdateSegcoreDeferredBusinessIndex(
+                -1, -ToMetricDelta(descriptor->estimated_bytes));
+        }
+        indexes.clear();
+    });
+    {
+        std::unique_lock lock(text_index_mutex_);
+        for (const auto& [_, descriptor] : deferred_text_indexes_) {
+            milvus::monitor::UpdateSegcoreDeferredTextIndex(
+                -1, -ToMetricDelta(descriptor->estimated_bytes));
+        }
+        deferred_text_indexes_.clear();
+    }
     UntrackRuntimeMemoryStats();
 
     // Clean up geometry cache for all fields in this segment
@@ -4198,6 +4663,21 @@ ChunkedSegmentSealedImpl::ClearData() {
         index_has_raw_data_.clear();
         num_rows_ = std::nullopt;
         ngram_fields_.wlock()->clear();
+        deferred_business_indexes_.withWLock([&](auto& indexes) {
+            for (const auto& [_, descriptor] : indexes) {
+                milvus::monitor::UpdateSegcoreDeferredBusinessIndex(
+                    -1, -ToMetricDelta(descriptor->estimated_bytes));
+            }
+            indexes.clear();
+        });
+        {
+            std::unique_lock text_index_lock(text_index_mutex_);
+            for (const auto& [_, descriptor] : deferred_text_indexes_) {
+                milvus::monitor::UpdateSegcoreDeferredTextIndex(
+                    -1, -ToMetricDelta(descriptor->estimated_bytes));
+            }
+            deferred_text_indexes_.clear();
+        }
         scalar_indexings_.withWLock([&](auto& scalar_indexings) {
             cancel_and_clear_scalar_indexings(scalar_indexings);
         });
@@ -4244,7 +4724,14 @@ ChunkedSegmentSealedImpl::CreateTextIndex(FieldId field_id,
                       field_id.get(),
                       "ChunkedSegmentSealedImpl::CreateTextIndex()");
 
+    auto column = get_column(field_id);
+    std::vector<PinWrapper<const index::IndexBase*>> pinned_indexes;
+    if (column == nullptr) {
+        pinned_indexes = PinIndex(op_ctx, field_id);
+    }
+
     std::unique_lock lck(mutex_);
+    std::unique_lock text_index_lock(text_index_mutex_);
 
     // Guard against re-entry on a field whose temp text index was already
     // built: the path `<mmap>/<segment_id>_<field_id>` is shared with the
@@ -4253,6 +4740,11 @@ ChunkedSegmentSealedImpl::CreateTextIndex(FieldId field_id,
     AssertInfo(text_indexes_.find(field_id) == text_indexes_.end(),
                "text index for field {} already exists, refusing to rebuild",
                field_id.get());
+    AssertInfo(
+        deferred_text_indexes_.find(field_id) == deferred_text_indexes_.end(),
+        "deferred text index for field {} already exists, refusing to "
+        "rebuild",
+        field_id.get());
 
     const auto& field_meta = schema_->operator[](field_id);
     auto& cfg = storage::MmapManager::GetInstance().GetMmapConfig();
@@ -4278,7 +4770,6 @@ ChunkedSegmentSealedImpl::CreateTextIndex(FieldId field_id,
 
     {
         // build
-        auto column = get_column(field_id);
         if (column) {
             // Check for cancellation before bulk operation
             CheckCancellation(op_ctx,
@@ -4291,26 +4782,19 @@ ChunkedSegmentSealedImpl::CreateTextIndex(FieldId field_id,
                     index->AddTextSealed(std::string(value), is_valid, offset);
                 });
         } else {  // fetch raw data from index.
-            auto field_index_iter =
-                scalar_indexings_.withRLock([&](auto& mapping) {
-                    auto iter = mapping.find(field_id);
-                    AssertInfo(iter != mapping.end(),
-                               "failed to create text index, neither "
-                               "raw data nor "
-                               "index are found");
-                    return iter;
-                });
-            auto accessor =
-                SemiInlineGet(field_index_iter->second->PinCells(nullptr, {0}));
-            auto ptr = accessor->get_cell_of(0);
+            AssertInfo(pinned_indexes.size() == 1,
+                       "failed to create text index, neither raw data nor "
+                       "index are found");
+            auto* ptr = pinned_indexes.front().get();
             AssertInfo(ptr->HasRawData(),
                        "text raw data not found, trying to create text index "
                        "from index, but this index don't contain raw data");
-            auto impl = dynamic_cast<index::ScalarIndex<std::string>*>(ptr);
+            auto impl = dynamic_cast<index::ScalarIndex<std::string>*>(
+                const_cast<index::IndexBase*>(ptr));
             AssertInfo(impl != nullptr,
                        "failed to create text index, field index cannot be "
                        "converted to string index");
-            auto n = impl->Size();
+            auto n = impl->Count();
             for (size_t i = 0; i < n; i++) {
                 auto raw = impl->Reverse_Lookup(i);
                 if (!raw.has_value()) {
@@ -4383,67 +4867,68 @@ void
 ChunkedSegmentSealedImpl::LoadTextIndex(
     milvus::OpContext* op_ctx,
     std::shared_ptr<milvus::proto::indexcgo::LoadTextIndexInfo> info_proto) {
-    // Check for cancellation before starting
     CheckCancellation(op_ctx, id_, "ChunkedSegmentSealedImpl::LoadTextIndex()");
-
-    milvus::storage::FieldDataMeta field_data_meta{info_proto->collectionid(),
-                                                   info_proto->partitionid(),
-                                                   this->get_segment_id(),
-                                                   info_proto->fieldid(),
-                                                   info_proto->schema()};
-    milvus::storage::IndexMeta index_meta{this->get_segment_id(),
-                                          info_proto->fieldid(),
-                                          info_proto->buildid(),
-                                          info_proto->version()};
-    auto field_meta = milvus::FieldMeta::ParseFrom(info_proto->schema());
-    auto remote_chunk_manager =
-        milvus::storage::RemoteChunkManagerSingleton::GetInstance()
-            .GetRemoteChunkManager();
-    auto fs = milvus::segcore::GetDefaultArrowFileSystem();
-    AssertInfo(fs != nullptr, "arrow file system is null");
-
-    milvus::Config config;
-    std::vector<std::string> files;
-    for (const auto& f : info_proto->files()) {
-        files.push_back(f);
-    }
-    config[milvus::index::INDEX_FILES] = files;
-    config[milvus::LOAD_PRIORITY] = info_proto->load_priority();
-    config[milvus::index::ENABLE_MMAP] = info_proto->enable_mmap();
-    config[milvus::index::COLLECTION_ID] = info_proto->collectionid();
-    if (info_proto->warmup_policy() != "") {
-        config[milvus::index::WARMUP] = info_proto->warmup_policy();
-    }
-    if (!info_proto->base_path().empty()) {
-        config[STATS_BASE_PATH_KEY] = info_proto->base_path();
-    }
-    milvus::storage::FileManagerContext file_ctx(
-        field_data_meta, index_meta, remote_chunk_manager, fs);
-    if (!info_proto->base_path().empty()) {
-        file_ctx.set_stats_base_path(info_proto->base_path());
-    }
-
     auto field_id = milvus::FieldId(info_proto->fieldid());
-    // const auto& field_meta = schema_->operator[](field_id);
-    milvus::segcore::storagev1translator::TextMatchIndexLoadInfo load_info{
-        info_proto->enable_mmap(),
-        this->get_segment_id(),
-        info_proto->fieldid(),
-        field_meta.get_analyzer_params(),
-        info_proto->index_size(),
-        info_proto->warmup_policy()};
+    if (CanDeferTextIndex(*info_proto)) {
+        ValidateDeferredTextIndexLoadInfo(*info_proto);
+        DeferTextIndex(std::move(info_proto));
+        return;
+    }
 
-    std::unique_ptr<
-        milvus::cachinglayer::Translator<milvus::index::TextMatchIndex>>
-        translator = std::make_unique<
-            milvus::segcore::storagev1translator::TextMatchIndexTranslator>(
-            load_info, file_ctx, config);
-    auto cache_slot =
-        milvus::cachinglayer::Manager::GetInstance().CreateCacheSlot(
-            std::move(translator), op_ctx);
-
-    std::unique_lock lck(mutex_);
+    auto cache_slot = CreateTextIndexCacheSlot(*info_proto, op_ctx);
+    std::unique_lock lock(text_index_mutex_);
+    auto deferred = deferred_text_indexes_.find(field_id);
+    if (deferred != deferred_text_indexes_.end()) {
+        milvus::monitor::UpdateSegcoreDeferredTextIndex(
+            -1, -ToMetricDelta(deferred->second->estimated_bytes));
+        deferred_text_indexes_.erase(deferred);
+    }
+    cancel_and_erase_text_index(text_indexes_, field_id);
     text_indexes_[field_id] = std::move(cache_slot);
+}
+
+PinWrapper<index::TextMatchIndex*>
+ChunkedSegmentSealedImpl::GetTextIndex(milvus::OpContext* op_ctx,
+                                       FieldId field_id) const {
+    EnsureTextIndexSlot(field_id, op_ctx);
+
+    std::shared_lock lock(text_index_mutex_);
+    auto iter = text_indexes_.find(field_id);
+    if (iter == text_indexes_.end()) {
+        throw SegcoreError(
+            milvus::ErrorCode::TextIndexNotFound,
+            fmt::format("text index not found for field {}", field_id.get()));
+    }
+
+    auto make_pin = [&](auto&& alt) -> PinWrapper<index::TextMatchIndex*> {
+        using Alt = std::decay_t<decltype(alt)>;
+
+        if constexpr (std::is_same_v<
+                          Alt,
+                          std::unique_ptr<milvus::index::TextMatchIndex>>) {
+            return PinWrapper<index::TextMatchIndex*>(alt.get());
+        } else if constexpr (std::is_same_v<
+                                 Alt,
+                                 std::shared_ptr<
+                                     milvus::index::TextMatchIndexHolder>>) {
+            return PinWrapper<index::TextMatchIndex*>(alt, alt->get());
+        } else if constexpr (std::is_same_v<
+                                 Alt,
+                                 std::shared_ptr<
+                                     milvus::cachinglayer::CacheSlot<
+                                         milvus::index::TextMatchIndex>>>) {
+            auto ca = SemiInlineGet(alt->PinCells(op_ctx, {0}));
+            return PinWrapper<index::TextMatchIndex*>(ca, ca->get_cell_of(0));
+        } else {
+            throw SegcoreError(
+                milvus::ErrorCode::UnexpectedError,
+                fmt::format(
+                    "text index of segment is not supported for field {}",
+                    field_id.get()));
+        }
+    };
+
+    return std::visit(make_pin, iter->second);
 }
 
 void
@@ -5064,8 +5549,6 @@ ChunkedSegmentSealedImpl::HasRawData(int64_t field_id) const {
     const auto& field_meta = schema_->operator[](fieldID);
     if (IsVectorDataType(field_meta.get_data_type())) {
         if (get_bit(index_ready_bitset_, fieldID)) {
-            AssertInfo(vector_indexings_.is_ready(fieldID),
-                       "vector index is not ready");
             AssertInfo(
                 index_has_raw_data_.find(fieldID) != index_has_raw_data_.end(),
                 "index_has_raw_data_ is not set for fieldID: " +
@@ -5083,17 +5566,12 @@ ChunkedSegmentSealedImpl::HasRawData(int64_t field_id) const {
         }
     } else if (IsJsonDataType(field_meta.get_data_type())) {
         return get_bit(field_data_ready_bitset_, fieldID);
-    } else {
-        auto has_scalar_index = scalar_indexings_.withRLock([&](auto& mapping) {
-            return mapping.find(fieldID) != mapping.end();
-        });
-        if (has_scalar_index) {
-            AssertInfo(
-                index_has_raw_data_.find(fieldID) != index_has_raw_data_.end(),
-                "index_has_raw_data_ is not set for fieldID: " +
-                    std::to_string(fieldID.get()));
-            return index_has_raw_data_.at(fieldID);
-        }
+    } else if (get_bit(index_ready_bitset_, fieldID)) {
+        AssertInfo(
+            index_has_raw_data_.find(fieldID) != index_has_raw_data_.end(),
+            "index_has_raw_data_ is not set for fieldID: " +
+                std::to_string(fieldID.get()));
+        return index_has_raw_data_.at(fieldID);
     }
     return true;
 }
@@ -5116,6 +5594,7 @@ ChunkedSegmentSealedImpl::CalcDistByIDs(
     size_t count,
     bool is_cosine,
     float* distances) const {
+    EnsureBusinessIndexSlot(field_id, nullptr);
     if (!vector_indexings_.is_ready(field_id)) {
         return false;
     }
@@ -5159,6 +5638,7 @@ ChunkedSegmentSealedImpl::CalcDistByIDs(
 
 bool
 ChunkedSegmentSealedImpl::IsIndexRefineEnabled(FieldId field_id) const {
+    EnsureBusinessIndexSlot(field_id, nullptr);
     if (!vector_indexings_.is_ready(field_id)) {
         return false;
     }
@@ -5525,7 +6005,7 @@ ChunkedSegmentSealedImpl::MayGenerateInterimIndex(
         return false;
     }
 
-    return !vector_indexings_.is_ready(field_id);
+    return !HasIndex(field_id);
 }
 
 bool
@@ -6638,12 +7118,17 @@ ChunkedSegmentSealedImpl::EnsureDeferredManifestColumnGroups(
     std::vector<FieldId> text_indexes_to_create;
     {
         std::shared_lock lck(mutex_);
+        std::shared_lock text_index_lock(text_index_mutex_);
         for (const auto& [field_id, field_meta] : schema_->get_fields()) {
             if (field_id.get() < START_USER_FIELDID ||
                 !field_meta.enable_match()) {
                 continue;
             }
             if (text_indexes_.find(field_id) != text_indexes_.end()) {
+                continue;
+            }
+            if (deferred_text_indexes_.find(field_id) !=
+                deferred_text_indexes_.end()) {
                 continue;
             }
             text_indexes_to_create.emplace_back(field_id);
@@ -7145,6 +7630,7 @@ ChunkedSegmentSealedImpl::LoadBatchIndexes(
                    field_id.get());
         auto data_type = schema_->operator[](field_id).get_data_type();
         auto& index_infos = pair.second;
+        auto defer_index = CanDeferBusinessIndex(field_id, index_infos);
         for (auto& load_index_info : index_infos) {
             auto* load_index_info_ptr = &load_index_info;
             auto submit_time = std::chrono::steady_clock::now();
@@ -7153,6 +7639,7 @@ ChunkedSegmentSealedImpl::LoadBatchIndexes(
                                        field_id,
                                        data_type,
                                        load_index_info_ptr,
+                                       defer_index,
                                        submit_time,
                                        op_ctx,
                                        is_replace]() mutable -> void {
@@ -7166,14 +7653,23 @@ ChunkedSegmentSealedImpl::LoadBatchIndexes(
                           field_id.get(),
                           load_index_info_ptr->index_files.size());
 
-                // Download & compose index
+                // Validate or create the index cache slot.
                 auto stage_start = std::chrono::steady_clock::now();
-                LoadIndexData(trace_ctx, load_index_info_ptr, op_ctx);
+                if (defer_index) {
+                    ValidateSealedIndexLoadInfo(*load_index_info_ptr);
+                } else {
+                    LoadIndexData(trace_ctx, load_index_info_ptr, op_ctx);
+                }
                 auto load_data_ns = DurationSinceNs(stage_start);
 
-                // Load index into segment
+                // Publish the ready index or its deferred descriptor.
                 stage_start = std::chrono::steady_clock::now();
-                LoadIndex(*load_index_info_ptr, is_replace);
+                if (defer_index) {
+                    DeferBusinessIndex(
+                        std::move(*load_index_info_ptr), trace_ctx, is_replace);
+                } else {
+                    LoadIndex(*load_index_info_ptr, is_replace);
+                }
                 auto load_index_ns = DurationSinceNs(stage_start);
                 RecordIndexTaskTiming(data_type,
                                       DurationSinceNs(task_start),

@@ -64,6 +64,12 @@ func TestSetupCoreConfigChangeCallback(t *testing.T) {
 
 	assert.NoError(t, pt.Save(pt.CommonCfg.ThreadPoolMaxThreadsSize.Key, "32"))
 	assert.Equal(t, "32", pt.CommonCfg.ThreadPoolMaxThreadsSize.GetValue())
+
+	defer pt.Reset(pt.QueryNodeCfg.TieredLazyIndexSlotEnabled.Key)
+	assert.NoError(t, pt.Save(pt.QueryNodeCfg.TieredLazyIndexSlotEnabled.Key, "false"))
+	assert.Equal(t, "false", pt.QueryNodeCfg.TieredLazyIndexSlotEnabled.GetValue())
+	assert.NoError(t, pt.Save(pt.QueryNodeCfg.TieredLazyIndexSlotEnabled.Key, "true"))
+	assert.Equal(t, "true", pt.QueryNodeCfg.TieredLazyIndexSlotEnabled.GetValue())
 }
 
 func TestInitArrowReaderConfig(t *testing.T) {

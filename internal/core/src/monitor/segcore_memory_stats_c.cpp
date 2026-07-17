@@ -61,6 +61,11 @@ std::atomic<int64_t> g_lazy_manifest_proxy_count{0};
 std::atomic<int64_t> g_lazy_manifest_proxy_object_bytes{0};
 std::atomic<int64_t> g_lazy_manifest_projected_column_count{0};
 
+std::atomic<int64_t> g_deferred_business_index_count{0};
+std::atomic<int64_t> g_deferred_business_index_estimated_bytes{0};
+std::atomic<int64_t> g_deferred_text_index_count{0};
+std::atomic<int64_t> g_deferred_text_index_estimated_bytes{0};
+
 std::atomic<int64_t> g_pk_index_slot_count{0};
 std::atomic<int64_t> g_timestamp_index_slot_count{0};
 std::atomic<int64_t> g_pk_index_translator_count{0};
@@ -194,6 +199,15 @@ GetSegcoreMemoryStats() {
         load_non_negative(g_lazy_manifest_proxy_object_bytes);
     stats.lazy_manifest_projected_column_count =
         load_non_negative(g_lazy_manifest_projected_column_count);
+
+    stats.deferred_business_index_count =
+        load_non_negative(g_deferred_business_index_count);
+    stats.deferred_business_index_estimated_bytes =
+        load_non_negative(g_deferred_business_index_estimated_bytes);
+    stats.deferred_text_index_count =
+        load_non_negative(g_deferred_text_index_count);
+    stats.deferred_text_index_estimated_bytes =
+        load_non_negative(g_deferred_text_index_estimated_bytes);
 
     stats.pk_index_slot_count = load_non_negative(g_pk_index_slot_count);
     stats.timestamp_index_slot_count =
@@ -369,6 +383,20 @@ UpdateSegcoreLazyManifestProxy(int64_t count_delta,
                                int64_t object_bytes_delta) {
     add(g_lazy_manifest_proxy_count, count_delta);
     add(g_lazy_manifest_proxy_object_bytes, object_bytes_delta);
+}
+
+void
+UpdateSegcoreDeferredBusinessIndex(int64_t count_delta,
+                                   int64_t estimated_bytes_delta) {
+    add(g_deferred_business_index_count, count_delta);
+    add(g_deferred_business_index_estimated_bytes, estimated_bytes_delta);
+}
+
+void
+UpdateSegcoreDeferredTextIndex(int64_t count_delta,
+                               int64_t estimated_bytes_delta) {
+    add(g_deferred_text_index_count, count_delta);
+    add(g_deferred_text_index_estimated_bytes, estimated_bytes_delta);
 }
 
 void

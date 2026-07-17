@@ -21,6 +21,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <shared_mutex>
 #include <string>
 #include <string_view>
 #include <tuple>
@@ -171,23 +172,7 @@ class ChunkedSegmentSealedImpl : public SegmentSealed {
     std::vector<PinWrapper<const index::IndexBase*>>
     PinIndex(milvus::OpContext* op_ctx,
              FieldId field_id,
-             bool include_ngram = false) const override {
-        auto [scalar_indexings, ngram_fields] =
-            lock(folly::rlock(scalar_indexings_), folly::rlock(ngram_fields_));
-        if (!include_ngram) {
-            if (ngram_fields->find(field_id) != ngram_fields->end()) {
-                return {};
-            }
-        }
-
-        auto iter = scalar_indexings->find(field_id);
-        if (iter == scalar_indexings->end()) {
-            return {};
-        }
-        auto ca = SemiInlineGet(iter->second->PinCells(op_ctx, {0}));
-        auto index = ca->get_cell_of(0);
-        return {PinWrapper<const index::IndexBase*>(ca, index)};
-    }
+             bool include_ngram = false) const override;
 
     bool
     Contain(const PkType& pk) const override;
@@ -234,6 +219,9 @@ class ChunkedSegmentSealedImpl : public SegmentSealed {
     LoadTextIndex(milvus::OpContext* op_ctx,
                   std::shared_ptr<milvus::proto::indexcgo::LoadTextIndexInfo>
                       info_proto) override;
+
+    PinWrapper<index::TextMatchIndex*>
+    GetTextIndex(milvus::OpContext* op_ctx, FieldId field_id) const override;
 
     void
     LoadJsonKeyIndex(
@@ -1223,6 +1211,38 @@ class ChunkedSegmentSealedImpl : public SegmentSealed {
     LoadIndex(LoadIndexInfo& info, bool is_replace);
 
     bool
+    CanDeferBusinessIndex(FieldId field_id,
+                          const LoadIndexInfo& index_info) const;
+
+    bool
+    CanDeferBusinessIndex(FieldId field_id,
+                          const std::vector<LoadIndexInfo>& index_infos) const;
+
+    void
+    DeferBusinessIndex(LoadIndexInfo&& info,
+                       milvus::tracer::TraceContext trace_ctx,
+                       bool is_replace);
+
+    void
+    EnsureBusinessIndexSlot(FieldId field_id, milvus::OpContext* op_ctx) const;
+
+    bool
+    CanDeferTextIndex(
+        const proto::indexcgo::LoadTextIndexInfo& info_proto) const;
+
+    void
+    DeferTextIndex(
+        std::shared_ptr<proto::indexcgo::LoadTextIndexInfo> info_proto);
+
+    void
+    EnsureTextIndexSlot(FieldId field_id, milvus::OpContext* op_ctx) const;
+
+    std::shared_ptr<CacheSlot<index::TextMatchIndex>>
+    CreateTextIndexCacheSlot(
+        const proto::indexcgo::LoadTextIndexInfo& info_proto,
+        milvus::OpContext* op_ctx) const;
+
+    bool
     generate_interim_index(const FieldId field_id, int64_t num_rows);
 
     bool
@@ -1548,9 +1568,81 @@ class ChunkedSegmentSealedImpl : public SegmentSealed {
                        output.data());
         return output;
     }
+
+    bool
+    TestCanDeferBusinessIndex(
+        FieldId field_id, const std::vector<LoadIndexInfo>& index_infos) const {
+        return CanDeferBusinessIndex(field_id, index_infos);
+    }
+
+    void
+    TestLoadBatchIndexes(
+        std::unordered_map<FieldId, std::vector<LoadIndexInfo>>& indexes,
+        bool is_replace = false) {
+        milvus::tracer::TraceContext trace_ctx;
+        LoadBatchIndexes(trace_ctx, indexes, nullptr, is_replace);
+    }
+
+    void
+    TestEnsureBusinessIndexSlot(FieldId field_id) {
+        EnsureBusinessIndexSlot(field_id, nullptr);
+    }
+
+    void
+    TestEnsureBusinessIndexSlotUnderSegmentReadLock(FieldId field_id) {
+        std::shared_lock lck(mutex_);
+        EnsureBusinessIndexSlot(field_id, nullptr);
+    }
+
+    size_t
+    TestDeferredBusinessIndexCount() const {
+        return deferred_business_indexes_.rlock()->size();
+    }
+
+    bool
+    TestHasMaterializedBusinessIndex(FieldId field_id) const {
+        if (schema_->operator[](field_id).is_vector()) {
+            return vector_indexings_.is_ready(field_id);
+        }
+        return scalar_indexings_.withRLock([&](const auto& indexes) {
+            return indexes.find(field_id) != indexes.end();
+        });
+    }
+
+    bool
+    TestCanDeferTextIndex(
+        const proto::indexcgo::LoadTextIndexInfo& info_proto) const {
+        return CanDeferTextIndex(info_proto);
+    }
+
+    void
+    TestEnsureTextIndexSlot(FieldId field_id) {
+        EnsureTextIndexSlot(field_id, nullptr);
+    }
+
+    void
+    TestEnsureTextIndexSlotUnderSegmentReadLock(FieldId field_id) {
+        std::shared_lock lck(mutex_);
+        EnsureTextIndexSlot(field_id, nullptr);
+    }
+
+    size_t
+    TestDeferredTextIndexCount() const {
+        std::shared_lock lock(text_index_mutex_);
+        return deferred_text_indexes_.size();
+    }
+
+    bool
+    TestHasMaterializedTextIndex(FieldId field_id) const {
+        std::shared_lock lock(text_index_mutex_);
+        return text_indexes_.find(field_id) != text_indexes_.end();
+    }
 #endif
 
  private:
+    struct DeferredBusinessIndex;
+    struct DeferredTextIndex;
+
     // InsertRecord needs to pin pk column.
     friend class storagev1translator::InsertRecordTranslator;
 
@@ -1578,10 +1670,22 @@ class ChunkedSegmentSealedImpl : public SegmentSealed {
     folly::Synchronized<std::unordered_set<FieldId>> ngram_fields_;
 
     // scalar field index
-    folly::Synchronized<std::unordered_map<FieldId, index::CacheIndexBasePtr>>
+    mutable folly::Synchronized<
+        std::unordered_map<FieldId, index::CacheIndexBasePtr>>
         scalar_indexings_;
     // vector field index
-    SealedIndexingRecord vector_indexings_;
+    mutable SealedIndexingRecord vector_indexings_;
+    mutable folly::Synchronized<
+        std::unordered_map<FieldId, std::shared_ptr<DeferredBusinessIndex>>>
+        deferred_business_indexes_;
+
+    // Protects both the inherited live text-index registry and deferred
+    // descriptors. Query paths can materialize a text index while holding the
+    // segment mutex in shared mode, so publication must not require upgrading
+    // that lock.
+    mutable std::shared_mutex text_index_mutex_;
+    mutable std::unordered_map<FieldId, std::shared_ptr<DeferredTextIndex>>
+        deferred_text_indexes_;
 
     // inserted fields data and row_ids, timestamps
     InsertRecord<true> insert_record_;
