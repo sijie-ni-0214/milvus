@@ -27,8 +27,10 @@ import (
 
 	"github.com/milvus-io/milvus/internal/storagev2"
 	"github.com/milvus-io/milvus/internal/util/fileresource"
+	"github.com/milvus-io/milvus/internal/util/sessionutil"
 	"github.com/milvus-io/milvus/pkg/v3/proto/indexpb"
 	"github.com/milvus-io/milvus/pkg/v3/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/v3/util/typeutil"
 )
 
 func TestRoles(t *testing.T) {
@@ -204,4 +206,42 @@ func TestComponentNum(t *testing.T) {
 			assert.Equal(t, test.count, test.roles.componentNum())
 		})
 	}
+}
+
+func TestEnableEmbeddedQueryNodeIfNeeded(t *testing.T) {
+	labelKey := sessionutil.NewServerLabel(typeutil.QueryNodeRole, sessionutil.LabelStreamingNodeEmbeddedQueryNode)
+
+	t.Run("disabled", func(t *testing.T) {
+		t.Setenv(labelKey, "")
+		roles := NewMilvusRoles()
+		roles.EnableStreamingNode = true
+
+		roles.enableEmbeddedQueryNodeIfNeeded(false)
+
+		assert.False(t, roles.EnableQueryNode)
+		assert.Empty(t, os.Getenv(labelKey))
+	})
+
+	t.Run("enable embedded querynode", func(t *testing.T) {
+		t.Setenv(labelKey, "")
+		roles := NewMilvusRoles()
+		roles.EnableStreamingNode = true
+
+		roles.enableEmbeddedQueryNodeIfNeeded(true)
+
+		assert.True(t, roles.EnableQueryNode)
+		assert.Equal(t, "1", os.Getenv(labelKey))
+	})
+
+	t.Run("keep explicit querynode", func(t *testing.T) {
+		t.Setenv(labelKey, "")
+		roles := NewMilvusRoles()
+		roles.EnableStreamingNode = true
+		roles.EnableQueryNode = true
+
+		roles.enableEmbeddedQueryNodeIfNeeded(true)
+
+		assert.True(t, roles.EnableQueryNode)
+		assert.Empty(t, os.Getenv(labelKey))
+	})
 }

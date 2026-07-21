@@ -17,6 +17,7 @@ import (
 	"github.com/milvus-io/milvus/internal/util/streamingutil/service/discoverer"
 	streamingresolver "github.com/milvus-io/milvus/internal/util/streamingutil/service/resolver"
 	"github.com/milvus-io/milvus/pkg/v3/proto/viewpb"
+	"github.com/milvus-io/milvus/pkg/v3/util/paramtable"
 	"github.com/milvus-io/milvus/pkg/v3/util/typeutil"
 )
 
@@ -43,37 +44,48 @@ func TestGetAllQueryNodesReturnsSessionNodeInfo(t *testing.T) {
 
 func TestIsQueryableQueryNodeSession(t *testing.T) {
 	tests := []struct {
-		name    string
-		labels  map[string]string
-		want    bool
-		message string
+		name      string
+		enableSQN bool
+		labels    map[string]string
+		want      bool
 	}{
 		{
 			name: "regular querynode",
 			want: true,
 		},
 		{
-			name:    "embedded querynode",
-			labels:  map[string]string{sessionutil.LabelStreamingNodeEmbeddedQueryNode: "1"},
-			want:    false,
-			message: "streamingnode embedded querynode should not be discovered by querynode manager",
+			name:   "embedded querynode disabled",
+			labels: map[string]string{sessionutil.LabelStreamingNodeEmbeddedQueryNode: "1"},
 		},
 		{
-			name:    "legacy embedded querynode",
-			labels:  map[string]string{sessionutil.LegacyLabelStreamingNodeEmbeddedQueryNode: "1"},
-			want:    false,
-			message: "legacy streamingnode embedded querynode should not be discovered by querynode manager",
+			name:   "legacy embedded querynode disabled",
+			labels: map[string]string{sessionutil.LegacyLabelStreamingNodeEmbeddedQueryNode: "1"},
+		},
+		{
+			name:      "embedded querynode enabled",
+			enableSQN: true,
+			labels:    map[string]string{sessionutil.LabelStreamingNodeEmbeddedQueryNode: "1"},
+			want:      true,
+		},
+		{
+			name:      "legacy embedded querynode enabled",
+			enableSQN: true,
+			labels:    map[string]string{sessionutil.LegacyLabelStreamingNodeEmbeddedQueryNode: "1"},
+			want:      true,
 		},
 	}
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
+			old := paramtable.Get().QueryCoordCfg.EnableSQNServeSegments.SwapTempValue(fmt.Sprint(test.enableSQN))
+			defer paramtable.Get().QueryCoordCfg.EnableSQNServeSegments.SwapTempValue(old)
+
 			session := &sessionutil.SessionRaw{
 				ServerID:     10,
 				Address:      "localhost:10",
 				ServerLabels: test.labels,
 			}
-			assert.Equal(t, test.want, isQueryableQueryNodeSession(session), test.message)
+			assert.Equal(t, test.want, isQueryableQueryNodeSession(session))
 		})
 	}
 }
