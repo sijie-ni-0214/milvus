@@ -11,6 +11,7 @@ import (
 	qnmanager "github.com/milvus-io/milvus/internal/querynodev2/client/manager"
 	"github.com/milvus-io/milvus/internal/util/sessionutil"
 	"github.com/milvus-io/milvus/internal/views/coord/balancer/api"
+	"github.com/milvus-io/milvus/pkg/v3/util/typeutil"
 )
 
 type fakeQueryNodeClient struct{}
@@ -106,4 +107,32 @@ func TestQueryNodePublisherFailedDiscoveryUnsubscribesGroups(t *testing.T) {
 	require.ErrorIs(t, err, context.Canceled)
 	require.Nil(t, publisher)
 	require.True(t, detached)
+}
+
+func TestQueryNodePublisherEmbeddedQueryNodeResourceGroup(t *testing.T) {
+	p := newQueryNodePublisher()
+	values := make(map[int64]*api.NodeInfo)
+	stop := p.RegisterNodeListener(func(id int64, node *api.NodeInfo) { values[id] = node })
+	defer stop()
+
+	p.onGroup("rg-meta", []int64{1, 2})
+	p.onNode(1, &qnmanager.NodeInfo{ServerID: 1})
+	p.onNode(2, &qnmanager.NodeInfo{ServerID: 2, ServerLabels: map[string]string{sessionutil.LabelStreamingNodeEmbeddedQueryNode: "1"}})
+	p.onNode(3, &qnmanager.NodeInfo{ServerID: 3, ServerLabels: map[string]string{sessionutil.LegacyLabelStreamingNodeEmbeddedQueryNode: "1"}})
+	require.Equal(t, "rg-meta", values[1].ResourceGroup)
+	// Embedded QueryNodes never use QueryCoord RG bindings.
+	require.Nil(t, values[2])
+	require.Nil(t, values[3])
+
+	p.onStreamingQueryNodes(map[string]typeutil.UniqueSet{
+		"rg-sqn":        typeutil.NewUniqueSet(2),
+		"rg-legacy-sqn": typeutil.NewUniqueSet(3),
+	})
+	require.Equal(t, "rg-meta", values[1].ResourceGroup)
+	require.Equal(t, "rg-sqn", values[2].ResourceGroup)
+	require.Equal(t, "rg-legacy-sqn", values[3].ResourceGroup)
+
+	p.onStreamingQueryNodes(map[string]typeutil.UniqueSet{"rg-sqn": typeutil.NewUniqueSet(3)})
+	require.Nil(t, values[2])
+	require.Equal(t, "rg-sqn", values[3].ResourceGroup)
 }

@@ -4,10 +4,14 @@ import (
 	"context"
 	"sync"
 
+	"github.com/milvus-io/milvus/internal/coordinator/snmanager"
 	qnmanager "github.com/milvus-io/milvus/internal/querynodev2/client/manager"
 	"github.com/milvus-io/milvus/internal/util/sessionutil"
 	"github.com/milvus-io/milvus/internal/views/coord/balancer/api"
 	"github.com/milvus-io/milvus/internal/views/coord/balancer/cache"
+	"github.com/milvus-io/milvus/pkg/v3/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/v3/util/syncutil"
+	"github.com/milvus-io/milvus/pkg/v3/util/typeutil"
 )
 
 // Both sources must synchronously replay and serialize committed updates with
@@ -20,19 +24,29 @@ type ResourceGroupStatePublisher interface {
 	RegisterResourceGroupListener(func(string, []int64)) func()
 }
 
+// StreamingQueryNodeSource reports the resource group of every StreamingNode
+// that embeds a QueryNode.
+type StreamingQueryNodeSource interface {
+	ListenNodeChanged() *syncutil.VersionedListener
+	GetStreamingQueryNodeIDsByResourceGroup() map[string]typeutil.UniqueSet
+}
+
 type nodeFacts struct {
 	label    string
 	stopping bool
+	embedded bool
 }
 
 // QueryNodePublisher joins node facts with RG assignments on publication.
 // A session label has precedence; overlapping RG bindings choose the smallest
-// name. Cache subscribers only read results.
+// name. QueryNodes embedded in StreamingNodes take the RG of their
+// StreamingNode. Cache subscribers only read results.
 type QueryNodePublisher struct {
 	mu           sync.Mutex
 	facts        map[int64]nodeFacts
 	groups       map[string]map[int64]struct{}
 	bindings     map[int64]map[string]struct{}
+	sqnGroups    map[int64]string
 	published    map[int64]*api.NodeInfo
 	listeners    map[uint64]cache.NodeListener
 	nextListener uint64
@@ -40,12 +54,15 @@ type QueryNodePublisher struct {
 }
 
 func newQueryNodePublisher() *QueryNodePublisher {
-	return &QueryNodePublisher{facts: make(map[int64]nodeFacts), groups: make(map[string]map[int64]struct{}), bindings: make(map[int64]map[string]struct{}), published: make(map[int64]*api.NodeInfo), listeners: make(map[uint64]cache.NodeListener)}
+	return &QueryNodePublisher{facts: make(map[int64]nodeFacts), groups: make(map[string]map[int64]struct{}), bindings: make(map[int64]map[string]struct{}), sqnGroups: make(map[int64]string), published: make(map[int64]*api.NodeInfo), listeners: make(map[uint64]cache.NodeListener)}
 }
 
 func NewQueryNodePublisher(ctx context.Context, nodes QueryNodeStatePublisher, groups ResourceGroupStatePublisher) (*QueryNodePublisher, error) {
 	p := newQueryNodePublisher()
 	p.unsubscribe = append(p.unsubscribe, groups.RegisterResourceGroupListener(p.onGroup))
+	if paramtable.Get().QueryCoordCfg.EnableSQNServeSegments.GetAsBool() {
+		p.unsubscribe = append(p.unsubscribe, p.watchStreamingQueryNodes(snmanager.StaticStreamingNodeManager))
+	}
 	stop, err := nodes.RegisterQueryNodeListener(ctx, p.onNode)
 	if err != nil {
 		p.Close()
@@ -79,9 +96,58 @@ func (p *QueryNodePublisher) onNode(id int64, info *qnmanager.NodeInfo) {
 	if info == nil {
 		delete(p.facts, id)
 	} else {
-		p.facts[id] = nodeFacts{label: info.ServerLabels[sessionutil.LabelResourceGroup], stopping: info.Stopping}
+		p.facts[id] = nodeFacts{
+			label:    info.ServerLabels[sessionutil.LabelResourceGroup],
+			stopping: info.Stopping,
+			embedded: isEmbeddedQueryNode(info.ServerLabels),
+		}
 	}
 	p.publishLocked(id)
+}
+
+// watchStreamingQueryNodes keeps the RG of embedded QueryNodes in sync with
+// their StreamingNodes. The source may block until the StreamingNode balancer
+// is ready, so it is never queried under p.mu or from a source callback.
+func (p *QueryNodePublisher) watchStreamingQueryNodes(source StreamingQueryNodeSource) func() {
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		listener := source.ListenNodeChanged()
+		for ctx.Err() == nil {
+			p.onStreamingQueryNodes(source.GetStreamingQueryNodeIDsByResourceGroup())
+			if listener.Wait(ctx) != nil {
+				return
+			}
+		}
+	}()
+	return cancel
+}
+
+func (p *QueryNodePublisher) onStreamingQueryNodes(nodesByRG map[string]typeutil.UniqueSet) {
+	next := make(map[int64]string)
+	for rg, nodeIDs := range nodesByRG {
+		for _, nodeID := range nodeIDs.Collect() {
+			next[nodeID] = rg
+		}
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	prev := p.sqnGroups
+	p.sqnGroups = next
+	for nodeID, rg := range next {
+		if prev[nodeID] != rg && p.facts[nodeID].embedded {
+			p.publishLocked(nodeID)
+		}
+	}
+	for nodeID := range prev {
+		if _, ok := next[nodeID]; !ok && p.facts[nodeID].embedded {
+			p.publishLocked(nodeID)
+		}
+	}
+}
+
+func isEmbeddedQueryNode(labels map[string]string) bool {
+	return labels[sessionutil.LabelStreamingNodeEmbeddedQueryNode] == "1" ||
+		labels[sessionutil.LegacyLabelStreamingNodeEmbeddedQueryNode] == "1"
 }
 
 func (p *QueryNodePublisher) onGroup(name string, nodes []int64) {
@@ -115,7 +181,9 @@ func (p *QueryNodePublisher) onGroup(name string, nodes []int64) {
 func (p *QueryNodePublisher) publishLocked(id int64) {
 	facts, exists := p.facts[id]
 	rg := facts.label
-	if rg == "" {
+	if facts.embedded {
+		rg = p.sqnGroups[id]
+	} else if rg == "" {
 		for name := range p.bindings[id] {
 			if rg == "" || name < rg {
 				rg = name

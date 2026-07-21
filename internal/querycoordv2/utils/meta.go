@@ -30,6 +30,7 @@ import (
 	"github.com/milvus-io/milvus/internal/views/coord/loadmgr"
 	"github.com/milvus-io/milvus/pkg/v3/mlog"
 	"github.com/milvus-io/milvus/pkg/v3/util/merr"
+	"github.com/milvus-io/milvus/pkg/v3/util/paramtable"
 	"github.com/milvus-io/milvus/pkg/v3/util/typeutil"
 )
 
@@ -131,6 +132,11 @@ func AssignReplica(ctx context.Context, m *meta.Meta, resourceGroups []string, r
 		}
 	}
 
+	var sqNodesByRG map[string]typeutil.UniqueSet
+	if checkNodeNum && streamingutil.IsStreamingServiceEnabled() && paramtable.Get().QueryCoordCfg.EnableSQNServeSegments.GetAsBool() {
+		sqNodesByRG = snmanager.StaticStreamingNodeManager.GetStreamingQueryNodeIDsByResourceGroup()
+	}
+
 	// TODO: !!!Warning, ResourceManager and ReplicaManager doesn't protected with each other in concurrent operation.
 	// 1. replica1 got rg1's node snapshot but doesn't spawn finished.
 	// 2. rg1 is removed.
@@ -144,10 +150,15 @@ func AssignReplica(ctx context.Context, m *meta.Meta, resourceGroups []string, r
 			return nil, err
 		}
 
-		if num > len(nodes) {
+		availableNodeNum := len(nodes)
+		if sqNodes := sqNodesByRG[rgName]; sqNodes != nil {
+			availableNodeNum += sqNodes.Len()
+		}
+
+		if num > availableNodeNum {
 			mlog.Warn(ctx, "failed to check resource group", mlog.Err(err))
 			if checkNodeNum {
-				err := merr.WrapErrResourceGroupNodeNotEnough(rgName, len(nodes), num)
+				err := merr.WrapErrResourceGroupNodeNotEnough(rgName, availableNodeNum, num)
 				return nil, err
 			}
 		}

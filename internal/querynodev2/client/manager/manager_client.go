@@ -85,6 +85,9 @@ func isQueryableQueryNodeSession(session *sessionutil.SessionRaw) bool {
 	if session == nil {
 		return false
 	}
+	if paramtable.Get().QueryCoordCfg.EnableSQNServeSegments.GetAsBool() {
+		return true
+	}
 	labels := session.GetServerLabel()
 	return labels[sessionutil.LabelStreamingNodeEmbeddedQueryNode] != "1" &&
 		labels[sessionutil.LegacyLabelStreamingNodeEmbeddedQueryNode] != "1"
