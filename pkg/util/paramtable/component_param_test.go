@@ -112,6 +112,23 @@ func TestComponentParam_QueryViewLiveEventDispatchConcurrencyPerPChannel(t *test
 	assert.Equal(t, 1, params.StreamingCfg.QueryViewLiveEventDispatchConcurrencyPerPChannel.GetAsInt())
 }
 
+func TestComponentParam_LazyManifestReaderEnabled(t *testing.T) {
+	Init()
+	params := Get()
+	item := &params.QueryNodeCfg.TieredLazyManifestReaderEnabled
+	t.Cleanup(func() { params.Reset(item.Key) })
+
+	assert.Equal(t, "queryNode.segcore.tieredStorage.lazyManifestReaderEnabled", item.Key)
+	assert.Equal(t, "false", item.DefaultValue)
+	assert.True(t, item.Export)
+	assert.False(t, item.GetAsBool())
+
+	assert.NoError(t, params.Save(item.Key, "true"))
+	assert.True(t, item.GetAsBool())
+	assert.NoError(t, params.Save(item.Key, "false"))
+	assert.False(t, item.GetAsBool())
+}
+
 func TestComponentParam(t *testing.T) {
 	Init()
 	params := Get()

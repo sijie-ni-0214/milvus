@@ -38,6 +38,7 @@
 #include "pb/index_cgo_msg.pb.h"
 #include "pb/index_coord.pb.h"
 #include "pb/segcore.pb.h"
+#include "segcore/SegcoreConfig.h"
 #include "segcore/SegmentLoadInfo.h"
 #include "segcore/Types.h"
 
@@ -3112,6 +3113,24 @@ TEST_F(SegmentLoadInfoTest,
 
 namespace {
 
+class PreferFieldDataGuard {
+ public:
+    explicit PreferFieldDataGuard(bool enabled)
+        : previous_(SegcoreConfig::default_config()
+                        .get_prefer_field_data_when_index_has_raw_data()) {
+        SegcoreConfig::default_config()
+            .set_prefer_field_data_when_index_has_raw_data(enabled);
+    }
+
+    ~PreferFieldDataGuard() {
+        SegcoreConfig::default_config()
+            .set_prefer_field_data_when_index_has_raw_data(previous_);
+    }
+
+ private:
+    bool previous_;
+};
+
 // Build a ColumnGroups payload from a list of (fields, files) pairs so
 // tests can exercise ComputeDiffColumnGroups without a real manifest.
 std::shared_ptr<milvus_storage::api::ColumnGroups>
@@ -3186,6 +3205,48 @@ MakeSchemaWithFieldIds(std::initializer_list<int64_t> field_ids) {
 }
 
 }  // namespace
+
+TEST_F(SegmentLoadInfoTest,
+       ComputeDiffColumnGroupRawDataKeepsPerFieldLazyEntries) {
+    PreferFieldDataGuard prefer_field_data_guard(false);
+    auto schema = MakeSchemaWithFieldIds({105, 106});
+
+    auto current_proto = MakeManifestProto("/manifest/empty");
+    current_proto.set_storageversion(STORAGE_V3);
+    SegmentLoadInfo current_info(current_proto, schema);
+    current_info.SetColumnGroupsForTesting(MakeColumnGroups({}));
+
+    auto new_proto = MakeManifestProto("/manifest/with-indexes");
+    new_proto.set_storageversion(STORAGE_V3);
+    for (auto field_id : {105, 106}) {
+        auto* index_info = new_proto.add_index_infos();
+        index_info->set_fieldid(field_id);
+        index_info->set_indexid(5000 + field_id);
+        index_info->add_index_file_paths("/path/to/sort_index_" +
+                                         std::to_string(field_id));
+        auto* index_param = index_info->add_index_params();
+        index_param->set_key("index_type");
+        index_param->set_value(milvus::index::ASCENDING_SORT);
+    }
+    SegmentLoadInfo new_info(new_proto, schema);
+    new_info.SetColumnGroupsForTesting(
+        MakeColumnGroups({{{105, 106}, {"/data/scalars.parquet"}}}));
+
+    auto diff = current_info.ComputeDiff(new_info);
+
+    ASSERT_EQ(diff.column_groups_to_lazyload.size(), 2);
+    std::set<int64_t> lazy_fields;
+    for (const auto& [column_group_index, field_ids] :
+         diff.column_groups_to_lazyload) {
+        EXPECT_EQ(column_group_index, 0);
+        ASSERT_EQ(field_ids.size(), 1);
+        lazy_fields.insert(field_ids.front().get());
+    }
+    EXPECT_EQ(lazy_fields, (std::set<int64_t>{105, 106}));
+    EXPECT_TRUE(diff.column_groups_to_load.empty());
+    EXPECT_TRUE(diff.column_groups_to_replace.empty());
+    EXPECT_TRUE(diff.column_groups_to_lazyreplace.empty());
+}
 
 TEST_F(SegmentLoadInfoTest, ConstructSkipsIndexInfoForDroppedField) {
     proto::segcore::SegmentLoadInfo p;
@@ -3665,6 +3726,107 @@ TEST_F(SegmentLoadInfoTest,
     }
     EXPECT_TRUE(saw_user_group);
     EXPECT_TRUE(diff.column_groups_to_load.empty());
+}
+
+TEST_F(SegmentLoadInfoTest, ComputeDiffColumnGroupFormatChangeTriggersReplace) {
+    auto current_cgs = MakeColumnGroups(
+        {{{100}, {"/pk/file.parquet"}}, {{105, 106}, {"/user/file.parquet"}}});
+    auto new_cgs = MakeColumnGroups(
+        {{{100}, {"/pk/file.parquet"}}, {{105, 106}, {"/user/file.parquet"}}});
+    new_cgs->at(1)->format = "vortex";
+
+    SegmentLoadInfo current_info(MakeManifestProto("/manifest/old"), schema_);
+    current_info.SetColumnGroupsForTesting(current_cgs);
+    SegmentLoadInfo new_info(MakeManifestProto("/manifest/new"), schema_);
+    new_info.SetColumnGroupsForTesting(new_cgs);
+
+    auto diff = current_info.ComputeDiff(new_info);
+
+    ASSERT_EQ(diff.column_groups_to_replace.size(), 1);
+    EXPECT_EQ(diff.column_groups_to_replace.front().first, 1);
+    std::set<int64_t> replaced_fields;
+    for (auto field_id : diff.column_groups_to_replace.front().second) {
+        replaced_fields.insert(field_id.get());
+    }
+    EXPECT_EQ(replaced_fields, (std::set<int64_t>{105, 106}));
+}
+
+TEST_F(SegmentLoadInfoTest,
+       ComputeDiffColumnGroupSchemaProjectionChangeKeepsSurvivor) {
+    auto current_schema = MakeSchemaWithFieldIds({105, 106});
+    auto new_schema = MakeSchemaWithFieldIds({105});
+    auto column_groups =
+        MakeColumnGroups({{{105, 106}, {"/user/file.parquet"}}});
+    auto proto = MakeManifestProto("/manifest/same");
+
+    SegmentLoadInfo current_info(proto, current_schema);
+    current_info.SetColumnGroupsForTesting(column_groups);
+    SegmentLoadInfo new_info(proto, new_schema);
+    new_info.SetColumnGroupsForTesting(column_groups);
+
+    auto diff = current_info.ComputeDiff(new_info);
+
+    EXPECT_TRUE(diff.column_groups_to_replace.empty());
+    EXPECT_TRUE(diff.column_groups_to_lazyreplace.empty());
+    EXPECT_EQ(diff.field_data_to_drop,
+              (std::unordered_set<FieldId>{FieldId(106)}));
+
+    SegmentLoadInfo stable_current(proto, new_schema);
+    stable_current.SetColumnGroupsForTesting(column_groups);
+    SegmentLoadInfo stable_new(proto, new_schema);
+    stable_new.SetColumnGroupsForTesting(column_groups);
+    auto stable_diff = stable_current.ComputeDiff(stable_new);
+    EXPECT_TRUE(stable_diff.column_groups_to_replace.empty());
+    EXPECT_TRUE(stable_diff.column_groups_to_lazyreplace.empty());
+    EXPECT_TRUE(stable_diff.field_data_to_drop.empty());
+}
+
+TEST_F(SegmentLoadInfoTest,
+       ComputeDiffColumnGroupColumnOrderChangeTriggersReplace) {
+    auto current_cgs = MakeColumnGroups(
+        {{{100}, {"/pk/file.parquet"}}, {{105, 106}, {"/user/file.parquet"}}});
+    auto new_cgs = MakeColumnGroups(
+        {{{100}, {"/pk/file.parquet"}}, {{106, 105}, {"/user/file.parquet"}}});
+
+    SegmentLoadInfo current_info(MakeManifestProto("/manifest/old"), schema_);
+    current_info.SetColumnGroupsForTesting(current_cgs);
+    SegmentLoadInfo new_info(MakeManifestProto("/manifest/new"), schema_);
+    new_info.SetColumnGroupsForTesting(new_cgs);
+
+    auto diff = current_info.ComputeDiff(new_info);
+
+    ASSERT_EQ(diff.column_groups_to_replace.size(), 1);
+    EXPECT_EQ(diff.column_groups_to_replace.front().first, 1);
+    std::set<int64_t> replaced_fields;
+    for (auto field_id : diff.column_groups_to_replace.front().second) {
+        replaced_fields.insert(field_id.get());
+    }
+    EXPECT_EQ(replaced_fields, (std::set<int64_t>{105, 106}));
+}
+
+TEST_F(SegmentLoadInfoTest,
+       ComputeDiffColumnGroupFilePropertiesChangeTriggersReplace) {
+    auto current_cgs = MakeColumnGroups(
+        {{{100}, {"/pk/file.parquet"}}, {{105, 106}, {"/user/file.parquet"}}});
+    auto new_cgs = MakeColumnGroups(
+        {{{100}, {"/pk/file.parquet"}}, {{105, 106}, {"/user/file.parquet"}}});
+    current_cgs->at(1)->files.front().properties["generation"] = "1";
+    new_cgs->at(1)->files.front().properties["generation"] = "2";
+
+    SegmentLoadInfo current_info(MakeManifestProto("/manifest/old"), schema_);
+    current_info.SetColumnGroupsForTesting(current_cgs);
+    SegmentLoadInfo new_info(MakeManifestProto("/manifest/new"), schema_);
+    new_info.SetColumnGroupsForTesting(new_cgs);
+
+    auto diff = current_info.ComputeDiff(new_info);
+
+    ASSERT_EQ(diff.column_groups_to_replace.size(), 1);
+    EXPECT_EQ(diff.column_groups_to_replace.front().first, 1);
+    std::set<int64_t> replaced_fields;
+    for (auto field_id : diff.column_groups_to_replace.front().second) {
+        replaced_fields.insert(field_id.get());
+    }
+    EXPECT_EQ(replaced_fields, (std::set<int64_t>{105, 106}));
 }
 
 // ==================== Drop Field Tests ====================

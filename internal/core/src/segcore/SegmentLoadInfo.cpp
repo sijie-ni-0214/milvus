@@ -478,36 +478,37 @@ SegmentLoadInfo::ComputeDiffColumnGroups(LoadDiff& diff,
     AssertInfo(new_column_group, "new column groups shall not be null");
 
     // The loon manifest gives no ordering guarantee on the column-groups
-    // vector, so we don't try to pair cur/new groups by position or by a
-    // synthesized leader. For each field we only ask: "is it present in
-    // current, and did its backing files change?" — field-level existence
-    // plus per-field file-list comparison is enough to classify
-    // new/replace/unchanged without any group-identity assumption.
-    std::map<int64_t, const std::vector<milvus_storage::api::ColumnGroupFile>*>
-        cur_field_to_files;
+    // vector, so map each field to its physical group instead of pairing
+    // current/new groups by position. A field can reuse its current task only
+    // while the complete physical group identity remains unchanged.
+    std::map<int64_t, const milvus_storage::api::ColumnGroup*>
+        cur_field_to_group;
     for (const auto& cg : *cur_column_group) {
         if (!cg) {
             continue;
         }
         for (const auto& column : cg->columns) {
             auto field_id = std::stoll(column);
-            cur_field_to_files[field_id] = &cg->files;
+            cur_field_to_group[field_id] = cg.get();
         }
     }
 
-    // Compare path + row range: storage v2 packed files can share a path
-    // across compactions while the row window (start_index/end_index)
-    // changes, so path-only comparison would leave stale cache in place.
-    auto same_files =
-        [](const std::vector<milvus_storage::api::ColumnGroupFile>& a,
-           const std::vector<milvus_storage::api::ColumnGroupFile>& b) -> bool {
-        if (a.size() != b.size()) {
+    // A lazy field keeps the physical reader inputs of its original manifest
+    // generation. Reuse is safe while the physical group identity is stable;
+    // schema-only projection changes are handled by dropping the removed field
+    // facade and do not require rebinding surviving fields.
+    auto same_group = [](const milvus_storage::api::ColumnGroup& a,
+                         const milvus_storage::api::ColumnGroup& b) -> bool {
+        if (a.columns != b.columns || a.format != b.format ||
+            a.files.size() != b.files.size()) {
             return false;
         }
-        for (size_t j = 0; j < a.size(); j++) {
-            if (a[j].path != b[j].path ||
-                a[j].start_index != b[j].start_index ||
-                a[j].end_index != b[j].end_index) {
+        for (size_t j = 0; j < a.files.size(); j++) {
+            const auto& lhs = a.files[j];
+            const auto& rhs = b.files[j];
+            if (lhs.path != rhs.path || lhs.start_index != rhs.start_index ||
+                lhs.end_index != rhs.end_index ||
+                lhs.properties != rhs.properties) {
                 return false;
             }
         }
@@ -533,19 +534,21 @@ SegmentLoadInfo::ComputeDiffColumnGroups(LoadDiff& diff,
             }
             new_seen_field_ids.emplace(field_id);
 
-            auto cur_iter = cur_field_to_files.find(field_id);
+            auto cur_iter = cur_field_to_group.find(field_id);
             bool was_default_filled =
                 fields_filled_with_default_.count(fid) > 0;
             bool is_new_field =
-                cur_iter == cur_field_to_files.end() && !was_default_filled;
+                cur_iter == cur_field_to_group.end() && !was_default_filled;
             // A field that was present in current must go to replace when
             // its backing files changed — whether that's the same group
             // rewriting its parquet (compaction) or the field landing in
             // a different group with a different file set. Either way the
             // cached chunks are stale.
-            bool files_changed = cur_iter != cur_field_to_files.end() &&
-                                 !same_files(*cur_iter->second, cg->files);
-            bool is_replace_field = was_default_filled || files_changed;
+            bool reader_identity_changed =
+                cur_iter != cur_field_to_group.end() &&
+                !same_group(*cur_iter->second, *cg);
+            bool is_replace_field =
+                was_default_filled || reader_identity_changed;
             bool index_has_raw_data =
                 new_info.field_index_has_raw_data_.count(fid) > 0;
             bool is_vector_field = IsVectorDataType(
@@ -568,7 +571,7 @@ SegmentLoadInfo::ComputeDiffColumnGroups(LoadDiff& diff,
                 // reopen transition (the raw column was loaded because the
                 // current index had no raw data; now the index carries it).
                 // Steady state (already skipped, never resident) drops nothing.
-                if (cur_iter != cur_field_to_files.end() &&
+                if (cur_iter != cur_field_to_group.end() &&
                     field_index_has_raw_data_.count(fid) == 0) {
                     diff.field_data_to_drop.emplace(field_id);
                 }
@@ -624,8 +627,15 @@ SegmentLoadInfo::ComputeDiffColumnGroups(LoadDiff& diff,
     }
 
     // Find field data to drop: fields in current but not in new
-    for (const auto& [field_id, files_ptr] : cur_field_to_files) {
+    for (const auto& [field_id, group] : cur_field_to_group) {
+        (void)group;
         auto fid = FieldId(field_id);
+        if (!HasFieldInSchema(fid)) {
+            // The physical manifest may retain a column after the logical
+            // schema has already dropped it. Do not emit the same drop on
+            // every subsequent schema-only reopen.
+            continue;
+        }
         if (!new_info.HasFieldInSchema(fid)) {
             diff.field_data_to_drop.emplace(field_id);
             continue;

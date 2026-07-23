@@ -100,7 +100,8 @@ class ManifestGroupTranslator
         int64_t fallback_bytes_per_row = 0,
         std::string shard = "",
         std::optional<ColumnSizeEstimateResult> column_size_estimate =
-            std::nullopt);
+            std::nullopt,
+        bool include_row_id = false);
     ~ManifestGroupTranslator() = default;
 
     /**
@@ -219,6 +220,7 @@ class ManifestGroupTranslator
     bool use_mmap_;
     bool mmap_populate_;
     bool has_array_field_{false};
+    bool include_row_id_{false};
     std::string mmap_dir_path_;
     milvus::proto::common::LoadPriority load_priority_{
         milvus::proto::common::LoadPriority::HIGH};

@@ -180,6 +180,8 @@ TimestampIndexTranslator::get_cells(
     // timestamp column directly. This avoids a DList deadlock where evicting
     // this cell would unpin GroupChunk cells under the same list_mtx_.
     auto all_chunks = column_->GetAllChunks(ctx);
+    CheckCancellation(
+        ctx, segment_id_, "TimestampIndexTranslator::get_cells()");
     TimestampIndex index;
     if (all_chunks.size() == 1) {
         auto* fixed_chunk = static_cast<FixedWidthChunk*>(all_chunks[0].get());
@@ -189,11 +191,15 @@ TimestampIndexTranslator::get_cells(
                    "timestamp chunk row count {} != expected {}",
                    span.row_count(),
                    num_rows_);
+        CheckCancellation(
+            ctx, segment_id_, "TimestampIndexTranslator::get_cells()");
         index = build_timestamp_index(ts_ptr, num_rows_);
     } else {
         std::vector<Timestamp> temp(num_rows_);
         size_t offset = 0;
         for (auto& pin : all_chunks) {
+            CheckCancellation(
+                ctx, segment_id_, "TimestampIndexTranslator::get_cells()");
             auto* fixed_chunk = static_cast<FixedWidthChunk*>(pin.get());
             auto span = fixed_chunk->Span();
             milvus::fastmem::FastMemcpy(
@@ -206,8 +212,12 @@ TimestampIndexTranslator::get_cells(
                    "timestamp total row count {} != expected {}",
                    offset,
                    num_rows_);
+        CheckCancellation(
+            ctx, segment_id_, "TimestampIndexTranslator::get_cells()");
         index = build_timestamp_index(temp.data(), num_rows_);
     }
+    CheckCancellation(
+        ctx, segment_id_, "TimestampIndexTranslator::get_cells()");
 
     std::vector<std::pair<milvus::cachinglayer::cid_t,
                           std::unique_ptr<TimestampIndexCell>>>
@@ -226,7 +236,8 @@ PkIndexTranslator::PkIndexTranslator(
     int64_t segment_id,
     std::shared_ptr<ChunkedColumnInterface> column,
     DataType data_type,
-    bool is_sorted_by_pk)
+    bool is_sorted_by_pk,
+    const std::string& warmup_policy)
     : segment_id_(segment_id),
       column_(std::move(column)),
       data_type_(data_type),
@@ -235,7 +246,7 @@ PkIndexTranslator::PkIndexTranslator(
       meta_(milvus::cachinglayer::StorageType::MEMORY,
             milvus::cachinglayer::CellIdMappingMode::ALWAYS_ZERO,
             milvus::cachinglayer::CellDataType::OTHER,
-            milvus::segcore::getCacheWarmupPolicy(/* warmup_policy */ "",
+            milvus::segcore::getCacheWarmupPolicy(warmup_policy,
                                                   /* is_vector */ false,
                                                   /* is_index */ true),
             /* support_eviction */ true) {
@@ -279,6 +290,7 @@ PkIndexTranslator::get_cells(milvus::OpContext* ctx,
     std::vector<int64_t> chunk_ids(num_chunks);
     std::iota(chunk_ids.begin(), chunk_ids.end(), 0);
     column_->PrefetchChunks(ctx, chunk_ids);
+    CheckCancellation(ctx, segment_id_, "PkIndexTranslator::get_cells()");
 
     int64_t offset = 0;
     switch (data_type_) {
@@ -289,10 +301,16 @@ PkIndexTranslator::get_cells(milvus::OpContext* ctx,
                 pk2offset = create_offset_map(data_type_);
             }
             for (int64_t i = 0; i < num_chunks; ++i) {
+                CheckCancellation(
+                    ctx, segment_id_, "PkIndexTranslator::get_cells()");
                 auto pw = column_->DataOfChunk(ctx, i);
                 auto pks = reinterpret_cast<const int64_t*>(pw.get());
                 auto chunk_num_rows = column_->chunk_row_nums(i);
                 for (int64_t j = 0; j < chunk_num_rows; ++j) {
+                    if ((j & 4095) == 0) {
+                        CheckCancellation(
+                            ctx, segment_id_, "PkIndexTranslator::get_cells()");
+                    }
                     auto pk = pks[j];
                     all_pks.push_back(pk);
                     if (pk2offset) {
@@ -301,8 +319,12 @@ PkIndexTranslator::get_cells(milvus::OpContext* ctx,
                     ++offset;
                 }
             }
+            CheckCancellation(
+                ctx, segment_id_, "PkIndexTranslator::get_cells()");
             offset2pk = std::make_unique<CompressedInt64PkArray>();
             offset2pk->build(all_pks.data(), all_pks.size());
+            CheckCancellation(
+                ctx, segment_id_, "PkIndexTranslator::get_cells()");
             break;
         }
         case DataType::VARCHAR: {
@@ -310,9 +332,15 @@ PkIndexTranslator::get_cells(milvus::OpContext* ctx,
                 pk2offset = create_offset_map(data_type_);
             }
             for (int64_t i = 0; i < num_chunks; ++i) {
+                CheckCancellation(
+                    ctx, segment_id_, "PkIndexTranslator::get_cells()");
                 auto pw = column_->StringViews(ctx, i);
                 auto& pks = pw.get().first;
                 for (auto pk : pks) {
+                    if ((offset & 4095) == 0) {
+                        CheckCancellation(
+                            ctx, segment_id_, "PkIndexTranslator::get_cells()");
+                    }
                     if (pk2offset) {
                         pk2offset->insert(std::string(pk), offset);
                     }
@@ -328,7 +356,9 @@ PkIndexTranslator::get_cells(milvus::OpContext* ctx,
     }
 
     if (pk2offset) {
+        CheckCancellation(ctx, segment_id_, "PkIndexTranslator::get_cells()");
         pk2offset->seal();
+        CheckCancellation(ctx, segment_id_, "PkIndexTranslator::get_cells()");
     }
 
     std::vector<

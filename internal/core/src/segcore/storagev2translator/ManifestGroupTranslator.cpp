@@ -93,7 +93,8 @@ ManifestGroupTranslator::ManifestGroupTranslator(
     const std::string& cache_key_suffix,
     int64_t fallback_bytes_per_row,
     std::string shard,
-    std::optional<ColumnSizeEstimateResult> column_size_estimate)
+    std::optional<ColumnSizeEstimateResult> column_size_estimate,
+    bool include_row_id)
     : segment_id_(segment_id),
       group_chunk_type_(group_chunk_type),
       column_group_index_(column_group_index),
@@ -145,6 +146,7 @@ ManifestGroupTranslator::ManifestGroupTranslator(
                                        return field.second.get_data_type() ==
                                               DataType::ARRAY;
                                    })),
+      include_row_id_(include_row_id),
       load_priority_(load_priority) {
     auto rows_result = chunk_reader_->get_chunk_rows();
     if (!rows_result.ok()) {
@@ -680,7 +682,7 @@ ManifestGroupTranslator::load_group_chunk(
         }
 
         auto fid = milvus::FieldId(field_id);
-        if (fid == RowFieldID) {
+        if (fid == RowFieldID && !include_row_id_) {
             // ignore row id field
             continue;
         }
