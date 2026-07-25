@@ -139,7 +139,7 @@ func (s *qnShardView) notifySegmentsReady(version qviews.QueryViewVersion, ready
 			From:         before,
 			To:           entry.sm.State(),
 		},
-		ReadySegmentCount: countReadySegments(readySegments),
+		ReadySegmentCount: entry.sm.readyCount,
 	})
 	s.consumeReportAndCleanup(key, entry)
 }
@@ -219,14 +219,6 @@ func (s *qnShardView) consumeReportAndCleanup(key qviews.QueryViewKey, entry *qn
 			s.onEmpty()
 		}
 	}
-}
-
-func countReadySegments(readySegments map[int64][]int64) int {
-	total := 0
-	for _, segmentIDs := range readySegments {
-		total += len(segmentIDs)
-	}
-	return total
 }
 
 func collectionIDForEntry(entry *qnViewEntry) int64 {

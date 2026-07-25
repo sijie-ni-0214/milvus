@@ -105,6 +105,8 @@ func TestEventMarshalLogObjectSplitsQueryViewKeyAndUsesStringers(t *testing.T) {
 		Node:                 qviews.NewQueryNode(10),
 		ReportedState:        qviews.QueryViewStateReady,
 		ResourceReadyPercent: 80,
+		ExpectedSegmentCount: 10,
+		ReadySegmentCount:    8,
 	}
 	enc := zapcore.NewMapObjectEncoder()
 
@@ -120,6 +122,8 @@ func TestEventMarshalLogObjectSplitsQueryViewKeyAndUsesStringers(t *testing.T) {
 	assertField(t, enc, "wn", qviews.NewQueryNode(10).String())
 	assertField(t, enc, "reportedState", qviews.QueryViewStateReady.String())
 	assertField(t, enc, "resourceReadyPercent", int64(80))
+	assertField(t, enc, "segmentCount", 10)
+	assertField(t, enc, "readySegmentCount", 8)
 }
 
 func TestEventMarshalLogObjectSplitsAdditionalQueryViewKey(t *testing.T) {

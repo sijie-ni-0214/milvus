@@ -265,12 +265,15 @@ func (e CoordViewHandoffToNewUpEvent) MarshalLogObject(enc mlog.ObjectEncoder) e
 // work-node report to a view. ResourceReadyPercent is the report-side resource
 // preparation progress in [0, 100]. StreamingNode reports derive this value
 // from view state: resource-ready states report 100, other states report 0.
+// Segment counts contain cumulative QueryNode progress for the whole view.
 type CoordViewReportAppliedEvent struct {
 	baseEvent
 	ViewStateTransition
 	Node                 qviews.WorkNode
 	ReportedState        qviews.QueryViewState
 	ResourceReadyPercent int64
+	ExpectedSegmentCount int
+	ReadySegmentCount    int
 }
 
 func (e CoordViewReportAppliedEvent) LogLevel() mlog.Level {
@@ -299,6 +302,8 @@ func (e CoordViewReportAppliedEvent) MarshalLogObject(enc mlog.ObjectEncoder) er
 	}
 	enc.AddString(fieldReportedState, e.ReportedState.String())
 	enc.AddInt64(fieldResourceReadyPercent, e.ResourceReadyPercent)
+	enc.AddInt(fieldSegmentCount, e.ExpectedSegmentCount)
+	enc.AddInt(fieldReadySegmentCount, e.ReadySegmentCount)
 	return nil
 }
 
@@ -556,7 +561,7 @@ func (e QueryNodeAcquireSegmentsEvent) MarshalLogObject(enc mlog.ObjectEncoder) 
 }
 
 // QueryNodeSegmentsReadyEvent is emitted after the segment readiness callback
-// moves a view forward.
+// moves a view forward. ReadySegmentCount is cumulative for the view.
 type QueryNodeSegmentsReadyEvent struct {
 	baseEvent
 	ViewStateTransition

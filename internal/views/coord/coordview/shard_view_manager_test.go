@@ -355,6 +355,25 @@ func simulateNodeResponse(t *testing.T, s *mockSyncer, node qviews.WorkNode, ver
 	return cb(resp)
 }
 
+func TestQueryViewSegmentProgress(t *testing.T) {
+	view := buildTestView(2)
+	sm := NewCoordQueryViewStateMachine(view)
+
+	expected, ready := queryViewSegmentProgress(sm)
+	assert.Equal(t, 2, expected)
+	assert.Zero(t, ready)
+
+	sm.OnNodeStateReported(qnReport(view, 1, qviews.QueryViewStatePreparing, 1000))
+	expected, ready = queryViewSegmentProgress(sm)
+	assert.Equal(t, 2, expected)
+	assert.Equal(t, 1, ready)
+
+	sm.OnNodeStateReported(qnReport(view, 2, qviews.QueryViewStateReady, 1001))
+	expected, ready = queryViewSegmentProgress(sm)
+	assert.Equal(t, 2, expected)
+	assert.Equal(t, 2, ready)
+}
+
 // ===========================================================================
 // AddPreparing tests
 // ===========================================================================

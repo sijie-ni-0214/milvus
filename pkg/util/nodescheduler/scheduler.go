@@ -20,8 +20,8 @@ import (
 	"container/list"
 	"context"
 	"math"
-	"reflect"
 	"sync"
+	"time"
 
 	"github.com/cockroachdb/errors"
 
@@ -73,6 +73,7 @@ var ErrDelay = &ScheduleError{kind: scheduleErrorKindDelay}
 type nodeScheduler struct {
 	ctx    context.Context
 	cancel context.CancelFunc
+	stats  *schedulerStats
 
 	mu     sync.Mutex
 	cond   *sync.Cond
@@ -82,15 +83,18 @@ type nodeScheduler struct {
 	concurrency int
 	workerCount int
 	workers     sync.WaitGroup
+	reporter    sync.WaitGroup
 }
 
 type taskEntry struct {
-	task   Task
-	ctx    context.Context
-	cancel context.CancelFunc
-	done   chan struct{}
-	once   sync.Once
-	wakeup func()
+	task     Task
+	taskType string
+	queuedAt time.Time
+	ctx      context.Context
+	cancel   context.CancelFunc
+	done     chan struct{}
+	once     sync.Once
+	wakeup   func()
 }
 
 func (e *taskEntry) finish() {
@@ -133,10 +137,13 @@ func New(concurrency int) *nodeScheduler {
 	scheduler := &nodeScheduler{
 		ctx:    ctx,
 		cancel: cancel,
+		stats:  newSchedulerStats(concurrency),
 		queue:  list.New(),
 	}
 	scheduler.cond = sync.NewCond(&scheduler.mu)
 	scheduler.resize(concurrency)
+	scheduler.reporter.Add(1)
+	go scheduler.reportStats()
 	return scheduler
 }
 
@@ -152,6 +159,7 @@ func (s *nodeScheduler) resize(concurrency int) {
 	}
 
 	s.concurrency = concurrency
+	s.stats.setCapacity(concurrency)
 	if concurrency > s.workerCount {
 		additional := concurrency - s.workerCount
 		s.workerCount += additional
@@ -166,11 +174,13 @@ func (s *nodeScheduler) resize(concurrency int) {
 func (s *nodeScheduler) Submit(task Task) TaskHandle {
 	ctx, cancel := context.WithCancel(s.ctx)
 	entry := &taskEntry{
-		task:   task,
-		ctx:    ctx,
-		cancel: cancel,
-		done:   make(chan struct{}),
-		wakeup: s.wakeup,
+		task:     task,
+		taskType: schedulerTaskType(task),
+		queuedAt: time.Now(),
+		ctx:      ctx,
+		cancel:   cancel,
+		done:     make(chan struct{}),
+		wakeup:   s.wakeup,
 	}
 	handle := &taskHandle{entry: entry}
 
@@ -182,6 +192,7 @@ func (s *nodeScheduler) Submit(task Task) TaskHandle {
 	}
 	// The queue is intentionally unbounded: Submit must never wait for capacity.
 	s.queue.PushBack(entry)
+	s.stats.submit(entry.taskType)
 	s.cond.Signal()
 	s.mu.Unlock()
 	return handle
@@ -192,12 +203,14 @@ func (s *nodeScheduler) Close() {
 	if s.closed {
 		s.mu.Unlock()
 		s.workers.Wait()
+		s.reporter.Wait()
 		return
 	}
 
 	s.closed = true
 	for element := s.queue.Front(); element != nil; element = element.Next() {
 		entry := element.Value.(*taskEntry)
+		s.stats.cancelQueued(entry.taskType)
 		entry.finish()
 	}
 	s.queue.Init()
@@ -206,6 +219,7 @@ func (s *nodeScheduler) Close() {
 	s.mu.Unlock()
 
 	s.workers.Wait()
+	s.reporter.Wait()
 }
 
 func (s *nodeScheduler) wakeup() {
@@ -222,26 +236,34 @@ func (s *nodeScheduler) runWorker() {
 			return
 		}
 		if entry.ctx.Err() != nil {
+			s.stats.cancelStarted(entry.taskType)
 			entry.finish()
 			continue
 		}
 
+		startedAt := time.Now()
 		err := entry.task.Execute(entry.ctx)
+		executeDuration := time.Since(startedAt)
 		if entry.ctx.Err() != nil {
+			s.stats.finishCanceled(entry.taskType, executeDuration)
 			entry.finish()
 			continue
 		}
 		if errors.Is(err, ErrDelay) {
-			if s.requeue(entry) {
+			if s.requeue(entry, executeDuration) {
 				continue
 			}
+			s.stats.finishDelayed(entry.taskType, executeDuration, false)
 			entry.finish()
 			continue
 		}
 		if err != nil {
+			s.stats.finishFailed(entry.taskType, executeDuration)
 			mlog.Error(entry.ctx, "node scheduler task failed",
-				mlog.String("taskType", reflect.TypeOf(entry.task).String()),
+				mlog.String("taskType", entry.taskType),
 				mlog.Err(err))
+		} else {
+			s.stats.finishCompleted(entry.taskType, executeDuration)
 		}
 		entry.finish()
 	}
@@ -259,20 +281,24 @@ func (s *nodeScheduler) dequeue() *taskEntry {
 		if s.queue.Len() > 0 {
 			element := s.queue.Front()
 			s.queue.Remove(element)
-			return element.Value.(*taskEntry)
+			entry := element.Value.(*taskEntry)
+			s.stats.start(entry.taskType, time.Since(entry.queuedAt))
+			return entry
 		}
 		s.cond.Wait()
 	}
 }
 
-func (s *nodeScheduler) requeue(entry *taskEntry) bool {
+func (s *nodeScheduler) requeue(entry *taskEntry, executeDuration time.Duration) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	if s.closed || entry.ctx.Err() != nil {
 		return false
 	}
+	entry.queuedAt = time.Now()
 	s.queue.PushBack(entry)
+	s.stats.finishDelayed(entry.taskType, executeDuration, true)
 	s.cond.Signal()
 	return true
 }
