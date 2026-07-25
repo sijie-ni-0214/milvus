@@ -93,6 +93,38 @@ func TestSchedulerMovesDelayedTaskToQueueTail(t *testing.T) {
 	assert.Equal(t, []string{"first-1", "second", "first-2"}, order)
 }
 
+func TestSchedulerStatsTrackDelayedAttempts(t *testing.T) {
+	scheduler := New(1)
+	defer scheduler.Close()
+
+	var attempts atomic.Int32
+	handle := scheduler.Submit(TaskFunc(func(context.Context) error {
+		if attempts.Add(1) == 1 {
+			return ErrDelay
+		}
+		return nil
+	}))
+	require.NoError(t, handle.Wait(context.Background()))
+
+	snapshot := scheduler.stats.snapshotAndReset()
+	assert.Equal(t, 1, snapshot.capacity)
+	require.Len(t, snapshot.tasks, 1)
+	stats := snapshot.tasks[0]
+	assert.Equal(t, int64(1), stats.submitted)
+	assert.Equal(t, int64(2), stats.started)
+	assert.Equal(t, int64(1), stats.delayed)
+	assert.Equal(t, int64(1), stats.completed)
+	assert.Zero(t, stats.failed)
+	assert.Zero(t, stats.canceled)
+	assert.Zero(t, stats.queued)
+	assert.Zero(t, stats.running)
+	assert.Equal(t, int64(2), stats.queueWaitCount)
+	assert.Equal(t, int64(2), stats.executeCount)
+
+	scheduler.resize(2)
+	assert.Equal(t, 2, scheduler.stats.snapshotAndReset().capacity)
+}
+
 func TestSchedulerHonorsConcurrencyLimit(t *testing.T) {
 	scheduler := New(2)
 	defer scheduler.Close()
