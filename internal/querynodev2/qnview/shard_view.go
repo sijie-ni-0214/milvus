@@ -153,7 +153,7 @@ func (s *qnShardView) notifySegmentsReady(version qviews.QueryViewVersion, ready
 			From:         before,
 			To:           entry.sm.State(),
 		},
-		ReadySegmentCount: countReadySegments(readySegments),
+		ReadySegmentCount: entry.sm.readyCount,
 	})
 	s.consumeReportAndCleanup(entry.View.QueryViewKey(), entry)
 }
