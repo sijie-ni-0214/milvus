@@ -828,6 +828,7 @@ func (m *ShardViewManager) makeOnSyncResponse(version qviews.QueryViewVersion, t
 			sm.State() == qviews.QueryViewStateUnrecoverable {
 			m.prepareBackoff.onFailure(version, time.Now())
 		}
+		expectedSegmentCount, readySegmentCount := queryViewSegmentProgress(sm)
 		qvobserve.Observe(m.ctx, qvobserve.CoordViewReportAppliedEvent{
 			ViewStateTransition: qvobserve.ViewStateTransition{
 				CollectionID: m.collectionIDForStateMachine(sm),
@@ -839,6 +840,8 @@ func (m *ShardViewManager) makeOnSyncResponse(version qviews.QueryViewVersion, t
 			ReportedState:        resp.State(),
 			ResourceReadyPercent: resourceReadyPercent(resp),
 			ResourceProgress:     resourceProgress,
+			ExpectedSegmentCount: expectedSegmentCount,
+			ReadySegmentCount:    readySegmentCount,
 		})
 		m.processStateMachine(sm)
 		event := m.consumeDirtyEventLocked()
@@ -1039,6 +1042,20 @@ func resourceReadyPercent(report qviews.QueryViewAtWorkNode) int64 {
 	default:
 		return 0
 	}
+}
+
+func queryViewSegmentProgress(sm *CoordQueryViewStateMachine) (int, int) {
+	expected := 0
+	for _, queryNode := range sm.View().GetQueryNode() {
+		for _, partition := range queryNode.GetPartitions() {
+			expected += len(partition.GetSegmentIds())
+		}
+	}
+	ready := 0
+	for _, segmentIDs := range sm.QNReadySegments() {
+		ready += len(segmentIDs)
+	}
+	return expected, ready
 }
 
 // releaseEmptyAfterFailedPrepareLocked retires an unpublished empty manager.
