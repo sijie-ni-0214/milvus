@@ -543,8 +543,15 @@ func (r *segmentResource) validateSnapshot(snapshot SegmentLoadInfoSnapshot) err
 	return nil
 }
 
-func (r *segmentResource) prepare(ctx context.Context, b *segmentBinding, collection CollectionRuntime, snapshot SegmentLoadInfoSnapshot) (*preparedSegmentRead, error) {
+func (r *segmentResource) prepare(ctx context.Context, b *segmentBinding, collection CollectionRuntime, snapshot SegmentLoadInfoSnapshot) (_ *preparedSegmentRead, err error) {
 	m := r.manager
+	startedAt := time.Now()
+	timing := segmentLoadTimingSample{}
+	defer func() {
+		timing.total = time.Since(startedAt)
+		timing.failed = err != nil
+		recordSQNSegmentLoadTiming(ctx, timing)
+	}()
 	info := proto.Clone(snapshot.LoadInfo).(*querypb.SegmentLoadInfo)
 	selected := make(map[int64]struct{}, len(collection.IndexInfos()))
 	for _, index := range collection.IndexInfos() {
@@ -555,12 +562,18 @@ func (r *segmentResource) prepare(ctx context.Context, b *segmentBinding, collec
 		return !ok
 	})
 	if m.estimator != nil {
+		reserveResourceStartedAt := time.Now()
 		reservation, err := m.estimator.Reserve(ctx, info, collection)
+		timing.reserveResource = time.Since(reserveResourceStartedAt)
 		if err != nil {
 			return nil, err
 		}
 		if reservation != nil {
-			defer reservation.Release()
+			defer func() {
+				releaseResourceStartedAt := time.Now()
+				reservation.Release()
+				timing.releaseResource = time.Since(releaseResourceStartedAt)
+			}()
 		}
 	}
 	var base *segmentBase
@@ -584,7 +597,9 @@ func (r *segmentResource) prepare(ctx context.Context, b *segmentBinding, collec
 	}
 	m.mu.Unlock()
 	if base == nil {
+		physicalLoadStartedAt := time.Now()
 		segment, err := m.loader.Load(ctx, info, collection)
+		timing.physicalLoad = time.Since(physicalLoadStartedAt)
 		if err != nil {
 			return nil, err
 		}
@@ -600,7 +615,10 @@ func (r *segmentResource) prepare(ctx context.Context, b *segmentBinding, collec
 	}
 	// Only this operation uses the filtered copy; the base retains the immutable source snapshot.
 	snapshot.LoadInfo = info
+	// onLoaded covers publishing the loaded segment as a read state.
+	onLoadedStartedAt := time.Now()
 	read, err := m.loader.PrepareReadState(ctx, base.segment, reuse, collection, snapshot)
+	timing.onLoaded = time.Since(onLoadedStartedAt)
 	if err != nil {
 		return nil, err
 	}
