@@ -3888,6 +3888,7 @@ type queryNodeConfig struct {
 
 	// Idf Oracle
 	IDFPreload             ParamItem `refreshable:"true"`
+	IDFLazyLoadSealedStats ParamItem `refreshable:"true"`
 	IDFReadBufferSize      ParamItem `refreshable:"true"`
 	BM25StatsBytesPerEntry ParamItem `refreshable:"true"`
 	// partial search
@@ -3928,6 +3929,15 @@ func (p *queryNodeConfig) init(base *BaseTable) {
 		Doc:          "Whether to parse and merge BM25 stats into current during load before first target. When false, stats are only written to disk and loaded on first SyncDistribution.",
 	}
 	p.IDFPreload.Init(base.mgr)
+
+	p.IDFLazyLoadSealedStats = ParamItem{
+		Key:          "queryNode.idfOracle.lazyLoadSealedStats",
+		Version:      "3.0.0",
+		Export:       true,
+		DefaultValue: "false",
+		Doc:          "Whether QueryView IDF runtimes defer sealed BM25 resource discovery and stats materialization until the first BM25 search.",
+	}
+	p.IDFLazyLoadSealedStats.Init(base.mgr)
 
 	p.IDFReadBufferSize = ParamItem{
 		Key:          "queryNode.idfOracle.readBufferSize",

@@ -129,6 +129,23 @@ func TestComponentParam_LazyManifestReaderEnabled(t *testing.T) {
 	assert.False(t, item.GetAsBool())
 }
 
+func TestComponentParam_IDFLazyLoadSealedStats(t *testing.T) {
+	Init()
+	params := Get()
+	item := &params.QueryNodeCfg.IDFLazyLoadSealedStats
+	t.Cleanup(func() { params.Reset(item.Key) })
+
+	assert.Equal(t, "queryNode.idfOracle.lazyLoadSealedStats", item.Key)
+	assert.Equal(t, "false", item.DefaultValue)
+	assert.True(t, item.Export)
+	assert.False(t, item.GetAsBool())
+
+	assert.NoError(t, params.Save(item.Key, "true"))
+	assert.True(t, item.GetAsBool())
+	assert.NoError(t, params.Save(item.Key, "false"))
+	assert.False(t, item.GetAsBool())
+}
+
 func TestComponentParam(t *testing.T) {
 	Init()
 	params := Get()
