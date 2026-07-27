@@ -3,6 +3,7 @@ package idf
 import (
 	"context"
 	"sync"
+	"time"
 
 	"github.com/cockroachdb/errors"
 	"google.golang.org/protobuf/proto"
@@ -96,7 +97,7 @@ type Runtime struct {
 	closed   bool
 }
 
-func (r *Runtime) Prepare(ctx context.Context, walView walview.VChannelWALView) error {
+func (r *Runtime) Prepare(ctx context.Context, walView walview.VChannelWALView) (err error) {
 	r.mu.Lock()
 	if r.closed {
 		r.mu.Unlock()
@@ -120,11 +121,17 @@ func (r *Runtime) Prepare(ctx context.Context, walView walview.VChannelWALView) 
 		}
 		return nil
 	}
+	lazyLoadSealedStats := paramtable.Get().QueryNodeCfg.IDFLazyLoadSealedStats.GetAsBool()
+	timing := bm25RuntimePrepareTimingSample{startedAt: time.Now()}
+	defer func() {
+		timing.total = time.Since(timing.startedAt)
+		timing.failed = err != nil
+		recordBM25RuntimePrepareTiming(ctx, lazyLoadSealedStats, timing)
+	}()
 	provider, err := r.resolveProvider(ctx)
 	if err != nil {
 		return err
 	}
-	lazyLoadSealedStats := paramtable.Get().QueryNodeCfg.IDFLazyLoadSealedStats.GetAsBool()
 	oracle, err := provider.buildOracle(ctx, walView, lazyLoadSealedStats)
 	if err != nil {
 		return err

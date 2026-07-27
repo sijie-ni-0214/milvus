@@ -2,6 +2,7 @@ package qnview
 
 import (
 	"context"
+	"time"
 
 	"github.com/milvus-io/milvus/internal/querynodev2/segments"
 	"github.com/milvus-io/milvus/pkg/v3/proto/indexpb"
@@ -17,43 +18,65 @@ func newSegmentLoadTask(loader PhysicalSegmentLoader, estimator SegmentResourceE
 }
 
 func (t *SegmentLoadTask) Execute(schedulerCtx context.Context) error {
+	startedAt := time.Now()
+	timing := segmentLoadTimingSample{}
+	logCtx := schedulerCtx
+	defer func() {
+		timing.total = time.Since(startedAt)
+		recordSQNSegmentLoadTiming(logCtx, timing)
+	}()
 	if t.OnFinished != nil {
 		defer t.OnFinished()
 	}
 	ctx, cancel := mergeTaskContext(schedulerCtx, t.Context)
 	defer cancel()
+	logCtx = ctx
 	if ctx.Err() != nil {
 		return nil
 	}
-	segment, err := t.load(ctx)
+	segment, err := t.load(ctx, &timing)
 	if err != nil {
+		timing.failed = true
 		if t.OnUnrecoverable != nil {
 			t.OnUnrecoverable(err)
 		}
 		return err
 	}
 	if t.OnLoaded != nil {
+		onLoadedStartedAt := time.Now()
 		t.OnLoaded(segment)
+		timing.onLoaded = time.Since(onLoadedStartedAt)
 	}
 	return nil
 }
 
-func (t *SegmentLoadTask) load(ctx context.Context) (TransformSegment, error) {
+func (t *SegmentLoadTask) load(ctx context.Context, timing *segmentLoadTimingSample) (TransformSegment, error) {
 	loadInfo, indexes, err := t.loadInfo()
 	if err != nil {
 		return nil, err
 	}
-	if err := updateCollectionIndexMeta(ctx, t.Collection, indexes); err != nil {
+	updateIndexMetaStartedAt := time.Now()
+	err = updateCollectionIndexMeta(ctx, t.Collection, indexes)
+	timing.updateIndexMeta = time.Since(updateIndexMetaStartedAt)
+	if err != nil {
 		return nil, err
 	}
+	reserveResourceStartedAt := time.Now()
 	reservation, err := t.reserve(ctx, loadInfo)
+	timing.reserveResource = time.Since(reserveResourceStartedAt)
 	if err != nil {
 		return nil, err
 	}
 	if reservation != nil {
-		defer reservation.Release()
+		defer func() {
+			releaseResourceStartedAt := time.Now()
+			reservation.Release()
+			timing.releaseResource = time.Since(releaseResourceStartedAt)
+		}()
 	}
+	physicalLoadStartedAt := time.Now()
 	segment, err := t.loader.Load(ctx, loadInfo, t.Collection)
+	timing.physicalLoad = time.Since(physicalLoadStartedAt)
 	if err != nil {
 		return nil, err
 	}
