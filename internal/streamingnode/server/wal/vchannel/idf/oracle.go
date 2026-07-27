@@ -2,11 +2,12 @@ package idf
 
 import (
 	"context"
+	"maps"
 	"sync"
 
 	"github.com/cockroachdb/errors"
-	"github.com/milvus-io/milvus-proto/go-api/v3/schemapb"
 
+	"github.com/milvus-io/milvus-proto/go-api/v3/schemapb"
 	"github.com/milvus-io/milvus/internal/storage"
 	"github.com/milvus-io/milvus/internal/streamingnode/server/wal/walview"
 	"github.com/milvus-io/milvus/internal/views/qviews"
@@ -249,6 +250,14 @@ type preparedOracleVersion struct {
 	growing map[int64]growingContribution
 }
 
+type materializationCall struct {
+	target qviews.DataVersion
+	ctx    context.Context
+	cancel context.CancelFunc
+	done   chan struct{}
+	err    error
+}
+
 type oracleRuntime struct {
 	provider *Provider
 
@@ -261,6 +270,7 @@ type oracleRuntime struct {
 	scheduler nodescheduler.Scheduler
 
 	mu               sync.RWMutex
+	lazy             bool
 	pending          qviews.DataVersion
 	hasPending       bool
 	advanceHandle    nodescheduler.TaskHandle
@@ -271,6 +281,7 @@ type oracleRuntime struct {
 	currentSealed    map[int64]sealedContribution
 	currentGrowing   map[int64]growingContribution
 	prepared         map[qviews.DataVersion]*preparedOracleVersion
+	materializations map[qviews.DataVersion]*materializationCall
 	growingStore     *growingStatsStore
 	revision         uint64
 
@@ -282,26 +293,36 @@ func newOracleRuntime(
 	provider *Provider,
 	walView walview.VChannelWALView,
 	initialResources []*datapb.StreamingNodeBM25Resource,
+	lazy bool,
 ) (*oracleRuntime, error) {
 	scheduler := provider.scheduler
 	if scheduler == nil {
 		scheduler = nodescheduler.Get()
 	}
 	r := &oracleRuntime{
-		provider:        provider,
-		scheduler:       scheduler,
-		collectionID:    walView.CollectionID,
-		vchannel:        walView.VChannel,
-		partitionIDs:    append([]int64(nil), walView.PartitionIDs...),
-		loadInfoVersion: walView.LoadInfoVersion,
-		schema:          walView.Schema,
-		currentVersion:  walView.SegmentSnapshot.DataVersion,
-		currentStats:    newBM25StatsFromSchema(walView.Schema),
-		currentSealed:   make(map[int64]sealedContribution),
-		currentGrowing:  make(map[int64]growingContribution),
-		prepared:        make(map[qviews.DataVersion]*preparedOracleVersion),
-		growingStore:    newGrowingStatsStore(walView.Schema),
+		provider:         provider,
+		scheduler:        scheduler,
+		lazy:             lazy,
+		collectionID:     walView.CollectionID,
+		vchannel:         walView.VChannel,
+		partitionIDs:     append([]int64(nil), walView.PartitionIDs...),
+		loadInfoVersion:  walView.LoadInfoVersion,
+		schema:           walView.Schema,
+		currentVersion:   walView.SegmentSnapshot.DataVersion,
+		prepared:         make(map[qviews.DataVersion]*preparedOracleVersion),
+		materializations: make(map[qviews.DataVersion]*materializationCall),
+		growingStore:     newGrowingStatsStore(walView.Schema),
 	}
+	if lazy {
+		if err := r.loadInitialGrowing(ctx, walView); err != nil {
+			return nil, err
+		}
+		return r, nil
+	}
+
+	r.currentStats = newBM25StatsFromSchema(walView.Schema)
+	r.currentSealed = make(map[int64]sealedContribution)
+	r.currentGrowing = make(map[int64]growingContribution)
 	sealed, err := provider.acquireSealedContributions(ctx, initialResources)
 	if err != nil {
 		return nil, err
@@ -368,7 +389,11 @@ func (r *oracleRuntime) collectPersistedGrowingStats(ctx context.Context, segmen
 	return nil
 }
 
-func (r *oracleRuntime) BuildIDF(dataVersion qviews.DataVersion, fieldID int64, tfs *schemapb.SparseFloatArray) ([][]byte, float64, error) {
+func (r *oracleRuntime) BuildIDF(ctx context.Context, dataVersion qviews.DataVersion, fieldID int64, tfs *schemapb.SparseFloatArray) ([][]byte, float64, error) {
+	if err := r.ensureMaterialized(ctx, dataVersion); err != nil {
+		return nil, 0, err
+	}
+
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
@@ -388,29 +413,56 @@ func (r *oracleRuntime) BuildIDF(dataVersion qviews.DataVersion, fieldID int64, 
 }
 
 func (r *oracleRuntime) statsForVersionLocked(dataVersion qviews.DataVersion) (bm25Stats, bool) {
-	if r.currentVersion.EQ(dataVersion) {
+	if r.currentVersion.EQ(dataVersion) && r.currentStats != nil {
 		return r.currentStats, true
 	}
 	prepared := r.prepared[dataVersion]
-	if prepared == nil {
+	if prepared == nil || prepared.stats == nil {
 		return nil, false
 	}
 	return prepared.stats, true
 }
 
+func (r *oracleRuntime) versionRegisteredLocked(dataVersion qviews.DataVersion) bool {
+	return r.currentVersion.EQ(dataVersion) || r.prepared[dataVersion] != nil
+}
+
 func (r *oracleRuntime) PrepareDataVersion(ctx context.Context, target qviews.DataVersion) error {
-	r.mu.RLock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	r.mu.Lock()
 	if r.closed {
-		r.mu.RUnlock()
+		r.mu.Unlock()
 		return context.Canceled
 	}
 	_, ready := r.statsForVersionLocked(target)
-	r.mu.RUnlock()
+	deferInitialLoad := r.lazy && r.currentStats == nil
+	if deferInitialLoad && !r.versionRegisteredLocked(target) {
+		if r.prepared == nil {
+			r.prepared = make(map[qviews.DataVersion]*preparedOracleVersion)
+		}
+		r.prepared[target] = &preparedOracleVersion{version: target}
+	}
+	r.mu.Unlock()
+	if deferInitialLoad {
+		return nil
+	}
 	if ready {
 		return nil
 	}
+	return r.prepareEagerDataVersion(ctx, target)
+}
 
-	resources, err := r.provider.getSealedBM25Resources(ctx, r.collectionID, r.vchannel, target, r.partitionIDs, r.loadInfoVersion)
+func (r *oracleRuntime) prepareEagerDataVersion(ctx context.Context, target qviews.DataVersion) error {
+	resources, err := r.provider.getSealedBM25Resources(
+		ctx,
+		r.collectionID,
+		r.vchannel,
+		target,
+		r.partitionIDs,
+		r.loadInfoVersion,
+	)
 	if err != nil {
 		return err
 	}
@@ -452,11 +504,166 @@ func (r *oracleRuntime) PrepareDataVersion(ctx context.Context, target qviews.Da
 	return nil
 }
 
+func (r *oracleRuntime) ensureMaterialized(ctx context.Context, target qviews.DataVersion) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	r.mu.RLock()
+	closed := r.closed
+	_, ready := r.statsForVersionLocked(target)
+	r.mu.RUnlock()
+	if closed {
+		return context.Canceled
+	}
+	if ready {
+		return nil
+	}
+
+	r.mu.Lock()
+	if r.closed {
+		r.mu.Unlock()
+		return context.Canceled
+	}
+	if _, ready := r.statsForVersionLocked(target); ready {
+		r.mu.Unlock()
+		return nil
+	}
+	if !r.versionRegisteredLocked(target) {
+		r.mu.Unlock()
+		return merr.WrapErrServiceNotReadyMsg("BM25 stats for data version %s are not registered", target.String())
+	}
+	if call := r.materializations[target]; call != nil {
+		r.mu.Unlock()
+		select {
+		case <-call.done:
+			return call.err
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	if r.materializations == nil {
+		r.materializations = make(map[qviews.DataVersion]*materializationCall)
+	}
+	materializationCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	call := &materializationCall{
+		target: target,
+		ctx:    materializationCtx,
+		cancel: cancel,
+		done:   make(chan struct{}),
+	}
+	r.materializations[target] = call
+	r.mu.Unlock()
+
+	r.materialize(call)
+	return call.err
+}
+
+func (r *oracleRuntime) materialize(call *materializationCall) {
+	var (
+		sealed    map[int64]sealedContribution
+		resultErr error
+		committed bool
+	)
+	defer func() {
+		if !committed {
+			r.releaseSealed(sealed)
+		}
+
+		r.mu.Lock()
+		call.err = resultErr
+		if r.materializations[call.target] == call {
+			delete(r.materializations, call.target)
+		}
+		close(call.done)
+		r.mu.Unlock()
+	}()
+
+	resources, err := r.provider.getSealedBM25Resources(
+		call.ctx,
+		r.collectionID,
+		r.vchannel,
+		call.target,
+		r.partitionIDs,
+		r.loadInfoVersion,
+	)
+	if err != nil {
+		resultErr = merr.Wrapf(err, "get sealed BM25 resources for data version %s", call.target.String())
+		return
+	}
+	sealed, err = r.provider.acquireSealedContributions(call.ctx, resources)
+	if err != nil {
+		resultErr = merr.Wrapf(err, "load sealed BM25 stats for data version %s", call.target.String())
+		return
+	}
+
+	stats := newBM25StatsFromSchema(r.schema)
+	for _, contribution := range sealed {
+		stats.merge(contribution.stats)
+	}
+
+	var oldSealed map[int64]sealedContribution
+	var currentGrowing map[int64]growingContribution
+	committedCurrent := false
+	r.mu.Lock()
+	if r.closed || r.materializations[call.target] != call || !r.versionRegisteredLocked(call.target) {
+		resultErr = call.ctx.Err()
+		if resultErr == nil {
+			resultErr = context.Canceled
+		}
+		r.mu.Unlock()
+		return
+	}
+	targetSealed := segmentSetFromSealed(sealed)
+	growing := r.growingStore.snapshotForDataVersion(call.target, targetSealed)
+	for _, contribution := range growing {
+		stats.merge(contribution.stats)
+	}
+	if resultErr = call.ctx.Err(); resultErr != nil {
+		r.mu.Unlock()
+		return
+	}
+	if r.currentVersion.EQ(call.target) {
+		oldSealed = r.currentSealed
+		r.currentStats = stats
+		r.currentSealed = sealed
+		r.currentGrowing = growing
+		r.revision++
+		// Cleanup only needs a stable segment membership snapshot.
+		currentGrowing = maps.Clone(growing)
+		committedCurrent = true
+		committed = true
+	} else if prepared := r.prepared[call.target]; prepared != nil {
+		oldSealed = prepared.sealed
+		prepared.stats = stats
+		prepared.sealed = sealed
+		prepared.growing = growing
+		committed = true
+	}
+	if !committed {
+		resultErr = context.Canceled
+	}
+	r.mu.Unlock()
+
+	if !committed {
+		return
+	}
+	r.releaseSealed(oldSealed)
+	if committedCurrent {
+		r.growingStore.cleanup(call.target, currentGrowing)
+	}
+}
+
 func (r *oracleRuntime) ReleaseDataVersion(dataVersion qviews.DataVersion) {
 	r.mu.Lock()
 	prepared := r.prepared[dataVersion]
 	delete(r.prepared, dataVersion)
+	call := r.materializations[dataVersion]
 	r.mu.Unlock()
+	if call != nil {
+		call.cancel()
+	}
 	if prepared != nil {
 		r.releaseSealed(prepared.sealed)
 	}
@@ -486,20 +693,26 @@ func (r *oracleRuntime) applyLiveMessage(_ context.Context, msg message.Immutabl
 		r.mu.Lock()
 		r.growingStore.registerSegment(segmentID, partitionID)
 		changed := false
-		if _, ok := r.currentSealed[segmentID]; !ok {
+		if r.currentStats != nil {
+			_, sealed := r.currentSealed[segmentID]
 			if _, ok := r.currentGrowing[segmentID]; !ok {
-				r.currentGrowing[segmentID] = growingContribution{
-					segmentID:   segmentID,
-					partitionID: partitionID,
-					stats:       newBM25StatsFromSchema(r.schema),
+				if !sealed {
+					r.currentGrowing[segmentID] = growingContribution{
+						segmentID:   segmentID,
+						partitionID: partitionID,
+						stats:       newBM25StatsFromSchema(r.schema),
+					}
+					changed = true
 				}
-				changed = true
 			}
 		}
 		if changed {
 			r.revision++
 		}
 		for _, prepared := range r.prepared {
+			if prepared.stats == nil {
+				continue
+			}
 			if _, ok := prepared.sealed[segmentID]; ok {
 				continue
 			}
@@ -561,7 +774,7 @@ func (r *oracleRuntime) MaybeAdvance(target qviews.DataVersion) {
 		r.mu.Unlock()
 		return
 	}
-	if prepared := r.prepared[target]; prepared != nil {
+	if prepared := r.prepared[target]; prepared != nil && prepared.stats != nil {
 		oldSealed := r.currentSealed
 		r.currentVersion = prepared.version
 		r.currentStats = prepared.stats
@@ -575,14 +788,62 @@ func (r *oracleRuntime) MaybeAdvance(target qviews.DataVersion) {
 				delete(r.prepared, version)
 			}
 		}
+		obsoleteCalls := make([]*materializationCall, 0)
+		for version, call := range r.materializations {
+			if !version.EQ(target) && !version.GT(target) {
+				obsoleteCalls = append(obsoleteCalls, call)
+			}
+		}
+		if r.hasPending && !r.pending.GT(target) {
+			r.pending = qviews.DataVersion{}
+			r.hasPending = false
+		}
 		r.revision++
 		currentGrowing := cloneGrowingContributions(r.currentGrowing)
 		r.mu.Unlock()
+		for _, call := range obsoleteCalls {
+			call.cancel()
+		}
 		r.releaseSealed(oldSealed)
 		for _, sealed := range obsolete {
 			r.releaseSealed(sealed)
 		}
 		r.growingStore.cleanup(target, currentGrowing)
+		return
+	}
+	if r.lazy && r.currentStats == nil {
+		oldSealed := r.currentSealed
+		r.currentVersion = target
+		r.currentStats = nil
+		r.currentSealed = nil
+		r.currentGrowing = nil
+		obsolete := make([]map[int64]sealedContribution, 0)
+		for version, candidate := range r.prepared {
+			if !version.GT(target) {
+				obsolete = append(obsolete, candidate.sealed)
+				delete(r.prepared, version)
+			}
+		}
+		obsoleteCalls := make([]*materializationCall, 0)
+		for version, call := range r.materializations {
+			if !version.EQ(target) && !version.GT(target) {
+				obsoleteCalls = append(obsoleteCalls, call)
+			}
+		}
+		if r.hasPending && !r.pending.GT(target) {
+			r.pending = qviews.DataVersion{}
+			r.hasPending = false
+		}
+		r.revision++
+		r.mu.Unlock()
+		for _, call := range obsoleteCalls {
+			call.cancel()
+		}
+		r.releaseSealed(oldSealed)
+		for _, sealed := range obsolete {
+			r.releaseSealed(sealed)
+		}
+		r.growingStore.cleanup(target, nil)
 		return
 	}
 	if !r.hasPending || target.GT(r.pending) {
@@ -605,10 +866,20 @@ func (r *oracleRuntime) Close() {
 		r.mu.Lock()
 		r.closed = true
 		handle := r.advanceHandle
+		calls := make([]*materializationCall, 0, len(r.materializations))
+		for _, call := range r.materializations {
+			calls = append(calls, call)
+		}
 		r.mu.Unlock()
+		for _, call := range calls {
+			call.cancel()
+		}
 		if handle != nil {
 			handle.Cancel()
 			_ = handle.Wait(context.Background())
+		}
+		for _, call := range calls {
+			<-call.done
 		}
 		r.mu.Lock()
 		sealed := r.currentSealed
@@ -616,6 +887,7 @@ func (r *oracleRuntime) Close() {
 		r.currentSealed = nil
 		r.currentGrowing = nil
 		r.prepared = nil
+		r.materializations = nil
 		r.mu.Unlock()
 		r.releaseSealed(sealed)
 		for _, version := range prepared {

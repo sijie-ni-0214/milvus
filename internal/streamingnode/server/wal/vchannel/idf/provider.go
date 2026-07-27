@@ -5,10 +5,10 @@ import (
 	"sync"
 
 	"github.com/cockroachdb/errors"
-	"github.com/milvus-io/milvus-proto/go-api/v3/msgpb"
-	"github.com/milvus-io/milvus-proto/go-api/v3/schemapb"
 	"google.golang.org/protobuf/proto"
 
+	"github.com/milvus-io/milvus-proto/go-api/v3/msgpb"
+	"github.com/milvus-io/milvus-proto/go-api/v3/schemapb"
 	"github.com/milvus-io/milvus/internal/storage"
 	"github.com/milvus-io/milvus/internal/streamingnode/server/wal/vchannel/queryresource"
 	"github.com/milvus-io/milvus/internal/streamingnode/server/wal/walview"
@@ -19,6 +19,7 @@ import (
 	"github.com/milvus-io/milvus/pkg/v3/proto/messagespb"
 	"github.com/milvus-io/milvus/pkg/v3/util/merr"
 	"github.com/milvus-io/milvus/pkg/v3/util/nodescheduler"
+	"github.com/milvus-io/milvus/pkg/v3/util/paramtable"
 	"github.com/milvus-io/milvus/pkg/v3/util/syncutil"
 )
 
@@ -123,7 +124,8 @@ func (r *Runtime) Prepare(ctx context.Context, walView walview.VChannelWALView) 
 	if err != nil {
 		return err
 	}
-	oracle, err := provider.buildOracle(ctx, walView)
+	lazyLoadSealedStats := paramtable.Get().QueryNodeCfg.IDFLazyLoadSealedStats.GetAsBool()
+	oracle, err := provider.buildOracle(ctx, walView, lazyLoadSealedStats)
 	if err != nil {
 		return err
 	}
@@ -162,16 +164,23 @@ func (r *Runtime) resolveProvider(ctx context.Context) (*Provider, error) {
 	}, nil
 }
 
-func (p *Provider) buildOracle(ctx context.Context, walView walview.VChannelWALView) (*oracleRuntime, error) {
+func (p *Provider) buildOracle(
+	ctx context.Context,
+	walView walview.VChannelWALView,
+	lazyLoadSealedStats bool,
+) (*oracleRuntime, error) {
 	if p.client == nil {
 		return nil, errors.New("querycoord client is nil")
 	}
 
+	if lazyLoadSealedStats {
+		return newOracleRuntime(ctx, p, walView, nil, true)
+	}
 	resources, err := p.getSealedBM25Resources(ctx, walView.CollectionID, walView.VChannel, walView.SegmentSnapshot.DataVersion, walView.PartitionIDs, walView.LoadInfoVersion)
 	if err != nil {
 		return nil, err
 	}
-	return newOracleRuntime(ctx, p, walView, resources)
+	return newOracleRuntime(ctx, p, walView, resources, false)
 }
 
 func loadFieldIDs(fields []*messagespb.LoadFieldConfig) []int64 {
@@ -182,12 +191,12 @@ func loadFieldIDs(fields []*messagespb.LoadFieldConfig) []int64 {
 	return ids
 }
 
-func (r *Runtime) BuildIDF(dataVersion qviews.DataVersion, fieldID int64, tfs *schemapb.SparseFloatArray) ([][]byte, float64, error) {
+func (r *Runtime) BuildIDF(ctx context.Context, dataVersion qviews.DataVersion, fieldID int64, tfs *schemapb.SparseFloatArray) ([][]byte, float64, error) {
 	oracle := r.currentOracle()
 	if oracle == nil {
 		return nil, 0, merr.WrapErrServiceNotReadyMsg("BM25 IDF oracle is not initialized")
 	}
-	return oracle.BuildIDF(dataVersion, fieldID, tfs)
+	return oracle.BuildIDF(ctx, dataVersion, fieldID, tfs)
 }
 
 func (r *Runtime) PrepareDataVersion(ctx context.Context, dataVersion qviews.DataVersion) error {
