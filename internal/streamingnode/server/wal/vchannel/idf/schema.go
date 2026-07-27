@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"slices"
+	"time"
 
 	"github.com/cockroachdb/errors"
 	"google.golang.org/protobuf/proto"
@@ -181,7 +182,12 @@ func (b *viewBinding) Prepare(ctx context.Context, loadInfo queryresource.LoadIn
 		}
 		fieldView := view
 		fieldView.RequiredFields = []*viewpb.LoadFieldConfig{{FieldId: field.key.fieldID}}
-		oracle, err := provider.buildOracle(ctx, fieldView, paramtable.Get().QueryViewCfg.IDFLazyLoadSealedStats.GetAsBool())
+		lazyLoadSealedStats := paramtable.Get().QueryViewCfg.IDFLazyLoadSealedStats.GetAsBool()
+		timing := bm25RuntimePrepareTimingSample{startedAt: time.Now()}
+		oracle, err := provider.buildOracle(ctx, fieldView, lazyLoadSealedStats)
+		timing.total = time.Since(timing.startedAt)
+		timing.failed = err != nil
+		recordBM25RuntimePrepareTiming(ctx, lazyLoadSealedStats, timing)
 		if err != nil {
 			return err
 		}
