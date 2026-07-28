@@ -1511,3 +1511,32 @@ func TestRemoteChunkManagerTLSVersion(t *testing.T) {
 		t.Logf("NewRemoteChunkManager(SslTLSMinVersion=<empty>, CloudProvider=%s): OK (default)", cloudProvider)
 	})
 }
+
+func TestClassifyPersistentObject(t *testing.T) {
+	tests := []struct {
+		name       string
+		objectName string
+		expected   string
+	}{
+		{name: "transform log", objectName: "files/transform-log/pchannel/vchannel/chunks/1.pb", expected: persistentObjectTypeTransformLog},
+		{name: "manifest", objectName: "files/insert_log/1/2/3/_metadata/manifest-7.avro", expected: persistentObjectTypeManifest},
+		{name: "legacy manifest", objectName: "files/insert_log/1/2/3/_metadata/manifest.json", expected: persistentObjectTypeManifest},
+		{name: "data", objectName: "files/insert_log/1/2/3/field/1", expected: persistentObjectTypeData},
+		{name: "index", objectName: "files/index_files/1/2/3/4/index", expected: persistentObjectTypeIndex},
+		{name: "legacy bloom stats", objectName: "files/stats_log/1/2/3/4/5", expected: persistentObjectTypeBloomStats},
+		{name: "manifest bloom stats", objectName: "files/insert_log/1/2/3/_stats/bloom_filter.4/5", expected: persistentObjectTypeBloomStats},
+		{name: "legacy bm25 stats", objectName: "files/bm25_stats/1/2/3/4/5", expected: persistentObjectTypeBM25Stats},
+		{name: "manifest bm25 stats", objectName: "files/insert_log/1/2/3/_stats/bm25.4/5", expected: persistentObjectTypeBM25Stats},
+		{name: "text stats", objectName: "files/insert_log/1/2/3/_stats/text_index.4/index", expected: persistentObjectTypeTextJSONStats},
+		{name: "json stats", objectName: "files/insert_log/1/2/3/_stats/json_stats.4/index", expected: persistentObjectTypeTextJSONStats},
+		{name: "legacy delta", objectName: "files/delta_log/1/2/3/4", expected: persistentObjectTypeDeltaDelete},
+		{name: "manifest delta", objectName: "files/insert_log/1/2/3/_delta/4", expected: persistentObjectTypeDeltaDelete},
+		{name: "other", objectName: "files/unknown/1", expected: persistentObjectTypeOther},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			assert.Equal(t, test.expected, classifyPersistentObject(test.objectName))
+		})
+	}
+}

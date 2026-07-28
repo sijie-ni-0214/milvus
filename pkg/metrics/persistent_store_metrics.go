@@ -28,6 +28,7 @@ const (
 	DataStatLabel   = "stat"
 
 	persistentDataOpType = "persistent_data_op_type"
+	storageObjectType    = "object_type"
 )
 
 var (
@@ -56,6 +57,14 @@ var (
 			Name:      "op_count",
 			Help:      "count of persistent data operation",
 		}, []string{persistentDataOpType, statusLabelName})
+
+	PersistentDataGetObjectCounter = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: milvusNamespace,
+			Subsystem: "storage",
+			Name:      "get_object_count",
+			Help:      "count of persistent data get operations by object type",
+		}, []string{storageObjectType, statusLabelName})
 
 	// Filesystem metrics (default filesystem only) - common across all nodes
 	FilesystemReadCount = prometheus.NewGaugeVec(
@@ -144,6 +153,7 @@ func RegisterStorageMetrics(registry *prometheus.Registry) {
 	registry.MustRegister(PersistentDataKvSize)
 	registry.MustRegister(PersistentDataRequestLatency)
 	registry.MustRegister(PersistentDataOpCounter)
+	registry.MustRegister(PersistentDataGetObjectCounter)
 
 	// filesystem metrics
 	registry.MustRegister(FilesystemReadCount)

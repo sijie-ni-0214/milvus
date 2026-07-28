@@ -71,6 +71,18 @@ type RemoteChunkManager struct {
 
 var _ ChunkManager = (*RemoteChunkManager)(nil)
 
+const (
+	persistentObjectTypeTransformLog  = "transform_log"
+	persistentObjectTypeManifest      = "manifest"
+	persistentObjectTypeData          = "data"
+	persistentObjectTypeIndex         = "index"
+	persistentObjectTypeBloomStats    = "stats_bloom_filter"
+	persistentObjectTypeBM25Stats     = "stats_bm25"
+	persistentObjectTypeTextJSONStats = "stats_text_json"
+	persistentObjectTypeDeltaDelete   = "delta_delete"
+	persistentObjectTypeOther         = "other"
+)
+
 func NewRemoteChunkManager(ctx context.Context, c *objectstorage.Config) (*RemoteChunkManager, error) {
 	var client ObjectStorage
 	var err error
@@ -362,20 +374,54 @@ func (mcm *RemoteChunkManager) getObject(ctx context.Context, bucketName, object
 ) (FileReader, error) {
 	start := timerecord.NewTimeRecorder("getObject")
 	reader, err := mcm.client.GetObject(ctx, bucketName, objectName, offset, size)
+	objectType := classifyPersistentObject(objectName)
 	metrics.PersistentDataOpCounter.WithLabelValues(metrics.DataGetLabel, metrics.TotalLabel).Inc()
+	metrics.PersistentDataGetObjectCounter.WithLabelValues(objectType, metrics.TotalLabel).Inc()
 	if err == nil && reader != nil {
 		metrics.PersistentDataRequestLatency.WithLabelValues(metrics.DataGetLabel).
 			Observe(float64(start.ElapseSpan().Milliseconds()))
 		metrics.PersistentDataOpCounter.WithLabelValues(metrics.DataGetLabel, metrics.SuccessLabel).Inc()
+		metrics.PersistentDataGetObjectCounter.WithLabelValues(objectType, metrics.SuccessLabel).Inc()
 	} else {
 		if errors.Is(err, context.Canceled) {
 			metrics.PersistentDataOpCounter.WithLabelValues(metrics.DataGetLabel, metrics.CancelLabel).Inc()
+			metrics.PersistentDataGetObjectCounter.WithLabelValues(objectType, metrics.CancelLabel).Inc()
 		} else {
 			metrics.PersistentDataOpCounter.WithLabelValues(metrics.DataGetLabel, metrics.FailLabel).Inc()
+			metrics.PersistentDataGetObjectCounter.WithLabelValues(objectType, metrics.FailLabel).Inc()
 		}
 	}
 
 	return reader, err
+}
+
+func classifyPersistentObject(objectName string) string {
+	normalized := "/" + strings.Trim(objectName, "/") + "/"
+	switch {
+	case strings.Contains(normalized, "/transform-log/"):
+		return persistentObjectTypeTransformLog
+	case strings.Contains(normalized, "/_metadata/manifest-") ||
+		strings.Contains(normalized, "/_metadata/manifest."):
+		return persistentObjectTypeManifest
+	case strings.Contains(normalized, "/index_files/"):
+		return persistentObjectTypeIndex
+	case strings.Contains(normalized, "/stats_log/") ||
+		strings.Contains(normalized, "/_stats/bloom_filter."):
+		return persistentObjectTypeBloomStats
+	case strings.Contains(normalized, "/bm25_stats/") ||
+		strings.Contains(normalized, "/_stats/bm25."):
+		return persistentObjectTypeBM25Stats
+	case strings.Contains(normalized, "/_stats/text_index.") ||
+		strings.Contains(normalized, "/_stats/json_stats."):
+		return persistentObjectTypeTextJSONStats
+	case strings.Contains(normalized, "/delta_log/") ||
+		strings.Contains(normalized, "/_delta/"):
+		return persistentObjectTypeDeltaDelete
+	case strings.Contains(normalized, "/insert_log/"):
+		return persistentObjectTypeData
+	default:
+		return persistentObjectTypeOther
+	}
 }
 
 func (mcm *RemoteChunkManager) putObject(ctx context.Context, bucketName, objectName string, reader io.Reader, objectSize int64) error {
