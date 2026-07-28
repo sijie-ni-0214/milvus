@@ -3,6 +3,7 @@ package qvresource
 import (
 	"context"
 	"sync"
+	"time"
 
 	"golang.org/x/sync/errgroup"
 
@@ -29,7 +30,12 @@ func (l *queryViewPhysicalSegmentLoader) Load(ctx context.Context, info *querypb
 		return nil, err
 	}
 
+	timing := segments.PhysicalLoadTimingFromContext(ctx)
+	startedAt := time.Now()
 	loaded, err := l.loader.NewSegment(ctx, collection, info)
+	if timing != nil {
+		timing.NewSegment = time.Since(startedAt)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -44,13 +50,28 @@ func (l *queryViewPhysicalSegmentLoader) Load(ctx context.Context, info *querypb
 	// failure cancels the other branch.
 	g, gctx := errgroup.WithContext(ctx)
 	g.Go(func() error {
-		return l.loader.LoadPKCandidate(gctx, loaded, info)
+		startedAt := time.Now()
+		err := l.loader.LoadPKCandidate(gctx, loaded, info)
+		if timing != nil {
+			timing.PKCandidate = time.Since(startedAt)
+		}
+		return err
 	})
 	g.Go(func() error {
-		if err := l.loader.LoadSegment(gctx, loaded, info); err != nil {
+		startedAt := time.Now()
+		err := l.loader.LoadSegment(gctx, loaded, info)
+		if timing != nil {
+			timing.LoadSegment = time.Since(startedAt)
+		}
+		if err != nil {
 			return err
 		}
-		return l.loader.LoadDeltaLogs(gctx, loaded, info)
+		startedAt = time.Now()
+		err = l.loader.LoadDeltaLogs(gctx, loaded, info)
+		if timing != nil {
+			timing.DeltaLogs = time.Since(startedAt)
+		}
+		return err
 	})
 	if err := g.Wait(); err != nil {
 		return nil, err

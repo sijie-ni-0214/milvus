@@ -21,6 +21,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/milvus-io/milvus/internal/querynodev2/segments"
 	"github.com/milvus-io/milvus/pkg/v3/mlog"
 )
 
@@ -38,6 +39,7 @@ type segmentLoadTimingSample struct {
 	total           time.Duration
 	reserveResource time.Duration
 	physicalLoad    time.Duration
+	physicalDetail  segments.PhysicalLoadTiming
 	releaseResource time.Duration
 	onLoaded        time.Duration
 	failed          bool
@@ -60,6 +62,30 @@ func (s durationStats) average(count int64) time.Duration {
 	return s.total / time.Duration(count)
 }
 
+type physicalLoadDetailStats struct {
+	newSegment         durationStats
+	loadSegment        durationStats
+	sealedLoadPoolWait durationStats
+	localSegmentLoad   durationStats
+	cSegmentLoad       durationStats
+	syncJSONStats      durationStats
+	sealedPostLoad     durationStats
+	deltaLogs          durationStats
+	pkCandidate        durationStats
+}
+
+func (s *physicalLoadDetailStats) add(timing segments.PhysicalLoadTiming) {
+	s.newSegment.add(timing.NewSegment)
+	s.loadSegment.add(timing.LoadSegment)
+	s.sealedLoadPoolWait.add(timing.SealedLoadPoolWait)
+	s.localSegmentLoad.add(timing.LocalSegmentLoad)
+	s.cSegmentLoad.add(timing.CSegmentLoad)
+	s.syncJSONStats.add(timing.SyncJSONStats)
+	s.sealedPostLoad.add(timing.SealedPostLoad)
+	s.deltaLogs.add(timing.DeltaLogs)
+	s.pkCandidate.add(timing.PKCandidate)
+}
+
 type segmentLoadTimingSnapshot struct {
 	count          int64
 	failed         int64
@@ -68,6 +94,7 @@ type segmentLoadTimingSnapshot struct {
 	total           durationStats
 	reserveResource durationStats
 	physicalLoad    durationStats
+	physicalDetail  physicalLoadDetailStats
 	releaseResource durationStats
 	onLoaded        durationStats
 }
@@ -84,6 +111,7 @@ type segmentLoadTimingStats struct {
 	total           durationStats
 	reserveResource durationStats
 	physicalLoad    durationStats
+	physicalDetail  physicalLoadDetailStats
 	releaseResource durationStats
 	onLoaded        durationStats
 }
@@ -110,6 +138,7 @@ func (s *segmentLoadTimingStats) add(now time.Time, sample segmentLoadTimingSamp
 	s.total.add(sample.total)
 	s.reserveResource.add(sample.reserveResource)
 	s.physicalLoad.add(sample.physicalLoad)
+	s.physicalDetail.add(sample.physicalDetail)
 	s.releaseResource.add(sample.releaseResource)
 	s.onLoaded.add(sample.onLoaded)
 
@@ -123,6 +152,7 @@ func (s *segmentLoadTimingStats) add(now time.Time, sample segmentLoadTimingSamp
 		total:           s.total,
 		reserveResource: s.reserveResource,
 		physicalLoad:    s.physicalLoad,
+		physicalDetail:  s.physicalDetail,
 		releaseResource: s.releaseResource,
 		onLoaded:        s.onLoaded,
 	}
@@ -137,6 +167,7 @@ func (s *segmentLoadTimingStats) reset() {
 	s.total = durationStats{}
 	s.reserveResource = durationStats{}
 	s.physicalLoad = durationStats{}
+	s.physicalDetail = physicalLoadDetailStats{}
 	s.releaseResource = durationStats{}
 	s.onLoaded = durationStats{}
 }
@@ -155,6 +186,24 @@ func logSQNSegmentLoadTiming(ctx context.Context, snapshot segmentLoadTimingSnap
 		mlog.Duration("maxReserveResource", snapshot.reserveResource.max),
 		mlog.Duration("avgPhysicalLoad", snapshot.physicalLoad.average(snapshot.count)),
 		mlog.Duration("maxPhysicalLoad", snapshot.physicalLoad.max),
+		mlog.Duration("avgPhysicalNewSegment", snapshot.physicalDetail.newSegment.average(snapshot.count)),
+		mlog.Duration("maxPhysicalNewSegment", snapshot.physicalDetail.newSegment.max),
+		mlog.Duration("avgPhysicalLoadSegment", snapshot.physicalDetail.loadSegment.average(snapshot.count)),
+		mlog.Duration("maxPhysicalLoadSegment", snapshot.physicalDetail.loadSegment.max),
+		mlog.Duration("avgPhysicalLoadPoolWait", snapshot.physicalDetail.sealedLoadPoolWait.average(snapshot.count)),
+		mlog.Duration("maxPhysicalLoadPoolWait", snapshot.physicalDetail.sealedLoadPoolWait.max),
+		mlog.Duration("avgPhysicalLocalSegmentLoad", snapshot.physicalDetail.localSegmentLoad.average(snapshot.count)),
+		mlog.Duration("maxPhysicalLocalSegmentLoad", snapshot.physicalDetail.localSegmentLoad.max),
+		mlog.Duration("avgPhysicalCSegmentLoad", snapshot.physicalDetail.cSegmentLoad.average(snapshot.count)),
+		mlog.Duration("maxPhysicalCSegmentLoad", snapshot.physicalDetail.cSegmentLoad.max),
+		mlog.Duration("avgPhysicalSyncJSONStats", snapshot.physicalDetail.syncJSONStats.average(snapshot.count)),
+		mlog.Duration("maxPhysicalSyncJSONStats", snapshot.physicalDetail.syncJSONStats.max),
+		mlog.Duration("avgPhysicalPostLoad", snapshot.physicalDetail.sealedPostLoad.average(snapshot.count)),
+		mlog.Duration("maxPhysicalPostLoad", snapshot.physicalDetail.sealedPostLoad.max),
+		mlog.Duration("avgPhysicalDeltaLogs", snapshot.physicalDetail.deltaLogs.average(snapshot.count)),
+		mlog.Duration("maxPhysicalDeltaLogs", snapshot.physicalDetail.deltaLogs.max),
+		mlog.Duration("avgPhysicalPKCandidate", snapshot.physicalDetail.pkCandidate.average(snapshot.count)),
+		mlog.Duration("maxPhysicalPKCandidate", snapshot.physicalDetail.pkCandidate.max),
 		mlog.Duration("avgReleaseResource", snapshot.releaseResource.average(snapshot.count)),
 		mlog.Duration("maxReleaseResource", snapshot.releaseResource.max),
 		mlog.Duration("avgOnLoaded", snapshot.onLoaded.average(snapshot.count)),
