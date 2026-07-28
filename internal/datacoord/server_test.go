@@ -54,6 +54,7 @@ import (
 	"github.com/milvus-io/milvus/internal/streamingcoord/server/broadcaster/registry"
 	"github.com/milvus-io/milvus/internal/types"
 	"github.com/milvus-io/milvus/internal/util/dependency"
+	kvfactory "github.com/milvus-io/milvus/internal/util/dependency/kv"
 	"github.com/milvus-io/milvus/internal/util/sessionutil"
 	"github.com/milvus-io/milvus/pkg/v3/common"
 	"github.com/milvus-io/milvus/pkg/v3/mlog"
@@ -77,7 +78,12 @@ const maxOperationsPerTxn = int64(64)
 
 func TestMain(m *testing.M) {
 	paramtable.Init()
-	rand.Seed(time.Now().UnixNano())
+	seed := time.Now().UnixNano()
+	rand.Seed(seed)
+	testRootPath := fmt.Sprintf("datacoord-test-%d", seed)
+	Params.EtcdCfg.RootPath.SwapTempValue(testRootPath)
+	Params.MinioCfg.RootPath.SwapTempValue(testRootPath)
+	kvfactory.CloseEtcdClient()
 	code := m.Run()
 	os.Exit(code)
 }
