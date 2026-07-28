@@ -74,9 +74,12 @@ func (t *SegmentLoadTask) load(ctx context.Context, timing *segmentLoadTimingSam
 			timing.releaseResource = time.Since(releaseResourceStartedAt)
 		}()
 	}
+	physicalLoadDetail := &segments.PhysicalLoadTiming{}
+	ctx = segments.WithPhysicalLoadTiming(ctx, physicalLoadDetail)
 	physicalLoadStartedAt := time.Now()
 	segment, err := t.loader.Load(ctx, loadInfo, t.Collection)
 	timing.physicalLoad = time.Since(physicalLoadStartedAt)
+	timing.physicalDetail = *physicalLoadDetail
 	if err != nil {
 		return nil, err
 	}

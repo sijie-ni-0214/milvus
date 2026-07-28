@@ -1093,7 +1093,16 @@ func (loader *segmentLoader) loadSealedSegment(ctx context.Context, loadInfo *qu
 		mlog.Int64s("unindexed text fields", lo.Keys(unindexedTextFields)),
 		mlog.Int64s("indexed json key fields", lo.Keys(jsonKeyStats)),
 	)
+	physicalLoadTiming := PhysicalLoadTimingFromContext(ctx)
+	loadSubmittedAt := time.Now()
 	_, err = GetLoadPool().Submit(func() (any, error) {
+		loadStartedAt := time.Now()
+		if physicalLoadTiming != nil {
+			physicalLoadTiming.SealedLoadPoolWait = loadStartedAt.Sub(loadSubmittedAt)
+			defer func() {
+				physicalLoadTiming.LocalSegmentLoad = time.Since(loadStartedAt)
+			}()
+		}
 		if err = segment.Load(ctx); err != nil {
 			return struct{}{}, merr.Wrap(err, "At Load")
 		}
@@ -1104,6 +1113,7 @@ func (loader *segmentLoader) loadSealedSegment(ctx context.Context, loadInfo *qu
 		return err
 	}
 
+	postLoadStartedAt := time.Now()
 	for _, indexInfo := range loadInfo.IndexInfos {
 		segment.fieldIndexes.Insert(indexInfo.GetIndexID(), &IndexedFieldInfo{
 			FieldBinlog: &datapb.FieldBinlog{
@@ -1119,6 +1129,9 @@ func (loader *segmentLoader) loadSealedSegment(ctx context.Context, loadInfo *qu
 	// legacy entry num = 0
 	if err := loader.patchEntryNumber(ctx, segment, loadInfo); err != nil {
 		return err
+	}
+	if physicalLoadTiming != nil {
+		physicalLoadTiming.SealedPostLoad = time.Since(postLoadStartedAt)
 	}
 	patchEntryNumberSpan := tr.RecordSpan()
 	mlog.Info(context.TODO(), "Finish loading segment",

@@ -8,6 +8,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/milvus-io/milvus/internal/querynodev2/segments"
 )
 
 func TestSegmentLoadTimingStatsAggregatesAndResets(t *testing.T) {
@@ -18,6 +20,17 @@ func TestSegmentLoadTimingStatsAggregatesAndResets(t *testing.T) {
 		updateIndexMeta: 2 * time.Millisecond,
 		reserveResource: 3 * time.Millisecond,
 		physicalLoad:    4 * time.Millisecond,
+		physicalDetail: segments.PhysicalLoadTiming{
+			NewSegment:         2 * time.Millisecond,
+			LoadSegment:        4 * time.Millisecond,
+			SealedLoadPoolWait: 6 * time.Millisecond,
+			LocalSegmentLoad:   8 * time.Millisecond,
+			CSegmentLoad:       10 * time.Millisecond,
+			SyncJSONStats:      12 * time.Millisecond,
+			SealedPostLoad:     14 * time.Millisecond,
+			DeltaLogs:          16 * time.Millisecond,
+			PKCandidate:        18 * time.Millisecond,
+		},
 		releaseResource: time.Millisecond,
 		onLoaded:        2 * time.Millisecond,
 	})
@@ -28,6 +41,17 @@ func TestSegmentLoadTimingStatsAggregatesAndResets(t *testing.T) {
 		updateIndexMeta: 4 * time.Millisecond,
 		reserveResource: 6 * time.Millisecond,
 		physicalLoad:    8 * time.Millisecond,
+		physicalDetail: segments.PhysicalLoadTiming{
+			NewSegment:         4 * time.Millisecond,
+			LoadSegment:        8 * time.Millisecond,
+			SealedLoadPoolWait: 12 * time.Millisecond,
+			LocalSegmentLoad:   16 * time.Millisecond,
+			CSegmentLoad:       20 * time.Millisecond,
+			SyncJSONStats:      24 * time.Millisecond,
+			SealedPostLoad:     28 * time.Millisecond,
+			DeltaLogs:          32 * time.Millisecond,
+			PKCandidate:        36 * time.Millisecond,
+		},
 		releaseResource: 2 * time.Millisecond,
 		failed:          true,
 	})
@@ -39,6 +63,15 @@ func TestSegmentLoadTimingStatsAggregatesAndResets(t *testing.T) {
 	assert.Equal(t, 20*time.Millisecond, snapshot.total.max)
 	assert.Equal(t, 3*time.Millisecond, snapshot.updateIndexMeta.average(snapshot.count))
 	assert.Equal(t, 6*time.Millisecond, snapshot.physicalLoad.average(snapshot.count))
+	assert.Equal(t, 3*time.Millisecond, snapshot.physicalDetail.newSegment.average(snapshot.count))
+	assert.Equal(t, 6*time.Millisecond, snapshot.physicalDetail.loadSegment.average(snapshot.count))
+	assert.Equal(t, 9*time.Millisecond, snapshot.physicalDetail.sealedLoadPoolWait.average(snapshot.count))
+	assert.Equal(t, 12*time.Millisecond, snapshot.physicalDetail.localSegmentLoad.average(snapshot.count))
+	assert.Equal(t, 15*time.Millisecond, snapshot.physicalDetail.cSegmentLoad.average(snapshot.count))
+	assert.Equal(t, 18*time.Millisecond, snapshot.physicalDetail.syncJSONStats.average(snapshot.count))
+	assert.Equal(t, 21*time.Millisecond, snapshot.physicalDetail.sealedPostLoad.average(snapshot.count))
+	assert.Equal(t, 24*time.Millisecond, snapshot.physicalDetail.deltaLogs.average(snapshot.count))
+	assert.Equal(t, 27*time.Millisecond, snapshot.physicalDetail.pkCandidate.average(snapshot.count))
 	assert.Equal(t, time.Millisecond, snapshot.onLoaded.average(snapshot.count))
 
 	_, ok = stats.add(startedAt.Add(2*time.Second), segmentLoadTimingSample{})

@@ -1285,10 +1285,20 @@ func (s *LocalSegment) syncFieldJSONStatsFromLoadInfo(ctx context.Context, loadI
 }
 
 func (s *LocalSegment) Load(ctx context.Context) error {
-	if err := s.csegment.Load(ctx); err != nil {
+	physicalLoadTiming := PhysicalLoadTimingFromContext(ctx)
+	startedAt := time.Now()
+	err := s.csegment.Load(ctx)
+	if physicalLoadTiming != nil {
+		physicalLoadTiming.CSegmentLoad = time.Since(startedAt)
+	}
+	if err != nil {
 		return err
 	}
+	startedAt = time.Now()
 	s.syncFieldJSONStatsFromLoadInfo(ctx, s.LoadInfo())
+	if physicalLoadTiming != nil {
+		physicalLoadTiming.SyncJSONStats = time.Since(startedAt)
+	}
 	return nil
 }
 
