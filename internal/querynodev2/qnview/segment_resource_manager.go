@@ -560,9 +560,11 @@ func (r *segmentResource) prepare(ctx context.Context, b *segmentBinding, collec
 	}
 	m.mu.Unlock()
 	if base == nil {
+		physicalLoadDetail := &segments.PhysicalLoadTiming{}
 		physicalLoadStartedAt := time.Now()
-		segment, err := m.loader.Load(ctx, info, collection)
+		segment, err := m.loader.Load(segments.WithPhysicalLoadTiming(ctx, physicalLoadDetail), info, collection)
 		timing.physicalLoad = time.Since(physicalLoadStartedAt)
+		timing.physicalDetail = *physicalLoadDetail
 		if err != nil {
 			return nil, err
 		}

@@ -18,12 +18,14 @@ import (
 )
 
 func TestQueryViewPhysicalSegmentLoader_LoadBorrowsCollectionAndWrapsSegment(t *testing.T) {
-	segments := &fakeQVSegmentManager{}
+	timing := &segments.PhysicalLoadTiming{}
+	ctx := segments.WithPhysicalLoadTiming(context.Background(), timing)
+	segmentManager := &fakeQVSegmentManager{}
 	loader := &fakeQVLoader{segment: &fakeQVSegment{id: 10, partitionID: 100}}
-	physical := newQueryViewPhysicalSegmentLoader(segments, loader)
+	physical := newQueryViewPhysicalSegmentLoader(segmentManager, loader)
 
 	loaded, err := physical.Load(
-		context.Background(),
+		ctx,
 		&querypb.SegmentLoadInfo{CollectionID: 1, SegmentID: 10, PartitionID: 100, InsertChannel: "v1", DeltaPosition: &msgpb.MsgPosition{Timestamp: 999}, TransformStartAfterTimetick: 50},
 		fakeQVCollectionRuntime{collectionID: 1, schema: &schemapb.CollectionSchema{Name: "coll"}, schemaVersion: 9},
 	)
@@ -35,6 +37,10 @@ func TestQueryViewPhysicalSegmentLoader_LoadBorrowsCollectionAndWrapsSegment(t *
 	assert.True(t, loader.deltaCalled)
 	assert.True(t, loader.pkCalled)
 	assert.True(t, loader.finalized)
+	assert.NotZero(t, timing.NewSegment)
+	assert.NotZero(t, timing.LoadSegment)
+	assert.NotZero(t, timing.DeltaLogs)
+	assert.NotZero(t, timing.PKCandidate)
 	assert.Equal(t, int64(10), loaded.ID())
 	assert.Equal(t, int64(100), loaded.PartitionID())
 	assert.Equal(t, "v1", loaded.VChannel())
