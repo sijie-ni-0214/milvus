@@ -2,6 +2,7 @@ package idf
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -10,6 +11,7 @@ import (
 	"github.com/bytedance/mockey"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/sync/semaphore"
 	"google.golang.org/grpc"
 
 	"github.com/milvus-io/milvus-proto/go-api/v3/schemapb"
@@ -118,6 +120,102 @@ func TestOracleRuntimeSchedulesCoalescedAdvance(t *testing.T) {
 	callsMu.Lock()
 	require.Equal(t, []qviews.DataVersion{latest}, calls)
 	callsMu.Unlock()
+}
+
+func TestAcquireSealedContributionsUsesSharedLimit(t *testing.T) {
+	stats := storage.NewBM25Stats()
+	stats.Append(map[uint32]float32{1: 1})
+	statsBytes, err := stats.Serialize()
+	require.NoError(t, err)
+
+	chunkManager := mocks.NewChunkManager(t)
+	var active atomic.Int32
+	var maxActive atomic.Int32
+	var started atomic.Int32
+	firstBatchStarted := make(chan struct{})
+	release := make(chan struct{})
+	chunkManager.EXPECT().Read(mock.Anything, mock.Anything).
+		RunAndReturn(func(ctx context.Context, _ string) ([]byte, error) {
+			current := active.Add(1)
+			defer active.Add(-1)
+			for {
+				observed := maxActive.Load()
+				if current <= observed || maxActive.CompareAndSwap(observed, current) {
+					break
+				}
+			}
+			if started.Add(1) == 2 {
+				close(firstBatchStarted)
+			}
+			select {
+			case <-release:
+				return statsBytes, nil
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		}).Times(4)
+
+	limiter := semaphore.NewWeighted(2)
+	providers := []*Provider{
+		{chunkManager: chunkManager, sealedCache: newSegmentCache(), sealedStatsLoadLimiter: limiter},
+		{chunkManager: chunkManager, sealedCache: newSegmentCache(), sealedStatsLoadLimiter: limiter},
+	}
+	type result struct {
+		contributions map[int64]sealedContribution
+		err           error
+	}
+	results := make(chan result, len(providers))
+	for i, provider := range providers {
+		resources := testSealedBM25Resources(int64(i*2+1), 2)
+		go func(provider *Provider, resources []*datapb.StreamingNodeBM25Resource) {
+			contributions, err := provider.acquireSealedContributions(context.Background(), resources)
+			results <- result{contributions: contributions, err: err}
+		}(provider, resources)
+	}
+
+	select {
+	case <-firstBatchStarted:
+	case <-time.After(time.Second):
+		t.Fatal("sealed BM25 stats loads did not start")
+	}
+	close(release)
+	for range providers {
+		result := <-results
+		require.NoError(t, result.err)
+		require.Len(t, result.contributions, 2)
+		for _, contribution := range result.contributions {
+			contribution.lease.Close()
+		}
+	}
+	require.Equal(t, int32(2), maxActive.Load())
+}
+
+func TestAcquireSealedContributionsReleasesLeasesAfterError(t *testing.T) {
+	stats := storage.NewBM25Stats()
+	stats.Append(map[uint32]float32{1: 1})
+	statsBytes, err := stats.Serialize()
+	require.NoError(t, err)
+
+	goodRead := make(chan struct{})
+	chunkManager := mocks.NewChunkManager(t)
+	chunkManager.EXPECT().Read(mock.Anything, mock.Anything).
+		RunAndReturn(func(_ context.Context, path string) ([]byte, error) {
+			if path == "stats-1" {
+				close(goodRead)
+				return statsBytes, nil
+			}
+			<-goodRead
+			return nil, merr.WrapErrDataIntegrityMsg("test sealed stats read failure")
+		}).Times(2)
+
+	provider := &Provider{
+		chunkManager:           chunkManager,
+		sealedCache:            newSegmentCache(),
+		sealedStatsLoadLimiter: semaphore.NewWeighted(2),
+	}
+	_, err = provider.acquireSealedContributions(context.Background(), testSealedBM25Resources(1, 2))
+	require.Error(t, err)
+	require.Empty(t, provider.sealedCache.entries)
 }
 
 func TestOracleRuntimeCloseCancelsScheduledAdvance(t *testing.T) {
@@ -623,4 +721,23 @@ func oracleCurrentVersion(oracle *oracleRuntime) qviews.DataVersion {
 	oracle.mu.RLock()
 	defer oracle.mu.RUnlock()
 	return oracle.currentVersion
+}
+
+func testSealedBM25Resources(firstSegmentID int64, count int) []*datapb.StreamingNodeBM25Resource {
+	resources := make([]*datapb.StreamingNodeBM25Resource, 0, count)
+	for i := range count {
+		segmentID := firstSegmentID + int64(i)
+		resources = append(resources, &datapb.StreamingNodeBM25Resource{
+			SegmentId:      segmentID,
+			PartitionId:    segmentID,
+			StorageVersion: storage.StorageV2,
+			Bm25Binlogs: []*datapb.FieldBinlog{{
+				FieldID: testBM25OutputFieldID,
+				Binlogs: []*datapb.Binlog{{
+					LogPath: fmt.Sprintf("stats-%d", segmentID),
+				}},
+			}},
+		})
+	}
+	return resources
 }

@@ -6,6 +6,7 @@ import (
 	"sync"
 
 	"github.com/cockroachdb/errors"
+	"golang.org/x/sync/errgroup"
 
 	"github.com/milvus-io/milvus-proto/go-api/v3/schemapb"
 	"github.com/milvus-io/milvus/internal/storage"
@@ -1081,24 +1082,56 @@ func (p *Provider) acquireSealedContributions(
 	ctx context.Context,
 	resources []*datapb.StreamingNodeBM25Resource,
 ) (map[int64]sealedContribution, error) {
-	contributions := make(map[int64]sealedContribution, len(resources))
-	for _, resource := range resources {
-		stats, lease, err := p.sealedCache.acquire(ctx, p.chunkManager, resource)
-		if err != nil {
-			for _, contribution := range contributions {
-				if contribution.lease != nil {
-					contribution.lease.Close()
-				}
+	loaded := make([]sealedContribution, len(resources))
+	keepLeases := false
+	defer func() {
+		if keepLeases {
+			return
+		}
+		for _, contribution := range loaded {
+			if contribution.lease != nil {
+				contribution.lease.Close()
+			}
+		}
+	}()
+
+	limiter := p.sealedStatsLoadLimiter
+	if limiter == nil {
+		limiter = getGlobalSealedStatsLoadLimiter()
+	}
+	group, groupCtx := errgroup.WithContext(ctx)
+	for i, resource := range resources {
+		if err := limiter.Acquire(groupCtx, 1); err != nil {
+			if groupErr := group.Wait(); groupErr != nil {
+				return nil, groupErr
 			}
 			return nil, err
 		}
-		contributions[resource.GetSegmentId()] = sealedContribution{
-			segmentID:   resource.GetSegmentId(),
-			partitionID: resource.GetPartitionId(),
-			stats:       stats,
-			lease:       lease,
-		}
+		i, resource := i, resource
+		group.Go(func() error {
+			defer limiter.Release(1)
+			stats, lease, err := p.sealedCache.acquire(groupCtx, p.chunkManager, resource)
+			if err != nil {
+				return err
+			}
+			loaded[i] = sealedContribution{
+				segmentID:   resource.GetSegmentId(),
+				partitionID: resource.GetPartitionId(),
+				stats:       stats,
+				lease:       lease,
+			}
+			return nil
+		})
 	}
+	if err := group.Wait(); err != nil {
+		return nil, err
+	}
+
+	contributions := make(map[int64]sealedContribution, len(loaded))
+	for _, contribution := range loaded {
+		contributions[contribution.segmentID] = contribution
+	}
+	keepLeases = true
 	return contributions, nil
 }
 

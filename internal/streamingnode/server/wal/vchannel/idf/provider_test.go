@@ -105,3 +105,17 @@ func setLazyLoadSealedStats(t *testing.T, enabled bool) {
 		require.NoError(t, params.Reset(key))
 	})
 }
+
+func TestSealedStatsLoadConcurrency(t *testing.T) {
+	require.Equal(t, int64(64), sealedStatsLoadConcurrency(16, 4))
+	require.Equal(t, int64(8), sealedStatsLoadConcurrency(16, 0.5))
+	require.Equal(t, int64(1), sealedStatsLoadConcurrency(1, 0.5))
+	require.Equal(t, int64(1), sealedStatsLoadConcurrency(0, 4))
+	require.Equal(t, int64(1), sealedStatsLoadConcurrency(16, 0))
+}
+
+func TestProvidersShareSealedStatsLoadLimiter(t *testing.T) {
+	provider := NewProvider(nil)
+	futureProvider := NewFutureProvider(nil)
+	require.Same(t, provider.sealedStatsLoadLimiter, futureProvider.sealedStatsLoadLimiter)
+}
