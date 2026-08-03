@@ -32,6 +32,39 @@ func TestManagerSharesDefaultBuildersAndLazilyAllocatesRefs(t *testing.T) {
 	assert.Nil(t, second.refs)
 }
 
+func TestManagerRetriesViewBuildUntilSnapshotReady(t *testing.T) {
+	scheduler := nodescheduler.New(1)
+	defer scheduler.Close()
+	dispatcher := NewDispatcher(1)
+	defer dispatcher.Close()
+
+	manager := NewManager(Config{
+		Scheduler:  scheduler,
+		Dispatcher: dispatcher,
+	})
+	var snapshotReady atomic.Bool
+	var attempts atomic.Int32
+	ready := make(chan struct{})
+	meta, key := testManagerQueryViewMetaAndKey(1)
+	manager.Acquire(snview.AcquireResource{Key: key, Meta: meta, OnReady: func() { close(ready) }}, func(*viewpb.QueryViewMeta) (walview.VChannelWALView, bool) {
+		attempts.Add(1)
+		return walview.VChannelWALView{}, snapshotReady.Load()
+	})
+
+	require.Eventually(t, func() bool {
+		return attempts.Load() > 0
+	}, time.Second, time.Millisecond)
+	snapshotReady.Store(true)
+	require.Eventually(t, func() bool {
+		select {
+		case <-ready:
+			return true
+		default:
+			return false
+		}
+	}, time.Second, time.Millisecond)
+}
+
 func TestManagerBuildNotifiesAllCurrentRefsWithoutWaiterGoroutines(t *testing.T) {
 	scheduler := nodescheduler.New(1)
 	defer scheduler.Close()
@@ -52,11 +85,11 @@ func TestManagerBuildNotifiesAllCurrentRefsWithoutWaiterGoroutines(t *testing.T)
 	ready1 := make(chan struct{})
 	ready2 := make(chan struct{})
 	meta1, key1 := testManagerQueryViewMetaAndKey(1)
-	manager.AcquireLocked(snview.AcquireResource{Key: key1, Meta: meta1, OnReady: func() { close(ready1) }}, testManagerViewBuilder)
+	manager.Acquire(snview.AcquireResource{Key: key1, Meta: meta1, OnReady: func() { close(ready1) }}, testManagerViewBuilder)
 	<-started
 
 	meta2, key2 := testManagerQueryViewMetaAndKey(2)
-	manager.AcquireLocked(snview.AcquireResource{Key: key2, Meta: meta2, OnReady: func() { close(ready2) }}, testManagerViewBuilder)
+	manager.Acquire(snview.AcquireResource{Key: key2, Meta: meta2, OnReady: func() { close(ready2) }}, testManagerViewBuilder)
 	close(release)
 
 	require.Eventually(t, func() bool {
@@ -104,7 +137,7 @@ func TestManagerWaitsForExactDataVersionBeforeReady(t *testing.T) {
 
 	ready1 := make(chan struct{})
 	meta1, key1 := testManagerQueryViewMetaAndKey(1)
-	manager.AcquireLocked(snview.AcquireResource{Key: key1, Meta: meta1, OnReady: func() { close(ready1) }}, testManagerViewBuilder)
+	manager.Acquire(snview.AcquireResource{Key: key1, Meta: meta1, OnReady: func() { close(ready1) }}, testManagerViewBuilder)
 	require.Eventually(t, func() bool {
 		select {
 		case <-ready1:
@@ -116,7 +149,7 @@ func TestManagerWaitsForExactDataVersionBeforeReady(t *testing.T) {
 
 	ready2 := make(chan struct{})
 	meta2, key2 := testManagerQueryViewMetaAndKey(2)
-	manager.AcquireLocked(snview.AcquireResource{Key: key2, Meta: meta2, OnReady: func() { close(ready2) }}, testManagerViewBuilder)
+	manager.Acquire(snview.AcquireResource{Key: key2, Meta: meta2, OnReady: func() { close(ready2) }}, testManagerViewBuilder)
 	select {
 	case <-ready2:
 		t.Fatal("query view became ready before its data version was prepared")
@@ -155,7 +188,7 @@ func TestManagerRetriesDataVersionPreparationBeforeReady(t *testing.T) {
 
 	ready := make(chan struct{})
 	meta, key := testManagerQueryViewMetaAndKey(1)
-	manager.AcquireLocked(snview.AcquireResource{Key: key, Meta: meta, OnReady: func() { close(ready) }}, testManagerViewBuilder)
+	manager.Acquire(snview.AcquireResource{Key: key, Meta: meta, OnReady: func() { close(ready) }}, testManagerViewBuilder)
 	require.Eventually(t, func() bool {
 		select {
 		case <-ready:
@@ -208,7 +241,7 @@ func TestManagerReleasesDataVersionPreparedAfterViewWasDropped(t *testing.T) {
 
 	ready1 := make(chan struct{})
 	meta1, key1 := testManagerQueryViewMetaAndKey(1)
-	manager.AcquireLocked(snview.AcquireResource{Key: key1, Meta: meta1, OnReady: func() { close(ready1) }}, testManagerViewBuilder)
+	manager.Acquire(snview.AcquireResource{Key: key1, Meta: meta1, OnReady: func() { close(ready1) }}, testManagerViewBuilder)
 	require.Eventually(t, func() bool {
 		select {
 		case <-ready1:
@@ -219,7 +252,7 @@ func TestManagerReleasesDataVersionPreparedAfterViewWasDropped(t *testing.T) {
 	}, time.Second, time.Millisecond)
 
 	meta2, key2 := testManagerQueryViewMetaAndKey(2)
-	manager.AcquireLocked(snview.AcquireResource{Key: key2, Meta: meta2, OnReady: func() {}}, testManagerViewBuilder)
+	manager.Acquire(snview.AcquireResource{Key: key2, Meta: meta2, OnReady: func() {}}, testManagerViewBuilder)
 	<-started
 	manager.Release(snview.ReleaseResource{Key: key2})
 	close(finish)
@@ -251,7 +284,7 @@ func TestManagerKeepsDataVersionWhileAnotherQueryViewReferencesIt(t *testing.T) 
 
 	meta1, key1 := testManagerQueryViewMetaAndKey(1)
 	ready1 := make(chan struct{})
-	manager.AcquireLocked(snview.AcquireResource{Key: key1, Meta: meta1, OnReady: func() { close(ready1) }}, testManagerViewBuilder)
+	manager.Acquire(snview.AcquireResource{Key: key1, Meta: meta1, OnReady: func() { close(ready1) }}, testManagerViewBuilder)
 	require.Eventually(t, func() bool {
 		select {
 		case <-ready1:
@@ -266,7 +299,7 @@ func TestManagerKeepsDataVersionWhileAnotherQueryViewReferencesIt(t *testing.T) 
 	meta2 := proto.Clone(meta1).(*viewpb.QueryViewMeta)
 	meta2.Version.QueryVersion = 2
 	ready2 := make(chan struct{})
-	manager.AcquireLocked(snview.AcquireResource{Key: key2, Meta: meta2, OnReady: func() { close(ready2) }}, testManagerViewBuilder)
+	manager.Acquire(snview.AcquireResource{Key: key2, Meta: meta2, OnReady: func() { close(ready2) }}, testManagerViewBuilder)
 	require.Eventually(t, func() bool {
 		select {
 		case <-ready2:
@@ -348,7 +381,7 @@ func TestManagerCloseWaitsForRunningBuild(t *testing.T) {
 		ShardID:          qviews.ShardID{ReplicaID: 1, VChannel: "v1"},
 		QueryViewVersion: version,
 	}
-	manager.AcquireLocked(snview.AcquireResource{
+	manager.Acquire(snview.AcquireResource{
 		Key: key,
 		Meta: &viewpb.QueryViewMeta{
 			ReplicaId: 1,
@@ -401,7 +434,7 @@ func TestManagerResolveLoadInfoFailureDelaysBuild(t *testing.T) {
 	})
 	meta, key := testManagerQueryViewMetaAndKey(1)
 	meta.LoadInfoVersion = 7
-	manager.AcquireLocked(snview.AcquireResource{Key: key, Meta: meta}, func(meta *viewpb.QueryViewMeta) (walview.VChannelWALView, bool) {
+	manager.Acquire(snview.AcquireResource{Key: key, Meta: meta}, func(meta *viewpb.QueryViewMeta) (walview.VChannelWALView, bool) {
 		return walview.VChannelWALView{
 			CollectionID:    1,
 			LoadInfoVersion: meta.GetLoadInfoVersion(),

@@ -22,8 +22,14 @@ func (m *VChannelRecoveryModule) AcquireQueryResource(req snview.AcquireResource
 		m.mu.Unlock()
 		return
 	}
-	m.queryResources.AcquireLocked(req, m.queryWALViewLocked)
+	m.queryResources.Acquire(req, m.queryWALView)
 	m.mu.Unlock()
+}
+
+func (m *VChannelRecoveryModule) queryWALView(meta *viewpb.QueryViewMeta) (walview.VChannelWALView, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.queryWALViewLocked(meta)
 }
 
 func (m *VChannelRecoveryModule) ReleaseQueryResource(req snview.ReleaseResource) {
