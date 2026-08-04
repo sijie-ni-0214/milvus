@@ -311,21 +311,19 @@ func (s *SegmentManager) AllocSegment(ctx context.Context, collectionID UniqueID
 
 	// filter segments
 	segmentInfos := make([]*SegmentInfo, 0)
-	// The concurrent set is a pointer: never Range over a missing one.
 	growing, _ := s.channel2Growing.GetOrInsert(channelName, typeutil.NewConcurrentSet[int64]())
-	growing.Range(func(segmentID int64) bool {
+	for _, segmentID := range growing.Collect() {
 		segment := s.meta.GetHealthySegment(ctx, segmentID)
 		if segment == nil {
 			mlog.Warn(context.TODO(), "failed to get segment, remove it", mlog.String("channel", channelName), mlog.Int64("segmentID", segmentID))
 			growing.Remove(segmentID)
-			return true
+			continue
 		}
 		if segment.GetPartitionID() != partitionID {
-			return true
+			continue
 		}
 		segmentInfos = append(segmentInfos, segment)
-		return true
-	})
+	}
 
 	// Apply allocation policy.
 	maxCountPerSegment, err := s.estimateMaxNumOfRows(collectionID)
@@ -606,12 +604,12 @@ func (s *SegmentManager) ExpireAllocations(ctx context.Context, channel string, 
 		return
 	}
 
-	growing.Range(func(id int64) bool {
+	for _, id := range growing.Collect() {
 		segment := s.meta.GetHealthySegment(ctx, id)
 		if segment == nil {
 			mlog.Warn(context.TODO(), "failed to get segment, remove it", mlog.String("channel", channel), mlog.Int64("segmentID", id))
 			growing.Remove(id)
-			return true
+			continue
 		}
 		allocations := make([]*Allocation, 0, len(segment.allocations))
 		for i := 0; i < len(segment.allocations); i++ {
@@ -623,8 +621,7 @@ func (s *SegmentManager) ExpireAllocations(ctx context.Context, channel string, 
 			}
 		}
 		s.meta.SetAllocations(segment.GetID(), allocations)
-		return true
-	})
+	}
 }
 
 func (s *SegmentManager) CleanZeroSealedSegmentsOfChannel(ctx context.Context, channel string, cpTs Timestamp) {
@@ -635,12 +632,12 @@ func (s *SegmentManager) CleanZeroSealedSegmentsOfChannel(ctx context.Context, c
 	if !ok {
 		return
 	}
-	sealed.Range(func(id int64) bool {
+	for _, id := range sealed.Collect() {
 		segment := s.meta.GetHealthySegment(ctx, id)
 		if segment == nil {
 			mlog.Warn(context.TODO(), "try remove empty sealed segment, failed to get segment, remove it in channel2Sealed", mlog.String("channel", channel), mlog.Int64("segmentID", id))
 			sealed.Remove(id)
-			return true
+			continue
 		}
 		// Check if segment is empty
 		if segment.GetLastExpireTime() > 0 && segment.GetLastExpireTime() < cpTs && segment.GetNumOfRows() == 0 {
@@ -657,8 +654,7 @@ func (s *SegmentManager) CleanZeroSealedSegmentsOfChannel(ctx context.Context, c
 					mlog.String("channel", channel), mlog.Any("cpTs", cpTs), mlog.Any("expireTs", segment.GetLastExpireTime()))
 			}
 		}
-		return true
-	})
+	}
 }
 
 // tryToSealSegment applies segment & channel seal policies
@@ -672,11 +668,10 @@ func (s *SegmentManager) tryToSealSegment(ctx context.Context, ts Timestamp, cha
 	channelSegmentInfos := make([]*SegmentInfo, 0)
 	sealedSegments := make(map[int64]struct{})
 
-	var setStateErr error
-	growing.Range(func(id int64) bool {
+	for _, id := range growing.Collect() {
 		info := s.meta.GetHealthySegment(ctx, id)
 		if info == nil {
-			return true
+			continue
 		}
 		channelSegmentInfos = append(channelSegmentInfos, info)
 		// change shouldSeal to segment seal policy logic
@@ -684,8 +679,7 @@ func (s *SegmentManager) tryToSealSegment(ctx context.Context, ts Timestamp, cha
 			if shouldSeal, reason := policy.ShouldSeal(info, ts); shouldSeal {
 				mlog.Info(context.TODO(), "Seal Segment for policy matched", mlog.Int64("segmentID", info.GetID()), mlog.String("reason", reason))
 				if err := s.meta.SetState(ctx, id, commonpb.SegmentState_Sealed); err != nil {
-					setStateErr = err
-					return false
+					return err
 				}
 				sealedSegments[id] = struct{}{}
 				sealed.Insert(id)
@@ -693,11 +687,6 @@ func (s *SegmentManager) tryToSealSegment(ctx context.Context, ts Timestamp, cha
 				break
 			}
 		}
-		return true
-	})
-
-	if setStateErr != nil {
-		return setStateErr
 	}
 
 	for _, policy := range s.channelSealPolicies {
@@ -729,19 +718,18 @@ func (s *SegmentManager) DropSegmentsOfChannel(ctx context.Context, channel stri
 	if !ok {
 		return
 	}
-	growing.Range(func(sid int64) bool {
+	for _, sid := range growing.Collect() {
 		segment := s.meta.GetHealthySegment(ctx, sid)
 		if segment == nil {
 			mlog.Warn(context.TODO(), "failed to get segment, remove it", mlog.String("channel", channel), mlog.Int64("segmentID", sid))
 			growing.Remove(sid)
-			return true
+			continue
 		}
 		s.meta.SetAllocations(sid, nil)
 		for _, allocation := range segment.allocations {
 			putAllocation(allocation)
 		}
-		return true
-	})
+	}
 	s.channel2Growing.Remove(channel)
 }
 
@@ -749,14 +737,14 @@ func (s *SegmentManager) DropSegmentsOfPartition(ctx context.Context, channel st
 	s.channelLock.Lock(channel)
 	defer s.channelLock.Unlock(channel)
 	if growing, ok := s.channel2Growing.Get(channel); ok {
-		growing.Range(func(sid int64) bool {
+		for _, sid := range growing.Collect() {
 			segment := s.meta.GetHealthySegment(ctx, sid)
 			if segment == nil {
 				mlog.Warn(context.TODO(), "failed to get segment, remove it",
 					mlog.String("channel", channel),
 					mlog.Int64("segmentID", sid))
 				growing.Remove(sid)
-				return true
+				continue
 			}
 
 			if contains(partitionIDs, segment.GetPartitionID()) {
@@ -766,19 +754,18 @@ func (s *SegmentManager) DropSegmentsOfPartition(ctx context.Context, channel st
 			for _, allocation := range segment.allocations {
 				putAllocation(allocation)
 			}
-			return true
-		})
+		}
 	}
 
 	if sealed, ok := s.channel2Sealed.Get(channel); ok {
-		sealed.Range(func(sid int64) bool {
+		for _, sid := range sealed.Collect() {
 			segment := s.meta.GetHealthySegment(ctx, sid)
 			if segment == nil {
 				mlog.Warn(context.TODO(), "failed to get segment, remove it",
 					mlog.String("channel", channel),
 					mlog.Int64("segmentID", sid))
 				sealed.Remove(sid)
-				return true
+				continue
 			}
 			if contains(partitionIDs, segment.GetPartitionID()) {
 				sealed.Remove(sid)
@@ -787,7 +774,6 @@ func (s *SegmentManager) DropSegmentsOfPartition(ctx context.Context, channel st
 			for _, allocation := range segment.allocations {
 				putAllocation(allocation)
 			}
-			return true
-		})
+		}
 	}
 }

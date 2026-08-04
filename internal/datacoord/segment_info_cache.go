@@ -305,17 +305,15 @@ func (s *CachedSegmentsInfo) reindex(old *SegmentInfo, existed bool, segment *Se
 // DropSegment removes the segment from the cache. A version > 0 is retained
 // as a tombstone until PruneSegment so that stale writes are rejected.
 func (s *CachedSegmentsInfo) DropSegment(segmentID UniqueID, version ...int64) {
-	old, ok := s.segments.Lookup(segmentID)
-	if !ok {
-		return
-	}
-	s.removeSecondaryIndex(old)
-	s.deleteCompactTo(old)
 	v := versionArg(version)
-	// Only the drop that erases the live value counts it, so concurrent drops
-	// of one segment decrement once.
-	if erased := s.segments.Erase(segmentID, v); erased != nil {
-		segmentMetricTransition(erased, nil)
+	// Erase first: a stale drop is rejected and must leave the indexes intact;
+	// a drop over a tombstone still advances the tombstone version. Only the
+	// drop that erases the live value counts it, so concurrent drops of one
+	// segment decrement once.
+	if old := s.segments.Erase(segmentID, v); old != nil {
+		s.removeSecondaryIndex(old)
+		s.deleteCompactTo(old)
+		segmentMetricTransition(old, nil)
 	}
 	if v <= 0 {
 		s.segments.Prune(segmentID)

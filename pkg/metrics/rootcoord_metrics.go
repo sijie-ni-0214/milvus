@@ -46,6 +46,15 @@ var (
 			Buckets:   buckets,
 		}, []string{functionLabelName})
 
+	RootCoordDDLCallbackDuration = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Namespace: milvusNamespace,
+			Subsystem: typeutil.RootCoordRole,
+			Name:      "ddl_callback_duration",
+			Help:      "latency of each DDL callback stage",
+			Buckets:   subMsBuckets,
+		}, []string{functionLabelName, "stage"})
+
 	// RootCoordSyncTimeTickLatency records the latency of sync time tick.
 	RootCoordSyncTimeTickLatency = prometheus.NewHistogram(
 		prometheus.HistogramOpts{
@@ -259,6 +268,7 @@ func RegisterMixCoord(registry *prometheus.Registry) {
 	// for DDL
 	registry.MustRegister(RootCoordDDLReqCounter)
 	registry.MustRegister(RootCoordDDLReqLatency)
+	registry.MustRegister(RootCoordDDLCallbackDuration)
 
 	// for allocator
 	registry.MustRegister(RootCoordIDAllocCounter)

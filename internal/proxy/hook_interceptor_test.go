@@ -7,6 +7,7 @@ import (
 
 	"github.com/bytedance/mockey"
 	"github.com/cockroachdb/errors"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
@@ -17,6 +18,7 @@ import (
 	"github.com/milvus-io/milvus-proto/go-api/v3/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v3/milvuspb"
 	"github.com/milvus-io/milvus/internal/util/hookutil"
+	"github.com/milvus-io/milvus/pkg/v3/metrics"
 	"github.com/milvus-io/milvus/pkg/v3/proto/internalpb"
 	"github.com/milvus-io/milvus/pkg/v3/util/crypto"
 	"github.com/milvus-io/milvus/pkg/v3/util/merr"
@@ -209,11 +211,18 @@ func TestHookInterceptorDoesNotLogCredentialRequests(t *testing.T) {
 }
 
 func TestUpdateProxyFunctionCallMetric(t *testing.T) {
+	metrics.ProxyFunctionCall.Reset()
+	t.Cleanup(metrics.ProxyFunctionCall.Reset)
+
 	assert.NotPanics(t, func() {
 		updateProxyFunctionCallMetric("/milvus.proto.milvus.MilvusService/Flush", errors.New("mock hook error"))
 		updateProxyFunctionCallMetric("Flush", merr.WrapErrParameterInvalidMsg("mock input error"))
 		updateProxyFunctionCallMetric("", nil)
 	})
+
+	metrics.ProxyFunctionCall.Reset()
+	updateProxyFunctionCallMetric(milvuspb.MilvusService_DropCollection_FullMethodName, errors.New("mock hook error"))
+	assert.Equal(t, 0, testutil.CollectAndCount(metrics.ProxyFunctionCall))
 }
 
 func TestHookInterceptorRedactsImportCredentials(t *testing.T) {

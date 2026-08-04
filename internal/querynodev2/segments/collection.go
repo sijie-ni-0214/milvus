@@ -436,6 +436,14 @@ func (c *Collection) updateIndexMeta(meta *segcorepb.CollectionIndexMeta) error 
 	if meta == nil {
 		return nil
 	}
+	blob, err := proto.Marshal(meta)
+	if err != nil {
+		return err
+	}
+	indexHash, err := typeutil.Hash32Bytes(blob)
+	if err != nil {
+		return err
+	}
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -443,10 +451,14 @@ func (c *Collection) updateIndexMeta(meta *segcorepb.CollectionIndexMeta) error 
 	if c.ccollection == nil {
 		return merr.WrapErrServiceInternal("update index meta on released collection")
 	}
-	if proto.Equal(c.ccollection.IndexMeta(), meta) {
+	if indexHash == c.indexHash.Load() {
 		return nil
 	}
-	return c.ccollection.UpdateIndexMeta(meta)
+	if err := c.ccollection.UpdateIndexMeta(meta); err != nil {
+		return err
+	}
+	c.indexHash.Store(indexHash)
+	return nil
 }
 
 // UpdateIndexMeta updates the native collection index metadata while keeping

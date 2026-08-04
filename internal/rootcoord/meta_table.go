@@ -64,6 +64,8 @@ var (
 	errAlterCollectionNotFound = errors.New("alter collection not found") // alter collection not found, so it can be ignored.
 )
 
+const metaRecoveryProgressLogInterval = 10000
+
 type MetaTableChecker interface {
 	RBACChecker
 
@@ -218,6 +220,7 @@ func (mt *MetaTable) reload() error {
 	defer mt.ddLock.Unlock()
 
 	record := timerecord.NewTimeRecorder("rootcoord")
+	mlog.Info(mt.ctx, "rootcoord meta recovery started")
 	mt.dbName2Meta = make(map[string]*model.Database)
 	mt.collID2Meta = make(map[UniqueID]*model.Collection)
 	mt.partitionName2ID = make(map[int64]map[string]int64)
@@ -231,53 +234,67 @@ func (mt *MetaTable) reload() error {
 	metrics.RootCoordNumOfDatabases.Set(0)
 
 	// recover databases.
+	databaseScanStart := time.Now()
+	mlog.Info(mt.ctx, "rootcoord database catalog scan started")
 	dbs, err := mt.catalog.ListDatabases(mt.ctx, typeutil.MaxTimestamp)
 	if err != nil {
 		return err
 	}
 
-	mlog.Info(mt.ctx, "recover databases", mlog.Int("num of dbs", len(dbs)))
+	mlog.Info(mt.ctx, "rootcoord database catalog scan done",
+		mlog.Int("numDatabases", len(dbs)),
+		mlog.Duration("duration", time.Since(databaseScanStart)))
 	for _, db := range dbs {
 		mt.dbName2Meta[db.Name] = db
 	}
 	dbNames := maps.Keys(mt.dbName2Meta)
 	// create default database.
+	defaultDatabaseStart := time.Now()
+	defaultDatabaseCreated := false
 	if !funcutil.SliceContain(dbNames, util.DefaultDBName) {
 		if err := mt.createDefaultDb(); err != nil {
 			return err
 		}
+		defaultDatabaseCreated = true
 	} else {
 		mt.names.createDbIfNotExist(util.DefaultDBName)
 		mt.aliases.createDbIfNotExist(util.DefaultDBName)
 	}
+	mlog.Info(mt.ctx, "rootcoord default database recovery done",
+		mlog.Bool("created", defaultDatabaseCreated),
+		mlog.Duration("duration", time.Since(defaultDatabaseStart)))
 
-	// Collections stored without a database are listed under util.NonDBID.
-	dbIDs := make([]int64, 0, len(mt.dbName2Meta)+1)
-	dbIDs = append(dbIDs, util.NonDBID)
-	for _, db := range mt.dbName2Meta {
-		dbIDs = append(dbIDs, db.ID)
-	}
-	collectionsByDB, err := mt.catalog.ListCollectionsForRecovery(mt.ctx, dbIDs, typeutil.MaxTimestamp)
+	collectionsByDB, err := mt.loadCollectionsForRecovery()
 	if err != nil {
 		return err
 	}
 
 	// in order to support backward compatibility with meta of the old version, it also
 	// needs to reload collections that have no database
+	legacyRecoveryStart := time.Now()
+	mlog.Info(mt.ctx, "rootcoord legacy metadata recovery started")
 	if err := mt.reloadWithNonDatabase(collectionsByDB[util.NonDBID]); err != nil {
 		return err
 	}
+	mlog.Info(mt.ctx, "rootcoord legacy metadata recovery done",
+		mlog.Duration("duration", time.Since(legacyRecoveryStart)))
 
 	// recover collections from db namespace
+	recoveredCollectionCount := len(mt.collID2Meta)
 	for dbName, db := range mt.dbName2Meta {
 		partitionNum := int64(0)
 		collectionNum := int64(0)
 
 		mt.names.createDbIfNotExist(dbName)
 
-		start := time.Now()
 		collections := collectionsByDB[db.ID]
-		for _, collection := range collections {
+		mlog.Info(mt.ctx, "rootcoord collection recovery result ready",
+			mlog.FieldDbName(dbName),
+			mlog.FieldDbID(db.ID),
+			mlog.Int("numCollections", len(collections)))
+
+		cacheBuildStart := time.Now()
+		for index, collection := range collections {
 			if collection.DBName != "" && collection.DBName != dbName {
 				mlog.Warn(mt.ctx,
 					"collection dbname is not correct, it will be fixed",
@@ -307,45 +324,105 @@ func (mt *MetaTable) reload() error {
 				collectionNum++
 				partitionNum += int64(pn)
 			}
+			recoveredCollectionCount++
+			completedInDatabase := index + 1
+			if completedInDatabase%metaRecoveryProgressLogInterval == 0 && completedInDatabase < len(collections) {
+				mlog.Info(mt.ctx, "rootcoord collection cache rebuild progress",
+					mlog.FieldDbName(dbName),
+					mlog.Int("completedDatabaseCollections", completedInDatabase),
+					mlog.Int("totalDatabaseCollections", len(collections)),
+					mlog.Int("completedCollections", recoveredCollectionCount),
+					mlog.Int64("availableCollections", collectionNum),
+					mlog.Int64("availablePartitions", partitionNum),
+					mlog.Duration("duration", time.Since(cacheBuildStart)))
+			}
 		}
 
 		metrics.RootCoordNumOfDatabases.Inc()
 		metrics.RootCoordNumOfCollections.WithLabelValues(dbName).Add(float64(collectionNum))
 		metrics.RootCoordNumOfPartitions.WithLabelValues().Add(float64(partitionNum))
-		mlog.Info(mt.ctx, "collections recovered from db", mlog.String("db_name", dbName),
-			mlog.Int64("collection_num", collectionNum),
-			mlog.Int64("partition_num", partitionNum),
-			mlog.Duration("dur", time.Since(start)))
+		mlog.Info(mt.ctx, "rootcoord collection cache rebuild done",
+			mlog.FieldDbName(dbName),
+			mlog.Int("numCatalogCollections", len(collections)),
+			mlog.Int64("numAvailableCollections", collectionNum),
+			mlog.Int64("numAvailablePartitions", partitionNum),
+			mlog.Duration("duration", time.Since(cacheBuildStart)))
 	}
 
 	// recover aliases from db namespace
+	aliasRecoveryStart := time.Now()
+	aliasCatalogDuration := time.Duration(0)
+	aliasCacheBuildDuration := time.Duration(0)
+	totalAliases := 0
+	mlog.Info(mt.ctx, "rootcoord alias recovery started", mlog.Int("numDatabases", len(mt.dbName2Meta)))
 	for dbName, db := range mt.dbName2Meta {
 		mt.aliases.createDbIfNotExist(dbName)
+		mlog.Info(mt.ctx, "rootcoord alias catalog scan started",
+			mlog.FieldDbName(dbName),
+			mlog.Int64("databaseID", db.ID))
+		catalogScanStart := time.Now()
 		aliases, err := mt.catalog.ListAliases(mt.ctx, db.ID, typeutil.MaxTimestamp)
 		if err != nil {
 			return err
 		}
+		catalogDuration := time.Since(catalogScanStart)
+		aliasCatalogDuration += catalogDuration
+		mlog.Info(mt.ctx, "rootcoord alias catalog scan done",
+			mlog.FieldDbName(dbName),
+			mlog.Int64("databaseID", db.ID),
+			mlog.Int("numAliases", len(aliases)),
+			mlog.Duration("duration", catalogDuration))
+		cacheBuildStart := time.Now()
 		for _, alias := range aliases {
 			mt.aliases.insert(dbName, alias.Name, alias.CollectionID)
 		}
+		aliasCacheBuildDuration += time.Since(cacheBuildStart)
+		totalAliases += len(aliases)
 	}
+	mlog.Info(mt.ctx, "rootcoord alias recovery done",
+		mlog.Int("numAliases", totalAliases),
+		mlog.Duration("catalogDuration", aliasCatalogDuration),
+		mlog.Duration("cacheBuildDuration", aliasCacheBuildDuration),
+		mlog.Duration("duration", time.Since(aliasRecoveryStart)))
 
+	availableCountStart := time.Now()
 	mt.rebuildAvailableCollectionCountLocked()
+	mlog.Info(mt.ctx, "rootcoord available collection counters rebuilt",
+		mlog.Int("numAvailableCollections", mt.availableCollectionCount),
+		mlog.Duration("duration", time.Since(availableCountStart)))
 
 	mlog.Info(mt.ctx, "rootcoord start to recover the channel stats for streaming coord balancer")
+	channelListBuildStart := time.Now()
 	vchannels := make([]string, 0, len(mt.collID2Meta)*2)
+	availableCollections := 0
 	for _, coll := range mt.collID2Meta {
 		if coll.Available() || coll.State == pb.CollectionState_CollectionRestoring {
+			availableCollections++
 			vchannels = append(vchannels, coll.VirtualChannelNames...)
 		}
 	}
+	mlog.Info(mt.ctx, "rootcoord streaming channel list rebuilt",
+		mlog.Int("numCollections", availableCollections),
+		mlog.Int("numVChannels", len(vchannels)),
+		mlog.Duration("duration", time.Since(channelListBuildStart)))
+	channelStatsRecoveryStart := time.Now()
 	channel.RecoverPChannelStatsManager(vchannels)
+	mlog.Info(mt.ctx, "rootcoord streaming channel stats recovery done",
+		mlog.Int("numVChannels", len(vchannels)),
+		mlog.Duration("duration", time.Since(channelStatsRecoveryStart)))
 
 	// reload file resources
+	fileResourceScanStart := time.Now()
+	mlog.Info(mt.ctx, "rootcoord file resource catalog scan started")
 	resources, version, err := mt.catalog.ListFileResource(mt.ctx)
 	if err != nil {
 		return err
 	}
+	mlog.Info(mt.ctx, "rootcoord file resource catalog scan done",
+		mlog.Int("numFileResources", len(resources)),
+		mlog.Uint64("version", version),
+		mlog.Duration("duration", time.Since(fileResourceScanStart)))
+	fileResourceCacheStart := time.Now()
 	mt.fileResourceName2Meta = make(map[string]*internalpb.FileResourceInfo)
 	mt.fileResourceID2Meta = make(map[int64]*internalpb.FileResourceInfo)
 	for _, resource := range resources {
@@ -353,16 +430,52 @@ func (mt *MetaTable) reload() error {
 		mt.fileResourceID2Meta[resource.Id] = resource
 	}
 	mt.fileResourceVersion = version
+	mlog.Info(mt.ctx, "rootcoord file resource cache rebuild done",
+		mlog.Int("numFileResources", len(resources)),
+		mlog.Duration("duration", time.Since(fileResourceCacheStart)))
 
-	mlog.Info(mt.ctx, "RootCoord meta table reload done", mlog.Duration("duration", record.ElapseSpan()))
+	mlog.Info(mt.ctx, "RootCoord meta table reload done",
+		mlog.Int("numCollections", len(mt.collID2Meta)),
+		mlog.Duration("duration", record.ElapseSpan()))
 	return nil
 }
 
 // insert into default database if the collections doesn't inside some database
+// loadCollectionsForRecovery lists the collections of every database, and those
+// stored without one under util.NonDBID, in one recovery pass.
+func (mt *MetaTable) loadCollectionsForRecovery() (map[int64][]*model.Collection, error) {
+	dbIDs := make([]int64, 0, len(mt.dbName2Meta)+1)
+	dbIDs = append(dbIDs, util.NonDBID)
+	for _, db := range mt.dbName2Meta {
+		dbIDs = append(dbIDs, db.ID)
+	}
+
+	start := time.Now()
+	mlog.Info(mt.ctx, "rootcoord collection recovery loader started",
+		mlog.Int("numDatabases", len(mt.dbName2Meta)))
+	collectionsByDB, err := mt.catalog.ListCollectionsForRecovery(mt.ctx, dbIDs, typeutil.MaxTimestamp)
+	if err != nil {
+		return nil, err
+	}
+	totalCollections := 0
+	for _, collections := range collectionsByDB {
+		totalCollections += len(collections)
+	}
+	mlog.Info(mt.ctx, "rootcoord collection recovery loader done",
+		mlog.Int("numCollections", totalCollections),
+		mlog.Int("numDatabases", len(mt.dbName2Meta)),
+		mlog.Duration("duration", time.Since(start)))
+	return collectionsByDB, nil
+}
+
 func (mt *MetaTable) reloadWithNonDatabase(oldCollections []*model.Collection) error {
+	mlog.Info(mt.ctx, "rootcoord legacy collection recovery result ready",
+		mlog.Int("numCollections", len(oldCollections)))
 	collectionNum := int64(0)
 	partitionNum := int64(0)
-	for _, collection := range oldCollections {
+
+	cacheBuildStart := time.Now()
+	for index, collection := range oldCollections {
 		ensureCollectionMaxFieldIDProperty(collection)
 		mt.collID2Meta[collection.CollectionID] = collection
 		if collection.Available() {
@@ -375,19 +488,37 @@ func (mt *MetaTable) reloadWithNonDatabase(oldCollections []*model.Collection) e
 			collectionNum++
 			partitionNum += int64(pn)
 		}
+		completed := index + 1
+		if completed%metaRecoveryProgressLogInterval == 0 && completed < len(oldCollections) {
+			mlog.Info(mt.ctx, "rootcoord legacy collection cache rebuild progress",
+				mlog.Int("completedCollections", completed),
+				mlog.Int("totalCollections", len(oldCollections)),
+				mlog.Int64("availableCollections", collectionNum),
+				mlog.Int64("availablePartitions", partitionNum),
+				mlog.Duration("duration", time.Since(cacheBuildStart)))
+		}
 	}
+	mlog.Info(mt.ctx, "rootcoord legacy collection cache rebuild done",
+		mlog.Int("numCatalogCollections", len(oldCollections)),
+		mlog.Int64("numAvailableCollections", collectionNum),
+		mlog.Int64("numAvailablePartitions", partitionNum),
+		mlog.Duration("duration", time.Since(cacheBuildStart)))
 
-	if collectionNum > 0 {
-		mlog.Info(mt.ctx, "recover collections without db", mlog.Int64("collection_num", collectionNum), mlog.Int64("partition_num", partitionNum))
-	}
-
+	aliasScanStart := time.Now()
 	aliases, err := mt.catalog.ListAliases(mt.ctx, util.NonDBID, typeutil.MaxTimestamp)
 	if err != nil {
 		return err
 	}
+	mlog.Info(mt.ctx, "rootcoord legacy alias catalog scan done",
+		mlog.Int("numAliases", len(aliases)),
+		mlog.Duration("duration", time.Since(aliasScanStart)))
+	aliasCacheStart := time.Now()
 	for _, alias := range aliases {
 		mt.aliases.insert(util.DefaultDBName, alias.Name, alias.CollectionID)
 	}
+	mlog.Info(mt.ctx, "rootcoord legacy alias cache rebuild done",
+		mlog.Int("numAliases", len(aliases)),
+		mlog.Duration("duration", time.Since(aliasCacheStart)))
 
 	metrics.RootCoordNumOfCollections.WithLabelValues(util.DefaultDBName).Add(float64(collectionNum))
 	metrics.RootCoordNumOfPartitions.WithLabelValues().Add(float64(partitionNum))

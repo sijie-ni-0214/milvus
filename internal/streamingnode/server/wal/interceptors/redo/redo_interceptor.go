@@ -2,11 +2,14 @@ package redo
 
 import (
 	"context"
+	"time"
 
 	"github.com/cockroachdb/errors"
 
 	"github.com/milvus-io/milvus/internal/streamingnode/server/wal/interceptors"
 	"github.com/milvus-io/milvus/internal/streamingnode/server/wal/interceptors/shard/shards"
+	"github.com/milvus-io/milvus/internal/streamingnode/server/wal/metricsutil"
+	"github.com/milvus-io/milvus/internal/streamingnode/server/wal/utility"
 	"github.com/milvus-io/milvus/internal/util/function"
 	"github.com/milvus-io/milvus/internal/util/streamingutil/status"
 	"github.com/milvus-io/milvus/pkg/v3/streaming/util/message"
@@ -31,7 +34,10 @@ func (r *redoAppendInterceptor) DoAppend(ctx context.Context, msg message.Mutabl
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
-		if err := r.waitUntilGrowingSegmentReady(ctx, msg); err != nil {
+		stageStart := time.Now()
+		err = r.waitUntilGrowingSegmentReady(ctx, msg)
+		utility.ObserveAppendStage(ctx, metricsutil.AppendStageRedoWaitGrowingSegment, stageStart)
+		if err != nil {
 			return nil, err
 		}
 

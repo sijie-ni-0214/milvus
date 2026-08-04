@@ -89,7 +89,7 @@ func hookError(err error) error {
 func updateProxyFunctionCallMetric(fullMethod string, err error) {
 	strs := strings.Split(fullMethod, "/")
 	method := strs[len(strs)-1]
-	if method == "" {
+	if method == "" || !metrics.ShouldObserveProxyFunctionCall(method) {
 		return
 	}
 	status, cause := failMetricLabel(err)

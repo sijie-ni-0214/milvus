@@ -160,6 +160,10 @@ func (t *SyncTask) Run(ctx context.Context) (err error) {
 	columnGroups := t.getColumnGroups(segmentInfo)
 	getColumnGroupsDur := time.Since(stageStart)
 	logger.Info(ctx, "sync task stage getColumnGroups done", mlog.Duration("duration", getColumnGroupsDur))
+	if t.storageConfig == nil {
+		t.storageConfig = packed.CreateStorageConfig()
+		logger.Info(ctx, "sync task uses default storage config")
+	}
 
 	// statsWriter, when set (V2 / V3), exposes this sync's prepared cumulative
 	// stats. SyncTask.Run installs it on the metaCache only after the DataCoord

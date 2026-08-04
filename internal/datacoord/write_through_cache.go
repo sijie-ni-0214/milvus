@@ -45,9 +45,12 @@ func (c *Cache[K, V]) Lookup(key K) (V, bool) {
 }
 
 // Insert creates or overwrites an entry with the given version.
-// Rejects if current version >= given version (stale write protection, including tombstones).
-// Returns the previous live value and whether it existed.
-func (c *Cache[K, V]) Insert(key K, value V, version int64) (old V, existed bool) {
+// If version > 0, rejects if current version >= given version
+// (stale write protection, including tombstones).
+// If version == 0, treats the write as local/test seed data and overwrites.
+// Returns the previous live value, whether it existed, and whether this write
+// was applied.
+func (c *Cache[K, V]) Insert(key K, value V, version int64) (old V, existed bool, applied bool) {
 	var zero V
 	newEntry := &cacheEntry[V]{value: value, version: version}
 	for {
@@ -55,23 +58,23 @@ func (c *Cache[K, V]) Insert(key K, value V, version int64) (old V, existed bool
 		if !ok {
 			if _, loaded := c.entries.GetOrInsert(key, newEntry); !loaded {
 				c.liveCount.Add(1)
-				return zero, false
+				return zero, false, true
 			}
 			continue // concurrent insert, retry
 		}
-		if entry.version >= version {
+		if version > 0 && entry.version >= version {
 			// Stale — current version is newer or equal
 			if entry.deleted {
-				return zero, false
+				return zero, false, false
 			}
-			return entry.value, true
+			return entry.value, true, false
 		}
 		if c.entries.CompareAndSwap(key, entry, newEntry) {
 			if entry.deleted {
 				c.liveCount.Add(1) // tombstone → live
-				return zero, false
+				return zero, false, true
 			}
-			return entry.value, true
+			return entry.value, true, true
 		}
 		// CAS failed, retry
 	}
@@ -188,10 +191,16 @@ func (c *Cache[K, V]) Erase(key K, version int64) (old V) {
 	tombstone := &cacheEntry[V]{version: version, deleted: true}
 	for {
 		entry, ok := c.entries.Get(key)
-		if !ok || entry.deleted {
+		if !ok {
+			return zero
+		}
+		if version > 0 && entry.version >= version {
 			return zero
 		}
 		if c.entries.CompareAndSwap(key, entry, tombstone) {
+			if entry.deleted {
+				return zero
+			}
 			c.liveCount.Add(-1)
 			return entry.value
 		}

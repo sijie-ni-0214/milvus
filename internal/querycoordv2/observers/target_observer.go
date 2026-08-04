@@ -511,33 +511,97 @@ func (ob *TargetObserver) shouldUpdateCurrentTarget(ctx context.Context, collect
 	// This prevents the issue where some replicas may lack nodes during dynamic replica scaling,
 	// while the total count still meets the threshold.
 	readyDelegatorsInCollection := make([]*meta.DmChannel, 0)
+	checkedDelegatorNum := 0
+	readyDelegatorNum := 0
+	missingReadyChannelInReplicaNum := 0
+	firstMissingReplicaID := int64(0)
+	firstMissingChannel := ""
+	firstMissingDelegatorNum := -1
 	replicas := ob.meta.GetByCollection(ctx, collectionID)
 	for _, replica := range replicas {
 		readyDelegatorsInReplica := make([]*meta.DmChannel, 0)
 		for channel := range channelNames {
 			// Filter delegators by replica to ensure we only check delegators belonging to this replica
 			delegatorList := ob.distMgr.ChannelDistManager.GetByFilter(meta.WithReplica2Channel(replica), meta.WithChannelName2Channel(channel))
+			checkedDelegatorNum += len(delegatorList)
 			readyDelegatorsInChannel := lo.Filter(delegatorList, func(ch *meta.DmChannel, _ int) bool {
 				return checkDelegatorDataReady(replica, ch)
 			})
+			readyDelegatorNum += len(readyDelegatorsInChannel)
 
 			if len(readyDelegatorsInChannel) > 0 {
 				readyDelegatorsInReplica = append(readyDelegatorsInReplica, readyDelegatorsInChannel...)
+			} else {
+				missingReadyChannelInReplicaNum++
+				if firstMissingDelegatorNum < 0 {
+					firstMissingReplicaID = replica.GetID()
+					firstMissingChannel = channel
+					firstMissingDelegatorNum = len(delegatorList)
+				}
 			}
 		}
 		readyDelegatorsInCollection = append(readyDelegatorsInCollection, readyDelegatorsInReplica...)
 	}
 
+	syncStart := time.Now()
 	syncSuccess := ob.syncNextTargetToDelegator(ctx, collectionID, readyDelegatorsInCollection, newVersion)
+	syncDuration := time.Since(syncStart)
 	syncedChannelNames := lo.Uniq(lo.Map(readyDelegatorsInCollection, func(ch *meta.DmChannel, _ int) string { return ch.ChannelName }))
+	allChannelsSynced := lo.Every(syncedChannelNames, lo.Keys(channelNames))
+	logReadinessDone := func(ready bool, notReadyReason string, extraFields ...mlog.Field) {
+		fields := []mlog.Field{
+			mlog.Int64("checkID", checkID),
+			mlog.Bool("ready", ready),
+			mlog.Int64("newTargetVersion", newVersion),
+			mlog.Int("targetChannelNum", targetChannelNum),
+			mlog.Int("syncedChannelNum", len(syncedChannelNames)),
+			mlog.Int("checkedDelegatorNum", checkedDelegatorNum),
+			mlog.Int("readyDelegatorNum", readyDelegatorNum),
+			mlog.Int("missingReadyChannelInReplicaNum", missingReadyChannelInReplicaNum),
+			mlog.Int64("firstMissingReplicaID", firstMissingReplicaID),
+			mlog.String("firstMissingChannel", firstMissingChannel),
+			mlog.Int("firstMissingDelegatorNum", firstMissingDelegatorNum),
+			mlog.Bool("syncSuccess", syncSuccess),
+			mlog.Bool("allChannelsSynced", allChannelsSynced),
+			mlog.Duration("syncDuration", syncDuration),
+			mlog.String("notReadyReason", notReadyReason),
+			mlog.Duration("duration", time.Since(checkStart)),
+		}
+		log.Info(ctx, "check current target readiness done", append(fields, extraFields...)...)
+	}
+
 	// only after all channel are synced, we can consider the current target is ready
-	if !syncSuccess || !lo.Every(syncedChannelNames, lo.Keys(channelNames)) {
+	if !syncSuccess || !allChannelsSynced {
+		notReadyReason := "channel_not_synced"
+		if !syncSuccess {
+			notReadyReason = "delegator_sync_failed"
+		}
+		logReadinessDone(false, notReadyReason)
 		return false
 	}
 
 	// segment data satisfies next target spec
-	return !paramtable.Get().QueryCoordCfg.UpdateTargetNeedSegmentDataReady.GetAsBool() ||
-		utils.CheckSegmentDataReady(ctx, collectionID, ob.distMgr, ob.targetMgr, meta.NextTarget) == nil
+	needSegmentDataReady := paramtable.Get().QueryCoordCfg.UpdateTargetNeedSegmentDataReady.GetAsBool()
+	segmentDataReady := true
+	var segmentDataReadyErr error
+	segmentCheckDuration := time.Duration(0)
+	if needSegmentDataReady {
+		segmentCheckStart := time.Now()
+		segmentDataReadyErr = utils.CheckSegmentDataReady(ctx, collectionID, ob.distMgr, ob.targetMgr, meta.NextTarget)
+		segmentCheckDuration = time.Since(segmentCheckStart)
+		segmentDataReady = segmentDataReadyErr == nil
+	}
+	notReadyReason := ""
+	if !segmentDataReady {
+		notReadyReason = "segment_data_not_ready"
+	}
+	logReadinessDone(segmentDataReady, notReadyReason,
+		mlog.Bool("needSegmentDataReady", needSegmentDataReady),
+		mlog.Bool("segmentDataReady", segmentDataReady),
+		mlog.Err(segmentDataReadyErr),
+		mlog.Duration("segmentCheckDuration", segmentCheckDuration),
+	)
+	return segmentDataReady
 }
 
 // sync next target info to delegator as readable snapshot

@@ -1227,9 +1227,9 @@ func (suite *SegmentLoaderSuite) TestLoadSingleBloomFilterSetExternalRealPKUsesE
 	bfs, err := suite.loader.(*segmentLoader).loadSingleBloomFilterSet(ctx, suite.collectionID, loadInfo, SegmentTypeSealed)
 
 	suite.NoError(err)
+	suite.True(bfs.PkCandidateExist())
 	suite.EqualValues(2, readCalls.Load())
 	suite.Equal(externalStatsPaths, gotPaths)
-	suite.True(bfs.PkCandidateExist())
 	suite.True(bfs.MayPkExist(storage.NewLocationsCache(storage.NewInt64PrimaryKey(1))))
 }
 
@@ -1253,9 +1253,9 @@ func (suite *SegmentLoaderSuite) TestLoadSingleBloomFilterSetExternalRealPKIgnor
 	bfs, err := suite.loader.(*segmentLoader).loadSingleBloomFilterSet(ctx, suite.collectionID, loadInfo, SegmentTypeSealed)
 
 	suite.NoError(err)
+	suite.True(bfs.PkCandidateExist())
 	suite.EqualValues(2, readCalls.Load())
 	suite.Equal(externalStatsPaths, gotPaths)
-	suite.True(bfs.PkCandidateExist())
 	suite.True(bfs.MayPkExist(storage.NewLocationsCache(storage.NewInt64PrimaryKey(1))))
 }
 
@@ -2058,6 +2058,8 @@ func (suite *SegmentLoaderDetailSuite) TestCheckLoadingResourceWithDiskLimit() {
 
 func (suite *SegmentLoaderDetailSuite) TestCheckLoadingResourceWithMemoryLimit() {
 	ctx := context.Background()
+	paramtable.Get().Save(paramtable.Get().QueryNodeCfg.MmapScalarField.Key, "false")
+	defer paramtable.Get().Reset(paramtable.Get().QueryNodeCfg.MmapScalarField.Key)
 
 	// Create a test segment that would exceed the memory limit
 	loadInfo := &querypb.SegmentLoadInfo{
@@ -2601,10 +2603,16 @@ func (suite *ExternalSegmentEstimateSuite) SetupSuite() {
 		ExternalSpec:   `{"format":"parquet"}`,
 		Fields: []*schemapb.FieldSchema{
 			{FieldID: 100, Name: "__virtual_pk__", DataType: schemapb.DataType_Int64, IsPrimaryKey: true},
-			{FieldID: 101, Name: "text", DataType: schemapb.DataType_VarChar, ExternalField: "text_col"},
+			{
+				FieldID: 101, Name: "text", DataType: schemapb.DataType_VarChar, ExternalField: "text_col",
+				TypeParams: []*commonpb.KeyValuePair{{Key: common.WarmupKey, Value: common.WarmupSync}},
+			},
 			{
 				FieldID: 102, Name: "vec", DataType: schemapb.DataType_FloatVector, ExternalField: "vec_col",
-				TypeParams: []*commonpb.KeyValuePair{{Key: common.DimKey, Value: "128"}},
+				TypeParams: []*commonpb.KeyValuePair{
+					{Key: common.DimKey, Value: "128"},
+					{Key: common.WarmupKey, Value: common.WarmupSync},
+				},
 			},
 		},
 	}
@@ -2645,9 +2653,10 @@ func (suite *ExternalSegmentEstimateSuite) TestExternalRawDataFactor() {
 
 	usage, err := estimateLoadingResourceUsageOfSegment(suite.schema, loadInfo, factor)
 	suite.NoError(err)
-	// PART 2 adds binlogSize (100000) to memory
-	// PART 2.5 adds extra = 100000 * (1.5 - 1.0) = 50000
-	suite.True(usage.MemorySize >= 150000, "should include raw data factor: got %d", usage.MemorySize)
+	// PART 2 accounts for binlogSize (100000) in memory or disk depending on mmap.
+	// PART 2.5 adds extra = 100000 * (1.5 - 1.0) = 50000 to memory.
+	totalUsage := usage.MemorySize + usage.DiskSize
+	suite.True(totalUsage >= 150000, "should include raw data factor: got %d", totalUsage)
 }
 
 func (suite *ExternalSegmentEstimateSuite) TestExternalRawDataFactorSkippedWithTieredEviction() {
@@ -2678,8 +2687,8 @@ func (suite *ExternalSegmentEstimateSuite) TestExternalRawDataFactor_NoExtraWhen
 
 	usage, err := estimateLoadingResourceUsageOfSegment(suite.schema, loadInfo, factor)
 	suite.NoError(err)
-	// factor <= 1.0, no extra memory added by PART 2.5
-	suite.True(usage.MemorySize >= 100000, "should include base binlog size")
+	// factor <= 1.0, no extra memory added by PART 2.5.
+	suite.True(usage.MemorySize+usage.DiskSize >= 100000, "should include base binlog size")
 }
 
 func (suite *ExternalSegmentEstimateSuite) TestLazyLoadSubtractsRawData() {

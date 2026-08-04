@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strconv"
+	"time"
 
 	"go.opentelemetry.io/otel"
 
@@ -176,9 +177,13 @@ func checkMaxInsertSize(ctx context.Context, op string, size int) error {
 		fmt.Sprintf("%s materialized message size %d exceeds maxInsertSize %d", op, size, maxInsertSize)))
 }
 
-func (it *InsertTask) PreExecute(ctx context.Context) error {
+func (it *InsertTask) PreExecute(ctx context.Context) (err error) {
 	ctx, sp := otel.Tracer(typeutil.ProxyRole).Start(ctx, "Proxy-Insert-PreExecute")
 	defer sp.End()
+	stageStart := time.Now()
+	defer func() {
+		observeProxyInsertStage(proxyInsertStagePreExecuteTotal, stageStart, err)
+	}()
 
 	it.result = &milvuspb.MutationResult{
 		Status: merr.Success(),
@@ -198,14 +203,18 @@ func (it *InsertTask) PreExecute(ctx context.Context) error {
 		return err
 	}
 
+	stageStart = time.Now()
 	collID, err := it.GetMetaCache().GetCollectionID(context.Background(), it.insertMsg.GetDbName(), collectionName)
+	observeProxyInsertStage(proxyInsertStagePreGetCollectionID, stageStart, err)
 	if err != nil {
 		log.Warn(ctx, "fail to get collection id", mlog.Err(err))
 		return err
 	}
 	it.collectionID = collID
 
+	stageStart = time.Now()
 	colInfo, err := it.GetMetaCache().GetCollectionWriteInfo(ctx, it.insertMsg.GetDbName(), collectionName, collID)
+	observeProxyInsertStage(proxyInsertStagePreGetCollectionInfo, stageStart, err)
 	if err != nil {
 		log.Warn(ctx, "fail to get collection info", mlog.Err(err))
 		return err
@@ -249,7 +258,10 @@ func (it *InsertTask) PreExecute(ctx context.Context) error {
 		return err
 	}
 
-	if err := genFunctionFields(ctx, it.insertMsg, schema, false); err != nil {
+	stageStart = time.Now()
+	err = genFunctionFields(ctx, it.insertMsg, schema, false)
+	observeProxyInsertStage(proxyInsertStagePreGenFunctionFields, stageStart, err)
+	if err != nil {
 		return err
 	}
 
@@ -259,7 +271,9 @@ func (it *InsertTask) PreExecute(ctx context.Context) error {
 	var rowIDEnd UniqueID
 	tr := timerecord.NewTimeRecorder("applyPK")
 	clusterID := paramtable.Get().CommonCfg.ClusterID.GetAsUint64()
+	stageStart = time.Now()
 	rowIDBegin, rowIDEnd, AllocErr := common.AllocAutoID(it.idAllocator.Alloc, rowNums, clusterID)
+	observeProxyInsertStage(proxyInsertStagePreAllocAutoID, stageStart, AllocErr)
 	metrics.ProxyApplyPrimaryKeyLatency.WithLabelValues(strconv.FormatInt(paramtable.GetNodeID(), 10)).Observe(float64(tr.ElapseSpan().Microseconds()) / 1000.0)
 	if AllocErr != nil {
 		log.Warn(ctx, "failed to allocate auto id",
@@ -311,7 +325,9 @@ func (it *InsertTask) PreExecute(ctx context.Context) error {
 	// check primaryFieldData whether autoID is true or not
 	// set rowIDs as primary data if autoID == true
 	// TODO(dragondriver): in fact, NumRows is not trustable, we should check all input fields
+	stageStart = time.Now()
 	it.result.IDs, err = checkPrimaryFieldData(ctx, allFields, it.schema, it.insertMsg)
+	observeProxyInsertStage(proxyInsertStagePreCheckPrimaryField, stageStart, err)
 	if err != nil {
 		log.Warn(ctx, "check primary field data and hash primary key failed",
 			mlog.Err(err))
@@ -372,8 +388,11 @@ func (it *InsertTask) PreExecute(ctx context.Context) error {
 		}
 	}
 
-	if err := fieldvalidator.NewValidateUtil(fieldvalidator.WithNANCheck(), fieldvalidator.WithOverflowCheck(), fieldvalidator.WithMaxLenCheck(), fieldvalidator.WithMaxCapCheck()).
-		Validate(it.insertMsg.GetFieldsData(), schema.SchemaHelper, it.insertMsg.NRows()); err != nil {
+	stageStart = time.Now()
+	err = fieldvalidator.NewValidateUtil(fieldvalidator.WithNANCheck(), fieldvalidator.WithOverflowCheck(), fieldvalidator.WithMaxLenCheck(), fieldvalidator.WithMaxCapCheck()).
+		Validate(it.insertMsg.GetFieldsData(), schema.SchemaHelper, it.insertMsg.NRows())
+	observeProxyInsertStage(proxyInsertStagePreValidateFields, stageStart, err)
+	if err != nil {
 		return merr.WrapErrAsInputError(err)
 	}
 

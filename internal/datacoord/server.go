@@ -734,12 +734,20 @@ func (s *Server) initMeta(chunkManager storage.ChunkManager) error {
 	}
 	var recoveredMeta *meta
 	reloadEtcdFn := func() error {
+		metaInitializationStart := time.Now()
+		mlog.Info(s.ctx, "datacoord metadata initialization attempt started")
 		var err error
 		recoveredMeta, err = newMetaWithPersist(s.ctx, s.catalog, chunkManager, s.metaStore, s.broker, segmentPersist, s.metaRootPath)
-		if err == nil {
-			recoveredMeta.preparationSchema = coordinatorPreparationSchema
+		if err != nil {
+			mlog.Warn(s.ctx, "datacoord metadata initialization attempt failed",
+				mlog.Duration("duration", time.Since(metaInitializationStart)),
+				mlog.Err(err))
+			return err
 		}
-		return err
+		recoveredMeta.preparationSchema = coordinatorPreparationSchema
+		mlog.Info(s.ctx, "datacoord metadata initialization attempt done",
+			mlog.Duration("duration", time.Since(metaInitializationStart)))
+		return nil
 	}
 	if err := retry.Do(s.ctx, reloadEtcdFn, retry.Attempts(connMetaMaxRetryTime)); err != nil {
 		return err
@@ -772,6 +780,9 @@ func (s *Server) initMeta(chunkManager storage.ChunkManager) error {
 		return c.ID, c.VChannelNames
 	})
 	var manager dataview.Manager
+	dataViewRecoveryStart := time.Now()
+	mlog.Info(s.ctx, "datacoord DataView recovery started",
+		mlog.Int("totalCollections", len(collectionIDs)))
 	if err := retry.Do(s.ctx, func() error {
 		var err error
 		manager, err = dataview.RecoverManager(
@@ -790,8 +801,14 @@ func (s *Server) initMeta(chunkManager storage.ChunkManager) error {
 		)
 		return err
 	}, retry.Attempts(connMetaMaxRetryTime)); err != nil {
+		mlog.Warn(s.ctx, "datacoord DataView recovery failed",
+			mlog.Duration("duration", time.Since(dataViewRecoveryStart)),
+			mlog.Err(err))
 		return err
 	}
+	mlog.Info(s.ctx, "datacoord DataView recovery done",
+		mlog.Int("totalCollections", len(collectionIDs)),
+		mlog.Duration("duration", time.Since(dataViewRecoveryStart)))
 	// Publish only fully recovered metadata. A failed later phase must not
 	// make a subsequent initMeta call return early with partial state.
 	recoveredMeta.dataViewManager = manager

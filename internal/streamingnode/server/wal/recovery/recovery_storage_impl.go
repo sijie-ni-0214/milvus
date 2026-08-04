@@ -4,6 +4,9 @@ import (
 	"context"
 	"math"
 	"sync"
+	"time"
+
+	xrate "golang.org/x/time/rate"
 
 	"google.golang.org/protobuf/proto"
 
@@ -42,6 +45,10 @@ const (
 	recoveryStorageStatePersistRecovering = "persist-recovering"
 	recoveryStorageStateStreamRecovering  = "stream-recovering"
 	recoveryStorageStateWorking           = "working"
+
+	dropCollectionStageTotal = "total"
+
+	dropCollectionStageSlowThreshold = 10 * time.Millisecond
 )
 
 // RecoverRecoveryStorage creates a new recovery storage.
@@ -530,6 +537,13 @@ func shouldAdvanceConsumePoint(current, next utility.WALCheckpoint) bool {
 
 // observeMessage observes a message and update the recovery storage.
 func (r *recoveryStorageImpl) observeMessage(ctx context.Context, msg message.ImmutableMessage) {
+	var started time.Time
+	if msg.MessageType() == message.MessageTypeDropCollection {
+		started = time.Now()
+		defer func() {
+			r.observeDropCollectionStage(ctx, msg, dropCollectionStageTotal, time.Since(started))
+		}()
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	// Scoped query progress follows the ordered prefix. Only persisted
@@ -558,6 +572,23 @@ func (r *recoveryStorageImpl) observeMessage(ctx context.Context, msg message.Im
 	if r.dirtyCounter > r.cfg.maxDirtyMessages {
 		r.notifyPersist()
 	}
+}
+
+func (r *recoveryStorageImpl) observeDropCollectionStage(
+	ctx context.Context,
+	msg message.ImmutableMessage,
+	stage string,
+	duration time.Duration,
+) {
+	r.metrics.ObserveDropCollectionStage(stage, duration)
+	if duration <= dropCollectionStageSlowThreshold {
+		return
+	}
+	r.Logger().RatedInfo(ctx, xrate.Limit(1), "drop collection recovery stage slow",
+		mlog.FieldVChannel(msg.VChannel()),
+		mlog.String("stage", stage),
+		mlog.Duration("duration", duration),
+		mlog.Uint64("timeTick", msg.TimeTick()))
 }
 
 func (r *recoveryStorageImpl) refreshRecoveryTail() {

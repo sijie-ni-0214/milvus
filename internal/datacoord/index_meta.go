@@ -183,7 +183,10 @@ func newIndexMeta(ctx context.Context, catalog metastore.DataCoordCatalog, scanT
 	return mt, nil
 }
 
-const segmentIndexScanProgressLogInterval = 10000
+const (
+	segmentIndexScanProgressLogInterval          = 10000
+	segmentIndexCacheRecoveryProgressLogInterval = 100000
+)
 
 // reloadFromKV loads meta from KV storage
 func (m *indexMeta) reloadFromKV(scanTargets []partitionScanTarget) error {
@@ -196,14 +199,25 @@ func (m *indexMeta) reloadFromKV(scanTargets []partitionScanTarget) error {
 	scanTargetSegIdxes := make([][]*model.SegmentIndex, len(scanTargets))
 	g, _ := errgroup.WithContext(m.ctx)
 	g.Go(func() error {
+		fieldIndexScanStart := time.Now()
+		mlog.Info(m.ctx, "indexMeta field index catalog scan started")
 		fieldIndexes, err := m.catalog.ListIndexes(m.ctx)
 		if err != nil {
-			mlog.Error(context.TODO(), "indexMeta reloadFromKV load field indexes fail", mlog.Err(err))
+			mlog.Error(m.ctx, "indexMeta reloadFromKV load field indexes fail",
+				mlog.Duration("duration", time.Since(fieldIndexScanStart)),
+				mlog.Err(err))
 			return err
 		}
+		mlog.Info(m.ctx, "indexMeta field index catalog scan done",
+			mlog.Int("numFieldIndexes", len(fieldIndexes)),
+			mlog.Duration("duration", time.Since(fieldIndexScanStart)))
+		fieldIndexCacheStart := time.Now()
 		for _, fieldIndex := range fieldIndexes {
 			m.updateCollectionIndex(fieldIndex)
 		}
+		mlog.Info(m.ctx, "indexMeta field index cache rebuild done",
+			mlog.Int("numFieldIndexes", len(fieldIndexes)),
+			mlog.Duration("duration", time.Since(fieldIndexCacheStart)))
 		return nil
 	})
 	g.Go(func() error {
@@ -258,6 +272,14 @@ func (m *indexMeta) reloadFromKV(scanTargets []partitionScanTarget) error {
 		if err := conc.AwaitAll(futures...); err != nil {
 			return err
 		}
+		mlog.Info(m.ctx, "indexMeta segment index catalog scan done",
+			mlog.Int64("numScanTargets", totalScanTargets),
+			mlog.Int64("numSegmentIndexes", totalSegmentIndexes.Load()),
+			mlog.Duration("duration", time.Since(scanStart)))
+
+		cacheBuildStart := time.Now()
+		totalSegmentIndexCount := int(totalSegmentIndexes.Load())
+		recoveredSegmentIndexes := 0
 		for _, segIdxes := range scanTargetSegIdxes {
 			for _, segIdx := range segIdxes {
 				if segIdx.IndexMemSize == 0 {
@@ -274,8 +296,18 @@ func (m *indexMeta) reloadFromKV(scanTargets []partitionScanTarget) error {
 				old, _ := m.segmentBuildInfo.Get(segIdx.BuildID)
 				m.taskCounts.replaceTask(old, segIdx)
 				m.segmentBuildInfo.AddForRecovery(segIdx)
+				recoveredSegmentIndexes++
+				if recoveredSegmentIndexes%segmentIndexCacheRecoveryProgressLogInterval == 0 && recoveredSegmentIndexes < totalSegmentIndexCount {
+					mlog.Info(m.ctx, "indexMeta segment index cache rebuild progress",
+						mlog.Int("completedSegmentIndexes", recoveredSegmentIndexes),
+						mlog.Int("totalSegmentIndexes", totalSegmentIndexCount),
+						mlog.Duration("duration", time.Since(cacheBuildStart)))
+				}
 			}
 		}
+		mlog.Info(m.ctx, "indexMeta segment index cache rebuild done",
+			mlog.Int("numSegmentIndexes", totalSegmentIndexCount),
+			mlog.Duration("duration", time.Since(cacheBuildStart)))
 		return nil
 	})
 	if err := g.Wait(); err != nil {
@@ -301,7 +333,7 @@ func (m *indexMeta) reloadFromKV(scanTargets []partitionScanTarget) error {
 		}
 	}()
 
-	mlog.Info(context.TODO(), "indexMeta reloadFromKV done", mlog.Duration("duration", record.ElapseSpan()))
+	mlog.Info(m.ctx, "indexMeta reloadFromKV done", mlog.Duration("duration", record.ElapseSpan()))
 	return nil
 }
 

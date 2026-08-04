@@ -50,7 +50,7 @@ func TestResourceBuildTaskRetriesErrDelayBeforeCompleting(t *testing.T) {
 	var attempts atomic.Int32
 	task := newResourceBuildTask(func(context.Context) (*QueryRuntime, error) {
 		if attempts.Add(1) == 1 {
-			return want, errors.Mark(errors.New("load info is not ready"), nodescheduler.ErrDelay)
+			return want, nodescheduler.MarkDelay(errors.New("load info is not ready"))
 		}
 		return want, nil
 	})

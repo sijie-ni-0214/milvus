@@ -30,6 +30,7 @@ import (
 	"github.com/cockroachdb/errors"
 	"github.com/gin-gonic/gin"
 	"github.com/gin-gonic/gin/binding"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
@@ -51,6 +52,7 @@ import (
 	"github.com/milvus-io/milvus/internal/types"
 	"github.com/milvus-io/milvus/internal/util/indexparamcheck"
 	"github.com/milvus-io/milvus/pkg/v3/common"
+	"github.com/milvus-io/milvus/pkg/v3/metrics"
 	"github.com/milvus-io/milvus/pkg/v3/mlog"
 	"github.com/milvus-io/milvus/pkg/v3/proto/internalpb"
 	"github.com/milvus-io/milvus/pkg/v3/util"
@@ -4744,6 +4746,33 @@ func TestMethodDelete(t *testing.T) {
 			fmt.Println(w.Body.String())
 		})
 	}
+}
+
+func TestDropCollectionDoesNotRecordProxyFunctionCall(t *testing.T) {
+	paramtable.Init()
+	paramtable.Get().Save(paramtable.Get().QuotaConfig.QuotaAndLimitsEnabled.Key, "false")
+	defer paramtable.Get().Reset(paramtable.Get().QuotaConfig.QuotaAndLimitsEnabled.Key)
+
+	metrics.ProxyFunctionCall.Reset()
+	defer metrics.ProxyFunctionCall.Reset()
+
+	mp := mocks.NewMockProxy(t)
+	mp.EXPECT().DropCollection(mock.Anything, mock.Anything).Return(commonSuccessStatus, nil).Once()
+	testEngine := initHTTPServerV2(mp, false)
+
+	req := httptest.NewRequest(
+		http.MethodPost,
+		versionalV2(CollectionCategory, DropAction),
+		bytes.NewReader([]byte(`{"collectionName": "`+DefaultCollectionName+`"}`)),
+	)
+	w := httptest.NewRecorder()
+	testEngine.ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusOK, w.Code)
+	returnBody := &ReturnErrMsg{}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), returnBody))
+	require.EqualValues(t, merr.Code(nil), returnBody.Code)
+	assert.Equal(t, 0, testutil.CollectAndCount(metrics.ProxyFunctionCall))
 }
 
 func TestMethodPost(t *testing.T) {

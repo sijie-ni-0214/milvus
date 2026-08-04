@@ -5162,11 +5162,23 @@ ChunkedSegmentSealedImpl::pk_range(milvus::OpContext* op_ctx,
     }
     if (!is_sorted_by_pk_) {
         auto pk_index = PinPkIndex(runtime, op_ctx);
+        const auto t1 = std::chrono::high_resolution_clock::now();
         auto* pk_cell = pk_index.get();
         AssertInfo(pk_cell != nullptr && pk_cell->has_pk2offset(),
                    "primary key index is not ready");
         pk_cell->pk2offset().find_range(
             pk, op, bitset, [](int64_t offset) { return true; });
+        const auto t2 = std::chrono::high_resolution_clock::now();
+        auto duration =
+            std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1)
+                .count();
+        LOG_INFO(
+            "[sss] pk_range. traceID: {}, partition: {}, segment: {}, "
+            "duration: {}",
+            milvus::tracer::GetRequestTraceID(op_ctx),
+            get_partition_id(),
+            get_segment_id(),
+            duration);
         return;
     }
 
@@ -8181,11 +8193,16 @@ ChunkedSegmentSealedImpl::load_field_data_common(
     milvus::OpContext* op_ctx,
     bool is_replace,
     StagedStateCommitter& committer) {
+    const auto start = std::chrono::steady_clock::now();
+    std::chrono::steady_clock::duration snapshot_duration{};
     std::shared_ptr<const PublishedSegmentState> snapshot;
     auto capture_snapshot =
         [&]() -> const std::shared_ptr<const PublishedSegmentState>& {
         if (snapshot == nullptr) {
+            const auto capture_start = std::chrono::steady_clock::now();
             snapshot = CapturePublishedState();
+            snapshot_duration +=
+                std::chrono::steady_clock::now() - capture_start;
         }
         return snapshot;
     };
@@ -8203,12 +8220,14 @@ ChunkedSegmentSealedImpl::load_field_data_common(
                              op_ctx);
     }
 
+    const auto prepare_done = std::chrono::steady_clock::now();
     generate_interim_index((*schema_snapshot)[field_id],
                            schema_snapshot,
                            num_rows,
                            column,
                            op_ctx,
                            &committer);
+    const auto interim_index_done = std::chrono::steady_clock::now();
 
     // Build the geometry cache OUTSIDE the publish lock (it decodes the whole
     // column), then stage it in the same immutable runtime snapshot as the
@@ -8308,6 +8327,30 @@ ChunkedSegmentSealedImpl::load_field_data_common(
         return memory_size_delta;
     };
 
+    auto log_load_done = [&]() {
+        const auto done = std::chrono::steady_clock::now();
+        LOG_INFO(
+            "[xxx] segment {} field {} load_field_data_common done, "
+            "snapshot={}ms, prepare={}ms, interim_index={}ms, "
+            "publish={}ms, total={}ms",
+            id_,
+            field_id.get(),
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                snapshot_duration)
+                .count(),
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                prepare_done - start)
+                .count(),
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                interim_index_done - prepare_done)
+                .count(),
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                done - interim_index_done)
+                .count(),
+            std::chrono::duration_cast<std::chrono::milliseconds>(done - start)
+                .count());
+    };
+
     committer.Commit([&](RuntimeResourceState& target_runtime,
                          PublishedSegmentState& staged_state) {
         std::shared_ptr<ChunkedColumnInterface> old_column;
@@ -8323,6 +8366,7 @@ ChunkedSegmentSealedImpl::load_field_data_common(
         committer.StageMemorySizeDeltaLocked(
             apply_loaded_column(target_runtime, old_column, staged_state));
     });
+    log_load_done();
 }
 
 void
@@ -11717,6 +11761,7 @@ void
 ChunkedSegmentSealedImpl::Prewarm(
     milvus::OpContext* op_ctx,
     const std::vector<FieldId>& requested_field_ids) const {
+    auto runtime = CaptureRuntimeResourceState();
     std::vector<FieldId> field_ids = requested_field_ids;
     if (field_ids.empty()) {
         auto published = CapturePublishedState();
@@ -11725,7 +11770,6 @@ ChunkedSegmentSealedImpl::Prewarm(
         }
     }
 
-    auto runtime = CaptureRuntimeResourceState();
     for (auto field_id : field_ids) {
         prefetch_chunks(op_ctx, field_id);
         if (runtime == nullptr) {

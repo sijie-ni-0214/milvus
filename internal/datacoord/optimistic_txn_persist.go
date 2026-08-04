@@ -936,17 +936,28 @@ type memEntry[V any] struct {
 }
 
 type memPersist[K comparable, V any] struct {
-	data    map[K]*memEntry[V]
-	raw     map[string]string
-	nextVer int64
+	data      map[K]*memEntry[V]
+	raw       map[string]string
+	nextVer   int64
+	marshaler Marshaler[V]
 }
 
 func NewOptimisticTxnMemoryPersist[K comparable, V any](marshaler Marshaler[V]) OptimisticTxnPersist[K, V] {
 	return &memPersist[K, V]{
-		data:    make(map[K]*memEntry[V]),
-		raw:     make(map[string]string),
-		nextVer: 1,
+		data:      make(map[K]*memEntry[V]),
+		raw:       make(map[string]string),
+		nextVer:   1,
+		marshaler: marshaler,
 	}
+}
+
+func (p *memPersist[K, V]) clone(value V) (V, error) {
+	data, err := p.marshaler.Marshal(value)
+	if err != nil {
+		var zero V
+		return zero, err
+	}
+	return p.marshaler.Unmarshal(data)
 }
 
 func (p *memPersist[K, V]) Txn(ctx context.Context) Txn[K, V] {
@@ -961,8 +972,12 @@ func (p *memPersist[K, V]) Scan(ctx context.Context, prefix K) ([]K, []V, []int6
 	for k, entry := range p.data {
 		keyStr := fmt.Sprintf("%v", k)
 		if strings.HasPrefix(keyStr, prefixStr) {
+			value, err := p.clone(entry.value)
+			if err != nil {
+				return nil, nil, nil, err
+			}
 			ks = append(ks, k)
-			vals = append(vals, entry.value)
+			vals = append(vals, value)
 			vers = append(vers, entry.version)
 		}
 	}
@@ -973,7 +988,11 @@ func (p *memPersist[K, V]) Get(ctx context.Context, keys []K) (map[K]TxnResult[V
 	result := make(map[K]TxnResult[V], len(keys))
 	for _, key := range keys {
 		if entry, ok := p.data[key]; ok {
-			result[key] = TxnResult[V]{Value: entry.value, Version: entry.version}
+			value, err := p.clone(entry.value)
+			if err != nil {
+				return nil, err
+			}
+			result[key] = TxnResult[V]{Value: value, Version: entry.version}
 		}
 	}
 	return result, nil
@@ -1021,14 +1040,22 @@ func (t *memTxn[K, V]) Commit() ([]TxnResult[V], error) {
 	for i, op := range t.ops {
 		switch op.kind {
 		case opInsert, opPutIfVersion:
-			p.data[op.key] = &memEntry[V]{value: op.value, version: ver}
+			stored, err := p.clone(op.value)
+			if err != nil {
+				return nil, err
+			}
+			p.data[op.key] = &memEntry[V]{value: stored, version: ver}
 			results[i] = TxnResult[V]{Value: op.value, Version: ver}
 
 		case opUpdate:
 			entry := p.data[op.key]
-			newV, shouldWrite := op.updateFunc(entry.value)
+			existing, err := p.clone(entry.value)
+			if err != nil {
+				return nil, err
+			}
+			newV, shouldWrite := op.updateFunc(existing)
 			if !shouldWrite {
-				results[i] = TxnResult[V]{Value: entry.value, Version: entry.version}
+				results[i] = TxnResult[V]{Value: existing, Version: entry.version}
 				continue
 			}
 			p.data[op.key] = &memEntry[V]{value: newV, version: ver}
@@ -1036,15 +1063,23 @@ func (t *memTxn[K, V]) Commit() ([]TxnResult[V], error) {
 
 		case opUpsert:
 			if entry, ok := p.data[op.key]; ok {
-				newV, shouldWrite := op.updateFunc(entry.value)
+				existing, err := p.clone(entry.value)
+				if err != nil {
+					return nil, err
+				}
+				newV, shouldWrite := op.updateFunc(existing)
 				if !shouldWrite {
-					results[i] = TxnResult[V]{Value: entry.value, Version: entry.version}
+					results[i] = TxnResult[V]{Value: existing, Version: entry.version}
 					continue
 				}
 				p.data[op.key] = &memEntry[V]{value: newV, version: ver}
 				results[i] = TxnResult[V]{Value: newV, Version: ver}
 			} else {
-				p.data[op.key] = &memEntry[V]{value: op.value, version: ver}
+				stored, err := p.clone(op.value)
+				if err != nil {
+					return nil, err
+				}
+				p.data[op.key] = &memEntry[V]{value: stored, version: ver}
 				results[i] = TxnResult[V]{Value: op.value, Version: ver}
 			}
 

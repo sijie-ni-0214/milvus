@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"strconv"
+	"time"
 
 	"github.com/milvus-io/milvus-proto/go-api/v3/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v3/milvuspb"
@@ -813,7 +814,9 @@ func (t *createCollectionTask) Prepare(ctx context.Context) error {
 		MsgType: commonpb.MsgType_CreateCollection,
 	}
 
+	stageStart := time.Now()
 	db, err := t.meta.GetDatabaseByName(ctx, t.Req.GetDbName(), typeutil.MaxTimestamp)
+	observeCreateCollectionStage(createCollectionStagePrepareGetDatabase, stageStart)
 	if err != nil {
 		return err
 	}
@@ -833,27 +836,45 @@ func (t *createCollectionTask) Prepare(ctx context.Context) error {
 
 	t.header.DbId = db.ID
 	t.body.DbID = t.header.DbId
+	stageStart = time.Now()
 	if err := t.validate(ctx); err != nil {
+		observeCreateCollectionStage(createCollectionStagePrepareValidate, stageStart)
 		return err
 	}
+	observeCreateCollectionStage(createCollectionStagePrepareValidate, stageStart)
 
+	stageStart = time.Now()
 	if err := t.prepareSchema(ctx); err != nil {
+		observeCreateCollectionStage(createCollectionStagePrepareSchema, stageStart)
 		return err
 	}
+	observeCreateCollectionStage(createCollectionStagePrepareSchema, stageStart)
 
+	stageStart = time.Now()
 	if err := t.assignCollectionID(); err != nil {
+		observeCreateCollectionStage(createCollectionStagePrepareAssignCollectionID, stageStart)
 		return err
 	}
+	observeCreateCollectionStage(createCollectionStagePrepareAssignCollectionID, stageStart)
 
+	stageStart = time.Now()
 	if err := t.assignPartitionIDs(ctx); err != nil {
+		observeCreateCollectionStage(createCollectionStagePrepareAssignPartitionIDs, stageStart)
 		return err
 	}
+	observeCreateCollectionStage(createCollectionStagePrepareAssignPartitionIDs, stageStart)
 
+	stageStart = time.Now()
 	if err := t.assignChannels(ctx); err != nil {
+		observeCreateCollectionStage(createCollectionStagePrepareAllocVChannels, stageStart)
 		return err
 	}
+	observeCreateCollectionStage(createCollectionStagePrepareAllocVChannels, stageStart)
 
-	return t.validateIfCollectionExists(ctx)
+	stageStart = time.Now()
+	err = t.validateIfCollectionExists(ctx)
+	observeCreateCollectionStage(createCollectionStagePrepareValidateCollectionName, stageStart)
+	return err
 }
 
 func (t *createCollectionTask) validateIfCollectionExists(ctx context.Context) error {

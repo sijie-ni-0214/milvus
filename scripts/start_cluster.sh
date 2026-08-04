@@ -28,8 +28,8 @@ if [[ "$OSTYPE" == "linux-gnu"* ]]; then
   export LD_LIBRARY_PATH=$PWD/internal/core/output/lib/:$LD_LIBRARY_PATH
 fi
 
-echo "Starting mixcoord..."
-METRICS_PORT=9093 nohup ./bin/milvus run mixcoord --run-with-subprocess >/tmp/mixcoord.log 2>&1 &
+# echo "Starting mixcoord..."
+# METRICS_PORT=9093 nohup ./bin/milvus run mixcoord --run-with-subprocess >/tmp/mixcoord.log 2>&1 &
 
 echo "Starting datanode..."
 METRICS_PORT=9094 nohup ./bin/milvus run datanode --run-with-subprocess >/tmp/datanode.log 2>&1 &

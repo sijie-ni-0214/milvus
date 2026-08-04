@@ -3,7 +3,6 @@ package segment
 import (
 	"context"
 
-	"github.com/cockroachdb/errors"
 	"go.uber.org/atomic"
 	"golang.org/x/time/rate"
 
@@ -55,7 +54,7 @@ func (t *segmentTaskBase) markSubmitted() {
 // retryability is only known at the call site, and as the fallback for errors
 // that are not explicitly marked unrecoverable.
 func (t *segmentTaskBase) markRetryable(err error) error {
-	return errors.Mark(err, nodescheduler.ErrDelay)
+	return nodescheduler.MarkDelay(err)
 }
 
 // execute runs fn once the task is actually submitted. Segment tasks are

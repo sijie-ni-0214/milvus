@@ -2,6 +2,7 @@ package shard
 
 import (
 	"context"
+	"time"
 
 	"github.com/cockroachdb/errors"
 
@@ -10,6 +11,7 @@ import (
 	"github.com/milvus-io/milvus/internal/streamingnode/server/wal/interceptors/shard/shards"
 	"github.com/milvus-io/milvus/internal/streamingnode/server/wal/interceptors/shard/stats"
 	"github.com/milvus-io/milvus/internal/streamingnode/server/wal/interceptors/txn"
+	"github.com/milvus-io/milvus/internal/streamingnode/server/wal/metricsutil"
 	"github.com/milvus-io/milvus/internal/streamingnode/server/wal/utility"
 	"github.com/milvus-io/milvus/internal/util/function"
 	"github.com/milvus-io/milvus/internal/util/streamingutil/status"
@@ -179,7 +181,9 @@ func (impl *shardInterceptor) handleInsertMessage(ctx context.Context, msg messa
 	header := insertMsg.Header()
 	collectionID := header.GetCollectionId()
 	schemaVersion := header.GetSchemaVersion()
+	stageStart := time.Now()
 	correctSchemaVersion, err := impl.shardManager.CheckIfCollectionSchemaVersionMatch(header)
+	utility.ObserveAppendStage(ctx, metricsutil.AppendStageShardSchemaCheck, stageStart)
 	if err != nil {
 		if errors.Is(err, shards.ErrCollectionNotFound) {
 			return nil, status.NewUnrecoverableError("collection %d not found", collectionID)
@@ -214,7 +218,10 @@ func (impl *shardInterceptor) handleInsertMessage(ctx context.Context, msg messa
 	// applied at the config-item read layer, so GetAsBool already returns the
 	// effective value.
 	if paramtable.Get().FunctionCfg.EnableWriteBeforeMaterialization.GetAsBool() {
-		if err := impl.materializeFunctionFields(ctx, insertMsg, header.GetCollectionId(), schemaVersion); err != nil {
+		stageStart = time.Now()
+		err := impl.materializeFunctionFields(ctx, insertMsg, header.GetCollectionId(), schemaVersion)
+		utility.ObserveAppendStage(ctx, metricsutil.AppendStageShardFunctionMaterialize, stageStart)
+		if err != nil {
 			var preparation *function.PreparationRequiredError
 			if errors.As(err, &preparation) {
 				// Unwind to redo before waiting for initialization. No
@@ -252,7 +259,9 @@ func (impl *shardInterceptor) handleInsertMessage(ctx context.Context, msg messa
 			// so we need to check nil before the assignment.
 			req.TxnSession = session
 		}
+		stageStart = time.Now()
 		result, err := impl.shardManager.AssignSegment(req)
+		utility.ObserveAppendStage(ctx, metricsutil.AppendStageShardAssignSegment, stageStart)
 		if errors.IsAny(err, shards.ErrTimeTickTooOld, shards.ErrWaitForNewSegment, shards.ErrFencedAssign) {
 			// 1. time tick is too old for segment assignment.
 			// 2. partition is fenced.

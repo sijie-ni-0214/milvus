@@ -1392,6 +1392,7 @@ func TestMetaTable_GetCollectionByName(t *testing.T) {
 }
 
 func TestMetaTable_AddCollectionDoesNotBlockReadersDuringCatalogCreate(t *testing.T) {
+	ctx := context.Background()
 	channel.ResetStaticPChannelStatsManager()
 	channel.RecoverPChannelStatsManager([]string{})
 	t.Cleanup(channel.ResetStaticPChannelStatsManager)
@@ -1432,10 +1433,11 @@ func TestMetaTable_AddCollectionDoesNotBlockReadersDuringCatalogCreate(t *testin
 		fileResourceRefCnt: map[int64]int{},
 	}
 	meta.names.insert(util.DefaultDBName, existingColl.Name, existingColl.CollectionID)
+	meta.rebuildAvailableCollectionCountLocked()
 
 	addErr := make(chan error, 1)
 	go func() {
-		addErr <- meta.AddCollection(context.Background(), &model.Collection{
+		addErr <- meta.AddCollection(ctx, &model.Collection{
 			CollectionID: 101,
 			DBID:         util.DefaultDBID,
 			DBName:       util.DefaultDBName,
@@ -1454,28 +1456,36 @@ func TestMetaTable_AddCollectionDoesNotBlockReadersDuringCatalogCreate(t *testin
 		require.FailNow(t, "AddCollection did not enter catalog CreateCollection")
 	}
 
-	type readResponse struct {
-		collection *model.Collection
-		err        error
-	}
-	readResult := make(chan readResponse, 1)
+	readResult := make(chan *model.Collection, 1)
+	readErr := make(chan error, 1)
 	go func() {
-		coll, err := meta.GetCollectionByName(context.Background(), util.DefaultDBName, existingColl.Name, typeutil.MaxTimestamp, false)
-		readResult <- readResponse{collection: coll, err: err}
+		coll, err := meta.GetCollectionByName(ctx, util.DefaultDBName, existingColl.Name, typeutil.MaxTimestamp, false)
+		readResult <- coll
+		readErr <- err
 	}()
 
+	readTimedOut := false
 	select {
-	case result := <-readResult:
-		require.NoError(t, result.err)
-		require.Equal(t, existingColl.CollectionID, result.collection.CollectionID)
-	case <-time.After(time.Second):
-		close(unblockCatalog)
-		require.NoError(t, <-addErr)
-		require.FailNow(t, "GetCollectionByName blocked while catalog CreateCollection was in progress")
+	case err := <-readErr:
+		require.NoError(t, err)
+		coll := <-readResult
+		require.NotNil(t, coll)
+		require.Equal(t, existingColl.CollectionID, coll.CollectionID)
+	case <-time.After(200 * time.Millisecond):
+		readTimedOut = true
 	}
 
 	close(unblockCatalog)
 	require.NoError(t, <-addErr)
+
+	if readTimedOut {
+		select {
+		case <-readErr:
+		case <-time.After(time.Second):
+			require.FailNow(t, "GetCollectionByName remained blocked after catalog CreateCollection was unblocked")
+		}
+		require.Fail(t, "GetCollectionByName blocked while catalog CreateCollection was in progress")
+	}
 }
 
 func TestMetaTable_AddCollectionRechecksAfterCatalogCreate(t *testing.T) {
