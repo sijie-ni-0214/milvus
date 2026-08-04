@@ -34,48 +34,93 @@ import (
 
 // BatchCommitProduce commits the produce tasks concurrently.
 func BatchCommitProduce(ctx context.Context, tasks ...*ProduceGuard) types.AppendResponses {
+	messageType := batchCommitProduceMessageTypeLabel(tasks...)
+	totalStart := time.Now()
+	defer observeBatchCommitProduceStage(messageType, batchCommitProduceStageTotal, totalStart)
+
 	if len(tasks) == 0 {
 		return types.NewAppendResponseN(0)
 	}
+	stageStart := time.Now()
 	if err := waitForReservationOK(ctx, tasks...); err != nil {
+		observeBatchCommitProduceStage(messageType, batchCommitProduceStageWaitReservation, stageStart)
+		stageStart = time.Now()
 		for _, task := range tasks {
 			// return the quota of reservation to the limiter as much as possible.
 			task.Cancel()
 		}
+		observeBatchCommitProduceStage(messageType, batchCommitProduceStageCancelReservations, stageStart)
+		stageStart = time.Now()
 		resp := types.NewAppendResponseN(len(tasks))
+		observeBatchCommitProduceStage(messageType, batchCommitProduceStageNewResponse, stageStart)
 		resp.FillAllError(err)
 		return resp
 	}
+	observeBatchCommitProduceStage(messageType, batchCommitProduceStageWaitReservation, stageStart)
 
 	if len(tasks) == 1 {
+		stageStart = time.Now()
 		resp := types.NewAppendResponseN(1)
+		observeBatchCommitProduceStage(messageType, batchCommitProduceStageNewResponse, stageStart)
+		stageStart = time.Now()
 		appendResult, err := tasks[0].commit(ctx)
+		observeBatchCommitProduceStage(messageType, batchCommitProduceStageSingleCommit, stageStart)
+		stageStart = time.Now()
 		resp.FillResponseAtIdx(types.AppendResponse{
 			AppendResult: appendResult,
 			Error:        err,
 		}, 0)
+		observeBatchCommitProduceStage(messageType, batchCommitProduceStageFillResponse, stageStart)
 		return resp
 	}
 
 	wg := sync.WaitGroup{}
 	wg.Add(len(tasks))
 	mu := sync.Mutex{}
+	stageStart = time.Now()
 	resp := types.NewAppendResponseN(len(tasks))
+	observeBatchCommitProduceStage(messageType, batchCommitProduceStageNewResponse, stageStart)
+	stageStart = time.Now()
 	for i, task := range tasks {
 		go func(i int, task *ProduceGuard) (struct{}, error) {
 			defer wg.Done()
+			taskStart := time.Now()
 			appendResult, err := task.commit(ctx)
+			observeBatchCommitProduceStage(messageType, batchCommitProduceStageTaskCommit, taskStart)
+			fillStart := time.Now()
 			mu.Lock()
 			resp.FillResponseAtIdx(types.AppendResponse{
 				AppendResult: appendResult,
 				Error:        err,
 			}, i)
 			mu.Unlock()
+			observeBatchCommitProduceStage(messageType, batchCommitProduceStageFillResponse, fillStart)
 			return struct{}{}, nil
 		}(i, task)
 	}
+	observeBatchCommitProduceStage(messageType, batchCommitProduceStageLaunchCommits, stageStart)
+	stageStart = time.Now()
 	wg.Wait()
+	observeBatchCommitProduceStage(messageType, batchCommitProduceStageWaitAll, stageStart)
 	return resp
+}
+
+func batchCommitProduceMessageTypeLabel(tasks ...*ProduceGuard) string {
+	msgType := message.MessageTypeUnknown
+	for _, task := range tasks {
+		if task == nil || len(task.msgs) == 0 {
+			continue
+		}
+		taskMsgType := task.msgs[0].MessageType()
+		if msgType == message.MessageTypeUnknown {
+			msgType = taskMsgType
+			continue
+		}
+		if taskMsgType != msgType {
+			return "Mixed"
+		}
+	}
+	return msgType.String()
 }
 
 // waitForReservationOK waits for all reservations of tasks to be ready.

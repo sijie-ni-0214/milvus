@@ -22,15 +22,21 @@ const (
 	WALStatusError                          = "error"
 
 	BroadcasterTaskStateLabelName         = "state"
+	BroadcasterTaskStageLabelName         = "stage"
+	AppendMessagesStageLabelName          = "stage"
+	BatchCommitProduceStageLabelName      = "stage"
+	ProduceInternalStageLabelName         = "stage"
 	ResourceKeyLockLabelName              = "rk_lock"
 	WALAccessModelLabelName               = "access_model"
 	WALScannerModelLabelName              = "scanner_model"
 	TimeTickSyncTypeLabelName             = "type"
 	TimeTickAckTypeLabelName              = "type"
 	WALInterceptorLabelName               = "interceptor_name"
+	WALAppendStageLabelName               = "stage"
 	WALTxnStateLabelName                  = "state"
 	WALFlusherStateLabelName              = "state"
 	WALRecoveryStorageStateLabelName      = "state"
+	WALRecoveryStageLabelName             = "stage"
 	WALStateLabelName                     = "state"
 	WALRateLimitControllerSourceLabelName = "source"
 	WALRateLimitStateLabelName            = "state"
@@ -94,6 +100,30 @@ var (
 		Buckets: secondsBuckets,
 	}, WALChannelLabelName)
 
+	StreamingServiceClientAppendMessagesStageDurationSeconds = newStreamingServiceClientHistogramVec(prometheus.HistogramOpts{
+		Name:    "append_messages_stage_duration_seconds",
+		Help:    "Duration of AppendMessages helper stages",
+		Buckets: secondsBuckets,
+	}, WALMessageTypeLabelName, AppendMessagesStageLabelName)
+
+	StreamingServiceClientBatchCommitProduceStageDurationSeconds = newStreamingServiceClientHistogramVec(prometheus.HistogramOpts{
+		Name:    "batch_commit_produce_stage_duration_seconds",
+		Help:    "Duration of BatchCommitProduce stages",
+		Buckets: secondsBuckets,
+	}, WALMessageTypeLabelName, BatchCommitProduceStageLabelName)
+
+	StreamingServiceClientProduceInternalStageDurationSeconds = newStreamingServiceClientHistogramVec(prometheus.HistogramOpts{
+		Name:    "produce_internal_stage_duration_seconds",
+		Help:    "Duration of ResumableProducer produceInternal stages",
+		Buckets: secondsBuckets,
+	}, WALMessageTypeLabelName, ProduceInternalStageLabelName)
+
+	StreamingServiceClientProduceInternalStageDurationByChannelSeconds = newStreamingServiceClientHistogramVec(prometheus.HistogramOpts{
+		Name:    "produce_internal_stage_duration_by_channel_seconds",
+		Help:    "Duration of ResumableProducer produceInternal stages by pchannel",
+		Buckets: secondsBuckets,
+	}, WALChannelLabelName, WALMessageTypeLabelName, ProduceInternalStageLabelName)
+
 	// Streaming Service Client Consumer Metrics.
 	StreamingServiceClientResumingConsumerTotal = newStreamingServiceClientGaugeVec(prometheus.GaugeOpts{
 		Name: "resuming_consumer_total",
@@ -151,6 +181,18 @@ var (
 	StreamingCoordBroadcasterTaskBroadcastDurationSeconds = newStreamingCoordHistogramVec(prometheus.HistogramOpts{
 		Name:    "broadcaster_task_broadcast_duration_seconds",
 		Help:    "Duration of broadcast message into wal",
+		Buckets: secondsBuckets,
+	}, WALMessageTypeLabelName)
+
+	StreamingCoordBroadcasterTaskBroadcastStageDurationSeconds = newStreamingCoordHistogramVec(prometheus.HistogramOpts{
+		Name:    "broadcaster_task_broadcast_stage_duration_seconds",
+		Help:    "Duration of broadcast message into wal by stage",
+		Buckets: secondsBuckets,
+	}, WALMessageTypeLabelName, BroadcasterTaskStageLabelName)
+
+	StreamingCoordBroadcasterTaskAckWaitDurationSeconds = newStreamingCoordHistogramVec(prometheus.HistogramOpts{
+		Name:    "broadcaster_task_ack_wait_duration_seconds",
+		Help:    "Duration from broadcast message append done to all target vchannels acked",
 		Buckets: secondsBuckets,
 	}, WALMessageTypeLabelName)
 
@@ -354,6 +396,12 @@ var (
 		Help: "Total of append message to wal",
 	}, WALChannelLabelName, WALMessageTypeLabelName, StatusLabelName)
 
+	WALAppendMessageStageDurationSeconds = newWALHistogramVec(prometheus.HistogramOpts{
+		Name:    "append_message_stage_duration_seconds",
+		Help:    "Duration of each stage while appending a message to wal",
+		Buckets: secondsBuckets,
+	}, WALChannelLabelName, WALMessageTypeLabelName, WALAppendStageLabelName, StatusLabelName)
+
 	WALAppendMessageBeforeInterceptorDurationSeconds = newWALHistogramVec(prometheus.HistogramOpts{
 		Name:    "interceptor_before_append_duration_seconds",
 		Help:    "Intercept duration before wal append message",
@@ -475,6 +523,12 @@ var (
 		Name: "flusher_time_tick",
 		Help: "the final timetick tick of flusher seen",
 	}, WALChannelLabelName, WALChannelTermLabelName)
+
+	WALRecoveryDropCollectionStageDurationSeconds = newWALHistogramVec(prometheus.HistogramOpts{
+		Name:    "recovery_drop_collection_stage_duration_seconds",
+		Help:    "Duration of DropCollection observation stages in WAL recovery storage",
+		Buckets: secondsBuckets,
+	}, WALChannelLabelName, WALChannelTermLabelName, WALRecoveryStageLabelName)
 
 	WALRecoveryInfo = newWALGaugeVec(prometheus.GaugeOpts{
 		Name: "recovery_info",
@@ -658,6 +712,10 @@ func RegisterStreamingServiceClient(registry *prometheus.Registry) {
 		registry.MustRegister(StreamingServiceClientSuccessProduceBytes)
 		registry.MustRegister(StreamingServiceClientSuccessProduceDurationSeconds)
 		registry.MustRegister(StreamingServiceClientProduceRateLimitDelaySeconds)
+		registry.MustRegister(StreamingServiceClientAppendMessagesStageDurationSeconds)
+		registry.MustRegister(StreamingServiceClientBatchCommitProduceStageDurationSeconds)
+		registry.MustRegister(StreamingServiceClientProduceInternalStageDurationSeconds)
+		registry.MustRegister(StreamingServiceClientProduceInternalStageDurationByChannelSeconds)
 		registry.MustRegister(StreamingServiceClientResumingConsumerTotal)
 		registry.MustRegister(StreamingServiceClientConsumerTotal)
 		registry.MustRegister(StreamingServiceClientConsumeBytes)
@@ -674,6 +732,8 @@ func registerStreamingCoord(registry *prometheus.Registry) {
 	registry.MustRegister(StreamingCoordBroadcasterTaskTotal)
 	registry.MustRegister(StreamingCoordBroadcasterTaskExecutionDurationSeconds)
 	registry.MustRegister(StreamingCoordBroadcasterTaskBroadcastDurationSeconds)
+	registry.MustRegister(StreamingCoordBroadcasterTaskBroadcastStageDurationSeconds)
+	registry.MustRegister(StreamingCoordBroadcasterTaskAckWaitDurationSeconds)
 	registry.MustRegister(StreamingCoordBroadcasterTaskAcquireLockDurationSeconds)
 	registry.MustRegister(StreamingCoordBroadcasterTaskAckCallbackDurationSeconds)
 }
@@ -726,6 +786,7 @@ func registerWAL(registry *prometheus.Registry) {
 	registry.MustRegister(WALCollectionTotal)
 	registry.MustRegister(WALAppendMessageBytes)
 	registry.MustRegister(WALAppendMessageTotal)
+	registry.MustRegister(WALAppendMessageStageDurationSeconds)
 	registry.MustRegister(WALAppendMessageBeforeInterceptorDurationSeconds)
 	registry.MustRegister(WALAppendMessageAfterInterceptorDurationSeconds)
 	registry.MustRegister(WALImplsAppendRetryTotal)
@@ -749,6 +810,7 @@ func registerWAL(registry *prometheus.Registry) {
 	registry.MustRegister(WALScannerTxnBufBytes)
 	registry.MustRegister(WALFlusherInfo)
 	registry.MustRegister(WALFlusherTimeTick)
+	registry.MustRegister(WALRecoveryDropCollectionStageDurationSeconds)
 	registry.MustRegister(WALRecoveryInfo)
 	registry.MustRegister(WALRecoveryObservedTimeTick)
 	registry.MustRegister(WALRecoveryInMemTimeTick)

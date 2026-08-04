@@ -251,6 +251,28 @@ var (
 			nodeIDLabelName,
 		})
 
+	DataCoordWatchChannelsStageDuration = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Namespace: milvusNamespace,
+			Subsystem: typeutil.DataCoordRole,
+			Name:      "watch_channels_stage_duration",
+			Help:      "duration of WatchChannels stages in milliseconds",
+			Buckets:   buckets,
+		}, []string{
+			"stage",
+		})
+
+	DataCoordUpdateChannelCheckpointStageDuration = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Namespace: milvusNamespace,
+			Subsystem: typeutil.DataCoordRole,
+			Name:      "update_channel_checkpoint_stage_duration",
+			Help:      "duration of UpdateChannelCheckpoint stages in milliseconds",
+			Buckets:   buckets,
+		}, []string{
+			"stage",
+		})
+
 	DataCoordCompactedSegmentSize = prometheus.NewHistogramVec(
 		prometheus.HistogramOpts{
 			Namespace: milvusNamespace,
@@ -606,6 +628,8 @@ func RegisterDataCoord(registry *prometheus.Registry) {
 	registry.MustRegister(DataCoordStoredIndexFilesSize)
 	registry.MustRegister(DataCoordSegmentBinLogFileCount)
 	registry.MustRegister(DataCoordDmlChannelNum)
+	registry.MustRegister(DataCoordWatchChannelsStageDuration)
+	registry.MustRegister(DataCoordUpdateChannelCheckpointStageDuration)
 	registry.MustRegister(DataCoordCompactedSegmentSize)
 	registry.MustRegister(DataCoordCompactionTaskNum)
 	registry.MustRegister(DataCoordCompactionLatency)

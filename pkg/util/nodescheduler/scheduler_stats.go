@@ -18,7 +18,6 @@ package nodescheduler
 
 import (
 	"context"
-	"reflect"
 	"sort"
 	"sync"
 	"time"
@@ -91,14 +90,6 @@ func (s *schedulerStats) setCapacity(capacity int) {
 	s.mu.Lock()
 	s.capacity = capacity
 	s.mu.Unlock()
-}
-
-func schedulerTaskType(task Task) string {
-	typ := reflect.TypeOf(task)
-	if typ == nil {
-		return "<nil>"
-	}
-	return typ.String()
 }
 
 func (s *schedulerStats) submit(taskType string) {

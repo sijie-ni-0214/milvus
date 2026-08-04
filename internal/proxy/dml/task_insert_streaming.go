@@ -3,6 +3,7 @@ package dml
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"go.opentelemetry.io/otel"
 
@@ -42,7 +43,9 @@ func (it *InsertTask) Execute(ctx context.Context) error {
 	channelNames := it.vChannels
 	if len(channelNames) == 0 {
 		var err error
+		stageStart := time.Now()
 		channelNames, err = it.chMgr.GetVChannels(collID)
+		observeProxyInsertStage(proxyInsertStageExecuteGetVChannels, stageStart, err)
 		if err != nil {
 			mlog.Warn(ctx, "get vChannels failed", mlog.FieldCollectionID(collID), mlog.Err(err))
 			it.result.Status = merr.Status(err)
@@ -66,26 +69,31 @@ func (it *InsertTask) Execute(ctx context.Context) error {
 	var msgs []message.MutableMessage
 	var err error
 	idempotency := it.idempotentInsertDecoration()
+	stageStart := time.Now()
 	if it.partitionKeys == nil {
 		msgs, err = repackInsertDataForStreamingService(it.TraceCtx(), it.GetMetaCache(), channelNames, it.insertMsg, it.result, ez, it.schemaVersion, nil, idempotency)
 	} else {
 		msgs, err = repackInsertDataWithPartitionKeyForStreamingService(it.TraceCtx(), it.GetMetaCache(), channelNames, it.insertMsg, it.result, it.partitionKeys, ez, it.schema, it.schemaVersion, nil, idempotency)
 	}
+	observeProxyInsertStage(proxyInsertStageExecuteRepack, stageStart, err)
 	if err != nil {
 		mlog.Warn(ctx, "assign segmentID and repack insert data failed", mlog.Err(err))
 		it.result.Status = merr.Status(err)
 		return err
 	}
+	stageStart = time.Now()
 	resp := streaming.WAL().AppendMessagesWithOptions(ctx, msgs, streaming.AppendOption{
 		IdempotencyKey: it.idempotencyKey,
 	})
+	appendErr := resp.UnwrapFirstError()
+	observeProxyInsertStage(proxyInsertStageExecuteWALAppend, stageStart, appendErr)
 	invalidateMismatchedWriteSchema(ctx, it.GetMetaCache(), collID, resp)
-	if err := resp.UnwrapFirstError(); err != nil {
-		mlog.Warn(ctx, "append messages to wal failed", mlog.Err(err))
-		if status.AsStreamingError(err).IsSchemaVersionMismatch() {
+	if appendErr != nil {
+		mlog.Warn(ctx, "append messages to wal failed", mlog.Err(appendErr))
+		if status.AsStreamingError(appendErr).IsSchemaVersionMismatch() {
 			it.result.Status = merr.Status(merr.ErrCollectionSchemaMismatch)
 		} else {
-			it.result.Status = merr.Status(err)
+			it.result.Status = merr.Status(appendErr)
 		}
 		return nil
 	}

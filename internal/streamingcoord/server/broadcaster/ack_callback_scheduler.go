@@ -287,6 +287,7 @@ func (s *ackCallbackScheduler) doAckCallback(bt *broadcastTask, g *lockGuards) (
 	if err := bt.BlockUntilAllAck(s.notifier.Context()); err != nil {
 		return err
 	}
+	bt.ObserveAckWaitDone()
 	logger.Debug(context.TODO(), "all vchannels are acked")
 
 	msg, result := bt.BroadcastResult()

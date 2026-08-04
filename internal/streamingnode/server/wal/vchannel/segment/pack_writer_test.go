@@ -564,3 +564,12 @@ func TestFlushInsertBufferMaterializesMissingBM25Output(t *testing.T) {
 		})
 	})
 }
+
+func TestNewBulkPackWriterUsesDefaultStorageConfig(t *testing.T) {
+	paramtable.Init()
+
+	writer := NewBulkPackWriter(nil, nil, nil)
+	bulkWriter, ok := writer.(*growingBulkPackWriter)
+	require.True(t, ok)
+	require.NotNil(t, bulkWriter.storageConfig)
+}

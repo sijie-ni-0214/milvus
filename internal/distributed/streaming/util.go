@@ -2,16 +2,27 @@ package streaming
 
 import (
 	"context"
+	"time"
 
 	"github.com/milvus-io/milvus/internal/distributed/streaming/internal/producer"
+	"github.com/milvus-io/milvus/pkg/v3/metrics"
 	"github.com/milvus-io/milvus/pkg/v3/streaming/util/message"
 	"github.com/milvus-io/milvus/pkg/v3/streaming/util/types"
+	"github.com/milvus-io/milvus/pkg/v3/util/paramtable"
 	"github.com/milvus-io/milvus/pkg/v3/util/typeutil"
 )
 
 type (
 	AppendResponses = types.AppendResponses
 	AppendResponse  = types.AppendResponse
+)
+
+const (
+	appendMessagesStageLifetimeGuard = "lifetime_guard"
+	appendMessagesStageDispatch      = "dispatch"
+	appendMessagesStageBeginProduce  = "begin_produce"
+	appendMessagesStageBatchCommit   = "batch_commit"
+	appendMessagesStageFillResponses = "fill_responses"
 )
 
 // AppendMessagesToWAL appends messages to the wal.
@@ -26,16 +37,22 @@ func (w *walAccesserImpl) AppendMessages(ctx context.Context, msgs ...message.Mu
 func (w *walAccesserImpl) AppendMessagesWithOptions(ctx context.Context, msgs []message.MutableMessage, opts ...AppendOption) AppendResponses {
 	assertValidMessage(msgs...)
 	msgs = applyOpt(msgs, opts...)
+	messageType := appendMessagesTypeLabel(msgs...)
 
+	stageStart := time.Now()
 	if !w.lifetime.Add(typeutil.LifetimeStateWorking) {
+		observeAppendMessagesStage(messageType, appendMessagesStageLifetimeGuard, stageStart)
 		err := types.NewAppendResponseN(len(msgs))
 		err.FillAllError(ErrWALAccesserClosed)
 		return err
 	}
+	observeAppendMessagesStage(messageType, appendMessagesStageLifetimeGuard, stageStart)
 	defer w.lifetime.Done()
 
 	// dispatch the messages into different vchannel.
+	stageStart = time.Now()
 	dispatchedMessages, indexes := w.dispatchMessages(msgs...)
+	observeAppendMessagesStage(messageType, appendMessagesStageDispatch, stageStart)
 
 	// Use a slice to maintain the order of vchannels and their corresponding indexes.
 	type vchannelTask struct {
@@ -46,9 +63,11 @@ func (w *walAccesserImpl) AppendMessagesWithOptions(ctx context.Context, msgs []
 	guards := make([]*producer.ProduceGuard, 0, len(dispatchedMessages))
 	resp := types.NewAppendResponseN(len(msgs))
 	produceOpts := toProduceOptions(opts...)
+	stageStart = time.Now()
 	for vchannel, vchannelMsgs := range dispatchedMessages {
 		g, err := w.getProducer(vchannel).BeginProduceWithOptions(ctx, vchannelMsgs, produceOpts...)
 		if err != nil {
+			observeAppendMessagesStage(messageType, appendMessagesStageBeginProduce, stageStart)
 			for _, guard := range guards {
 				guard.Cancel()
 			}
@@ -61,17 +80,22 @@ func (w *walAccesserImpl) AppendMessagesWithOptions(ctx context.Context, msgs []
 			indexes:  indexes[vchannel],
 		})
 	}
+	observeAppendMessagesStage(messageType, appendMessagesStageBeginProduce, stageStart)
 
 	// Batch commit and get responses per vchannel.
+	stageStart = time.Now()
 	guardResps := producer.BatchCommitProduce(ctx, guards...)
+	observeAppendMessagesStage(messageType, appendMessagesStageBatchCommit, stageStart)
 
 	// Map the responses back to the original order using indexes.
+	stageStart = time.Now()
 	for i, task := range tasks {
 		guardResp := guardResps.Responses[i]
 		for _, origIdx := range task.indexes {
 			resp.FillResponseAtIdx(guardResp, origIdx)
 		}
 	}
+	observeAppendMessagesStage(messageType, appendMessagesStageFillResponses, stageStart)
 
 	return resp
 }
@@ -83,6 +107,23 @@ func (w *walAccesserImpl) appendReplicateMessageToWAL(ctx context.Context, msg m
 	}
 	resp := producer.BatchCommitProduce(ctx, guard)
 	return resp.Responses[0].AppendResult, resp.Responses[0].Error
+}
+
+func appendMessagesTypeLabel(msgs ...message.MutableMessage) string {
+	if len(msgs) == 0 {
+		return message.MessageTypeUnknown.String()
+	}
+	msgType := msgs[0].MessageType()
+	for _, msg := range msgs[1:] {
+		if msg.MessageType() != msgType {
+			return "Mixed"
+		}
+	}
+	return msgType.String()
+}
+
+func observeAppendMessagesStage(messageType string, stage string, start time.Time) {
+	metrics.StreamingServiceClientAppendMessagesStageDurationSeconds.WithLabelValues(paramtable.GetStringNodeID(), messageType, stage).Observe(time.Since(start).Seconds())
 }
 
 // dispatchMessages dispatches the messages into different vchannel.

@@ -3,6 +3,7 @@ package utility
 import (
 	"context"
 	"reflect"
+	"time"
 
 	"google.golang.org/protobuf/reflect/protoreflect"
 
@@ -102,6 +103,21 @@ func WithAppendMetricsContext(ctx context.Context, m *metricsutil.AppendMetrics)
 // MustGetAppendMetrics get append metrics from context
 func MustGetAppendMetrics(ctx context.Context) *metricsutil.AppendMetrics {
 	return ctx.Value(metricsValue).(*metricsutil.AppendMetrics)
+}
+
+// GetAppendMetrics gets append metrics from context if the append is running
+// through the WAL adaptor metrics path.
+func GetAppendMetrics(ctx context.Context) *metricsutil.AppendMetrics {
+	metrics, _ := ctx.Value(metricsValue).(*metricsutil.AppendMetrics)
+	return metrics
+}
+
+// ObserveAppendStage records one explicitly instrumented append stage when
+// append metrics are available. Direct interceptor unit tests may omit them.
+func ObserveAppendStage(ctx context.Context, stage string, start time.Time) {
+	if metrics := GetAppendMetrics(ctx); metrics != nil {
+		metrics.ObserveStage(stage, time.Since(start))
+	}
 }
 
 // WithFlushFromOldArch set flush from old arch to context

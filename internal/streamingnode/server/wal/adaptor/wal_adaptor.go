@@ -387,7 +387,9 @@ func (w *walAdaptorImpl) appendOneWithRetry(ctx context.Context, msg message.Mut
 		}
 		appendCtx, span := message.StartSpanForMessage(ctx, msg, message.SpanNameWALAppendImpl)
 		message.OverwriteTraceContext(appendCtx, msg)
+		stageStart := time.Now()
 		msgID, err := w.rwWALImpls.Append(appendCtx, msg)
+		utility.ObserveAppendStage(ctx, metricsutil.AppendStageWALImplAttempt, stageStart)
 		failpoint.Inject("afterBackendAppend", func(value failpoint.Value) {
 			if err == nil && walpoint.Hit(appendCtx, value, walpoint.AfterBackendAppend, msg, msgID, nil) {
 				// Persisted data with a lost acknowledgement must enter the real retry loop.
@@ -419,13 +421,17 @@ func (w *walAdaptorImpl) appendOneWithRetry(ctx context.Context, msg message.Mut
 		nextInterval := backoff.NextBackOff()
 		w.Logger().Warn(ctx, "append message into wal impls failed, retrying...", mlog.FieldMessage(msg), mlog.Int("retry", i), mlog.Duration("nextInterval", nextInterval), mlog.Err(err))
 
+		stageStart = time.Now()
 		select {
 		case <-ctx.Done():
+			utility.ObserveAppendStage(ctx, metricsutil.AppendStageWALImplBackoff, stageStart)
 			return nil, context.Cause(ctx)
 		case <-w.availableCtx.Done():
+			utility.ObserveAppendStage(ctx, metricsutil.AppendStageWALImplBackoff, stageStart)
 			return nil, status.NewOnShutdownError("wal is on shutdown")
 		case <-time.After(nextInterval):
 		}
+		utility.ObserveAppendStage(ctx, metricsutil.AppendStageWALImplBackoff, stageStart)
 	}
 }
 
@@ -520,6 +526,11 @@ func buildInterceptor(builders []interceptors.InterceptorBuilder, param *interce
 	for _, b := range builders {
 		builtIterceptors = append(builtIterceptors, b.Build(param))
 	}
+	// The WAL adaptor and time-tick operator retain param for their whole
+	// lifetime. All recovery-dependent components have consumed the initial
+	// snapshot by this point, so release the build-only reference instead of
+	// retaining a second copy of the recovery metadata.
+	param.InitialRecoverSnapshot = nil
 	return interceptorBuildResult{
 		Interceptor: interceptors.NewChainedInterceptor(builtIterceptors...),
 		GracefulCloseFunc: func() {

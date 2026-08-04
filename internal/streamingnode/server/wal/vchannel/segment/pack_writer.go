@@ -67,6 +67,9 @@ func NewBulkPackWriter(
 	storageConfig *indexpb.StorageConfig,
 	writeRetryOpts ...retry.Option,
 ) PackWriter {
+	if storageConfig == nil {
+		storageConfig = packed.CreateStorageConfig()
+	}
 	return &growingBulkPackWriter{
 		chunkManager:   chunkManager,
 		allocator:      allocator,

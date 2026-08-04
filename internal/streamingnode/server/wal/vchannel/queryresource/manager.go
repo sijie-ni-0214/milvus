@@ -371,7 +371,7 @@ func (m *Manager) startBuildLocked(meta *viewpb.QueryViewMeta, build ViewBuilder
 			return nil, err
 		}
 		mlog.Warn(ctx, "retry query runtime preparation", mlog.FieldVChannel(view.VChannel), mlog.Err(err))
-		return nil, errors.Mark(merr.Wrap(err, "initialize query runtime"), nodescheduler.ErrDelay)
+		return nil, nodescheduler.MarkDelay(merr.Wrap(err, "initialize query runtime"))
 	})
 	m.task = scheduleResourceBuild(m.scheduler, task, m.finishBuild, nodescheduler.WithPriority(m.buildPriorityLocked()))
 	m.err = nil
@@ -542,7 +542,7 @@ func (m *Manager) prepareViewRef(ctx context.Context, key qviews.QueryViewKey, r
 			}
 			return nil
 		}
-		return errors.Mark(err, nodescheduler.ErrDelay)
+		return nodescheduler.MarkDelay(err)
 	}
 	m.mu.Lock()
 	currentRef, ok := m.refs[key]

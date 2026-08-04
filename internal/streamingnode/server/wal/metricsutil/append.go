@@ -15,6 +15,21 @@ const (
 	logThreshold = 10 * time.Millisecond
 )
 
+const (
+	AppendStageTotal                    = "total"
+	AppendStageWALImpl                  = "wal_impl"
+	AppendStageWALImplAttempt           = "wal_impl_attempt"
+	AppendStageWALImplBackoff           = "wal_impl_backoff"
+	AppendStageRedoWaitGrowingSegment   = "redo_wait_growing_segment"
+	AppendStageLockAcquire              = "lock_acquire"
+	AppendStageTimeTickAllocate         = "timetick_allocate"
+	AppendStageTimeTickAck              = "timetick_ack"
+	AppendStageShardSchemaCheck         = "shard_schema_check"
+	AppendStageShardFunctionMaterialize = "shard_function_materialize"
+	AppendStageShardAssignSegment       = "shard_assign_segment"
+	AppendStageMVCCUpdate               = "mvcc_update"
+)
+
 type InterceptorMetrics struct {
 	Before    time.Duration
 	BeforeErr error
@@ -39,6 +54,7 @@ type AppendMetrics struct {
 	appendDuration     time.Duration
 	implAppendDuration time.Duration
 	interceptors       map[string][]*InterceptorMetrics
+	stages             map[string]time.Duration
 }
 
 type AppendMetricsGuard struct {
@@ -119,6 +135,25 @@ func (m *AppendMetricsGuard) FinishWALImplAppend() {
 // FinishAppend finish the append operation.
 func (m *AppendMetricsGuard) FinishAppend() {
 	m.inner.appendDuration = time.Since(m.startAppend)
+}
+
+// ObserveStage adds duration to a low-cardinality append stage. Multiple
+// observations of the same stage in one append are aggregated before export.
+func (m *AppendMetrics) ObserveStage(stage string, duration time.Duration) {
+	if stage == "" || duration <= 0 {
+		return
+	}
+	if m.stages == nil {
+		m.stages = make(map[string]time.Duration)
+	}
+	m.stages[stage] += duration
+}
+
+// RangeOverStages ranges over explicitly instrumented append stages.
+func (m *AppendMetrics) RangeOverStages(f func(stage string, duration time.Duration)) {
+	for stage, duration := range m.stages {
+		f(stage, duration)
+	}
 }
 
 // RangeOverInterceptors range over the interceptors.

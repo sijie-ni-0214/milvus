@@ -26,6 +26,49 @@ import (
 
 func tombstone() string { return string(SuffixSnapshotTombstone) }
 
+func TestCatalog_ListAliasHelpers_SkipTombstone(t *testing.T) {
+	ctx := context.Background()
+	legacyAlias, err := proto.Marshal(&pb.CollectionInfo{
+		ID:     10,
+		DbId:   util.DefaultDBID,
+		Schema: &schemapb.CollectionSchema{Name: "legacy-alias"},
+	})
+	require.NoError(t, err)
+	alias, err := proto.Marshal(&pb.AliasInfo{
+		AliasName:    "alias",
+		CollectionId: 20,
+	})
+	require.NoError(t, err)
+
+	t.Run("legacy alias", func(t *testing.T) {
+		kv := mocks.NewTxnKV(t)
+		kv.EXPECT().LoadWithPrefix(mock.Anything, CollectionAliasMetaPrefix210+"/").Return(
+			[]string{"alias-tombstone", "alias-valid"},
+			[]string{tombstone(), string(legacyAlias)},
+			nil,
+		)
+		catalog := NewCatalog(kv).(*Catalog)
+		aliases, err := catalog.listAliasesBefore210(ctx, 0)
+		require.NoError(t, err)
+		require.Len(t, aliases, 1)
+		assert.Equal(t, "legacy-alias", aliases[0].Name)
+	})
+
+	t.Run("database alias", func(t *testing.T) {
+		kv := mocks.NewTxnKV(t)
+		kv.EXPECT().LoadWithPrefix(mock.Anything, BuildAliasPrefixWithDB(testDb)).Return(
+			[]string{"alias-tombstone", "alias-valid"},
+			[]string{tombstone(), string(alias)},
+			nil,
+		)
+		catalog := NewCatalog(kv).(*Catalog)
+		aliases, err := catalog.listAliasesAfter210WithDb(ctx, testDb, 0)
+		require.NoError(t, err)
+		require.Len(t, aliases, 1)
+		assert.Equal(t, "alias", aliases[0].Name)
+	})
+}
+
 func TestCatalog_ListCollections_SkipsTombstone(t *testing.T) {
 	ctx := context.Background()
 	coll := &pb.CollectionInfo{

@@ -3,9 +3,12 @@ package lock
 import (
 	"context"
 	"sync"
+	"time"
 
 	"github.com/milvus-io/milvus/internal/streamingnode/server/wal/interceptors"
 	"github.com/milvus-io/milvus/internal/streamingnode/server/wal/interceptors/txn"
+	"github.com/milvus-io/milvus/internal/streamingnode/server/wal/metricsutil"
+	"github.com/milvus-io/milvus/internal/streamingnode/server/wal/utility"
 	"github.com/milvus-io/milvus/pkg/v3/streaming/util/message"
 	"github.com/milvus-io/milvus/pkg/v3/streaming/util/types"
 	"github.com/milvus-io/milvus/pkg/v3/util/funcutil"
@@ -22,7 +25,9 @@ type lockAppendInterceptor struct {
 }
 
 func (r *lockAppendInterceptor) DoAppend(ctx context.Context, msg message.MutableMessage, append interceptors.Append) (message.MessageID, error) {
+	stageStart := time.Now()
 	unlock := r.acquireLockGuard(msg)
+	utility.ObserveAppendStage(ctx, metricsutil.AppendStageLockAcquire, stageStart)
 	defer unlock()
 
 	// Row locks are taken under the shard lifecycle lock and before TimeTick

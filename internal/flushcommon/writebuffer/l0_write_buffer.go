@@ -109,12 +109,12 @@ func (wb *l0WriteBuffer) BufferData(insertData []*InsertData, deleteMsgs []*msgs
 
 // bufferInsert function InsertMsg into bufferred InsertData and returns primary key field data for future usage.
 func (wb *l0WriteBuffer) bufferInsert(inData *InsertData, startPos, endPos *msgpb.MsgPosition, schemaVersion int32) error {
-	if err := wb.CreateNewGrowingSegment(CreateGrowingSegmentInfo{
+	if err := wb.createNewGrowingSegment(CreateGrowingSegmentInfo{
 		PartitionID:   inData.partitionID,
 		SegmentID:     inData.segmentID,
 		StartPos:      startPos,
 		SchemaVersion: schemaVersion,
-	}); err != nil {
+	}, false); err != nil {
 		return err
 	}
 	segBuf := wb.getOrCreateBuffer(inData.segmentID, startPos.GetTimestamp())

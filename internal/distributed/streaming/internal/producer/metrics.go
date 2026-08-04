@@ -15,6 +15,36 @@ import (
 	"github.com/milvus-io/milvus/pkg/v3/util/paramtable"
 )
 
+const (
+	batchCommitProduceStageTotal              = "total"
+	batchCommitProduceStageWaitReservation    = "wait_reservation"
+	batchCommitProduceStageCancelReservations = "cancel_reservations"
+	batchCommitProduceStageNewResponse        = "new_response"
+	batchCommitProduceStageSingleCommit       = "single_commit"
+	batchCommitProduceStageLaunchCommits      = "launch_commits"
+	batchCommitProduceStageTaskCommit         = "task_commit"
+	batchCommitProduceStageFillResponse       = "fill_response"
+	batchCommitProduceStageWaitAll            = "wait_all"
+)
+
+const (
+	produceInternalStageTotal                     = "total"
+	produceInternalStageLifetimeGuard             = "lifetime_guard"
+	produceInternalStageGetProducerAfterAvailable = "get_producer_after_available"
+	produceInternalStageAppend                    = "append"
+	produceInternalStageWaitRateLimitAvailable    = "wait_rate_limit_available"
+)
+
+func observeBatchCommitProduceStage(messageType string, stage string, start time.Time) {
+	metrics.StreamingServiceClientBatchCommitProduceStageDurationSeconds.WithLabelValues(paramtable.GetStringNodeID(), messageType, stage).Observe(time.Since(start).Seconds())
+}
+
+func observeProduceInternalStage(pchannel string, messageType string, stage string, start time.Time) {
+	duration := time.Since(start).Seconds()
+	metrics.StreamingServiceClientProduceInternalStageDurationSeconds.WithLabelValues(paramtable.GetStringNodeID(), messageType, stage).Observe(duration)
+	metrics.StreamingServiceClientProduceInternalStageDurationByChannelSeconds.WithLabelValues(paramtable.GetStringNodeID(), pchannel, messageType, stage).Observe(duration)
+}
+
 // newResumingProducerMetrics creates a new producer metrics.
 func newResumingProducerMetrics(pchannel string) *resumingProducerMetrics {
 	constLabel := prometheus.Labels{
