@@ -19,12 +19,14 @@ package rootcoord
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/milvus-io/milvus-proto/go-api/v3/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v3/milvuspb"
 	"github.com/milvus-io/milvus/internal/distributed/streaming"
 	"github.com/milvus-io/milvus/internal/streamingcoord/server/broadcaster/registry"
 	"github.com/milvus-io/milvus/pkg/v3/common"
+	"github.com/milvus-io/milvus/pkg/v3/metrics"
 	"github.com/milvus-io/milvus/pkg/v3/mlog"
 	"github.com/milvus-io/milvus/pkg/v3/proto/datapb"
 	"github.com/milvus-io/milvus/pkg/v3/proto/proxypb"
@@ -39,6 +41,20 @@ import (
 
 type collectionDataViewDropper interface {
 	DropCollectionDataView(ctx context.Context, collectionID int64) error
+}
+
+const (
+	dropCollectionCallbackStageDropLoadConfig    = "drop_load_config"
+	dropCollectionCallbackStageDropIndex         = "drop_index"
+	dropCollectionCallbackStageDropSnapshots     = "drop_snapshots"
+	dropCollectionCallbackStageDropMeta          = "drop_meta"
+	dropCollectionCallbackStageDropVirtual       = "drop_virtual_channel"
+	dropCollectionCallbackStageRefreshPolicyInfo = "refresh_policy_info_cache"
+	dropCollectionCallbackStageExpireCaches      = "expire_caches"
+)
+
+func observeDropCollectionCallbackStage(stage string, start time.Time) {
+	metrics.RootCoordDDLCallbackDuration.WithLabelValues("DropCollection", stage).Observe(float64(time.Since(start).Microseconds()) / 1000.0)
 }
 
 func (c *Core) broadcastDropCollectionV1(ctx context.Context, req *milvuspb.DropCollectionRequest) error {
@@ -87,9 +103,12 @@ func (c *DDLCallback) dropCollectionV1AckCallback(ctx context.Context, result me
 				WithBroadcast([]string{streaming.WAL().ControlChannel()}).
 				MustBuildBroadcast().
 				WithBroadcastID(msg.BroadcastHeader().BroadcastID)
-			if err := registry.CallMessageAckCallback(ctx, dropLoadConfigMsg, map[string]*message.AppendResult{
+			stageStart := time.Now()
+			err := registry.CallMessageAckCallback(ctx, dropLoadConfigMsg, map[string]*message.AppendResult{
 				streaming.WAL().ControlChannel(): result,
-			}); err != nil {
+			})
+			observeDropCollectionCallbackStage(dropCollectionCallbackStageDropLoadConfig, stageStart)
+			if err != nil {
 				return merr.Wrap(err, "failed to release collection")
 			}
 
@@ -103,9 +122,12 @@ func (c *DDLCallback) dropCollectionV1AckCallback(ctx context.Context, result me
 				MustBuildBroadcast().
 				WithBroadcastID(msg.BroadcastHeader().BroadcastID)
 
-			if err := registry.CallMessageAckCallback(ctx, dropIndexMsg, map[string]*message.AppendResult{
+			stageStart = time.Now()
+			err = registry.CallMessageAckCallback(ctx, dropIndexMsg, map[string]*message.AppendResult{
 				streaming.WAL().ControlChannel(): result,
-			}); err != nil {
+			})
+			observeDropCollectionCallbackStage(dropCollectionCallbackStageDropIndex, stageStart)
+			if err != nil {
 				return merr.Wrap(err, "failed to drop collection index")
 			}
 
@@ -119,16 +141,22 @@ func (c *DDLCallback) dropCollectionV1AckCallback(ctx context.Context, result me
 				MustBuildBroadcast().
 				WithBroadcastID(msg.BroadcastHeader().BroadcastID)
 
-			if err := registry.CallMessageAckCallback(ctx, dropSnapshotsMsg, map[string]*message.AppendResult{
+			stageStart = time.Now()
+			err = registry.CallMessageAckCallback(ctx, dropSnapshotsMsg, map[string]*message.AppendResult{
 				streaming.WAL().ControlChannel(): result,
-			}); err != nil {
+			})
+			observeDropCollectionCallbackStage(dropCollectionCallbackStageDropSnapshots, stageStart)
+			if err != nil {
 				mlog.Warn(ctx, "best-effort drop collection snapshots failed, will be cleaned up by GC",
 					mlog.Int64("collectionID", collectionID), mlog.Err(err))
 			}
 
 			// 3. persist the CollectionMeta tombstone before deleting its DataViews.
 			// Recovery uses this state to distinguish stale DataViews from live ones.
-			if err := c.meta.DropCollection(ctx, collectionID, result.TimeTick); err != nil {
+			stageStart = time.Now()
+			err = c.meta.DropCollection(ctx, collectionID, result.TimeTick)
+			observeDropCollectionCallbackStage(dropCollectionCallbackStageDropMeta, stageStart)
+			if err != nil {
 				return merr.Wrap(err, "failed to drop collection")
 			}
 
@@ -144,12 +172,14 @@ func (c *DDLCallback) dropCollectionV1AckCallback(ctx context.Context, result me
 			continue
 		}
 		// Drop virtual channel data when the vchannel is acknowledged.
+		stageStart := time.Now()
 		resp, err := c.mixCoord.DropVirtualChannel(ctx, &datapb.DropVirtualChannelRequest{
 			Base: commonpbutil.NewMsgBase(
 				commonpbutil.WithSourceID(paramtable.GetNodeID()),
 			),
 			ChannelName: vchannel,
 		})
+		observeDropCollectionCallbackStage(dropCollectionCallbackStageDropVirtual, stageStart)
 		if err := merr.CheckRPCCall(resp, err); err != nil {
 			return merr.Wrap(err, "failed to drop virtual channel")
 		}
@@ -158,18 +188,24 @@ func (c *DDLCallback) dropCollectionV1AckCallback(ctx context.Context, result me
 	c.tombstoneSweeper.AddTombstone(newCollectionTombstone(c.meta, c.broker, header.CollectionId))
 	// DropCollection already deleted grants for the dropped collection.
 	// Refresh the RBAC policy cache on all proxies so they stop using stale grant entries.
-	if err := c.proxyClientManager.RefreshPolicyInfoCache(ctx, &proxypb.RefreshPolicyInfoCacheRequest{
+	stageStart := time.Now()
+	err := c.proxyClientManager.RefreshPolicyInfoCache(ctx, &proxypb.RefreshPolicyInfoCacheRequest{
 		OpType: int32(typeutil.CacheRefresh),
-	}); err != nil {
+	})
+	observeDropCollectionCallbackStage(dropCollectionCallbackStageRefreshPolicyInfo, stageStart)
+	if err != nil {
 		mlog.Warn(ctx, "failed to refresh RBAC policy cache after collection drop, skipping",
 			mlog.Int64("collectionID", header.CollectionId), mlog.Err(err))
 	}
 	// expire the collection meta cache on proxy.
-	return c.ExpireCaches(ctx, ce.NewBuilder().WithLegacyProxyCollectionMetaCache(
+	stageStart = time.Now()
+	err = c.ExpireCaches(ctx, ce.NewBuilder().WithLegacyProxyCollectionMetaCache(
 		ce.OptLPCMDBName(body.DbName),
 		ce.OptLPCMCollectionName(body.CollectionName),
 		ce.OptLPCMCollectionID(header.CollectionId),
 		ce.OptLPCMMsgType(commonpb.MsgType_DropCollection)).Build())
+	observeDropCollectionCallbackStage(dropCollectionCallbackStageExpireCaches, stageStart)
+	return err
 }
 
 // newCollectionTombstone creates a new collection tombstone.

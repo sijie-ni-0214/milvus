@@ -127,19 +127,30 @@ func (p *ResumableProducer) BeginProduceWithOptions(ctx context.Context, msgs []
 }
 
 func (p *ResumableProducer) produceInternal(ctx context.Context, msg message.MutableMessage) (result *types.AppendResult, err error) {
+	messageType := msg.MessageType().String()
+	totalStart := time.Now()
+	defer observeProduceInternalStage(p.opts.PChannel, messageType, produceInternalStageTotal, totalStart)
+
+	stageStart := time.Now()
 	if !p.lifetime.Add(typeutil.LifetimeStateWorking) {
+		observeProduceInternalStage(p.opts.PChannel, messageType, produceInternalStageLifetimeGuard, stageStart)
 		return nil, errors.Wrapf(errs.ErrClosed, "produce on closed producer")
 	}
+	observeProduceInternalStage(p.opts.PChannel, messageType, produceInternalStageLifetimeGuard, stageStart)
 	defer p.lifetime.Done()
 
 	for {
 		// get producer.
+		stageStart = time.Now()
 		producerHandler, err := p.producer.GetProducerAfterAvailable(ctx)
+		observeProduceInternalStage(p.opts.PChannel, messageType, produceInternalStageGetProducerAfterAvailable, stageStart)
 		if err != nil {
 			return nil, err
 		}
 		appendCtx, span := p.startDistAppendSpanIfRemote(ctx, producerHandler, msg)
+		stageStart = time.Now()
 		produceResult, err := producerHandler.Append(appendCtx, msg)
+		observeProduceInternalStage(p.opts.PChannel, messageType, produceInternalStageAppend, stageStart)
 		if sErr := status.AsStreamingError(err); sErr != nil && sErr.IsSchemaVersionMismatch() && p.opts.OnSchemaVersionMismatch != nil {
 			p.opts.OnSchemaVersionMismatch(msg.VChannel())
 		}
@@ -174,9 +185,12 @@ func (p *ResumableProducer) produceInternal(ctx context.Context, msg message.Mut
 			}
 			if sErr.IsRateLimitRejected() {
 				// current message is rate limit rejected, wait until the rate limit is available.
+				stageStart = time.Now()
 				if err := p.rateLimiter.WaitUntilAvailable(ctx); err != nil {
+					observeProduceInternalStage(p.opts.PChannel, messageType, produceInternalStageWaitRateLimitAvailable, stageStart)
 					return nil, errors.Mark(err, errs.ErrCanceledOrDeadlineExceed)
 				}
+				observeProduceInternalStage(p.opts.PChannel, messageType, produceInternalStageWaitRateLimitAvailable, stageStart)
 			}
 		}
 	}

@@ -163,6 +163,9 @@ func (m *Meta) CloseManifestCommitExecutor() {
 
 // NewMeta creates meta from provided `kv.TxnKV`
 func NewMeta(ctx context.Context, catalog metastore.DataCoordCatalog, chunkManager storage.ChunkManager, metaStore metacache.MetaStore, broker broker.Broker, loadDomainMetas DomainMetaLoader) (*Meta, error) {
+	metaRecoveryStart := time.Now()
+	mlog.Info(ctx, "datacoord meta recovery started")
+
 	// RootCoord has loaded the collection view before DataCoord starts, so
 	// its IDs (Dropping included) drive per-collection loading in both
 	// MetaStore.LoadFromCatalog and indexMeta.
@@ -199,6 +202,7 @@ func NewMeta(ctx context.Context, catalog metastore.DataCoordCatalog, chunkManag
 	}()
 
 	g, _ := errgroup.WithContext(ctx)
+	parallelRecoveryStart := time.Now()
 
 	g.Go(func() error {
 		var err error
@@ -218,8 +222,13 @@ func NewMeta(ctx context.Context, catalog metastore.DataCoordCatalog, chunkManag
 	})
 
 	if err := g.Wait(); err != nil {
+		mlog.Warn(ctx, "datacoord parallel metadata recovery failed",
+			mlog.Duration("duration", time.Since(parallelRecoveryStart)),
+			mlog.Err(err))
 		return nil, err
 	}
+	mlog.Info(ctx, "datacoord parallel metadata recovery done",
+		mlog.Duration("duration", time.Since(parallelRecoveryStart)))
 
 	// Segments entered the store directly, so seed the DataCoord-side state
 	// (compaction relations, per-segment transient state) they skipped.
@@ -253,6 +262,9 @@ func NewMeta(ctx context.Context, catalog metastore.DataCoordCatalog, chunkManag
 	mt.stagedSegmentToGroup = stag
 	mt.supersededSegmentToGroup = sup
 
+	mlog.Info(ctx, "datacoord meta recovery done",
+		mlog.Int("numCollections", len(collectionIDs)),
+		mlog.Duration("duration", time.Since(metaRecoveryStart)))
 	initialized = true
 	return mt, nil
 }
@@ -2999,15 +3011,23 @@ func (m *Meta) CollectionTextFieldIDs(collectionID int64) []int64 {
 
 // UpdateChannelCheckpoint updates and saves channel checkpoint.
 func (m *Meta) UpdateChannelCheckpoint(ctx context.Context, vChannel string, pos *msgpb.MsgPosition) error {
+	totalStart := time.Now()
+	defer metacache.ObserveUpdateChannelCheckpointStage(metacache.UpdateChannelCheckpointStageTotal, totalStart)
+
+	stageStart := time.Now()
 	if pos == nil || pos.GetMsgID() == nil {
+		metacache.ObserveUpdateChannelCheckpointStage(metacache.UpdateChannelCheckpointStageValidate, stageStart)
 		return merr.WrapErrServiceInternalMsg("channelCP is nil, vChannel=%s", vChannel)
 	}
+	metacache.ObserveUpdateChannelCheckpointStage(metacache.UpdateChannelCheckpointStageValidate, stageStart)
 
 	// The writer reports a safe channel position after accounting for buffered
 	// data, in-flight syncs and metadata publication. A Growing segment's last
 	// DmlPosition is a data-flush position, not a limit on later idle progress.
 	// Clamping to it would pin TEXT channels indefinitely after a data sync.
+	stageStart = time.Now()
 	m.ChannelSync.channelLocks.Lock(vChannel)
+	metacache.ObserveUpdateChannelCheckpointStage(metacache.UpdateChannelCheckpointStageLockWait, stageStart)
 	defer m.ChannelSync.channelLocks.Unlock(vChannel)
 
 	return m.MetaStore.UpdateChannelCheckpoint(ctx, vChannel, pos)

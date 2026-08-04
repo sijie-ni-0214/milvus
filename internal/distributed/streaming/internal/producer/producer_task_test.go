@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/bytedance/mockey"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
@@ -33,6 +34,7 @@ import (
 	"github.com/milvus-io/milvus/internal/streamingnode/client/handler"
 	"github.com/milvus-io/milvus/internal/streamingnode/client/handler/producer"
 	"github.com/milvus-io/milvus/internal/util/streamingutil/status"
+	"github.com/milvus-io/milvus/pkg/v3/metrics"
 	"github.com/milvus-io/milvus/pkg/v3/proto/messagespb"
 	"github.com/milvus-io/milvus/pkg/v3/streaming/util/message"
 	"github.com/milvus-io/milvus/pkg/v3/streaming/util/types"
@@ -411,6 +413,20 @@ func TestBatchCommitProduce_ReservationError(t *testing.T) {
 	err := resp.UnwrapFirstError()
 	assert.Error(t, err)
 	assert.Equal(t, context.Canceled, err)
+}
+
+func TestBatchCommitProduceStageMetricsDoNotPanicOnLabels(t *testing.T) {
+	metrics.StreamingServiceClientBatchCommitProduceStageDurationSeconds.Reset()
+	metrics.StreamingServiceClientProduceInternalStageDurationSeconds.Reset()
+	metrics.StreamingServiceClientProduceInternalStageDurationByChannelSeconds.Reset()
+
+	assert.NotPanics(t, func() {
+		observeBatchCommitProduceStage(message.MessageTypeCreateCollection.String(), batchCommitProduceStageTotal, time.Now())
+		observeProduceInternalStage("pchannel", message.MessageTypeCreateCollection.String(), produceInternalStageAppend, time.Now())
+	})
+	assert.Equal(t, 1, testutil.CollectAndCount(metrics.StreamingServiceClientBatchCommitProduceStageDurationSeconds))
+	assert.Equal(t, 1, testutil.CollectAndCount(metrics.StreamingServiceClientProduceInternalStageDurationSeconds))
+	assert.Equal(t, 1, testutil.CollectAndCount(metrics.StreamingServiceClientProduceInternalStageDurationByChannelSeconds))
 }
 
 func TestProduceGuard_Commit_Txn(t *testing.T) {

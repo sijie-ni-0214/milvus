@@ -833,12 +833,12 @@ func (wb *writeBufferBase) getGrowingSourceSegmentsToRetry() ([]int64, bool) {
 }
 
 func (wb *writeBufferBase) recordGrowingSourceProgress(inData *InsertData, startPos, endPos *msgpb.MsgPosition, schemaVersion int32, targetOffset int64) error {
-	err := wb.CreateNewGrowingSegment(CreateGrowingSegmentInfo{
+	err := wb.createNewGrowingSegment(CreateGrowingSegmentInfo{
 		PartitionID:   inData.partitionID,
 		SegmentID:     inData.segmentID,
 		StartPos:      startPos,
 		SchemaVersion: schemaVersion,
-	})
+	}, false)
 	if err != nil {
 		return err
 	}
@@ -1397,6 +1397,13 @@ func (id *InsertData) batchPkExists(pks []storage.PrimaryKey, tss []uint64, hits
 }
 
 func (wb *writeBufferBase) CreateNewGrowingSegment(info CreateGrowingSegmentInfo) error {
+	wb.mut.Lock()
+	defer wb.mut.Unlock()
+	return wb.createNewGrowingSegment(info, true)
+}
+
+// createNewGrowingSegment creates a growing segment while the caller holds wb.mut.
+func (wb *writeBufferBase) createNewGrowingSegment(info CreateGrowingSegmentInfo, anchorCheckpoint bool) error {
 	_, ok := wb.metaCache.GetSegmentByID(info.SegmentID)
 	// new segment
 	if !ok {
@@ -1419,13 +1426,32 @@ func (wb *writeBufferBase) CreateNewGrowingSegment(info CreateGrowingSegmentInfo
 		actions := []metacache.SegmentAction{metacache.SetStartPosRecorded(false)}
 		// When startPos is provided (from CreateSegment message in streaming mode),
 		// mark the segment as needing AllocSegment at DataCoord during the first SyncTask.
-		if info.StartPos != nil {
+		if anchorCheckpoint && info.StartPos != nil {
 			actions = append(actions, metacache.SetNeedAllocAtCoord(true))
 		}
 		wb.metaCache.AddSegment(segmentInfo, func(_ *datapb.SegmentInfo) pkoracle.PkStat {
 			return pkoracle.NewBloomFilterSetWithBatchSize(wb.getEstBatchSize())
 		}, metacache.NewBM25StatsFactory, metacache.SegmentActions(actions...))
-		mlog.Info(context.TODO(), "add growing segment", mlog.FieldSegmentID(info.SegmentID), mlog.String("channel", wb.channelName), mlog.Int64("storage version", storageVersion))
+		mlog.Info(context.TODO(), "add growing segment",
+			mlog.FieldSegmentID(info.SegmentID),
+			mlog.String("channel", wb.channelName),
+			mlog.Int64("storage version", storageVersion),
+			mlog.Bool("needAllocAtCoord", anchorCheckpoint && info.StartPos != nil))
+
+		// Anchor the checkpoint at CreateSegment until the first payload is synced.
+		if anchorCheckpoint && info.StartPos != nil {
+			segBuf, ok := wb.buffers[info.SegmentID]
+			if !ok {
+				var err error
+				segBuf, err = newSegmentBuffer(info.SegmentID, wb.metaCache.GetSchema(info.StartPos.GetTimestamp()))
+				if err != nil {
+					return err
+				}
+				wb.buffers[info.SegmentID] = segBuf
+			}
+			segBuf.insertBuffer.startPos = info.StartPos
+			wb.bufferHeap.Update(info.SegmentID, info.StartPos.GetTimestamp())
+		}
 	}
 	return nil
 }

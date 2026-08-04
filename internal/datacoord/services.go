@@ -1695,33 +1695,60 @@ func (s *Server) GetCompactionStateWithPlans(ctx context.Context, req *milvuspb.
 	return resp, nil
 }
 
+const (
+	watchChannelsStageTotal                   = "total"
+	watchChannelsStageCheckHealthy            = "check_healthy"
+	watchChannelsStageMarkChannelAdded        = "mark_channel_added"
+	watchChannelsStageBuildStartPosition      = "build_start_position"
+	watchChannelsStageUpdateChannelCheckpoint = "update_channel_checkpoint"
+)
+
+func observeWatchChannelsStage(stage string, start time.Time) {
+	metrics.DataCoordWatchChannelsStageDuration.WithLabelValues(stage).Observe(float64(time.Since(start).Microseconds()) / 1000.0)
+}
+
 // WatchChannels notifies DataCoord to watch vchannels of a collection.
 // Deprecated: Redundant design by now, remove it in future.
 func (s *Server) WatchChannels(ctx context.Context, req *datapb.WatchChannelsRequest) (*datapb.WatchChannelsResponse, error) {
+	totalStart := time.Now()
+	defer observeWatchChannelsStage(watchChannelsStageTotal, totalStart)
+
 	mlog.Info(context.TODO(), "receive watch channels request")
 	resp := &datapb.WatchChannelsResponse{
 		Status: merr.Success(),
 	}
 
+	stageStart := time.Now()
 	if err := merr.CheckHealthy(s.GetStateCode()); err != nil {
+		observeWatchChannelsStage(watchChannelsStageCheckHealthy, stageStart)
 		return &datapb.WatchChannelsResponse{
 			Status: merr.Status(err),
 		}, nil
 	}
+	observeWatchChannelsStage(watchChannelsStageCheckHealthy, stageStart)
+
 	for _, channelName := range req.GetChannelNames() {
 		// TODO: redundant channel mark by now, remove it in future.
+		stageStart = time.Now()
 		if err := s.meta.MetaStore.MarkChannelAdded(ctx, channelName); err != nil {
+			observeWatchChannelsStage(watchChannelsStageMarkChannelAdded, stageStart)
 			// TODO: add background task to periodically cleanup the orphaned channel add marks.
 			mlog.Error(context.TODO(), "failed to mark channel added", mlog.Err(err))
 			resp.Status = merr.Status(err)
 			return resp, nil
 		}
+		observeWatchChannelsStage(watchChannelsStageMarkChannelAdded, stageStart)
 
 		// try to init channel checkpoint, if failed, we will log it and continue
+		stageStart = time.Now()
 		startPos := meta.ToMsgPositionWithWALNames(channelName, req.GetStartPositions(), req.ChannelWalNames)
+		observeWatchChannelsStage(watchChannelsStageBuildStartPosition, stageStart)
 		if startPos != nil {
 			startPos.Timestamp = req.GetCreateTimestamp()
-			if err := s.meta.UpdateChannelCheckpoint(ctx, channelName, startPos); err != nil {
+			stageStart = time.Now()
+			err := s.meta.UpdateChannelCheckpoint(ctx, channelName, startPos)
+			observeWatchChannelsStage(watchChannelsStageUpdateChannelCheckpoint, stageStart)
+			if err != nil {
 				mlog.Warn(context.TODO(), "failed to init channel checkpoint, meta update error", mlog.String("channel", channelName), mlog.Err(err))
 			}
 		} else {

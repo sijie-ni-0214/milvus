@@ -49,15 +49,22 @@ type pendingBroadcastTask struct {
 // Same semantics as the `Poll` operation in eventloop.
 func (b *pendingBroadcastTask) Execute(ctx context.Context) error {
 	ctx = message.ExtractTraceContext(ctx, b.msg)
+	b.ObserveBroadcastWorkerStart()
+	stageStart := time.Now()
 
 	if err := b.InitializeRecovery(ctx); err != nil {
+		b.ObserveBroadcastStageDuration(broadcastStageInitializeRecovery, stageStart)
 		b.Logger().Warn(ctx, "broadcast task initialize recovery failed", mlog.Err(err))
 		return err
 	}
+	b.ObserveBroadcastStageDuration(broadcastStageInitializeRecovery, stageStart)
 
 	if len(b.pendingMessages) > 0 {
 		b.Logger().Debug(ctx, "broadcast task is polling to make sent...", mlog.Int("pendingMessages", len(b.pendingMessages)))
+		stageStart = time.Now()
 		resps := streaming.WAL().AppendMessages(ctx, b.pendingMessages...)
+		b.ObserveBroadcastStageDuration(broadcastStageAppendMessages, stageStart)
+		stageStart = time.Now()
 		newPendings := make([]message.MutableMessage, 0)
 		for idx, resp := range resps.Responses {
 			if resp.Error != nil {
@@ -68,6 +75,7 @@ func (b *pendingBroadcastTask) Execute(ctx context.Context) error {
 			b.appendResult[b.pendingMessages[idx].VChannel()] = resp.AppendResult
 		}
 		b.pendingMessages = newPendings
+		b.ObserveBroadcastStageDuration(broadcastStageAppendResults, stageStart)
 		b.Logger().Info(ctx, "broadcast task make a new broadcast done", mlog.Int("backoffRetryMessages", len(b.pendingMessages)))
 	}
 	if len(b.pendingMessages) == 0 {

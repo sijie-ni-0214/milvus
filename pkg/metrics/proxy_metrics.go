@@ -146,6 +146,16 @@ var (
 			Buckets:   buckets, // unit: ms
 		}, []string{nodeIDLabelName, msgTypeLabelName, databaseLabelName, collectionName})
 
+	// ProxyInsertStageLatency records low-cardinality insert processing stages.
+	ProxyInsertStageLatency = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Namespace: milvusNamespace,
+			Subsystem: typeutil.ProxyRole,
+			Name:      "insert_stage_latency",
+			Help:      "latency of each insert processing stage",
+			Buckets:   subMsBuckets, // unit: ms
+		}, []string{nodeIDLabelName, "stage", statusLabelName})
+
 	// ProxyWaitForSearchResultLatency record the time that the proxy waits for the search result.
 	ProxyWaitForSearchResultLatency = prometheus.NewHistogramVec(
 		prometheus.HistogramOpts{
@@ -271,6 +281,16 @@ var (
 			Help:      "latency of each grpc request",
 			Buckets:   buckets, // unit: ms
 		}, []string{nodeIDLabelName, functionLabelName, statusLabelName, causeLabelName})
+
+	// ProxyGRPCStageLatency records the latency of each stage in the unified gRPC request interceptor.
+	ProxyGRPCStageLatency = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Namespace: milvusNamespace,
+			Subsystem: typeutil.ProxyRole,
+			Name:      "grpc_stage_latency",
+			Help:      "latency of each stage in grpc request interceptor",
+			Buckets:   subMsBuckets, // unit: ms
+		}, []string{nodeIDLabelName, functionLabelName, "stage"})
 
 	// ProxyReqLatency records the latency that for all requests, like "CreateCollection".
 	ProxyReqLatency = prometheus.NewHistogramVec(
@@ -564,6 +584,10 @@ var (
 		}, []string{nodeIDLabelName, msgTypeLabelName, databaseLabelName, collectionName})
 )
 
+func ShouldObserveProxyFunctionCall(method string) bool {
+	return method != "DropCollection"
+}
+
 // RegisterProxy registers Proxy metrics
 func RegisterProxy(registry *prometheus.Registry) {
 	registry.MustRegister(ProxyReceivedNQ)
@@ -579,6 +603,7 @@ func RegisterProxy(registry *prometheus.Registry) {
 	registry.MustRegister(ProxyResourceGroupFunctionCall)
 	registry.MustRegister(ProxyResourceGroupSearchVectors)
 	registry.MustRegister(ProxyMutationLatency)
+	registry.MustRegister(ProxyInsertStageLatency)
 
 	registry.MustRegister(ProxyWaitForSearchResultLatency)
 	registry.MustRegister(ProxyReduceResultLatency)
@@ -598,6 +623,7 @@ func RegisterProxy(registry *prometheus.Registry) {
 
 	registry.MustRegister(ProxyFunctionCall)
 	registry.MustRegister(ProxyGRPCLatency)
+	registry.MustRegister(ProxyGRPCStageLatency)
 	registry.MustRegister(ProxyReqLatency)
 
 	registry.MustRegister(ProxyReceiveBytes)

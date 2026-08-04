@@ -38,6 +38,15 @@ var (
 	sf                 conc.Singleflight[string]
 )
 
+const (
+	proxyGRPCStageRequestInfo     = "request_info"
+	proxyGRPCStageRequestMetrics  = "request_metrics"
+	proxyGRPCStageHandler         = "handler"
+	proxyGRPCStageResponseLabel   = "response_label"
+	proxyGRPCStageResponseMetrics = "response_metrics"
+	proxyGRPCStageFailureLog      = "failure_log"
+)
+
 func init() {
 	fullMethodName2Tag = typeutil.NewConcurrentMap[string, string]()
 }
@@ -48,40 +57,58 @@ func init() {
 // when some retirable error occurs, it will record it as `RetryLabel` instead of failure one
 // when other interceptor rejects the request, it will record it as `RejectedLabel`
 func UnaryRequestStatsInterceptor(ctx context.Context, req any, rpcInfo *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
+	stageStart := time.Now()
 	methodTag := FullMethodName2Tag(rpcInfo.FullMethod)
+	observeProxyFunctionCall := metrics.ShouldObserveProxyFunctionCall(methodTag)
 	db, _ := requestutil.GetDbNameFromRequest(req)
 	collection, _ := requestutil.GetCollectionNameFromRequest(req)
 
 	dbName := db.(string)
 	collectionName := collection.(string)
+	nodeID := strconv.FormatInt(paramtable.GetNodeID(), 10)
+	observeProxyGRPCStage(nodeID, methodTag, proxyGRPCStageRequestInfo, stageStart)
 
-	metrics.ProxyFunctionCall.WithLabelValues(
-		strconv.FormatInt(paramtable.GetNodeID(), 10),
-		methodTag,
-		metrics.TotalLabel,
-		metrics.CauseNA,
-		dbName,
-		collectionName,
-	).Inc()
+	stageStart = time.Now()
+	if observeProxyFunctionCall {
+		metrics.ProxyFunctionCall.WithLabelValues(
+			nodeID,
+			methodTag,
+			metrics.TotalLabel,
+			metrics.CauseNA,
+			dbName,
+			collectionName,
+		).Inc()
+	}
+	observeProxyGRPCStage(nodeID, methodTag, proxyGRPCStageRequestMetrics, stageStart)
 
 	start := time.Now()
+	stageStart = time.Now()
 	resp, err := handler(ctx, req)
+	observeProxyGRPCStage(nodeID, methodTag, proxyGRPCStageHandler, stageStart)
+
+	stageStart = time.Now()
 	label, cause := requestutil.ParseMetricLabel(resp, err)
+	observeProxyGRPCStage(nodeID, methodTag, proxyGRPCStageResponseLabel, stageStart)
 
 	// set metrics for state code
-	metrics.ProxyFunctionCall.WithLabelValues(
-		strconv.FormatInt(paramtable.GetNodeID(), 10),
-		methodTag,
-		label,
-		cause,
-		dbName,
-		collectionName,
-	).Inc()
+	stageStart = time.Now()
+	if observeProxyFunctionCall {
+		metrics.ProxyFunctionCall.WithLabelValues(
+			nodeID,
+			methodTag,
+			label,
+			cause,
+			dbName,
+			collectionName,
+		).Inc()
+	}
+	observeProxyGRPCStage(nodeID, methodTag, proxyGRPCStageResponseMetrics, stageStart)
 
 	// Mirror the metric's cause into the logs so a failed request can be
 	// filtered by error_type the same way the metric is. System failures are
 	// logged at Warn (actionable for SRE); input failures at Info (expected user
 	// mistakes — keeping them at Warn would spam the logs).
+	stageStart = time.Now()
 	if label == metrics.FailLabel && (cause == metrics.CauseSystem || cause == metrics.CauseUser) {
 		status, _ := requestutil.GetStatusFromResponse(resp)
 		errType := merr.SystemError
@@ -100,16 +127,22 @@ func UnaryRequestStatsInterceptor(ctx context.Context, req any, rpcInfo *grpc.Un
 			logger.Warn(ctx, "rpc returned a system error")
 		}
 	}
+	observeProxyGRPCStage(nodeID, methodTag, proxyGRPCStageFailureLog, stageStart)
 
 	// set metrics for latency
 	metrics.ProxyGRPCLatency.WithLabelValues(
-		strconv.FormatInt(paramtable.GetNodeID(), 10),
+		nodeID,
 		methodTag,
 		label,
 		cause,
 	).Observe(float64(time.Since(start).Milliseconds()))
 
 	return resp, err
+}
+
+func observeProxyGRPCStage(nodeID, methodTag, stage string, start time.Time) {
+	metrics.ProxyGRPCStageLatency.WithLabelValues(nodeID, methodTag, stage).
+		Observe(float64(time.Since(start).Microseconds()) / 1000.0)
 }
 
 // FullMethodName2Tag returns method tag for grpc full method name

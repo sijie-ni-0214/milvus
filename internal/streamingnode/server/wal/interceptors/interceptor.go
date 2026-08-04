@@ -34,12 +34,15 @@ type MessageRowLock interface {
 type InterceptorBuildParam struct {
 	Context                context.Context // WAL-open context for bounded startup recovery; optional in tests.
 	ChannelInfo            types.PChannelInfo
-	WAL                    *syncutil.Future[wal.WAL]    // The wal final object, can be used after interceptor is ready.
-	LastTimeTickMessage    message.ImmutableMessage     // The last time tick message in wal.
-	LastConfirmedMessageID message.MessageID            // The last confirmed message id in wal.
-	WriteAheadBuffer       *wab.WriteAheadBuffer        // The write ahead buffer for the wal, used to erase the subscription of underlying wal.
-	MVCCManager            *mvcc.MVCCManager            // The MVCC manager for the wal, can be used to get the latest mvcc timetick.
-	InitialRecoverSnapshot *recovery.RecoverySnapshot   // The initial recover snapshot for the wal, used to recover the wal state.
+	WAL                    *syncutil.Future[wal.WAL] // The wal final object, can be used after interceptor is ready.
+	LastTimeTickMessage    message.ImmutableMessage  // The last time tick message in wal.
+	LastConfirmedMessageID message.MessageID         // The last confirmed message id in wal.
+	WriteAheadBuffer       *wab.WriteAheadBuffer     // The write ahead buffer for the wal, used to erase the subscription of underlying wal.
+	MVCCManager            *mvcc.MVCCManager         // The MVCC manager for the wal, can be used to get the latest mvcc timetick.
+	// InitialRecoverSnapshot is build-only state used to recover WAL components.
+	// It is cleared after all interceptor builders return so the long-lived build
+	// param does not retain duplicated recovery metadata.
+	InitialRecoverSnapshot *recovery.RecoverySnapshot
 	RecoveryStorage        recovery.RecoveryStorage     // The recovery storage owned by the wal lifecycle.
 	TxnManager             *txn.TxnManager              // The transaction manager for the wal, used to manage the transactions.
 	ShardManager           shards.ShardManager          // The shard manager for the wal, used to manage the shards, segment assignment, partition.

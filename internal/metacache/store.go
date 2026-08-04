@@ -28,6 +28,7 @@ import (
 	"slices"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"google.golang.org/protobuf/proto"
 
@@ -429,6 +430,24 @@ func GetDatabaseOrNotFound(view MetaView, dbName string) (*DatabaseInfo, error) 
 
 // --- Channel checkpoint methods ---
 
+// Stages of DataCoord's UpdateChannelCheckpoint observed by
+// DataCoordUpdateChannelCheckpointStageDuration.
+const (
+	UpdateChannelCheckpointStageTotal                   = "total"
+	UpdateChannelCheckpointStageValidate                = "validate"
+	UpdateChannelCheckpointStageGetMinGrowingCheckpoint = "get_min_growing_checkpoint"
+	UpdateChannelCheckpointStageLockWait                = "lock_wait"
+	UpdateChannelCheckpointStageCheckUpdateNeeded       = "check_update_needed"
+	UpdateChannelCheckpointStageSaveChannelCheckpoint   = "save_channel_checkpoint"
+	UpdateChannelCheckpointStageUpdateMemory            = "update_memory"
+	UpdateChannelCheckpointStageUpdateCheckpointMetric  = "update_checkpoint_metric"
+)
+
+// ObserveUpdateChannelCheckpointStage records the time a checkpoint update stage took since start.
+func ObserveUpdateChannelCheckpointStage(stage string, start time.Time) {
+	metrics.DataCoordUpdateChannelCheckpointStageDuration.WithLabelValues(stage).Observe(float64(time.Since(start).Microseconds()) / 1000.0)
+}
+
 // UpdateChannelCheckpoint saves a channel checkpoint if it is newer than the
 // existing one. The timestamp comparison is done under RLock and the catalog
 // write happens outside the lock to avoid holding it during I/O. This leaves
@@ -465,21 +484,28 @@ func (s *metaStore) UpdateChannelCheckpoint(ctx context.Context, vChannel string
 		return merr.WrapErrServiceInternalMsg("channelCP is nil, vChannel=%s", vChannel)
 	}
 
+	stageStart := time.Now()
 	s.mu.RLock()
-	oldPosition := s.checkpoints[vChannel]
-	if !checkpointAdvances(oldPosition, pos) {
-		s.mu.RUnlock()
+	needUpdate := checkpointAdvances(s.checkpoints[vChannel], pos)
+	s.mu.RUnlock()
+	ObserveUpdateChannelCheckpointStage(UpdateChannelCheckpointStageCheckUpdateNeeded, stageStart)
+	if !needUpdate {
 		return nil
 	}
-	s.mu.RUnlock()
 
-	if err := s.catalog.SaveChannelCheckpoint(ctx, vChannel, pos); err != nil {
+	stageStart = time.Now()
+	err := s.catalog.SaveChannelCheckpoint(ctx, vChannel, pos)
+	ObserveUpdateChannelCheckpointStage(UpdateChannelCheckpointStageSaveChannelCheckpoint, stageStart)
+	if err != nil {
 		return err
 	}
+	stageStart = time.Now()
 	s.mu.Lock()
 	s.checkpoints[vChannel] = pos
 	s.mu.Unlock()
+	ObserveUpdateChannelCheckpointStage(UpdateChannelCheckpointStageUpdateMemory, stageStart)
 
+	stageStart = time.Now()
 	ts, _ := tsoutil.ParseTS(pos.Timestamp)
 	mlog.Info(ctx, "UpdateChannelCheckpoint done",
 		mlog.String("vChannel", vChannel),
@@ -488,6 +514,7 @@ func (s *metaStore) UpdateChannelCheckpoint(ctx context.Context, vChannel string
 		mlog.Time("time", ts))
 	metrics.DataCoordCheckpointUnixSeconds.WithLabelValues(fmt.Sprint(paramtable.GetNodeID()), vChannel).
 		Set(float64(ts.Unix()))
+	ObserveUpdateChannelCheckpointStage(UpdateChannelCheckpointStageUpdateCheckpointMetric, stageStart)
 	return nil
 }
 

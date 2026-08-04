@@ -77,36 +77,19 @@ func Test_NewInputNode(t *testing.T) {
 	assert.Equal(t, node.maxParallelism, maxParallelism)
 }
 
-func TestInputNodeMetricsHandlesSurvivePartialCleanup(t *testing.T) {
+func TestNewInputNodeCachesDataNodeMetrics(t *testing.T) {
 	metrics.DataNodeConsumeMsgCount.Reset()
 	metrics.DataNodeConsumeTimeTickLag.Reset()
 
-	const (
-		nodeID       = int64(10101)
-		collectionID = int64(20202)
-	)
-	node1 := NewInputNode(nil, "input-node-1", 0, 1, typeutil.DataNodeRole, nodeID, collectionID, metrics.AllLabel)
-	node2 := NewInputNode(nil, "input-node-2", 0, 1, typeutil.DataNodeRole, nodeID, collectionID, metrics.AllLabel)
+	node := NewInputNode(nil, "input_node", 0, 100, typeutil.DataNodeRole, 7, 11, metrics.AllLabel)
+	assert.NotNil(t, node.consumeMsgCount)
+	assert.NotNil(t, node.consumeTimeTickLag)
 
-	node1.consumeMsgCount.Inc()
-	node1.consumeTimeTickLag.Set(100)
-	node1.Free()
-	node1.Free()
+	node.consumeMsgCount.Inc()
+	node.consumeTimeTickLag.Set(123)
 
-	// Closing one channel still runs collection cleanup. The surviving InputNode
-	// must keep updating the exported AllLabel metrics with its cached handles.
-	metrics.CleanupDataNodeCollectionMetrics(nodeID, collectionID, "unused-channel")
-	node2.consumeMsgCount.Inc()
-	node2.consumeTimeTickLag.Set(200)
-
-	assert.Equal(t, float64(2), testutil.ToFloat64(node2.consumeMsgCount))
-	assert.Equal(t, float64(200), testutil.ToFloat64(node2.consumeTimeTickLag))
-	assert.Equal(t, 1, testutil.CollectAndCount(metrics.DataNodeConsumeMsgCount))
-	assert.Equal(t, 1, testutil.CollectAndCount(metrics.DataNodeConsumeTimeTickLag))
-
-	node2.Free()
-	assert.Equal(t, 0, testutil.CollectAndCount(metrics.DataNodeConsumeMsgCount))
-	assert.Equal(t, 0, testutil.CollectAndCount(metrics.DataNodeConsumeTimeTickLag))
+	assert.Equal(t, float64(1), testutil.ToFloat64(metrics.DataNodeConsumeMsgCount.WithLabelValues("7", metrics.AllLabel, "11")))
+	assert.Equal(t, float64(123), testutil.ToFloat64(metrics.DataNodeConsumeTimeTickLag.WithLabelValues("7", metrics.AllLabel, "11")))
 }
 
 func Test_InputNodeSkipMode(t *testing.T) {

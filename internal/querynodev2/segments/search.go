@@ -152,15 +152,7 @@ func searchSegmentsAttempt(ctx context.Context, mgr *Manager, segments []Segment
 		logger.Warn(ctx, "search segments fanout failed",
 			mlog.Duration("duration", time.Since(fanoutStart)),
 			mlog.Err(err))
-		// Collect non-nil results for cleanup
-		validResults := make([]*SearchResult, 0, len(segments))
-		for _, r := range searchResults {
-			if r != nil {
-				validResults = append(validResults, r)
-			}
-		}
-		DeleteSearchResults(validResults)
-		return nil, err
+		return searchResults, err
 	}
 
 	if len(segmentsWithoutIndex) > 0 {
