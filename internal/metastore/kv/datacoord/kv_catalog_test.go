@@ -48,6 +48,7 @@ import (
 	"github.com/milvus-io/milvus/pkg/v3/kv/predicates"
 	"github.com/milvus-io/milvus/pkg/v3/proto/datapb"
 	"github.com/milvus-io/milvus/pkg/v3/proto/indexpb"
+	pkgutil "github.com/milvus-io/milvus/pkg/v3/util"
 	"github.com/milvus-io/milvus/pkg/v3/util/etcd"
 	"github.com/milvus-io/milvus/pkg/v3/util/paramtable"
 )
@@ -1201,6 +1202,22 @@ func TestCatalog_CreateSegmentIndex(t *testing.T) {
 }
 
 func TestCatalog_ListSegmentIndexes(t *testing.T) {
+	t.Run("all segment indexes", func(t *testing.T) {
+		metakv := mocks.NewMetaKv(t)
+		metakv.EXPECT().WalkWithPrefix(
+			mock.Anything,
+			pkgutil.SegmentIndexPrefix+"/",
+			mock.Anything,
+			mock.Anything,
+		).Return(nil).Once()
+		catalog := &Catalog{MetaKv: metakv}
+
+		segmentIndexes, err := catalog.ListAllSegmentIndexes(context.Background())
+
+		assert.NoError(t, err)
+		assert.Empty(t, segmentIndexes)
+	})
+
 	t.Run("success", func(t *testing.T) {
 		segIdx := &indexpb.SegmentIndex{
 			CollectionID:  0,

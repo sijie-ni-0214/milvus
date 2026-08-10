@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/samber/lo"
+	"go.etcd.io/etcd/api/v3/mvccpb"
 	clientv3 "go.etcd.io/etcd/client/v3"
 	"go.etcd.io/etcd/server/v3/embed"
 	"go.etcd.io/etcd/server/v3/etcdserver/api/v3client"
@@ -128,57 +129,37 @@ func (kv *EmbedEtcdKV) GetPath(key string) string {
 	return util.GetPath(kv.rootPath, key)
 }
 
+func (kv *EmbedEtcdKV) walkPrefix(ctx context.Context, prefix string, paginationSize int, fn func(*mvccpb.KeyValue) error) error {
+	return WalkPrefix(
+		getContextWithoutAuth(ctx),
+		kv.client,
+		prefix,
+		paginationSize,
+		kv.requestTimeout,
+		fn,
+	)
+}
+
 func (kv *EmbedEtcdKV) WalkWithPrefix(ctx context.Context, prefix string, paginationSize int, fn func([]byte, []byte) error) error {
 	prefix = kv.GetPath(prefix)
-	ctx1, cancel := getContextWithTimeout(ctx, kv.requestTimeout)
-	defer cancel()
-
-	batch := int64(paginationSize)
-	opts := []clientv3.OpOption{
-		clientv3.WithSort(clientv3.SortByKey, clientv3.SortAscend),
-		clientv3.WithLimit(batch),
-		clientv3.WithRange(clientv3.GetPrefixRangeEnd(prefix)),
-	}
-
-	key := prefix
-	for {
-		resp, err := kv.client.Get(ctx1, key, opts...)
-		if err != nil {
-			return merr.WrapErrIoFailed(key, err)
-		}
-
-		for _, kv := range resp.Kvs {
-			if err = fn(kv.Key, kv.Value); err != nil {
-				return err
-			}
-		}
-
-		if !resp.More {
-			break
-		}
-		// move to next key
-		key = string(append(resp.Kvs[len(resp.Kvs)-1].Key, 0))
-	}
-	return nil
+	return kv.walkPrefix(ctx, prefix, paginationSize, func(keyValue *mvccpb.KeyValue) error {
+		return fn(keyValue.Key, keyValue.Value)
+	})
 }
 
 // LoadWithPrefix returns all the keys and values with the given key prefix
 func (kv *EmbedEtcdKV) LoadWithPrefix(ctx context.Context, key string) ([]string, []string, error) {
 	key = kv.GetPath(key)
 	mlog.Debug(ctx, "LoadWithPrefix ", mlog.String("prefix", key))
-	ctx1, cancel := getContextWithTimeout(ctx, kv.requestTimeout)
-	defer cancel()
-	resp, err := kv.client.Get(ctx1, key, clientv3.WithPrefix(),
-		clientv3.WithSort(clientv3.SortByKey, clientv3.SortAscend))
+	keys := make([]string, 0)
+	values := make([]string, 0)
+	err := kv.walkPrefix(ctx, key, paramtable.Get().MetaStoreCfg.PaginationSize.GetAsInt(), func(keyValue *mvccpb.KeyValue) error {
+		keys = append(keys, string(keyValue.Key))
+		values = append(values, string(keyValue.Value))
+		return nil
+	})
 	if err != nil {
-		return nil, nil, merr.WrapErrIoFailed(key, err)
-	}
-
-	keys := make([]string, 0, resp.Count)
-	values := make([]string, 0, resp.Count)
-	for _, kv := range resp.Kvs {
-		keys = append(keys, string(kv.Key))
-		values = append(values, string(kv.Value))
+		return nil, nil, err
 	}
 	return keys, values, nil
 }
@@ -214,18 +195,15 @@ func (kv *EmbedEtcdKV) HasPrefix(ctx context.Context, prefix string) (bool, erro
 func (kv *EmbedEtcdKV) LoadBytesWithPrefix(ctx context.Context, key string) ([]string, [][]byte, error) {
 	key = kv.GetPath(key)
 	mlog.Debug(ctx, "LoadBytesWithPrefix ", mlog.String("prefix", key))
-	ctx1, cancel := getContextWithTimeout(ctx, kv.requestTimeout)
-	defer cancel()
-	resp, err := kv.client.Get(ctx1, key, clientv3.WithPrefix(),
-		clientv3.WithSort(clientv3.SortByKey, clientv3.SortAscend))
+	keys := make([]string, 0)
+	values := make([][]byte, 0)
+	err := kv.walkPrefix(ctx, key, paramtable.Get().MetaStoreCfg.PaginationSize.GetAsInt(), func(keyValue *mvccpb.KeyValue) error {
+		keys = append(keys, string(keyValue.Key))
+		values = append(values, keyValue.Value)
+		return nil
+	})
 	if err != nil {
-		return nil, nil, merr.WrapErrIoFailed(key, err)
-	}
-	keys := make([]string, 0, resp.Count)
-	values := make([][]byte, 0, resp.Count)
-	for _, kv := range resp.Kvs {
-		keys = append(keys, string(kv.Key))
-		values = append(values, kv.Value)
+		return nil, nil, err
 	}
 	return keys, values, nil
 }
@@ -234,20 +212,17 @@ func (kv *EmbedEtcdKV) LoadBytesWithPrefix(ctx context.Context, key string) ([]s
 func (kv *EmbedEtcdKV) LoadBytesWithPrefix2(ctx context.Context, key string) ([]string, [][]byte, []int64, error) {
 	key = kv.GetPath(key)
 	mlog.Debug(ctx, "LoadBytesWithPrefix2 ", mlog.String("prefix", key))
-	ctx1, cancel := getContextWithTimeout(ctx, kv.requestTimeout)
-	defer cancel()
-	resp, err := kv.client.Get(ctx1, key, clientv3.WithPrefix(),
-		clientv3.WithSort(clientv3.SortByKey, clientv3.SortAscend))
+	keys := make([]string, 0)
+	values := make([][]byte, 0)
+	versions := make([]int64, 0)
+	err := kv.walkPrefix(ctx, key, paramtable.Get().MetaStoreCfg.PaginationSize.GetAsInt(), func(keyValue *mvccpb.KeyValue) error {
+		keys = append(keys, string(keyValue.Key))
+		values = append(values, keyValue.Value)
+		versions = append(versions, keyValue.Version)
+		return nil
+	})
 	if err != nil {
-		return nil, nil, nil, merr.WrapErrIoFailed(key, err)
-	}
-	keys := make([]string, 0, resp.Count)
-	values := make([][]byte, 0, resp.Count)
-	versions := make([]int64, 0, resp.Count)
-	for _, kv := range resp.Kvs {
-		keys = append(keys, string(kv.Key))
-		values = append(values, kv.Value)
-		versions = append(versions, kv.Version)
+		return nil, nil, nil, err
 	}
 	return keys, values, versions, nil
 }
