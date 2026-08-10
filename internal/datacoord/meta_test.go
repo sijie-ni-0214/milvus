@@ -281,6 +281,54 @@ func (suite *MetaReloadSuite) TestReloadFromKV() {
 		suite.MetricsEqual(metrics.DataCoordNumSegments.WithLabelValues(metrics.FlushedSegmentLabel, datapb.SegmentLevel_Legacy.String(), "unsorted", "0", "legacy"), 1)
 	})
 
+	suite.Run("cas store scans all segments in one walk", func() {
+		defer suite.resetMock()
+		brk := broker.NewMockBroker(suite.T())
+		brk.EXPECT().ShowCollectionIDs(mock.Anything).Return(&rootcoordpb.ShowCollectionIDsResponse{
+			Status: merr.Success(),
+			DbCollections: []*rootcoordpb.DBCollections{
+				{
+					DbName:        "db_1",
+					CollectionIDs: []int64{1, 2},
+				},
+			},
+		}, nil)
+		suite.catalog.EXPECT().ListIndexes(mock.Anything).Return([]*model.Index{}, nil)
+		suite.catalog.EXPECT().ListSegmentIndexes(mock.Anything, mock.Anything).Return([]*model.SegmentIndex{}, nil).Maybe()
+		suite.catalog.EXPECT().ListAnalyzeTasks(mock.Anything).Return(nil, nil)
+		suite.catalog.EXPECT().ListCompactionTask(mock.Anything).Return(nil, nil)
+		suite.catalog.EXPECT().ListPartitionStatsInfos(mock.Anything).Return(nil, nil)
+		suite.catalog.EXPECT().ListStatsTasks(mock.Anything).Return(nil, nil)
+		suite.catalog.EXPECT().ListChannelCheckpoint(mock.Anything).Return(nil, nil)
+		suite.catalog.EXPECT().ListSnapshots(mock.Anything).Return(nil, nil)
+		suite.catalog.EXPECT().ListExternalCollectionRefreshJobs(mock.Anything).Return(nil, nil)
+		suite.catalog.EXPECT().ListExternalCollectionRefreshTasks(mock.Anything).Return(nil, nil)
+		// No ListSegments expectation: the catalog must not be scanned per collection.
+
+		persist := NewOptimisticTxnMemoryPersist[string, *datapb.SegmentInfo](&SegmentInfoMarshaler{})
+		txn := persist.Txn(ctx)
+		for _, segment := range []*datapb.SegmentInfo{
+			{ID: 10, CollectionID: 1, PartitionID: 100, State: commonpb.SegmentState_Flushed},
+			{ID: 20, CollectionID: 2, PartitionID: 200, State: commonpb.SegmentState_Flushed},
+		} {
+			key := testSegmentStoreRoot + "/" + segmentKey(segment.GetCollectionID(), segment.GetPartitionID(), segment.GetID())
+			txn.PutIfVersion(key, segment, 0, false)
+		}
+		// A sibling catalog prefix that also starts with "s" is not segment metadata.
+		txn.PutIfVersion(testSegmentStoreRoot+"/datacoord-meta/statslog/1/100/30", &datapb.SegmentInfo{ID: 30}, 0, false)
+		_, err := txn.Commit()
+		suite.Require().NoError(err)
+
+		meta, err := newMetaWithPersist(ctx, suite.catalog, nil, metacache.NewMetaStore(suite.catalog), brk, persist, testSegmentStoreRoot)
+		suite.Require().NoError(err)
+		suite.NotNil(meta.GetSegment(ctx, 10))
+		suite.NotNil(meta.GetSegment(ctx, 20))
+		suite.Nil(meta.GetSegment(ctx, 30))
+		version, ok := meta.segments.Version(10)
+		suite.True(ok)
+		suite.Positive(version)
+	})
+
 	suite.Run("ListIndexes_fail", func() {
 		defer suite.resetMock()
 		brk := broker.NewMockBroker(suite.T())

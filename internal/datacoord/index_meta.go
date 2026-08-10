@@ -22,7 +22,6 @@ import (
 	"fmt"
 	"strconv"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/cockroachdb/errors"
@@ -44,7 +43,6 @@ import (
 	"github.com/milvus-io/milvus/pkg/v3/mlog"
 	"github.com/milvus-io/milvus/pkg/v3/proto/indexpb"
 	"github.com/milvus-io/milvus/pkg/v3/proto/workerpb"
-	"github.com/milvus-io/milvus/pkg/v3/util/conc"
 	"github.com/milvus-io/milvus/pkg/v3/util/funcutil"
 	"github.com/milvus-io/milvus/pkg/v3/util/indexparams"
 	"github.com/milvus-io/milvus/pkg/v3/util/lock"
@@ -167,7 +165,7 @@ func (m *segmentBuildInfo) GetTaskStats() []*metricsinfo.IndexTaskStats {
 }
 
 // NewMeta creates meta from provided `kv.TxnKV`
-func newIndexMeta(ctx context.Context, catalog metastore.DataCoordCatalog, scanTargets []partitionScanTarget) (*indexMeta, error) {
+func newIndexMeta(ctx context.Context, catalog metastore.DataCoordCatalog) (*indexMeta, error) {
 	mt := &indexMeta{
 		ctx:              ctx,
 		catalog:          catalog,
@@ -176,7 +174,7 @@ func newIndexMeta(ctx context.Context, catalog metastore.DataCoordCatalog, scanT
 		segmentBuildInfo: newSegmentIndexBuildInfo(),
 		segmentIndexes:   typeutil.NewConcurrentMap[UniqueID, *typeutil.ConcurrentMap[UniqueID, *model.SegmentIndex]](),
 	}
-	err := mt.reloadFromKV(scanTargets)
+	err := mt.reloadFromKV()
 	if err != nil {
 		return nil, err
 	}
@@ -184,19 +182,27 @@ func newIndexMeta(ctx context.Context, catalog metastore.DataCoordCatalog, scanT
 }
 
 const (
-	segmentIndexScanProgressLogInterval          = 10000
 	segmentIndexCacheRecoveryProgressLogInterval = 100000
 )
 
+type allSegmentIndexRecoveryCatalog interface {
+	ListAllSegmentIndexes(ctx context.Context) ([]*model.SegmentIndex, error)
+}
+
+func (m *indexMeta) listAllSegmentIndexes() ([]*model.SegmentIndex, error) {
+	if catalog, ok := m.catalog.(allSegmentIndexRecoveryCatalog); ok {
+		return catalog.ListAllSegmentIndexes(m.ctx)
+	}
+	// Compatibility path for tests and catalog implementations that predate
+	// the recovery-only global scan method.
+	return m.catalog.ListSegmentIndexes(m.ctx, 0)
+}
+
 // reloadFromKV loads meta from KV storage
-func (m *indexMeta) reloadFromKV(scanTargets []partitionScanTarget) error {
+func (m *indexMeta) reloadFromKV() error {
 	record := timerecord.NewTimeRecorder("indexMeta-reloadFromKV")
 
-	// Parallel load and process: ListIndexes and ListSegmentIndexes have no dependency,
-	// and they update completely separate data structures so memory updates can also run in parallel.
-	// scanTargetSegIdxes is hoisted to function scope so the gauge goroutine
-	// (launched after g.Wait) can access it when both indexes and segment indexes are loaded.
-	scanTargetSegIdxes := make([][]*model.SegmentIndex, len(scanTargets))
+	var segmentIndexes []*model.SegmentIndex
 	g, _ := errgroup.WithContext(m.ctx)
 	g.Go(func() error {
 		fieldIndexScanStart := time.Now()
@@ -221,92 +227,44 @@ func (m *indexMeta) reloadFromKV(scanTargets []partitionScanTarget) error {
 		return nil
 	})
 	g.Go(func() error {
-		pool := conc.NewPool[any](paramtable.Get().MetaStoreCfg.ReadConcurrency.GetAsInt())
-		defer pool.Release()
-		futures := make([]*conc.Future[any], 0, len(scanTargets))
-		totalScanTargets := int64(len(scanTargets))
-		numPartitionTargets := lo.CountBy(scanTargets, func(target partitionScanTarget) bool {
-			return target.partitionScoped
-		})
-		var completedScanTargets atomic.Int64
-		var totalSegmentIndexes atomic.Int64
 		scanStart := time.Now()
-		mlog.Info(m.ctx, "indexMeta segment index scan targets prepared",
-			mlog.Int("numScanTargets", len(scanTargets)),
-			mlog.Int("numPartitionTargets", numPartitionTargets),
-			mlog.Int("readConcurrency", paramtable.Get().MetaStoreCfg.ReadConcurrency.GetAsInt()))
-		for i, target := range scanTargets {
-			i := i
-			target := target
-			futures = append(futures, pool.Submit(func() (any, error) {
-				var (
-					segIdxes []*model.SegmentIndex
-					err      error
-				)
-				if target.partitionScoped {
-					segIdxes, err = m.catalog.ListPartitionSegmentIndexes(m.ctx, target.collectionID, target.partitionID)
-				} else {
-					segIdxes, err = m.catalog.ListSegmentIndexes(m.ctx, target.collectionID)
-				}
-				if err != nil {
-					mlog.Warn(m.ctx, "indexMeta segment index scan failed",
-						mlog.FieldCollectionID(target.collectionID),
-						mlog.FieldPartitionID(target.partitionID),
-						mlog.Bool("partitionScoped", target.partitionScoped),
-						mlog.Err(err))
-					return nil, err
-				}
-				scanTargetSegIdxes[i] = segIdxes
-				totalSegmentIndexes.Add(int64(len(segIdxes)))
-				completed := completedScanTargets.Add(1)
-				if completed == totalScanTargets || completed%segmentIndexScanProgressLogInterval == 0 {
-					mlog.Info(m.ctx, "indexMeta segment index scan progress",
-						mlog.Int64("completedScanTargets", completed),
-						mlog.Int64("totalScanTargets", totalScanTargets),
-						mlog.Int64("numSegmentIndexes", totalSegmentIndexes.Load()),
-						mlog.Duration("duration", time.Since(scanStart)))
-				}
-				return nil, nil
-			}))
-		}
-		if err := conc.AwaitAll(futures...); err != nil {
+		mlog.Info(m.ctx, "indexMeta global segment index catalog scan started")
+		var err error
+		segmentIndexes, err = m.listAllSegmentIndexes()
+		if err != nil {
+			mlog.Warn(m.ctx, "indexMeta global segment index catalog scan failed", mlog.Err(err))
 			return err
 		}
-		mlog.Info(m.ctx, "indexMeta segment index catalog scan done",
-			mlog.Int64("numScanTargets", totalScanTargets),
-			mlog.Int64("numSegmentIndexes", totalSegmentIndexes.Load()),
+		mlog.Info(m.ctx, "indexMeta global segment index catalog scan done",
+			mlog.Int("numSegmentIndexes", len(segmentIndexes)),
 			mlog.Duration("duration", time.Since(scanStart)))
 
 		cacheBuildStart := time.Now()
-		totalSegmentIndexCount := int(totalSegmentIndexes.Load())
-		recoveredSegmentIndexes := 0
-		for _, segIdxes := range scanTargetSegIdxes {
-			for _, segIdx := range segIdxes {
-				if segIdx.IndexMemSize == 0 {
-					segIdx.IndexMemSize = segIdx.IndexSerializedSize * paramtable.Get().DataCoordCfg.IndexMemSizeEstimateMultiplier.GetAsUint64()
-				}
-				indexes, ok := m.segmentIndexes.Get(segIdx.SegmentID)
-				if ok {
-					indexes.Insert(segIdx.IndexID, segIdx)
-				} else {
-					indexes = typeutil.NewConcurrentMap[UniqueID, *model.SegmentIndex]()
-					indexes.Insert(segIdx.IndexID, segIdx)
-					m.segmentIndexes.Insert(segIdx.SegmentID, indexes)
-				}
-				old, _ := m.segmentBuildInfo.Get(segIdx.BuildID)
-				m.taskCounts.replaceTask(old, segIdx)
-				m.segmentBuildInfo.AddForRecovery(segIdx)
-				recoveredSegmentIndexes++
-				if recoveredSegmentIndexes%segmentIndexCacheRecoveryProgressLogInterval == 0 && recoveredSegmentIndexes < totalSegmentIndexCount {
-					mlog.Info(m.ctx, "indexMeta segment index cache rebuild progress",
-						mlog.Int("completedSegmentIndexes", recoveredSegmentIndexes),
-						mlog.Int("totalSegmentIndexes", totalSegmentIndexCount),
-						mlog.Duration("duration", time.Since(cacheBuildStart)))
-				}
+		for recoveredSegmentIndexes, segIdx := range segmentIndexes {
+			if segIdx.IndexMemSize == 0 {
+				segIdx.IndexMemSize = segIdx.IndexSerializedSize * paramtable.Get().DataCoordCfg.IndexMemSizeEstimateMultiplier.GetAsUint64()
+			}
+			indexes, ok := m.segmentIndexes.Get(segIdx.SegmentID)
+			if ok {
+				indexes.Insert(segIdx.IndexID, segIdx)
+			} else {
+				indexes = typeutil.NewConcurrentMap[UniqueID, *model.SegmentIndex]()
+				indexes.Insert(segIdx.IndexID, segIdx)
+				m.segmentIndexes.Insert(segIdx.SegmentID, indexes)
+			}
+			old, _ := m.segmentBuildInfo.Get(segIdx.BuildID)
+			m.taskCounts.replaceTask(old, segIdx)
+			m.segmentBuildInfo.AddForRecovery(segIdx)
+			completed := recoveredSegmentIndexes + 1
+			if completed%segmentIndexCacheRecoveryProgressLogInterval == 0 && completed < len(segmentIndexes) {
+				mlog.Info(m.ctx, "indexMeta segment index cache rebuild progress",
+					mlog.Int("completedSegmentIndexes", completed),
+					mlog.Int("totalSegmentIndexes", len(segmentIndexes)),
+					mlog.Duration("duration", time.Since(cacheBuildStart)))
 			}
 		}
 		mlog.Info(m.ctx, "indexMeta segment index cache rebuild done",
-			mlog.Int("numSegmentIndexes", totalSegmentIndexCount),
+			mlog.Int("numSegmentIndexes", len(segmentIndexes)),
 			mlog.Duration("duration", time.Since(cacheBuildStart)))
 		return nil
 	})
@@ -314,17 +272,13 @@ func (m *indexMeta) reloadFromKV(scanTargets []partitionScanTarget) error {
 		return err
 	}
 
-	// Update Prometheus metrics asynchronously. Launched after g.Wait() so that
-	// both m.indexes (from goroutine 1) and scanTargetSegIdxes (from goroutine 2)
-	// are fully populated. Only count active indexes (index definition alive).
+	// Update Prometheus metrics after both independent walkers have completed.
 	go func() {
 		storedSizeByCollection := make(map[int64]float64)
-		for _, segIdxes := range scanTargetSegIdxes {
-			for _, segIdx := range segIdxes {
-				metrics.FlushedSegmentFileNum.WithLabelValues(metrics.IndexFileLabel).Observe(float64(len(segIdx.IndexFileKeys)))
-				if m.IsIndexExist(segIdx.CollectionID, segIdx.IndexID) {
-					storedSizeByCollection[segIdx.CollectionID] += float64(segIdx.IndexSerializedSize)
-				}
+		for _, segIdx := range segmentIndexes {
+			metrics.FlushedSegmentFileNum.WithLabelValues(metrics.IndexFileLabel).Observe(float64(len(segIdx.IndexFileKeys)))
+			if m.IsIndexExist(segIdx.CollectionID, segIdx.IndexID) {
+				storedSizeByCollection[segIdx.CollectionID] += float64(segIdx.IndexSerializedSize)
 			}
 		}
 		for collID, size := range storedSizeByCollection {

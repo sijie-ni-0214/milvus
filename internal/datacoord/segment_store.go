@@ -2,8 +2,8 @@ package datacoord
 
 import (
 	"context"
-	"fmt"
 	"path"
+	"strings"
 	"sync/atomic"
 
 	"github.com/cockroachdb/errors"
@@ -29,8 +29,9 @@ import (
 //   - catalogSegmentStore: forwards to the catalog unchanged. Used when meta is
 //     built without a persist (unit tests).
 type segmentStore interface {
-	// ListSegments lists the segments of a scan target with their versions.
-	ListSegments(ctx context.Context, target partitionScanTarget) ([]*datapb.SegmentInfo, []int64, error)
+	// ListSegments lists every stored segment with its version. collectionIDs
+	// bounds the scan only for stores that cannot list globally.
+	ListSegments(ctx context.Context, collectionIDs []int64) ([]*datapb.SegmentInfo, []int64, error)
 	// AddSegment persists a segment that must not exist yet.
 	AddSegment(ctx context.Context, segment *datapb.SegmentInfo) (int64, error)
 	// DropSegment removes a segment record.
@@ -66,19 +67,14 @@ func (s *catalogSegmentStore) nextVersions(segments []*datapb.SegmentInfo) map[i
 	return versions
 }
 
-func (s *catalogSegmentStore) ListSegments(ctx context.Context, target partitionScanTarget) ([]*datapb.SegmentInfo, []int64, error) {
-	segments, err := s.catalog().ListSegments(ctx, target.collectionID)
-	if err != nil {
-		return nil, nil, err
-	}
-	if target.partitionScoped {
-		filtered := segments[:0]
-		for _, segment := range segments {
-			if segment.GetPartitionID() == target.partitionID {
-				filtered = append(filtered, segment)
-			}
+func (s *catalogSegmentStore) ListSegments(ctx context.Context, collectionIDs []int64) ([]*datapb.SegmentInfo, []int64, error) {
+	var segments []*datapb.SegmentInfo
+	for _, collectionID := range collectionIDs {
+		collectionSegments, err := s.catalog().ListSegments(ctx, collectionID)
+		if err != nil {
+			return nil, nil, err
 		}
-		segments = filtered
+		segments = append(segments, collectionSegments...)
 	}
 	versions := make([]int64, len(segments))
 	for i := range segments {
@@ -171,11 +167,11 @@ func (s *casSegmentStore) key(segment *datapb.SegmentInfo) string {
 	return s.join(segmentKey(segment.GetCollectionID(), segment.GetPartitionID(), segment.GetID()))
 }
 
-func (s *casSegmentStore) scanPrefix(target partitionScanTarget) string {
-	if target.partitionScoped {
-		return s.join(fmt.Sprintf("%s%d/%d", segmentMetaPrefix, target.collectionID, target.partitionID)) + "/"
-	}
-	return s.join(fmt.Sprintf("%s%d", segmentMetaPrefix, target.collectionID)) + "/"
+// scanPrefix is the prefix of every segment record. join drops a trailing
+// separator, which must stay: without it the scan would also cover sibling
+// catalog prefixes such as statslog and stats-task.
+func (s *casSegmentStore) scanPrefix() string {
+	return strings.TrimSuffix(s.join(segmentMetaPrefix), "/") + "/"
 }
 
 // version returns the version the write of segment is built from: the cached
@@ -185,8 +181,10 @@ func (s *casSegmentStore) version(segmentID int64) int64 {
 	return version
 }
 
-func (s *casSegmentStore) ListSegments(ctx context.Context, target partitionScanTarget) ([]*datapb.SegmentInfo, []int64, error) {
-	_, values, versions, err := s.persist.Scan(ctx, s.scanPrefix(target))
+// ListSegments scans all segment records in one walk; the store is keyed by
+// segment, so collectionIDs is not needed to bound the scan.
+func (s *casSegmentStore) ListSegments(ctx context.Context, _ []int64) ([]*datapb.SegmentInfo, []int64, error) {
+	_, values, versions, err := s.persist.Scan(ctx, s.scanPrefix())
 	if err != nil {
 		return nil, nil, err
 	}

@@ -69,6 +69,16 @@ func (c *indexGCReadinessCatalog) ListSegmentIndexes(_ context.Context, collecti
 	return ret, nil
 }
 
+func (c *indexGCReadinessCatalog) ListAllSegmentIndexes(context.Context) ([]*model.SegmentIndex, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	ret := make([]*model.SegmentIndex, 0, len(c.stored))
+	for _, index := range c.stored {
+		ret = append(ret, model.CloneSegmentIndex(index))
+	}
+	return ret, nil
+}
+
 func (c *indexGCReadinessCatalog) AlterSegmentIndexes(_ context.Context, indexes []*model.SegmentIndex) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -116,7 +126,7 @@ func newIndexGCReadinessServer(t *testing.T, secondIndex bool) (*Server, *model.
 		catalog.stored[120] = &model.SegmentIndex{CollectionID: 1, PartitionID: 1, SegmentID: 1, IndexID: 20, BuildID: 120, IndexState: commonpb.IndexState_Finished}
 	}
 	var err error
-	s.meta.indexMeta, err = newIndexMeta(context.Background(), catalog, collectionScanTargets([]int64{1}))
+	s.meta.indexMeta, err = newIndexMeta(context.Background(), catalog)
 	require.NoError(t, err)
 	return s, index, catalog
 }
@@ -194,7 +204,7 @@ func TestIndexGCReadinessMetaFailureSurvivesRestart(t *testing.T) {
 	// Reload the actual indexMeta from persisted catalog rows, including the
 	// Finished state underneath the deletion marker.
 	var err error
-	s.meta.indexMeta, err = newIndexMeta(context.Background(), catalog, collectionScanTargets([]int64{1}))
+	s.meta.indexMeta, err = newIndexMeta(context.Background(), catalog)
 	require.NoError(t, err)
 	assertIndexGCReadinessInvalidated(t, s, index)
 	gc.recycleDroppedSegment(context.Background(), newGCManifestReadIO(t), 1, s.meta.segments.GetSegment(1))

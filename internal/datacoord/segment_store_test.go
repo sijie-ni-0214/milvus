@@ -260,10 +260,10 @@ type serializedSegmentStore struct {
 	inner segmentStore
 }
 
-func (s *serializedSegmentStore) ListSegments(ctx context.Context, target partitionScanTarget) ([]*datapb.SegmentInfo, []int64, error) {
+func (s *serializedSegmentStore) ListSegments(ctx context.Context, collectionIDs []int64) ([]*datapb.SegmentInfo, []int64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.inner.ListSegments(ctx, target)
+	return s.inner.ListSegments(ctx, collectionIDs)
 }
 
 func (s *serializedSegmentStore) AddSegment(ctx context.Context, segment *datapb.SegmentInfo) (int64, error) {

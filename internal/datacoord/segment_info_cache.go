@@ -237,15 +237,30 @@ func (s *CachedSegmentsInfo) GetCompactionTo(fromSegmentID int64) ([]*SegmentInf
 // holds an equal or newer version); without one the write is forced and keeps
 // the cached version. Returns the previous value and whether it existed.
 func (s *CachedSegmentsInfo) SetSegment(segmentID UniqueID, segment *SegmentInfo, version ...int64) (old *SegmentInfo, existed bool) {
+	old, existed, applied := s.install(segmentID, segment, versionArg(version))
+	if applied {
+		segmentMetricTransition(liveOrNil(old, existed), segment)
+	}
+	return old, existed
+}
+
+// LoadSegment installs a segment read back by recovery at its store version
+// like SetSegment, but does not count it in DataCoordNumSegments: recovery
+// publishes the counts of all loaded segments at once.
+func (s *CachedSegmentsInfo) LoadSegment(segmentID UniqueID, segment *SegmentInfo, version int64) {
+	s.install(segmentID, segment, version)
+}
+
+// install swaps segment in at version and reindexes it if the swap applied.
+func (s *CachedSegmentsInfo) install(segmentID UniqueID, segment *SegmentInfo, version int64) (old *SegmentInfo, existed bool, applied bool) {
 	normalizeSegmentRowCount(segment.SegmentInfo)
-	old, existed, applied := s.segments.Swap(segmentID, versionArg(version), func(*SegmentInfo, bool) *SegmentInfo {
+	old, existed, applied = s.segments.Swap(segmentID, version, func(*SegmentInfo, bool) *SegmentInfo {
 		return segment
 	})
 	if applied {
 		s.reindex(old, existed, segment)
-		segmentMetricTransition(liveOrNil(old, existed), segment)
 	}
-	return old, existed
+	return old, existed, applied
 }
 
 // PublishSegment installs a newly persisted value of a segment at version.

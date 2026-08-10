@@ -809,6 +809,11 @@ func (kc *Catalog) ListSegmentIndexes(ctx context.Context, collectionID int64) (
 	return kc.listSegmentIndexesWithPrefix(ctx, buildSegmentIndexCollectionPrefix(collectionID))
 }
 
+// ListAllSegmentIndexes scans the global segment-index prefix for metadata recovery.
+func (kc *Catalog) ListAllSegmentIndexes(ctx context.Context) ([]*model.SegmentIndex, error) {
+	return kc.listSegmentIndexesWithPrefix(ctx, util.SegmentIndexPrefix+"/")
+}
+
 func (kc *Catalog) ListPartitionSegmentIndexes(ctx context.Context, collectionID, partitionID int64) ([]*model.SegmentIndex, error) {
 	return kc.listSegmentIndexesWithPrefix(ctx, buildSegmentIndexPartitionPrefix(collectionID, partitionID))
 }

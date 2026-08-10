@@ -46,8 +46,69 @@ import (
 	"github.com/milvus-io/milvus/pkg/v3/util/typeutil"
 )
 
+type blockingIndexRecoveryCatalog struct {
+	metastore.DataCoordCatalog
+	fieldStarted        chan struct{}
+	releaseField        chan struct{}
+	segmentIndexStarted chan struct{}
+}
+
+func (c *blockingIndexRecoveryCatalog) ListIndexes(ctx context.Context) ([]*model.Index, error) {
+	close(c.fieldStarted)
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-c.releaseField:
+		return nil, nil
+	}
+}
+
+func (c *blockingIndexRecoveryCatalog) ListAllSegmentIndexes(ctx context.Context) ([]*model.SegmentIndex, error) {
+	close(c.segmentIndexStarted)
+	return nil, nil
+}
+
+func TestIndexRecoveryScansRunConcurrently(t *testing.T) {
+	fieldStarted := make(chan struct{})
+	releaseField := make(chan struct{})
+	segmentIndexStarted := make(chan struct{})
+	catalog := &blockingIndexRecoveryCatalog{
+		DataCoordCatalog:    catalogmocks.NewDataCoordCatalog(t),
+		fieldStarted:        fieldStarted,
+		releaseField:        releaseField,
+		segmentIndexStarted: segmentIndexStarted,
+	}
+
+	result := make(chan error, 1)
+	go func() {
+		_, err := newIndexMeta(context.Background(), catalog)
+		result <- err
+	}()
+
+	select {
+	case <-fieldStarted:
+	case <-time.After(5 * time.Second):
+		require.FailNow(t, "field index recovery did not start")
+	}
+
+	select {
+	case <-segmentIndexStarted:
+	case <-time.After(5 * time.Second):
+		close(releaseField)
+		require.FailNow(t, "segment index recovery did not start while field index recovery was blocked")
+	}
+	close(releaseField)
+
+	select {
+	case err := <-result:
+		require.NoError(t, err)
+	case <-time.After(5 * time.Second):
+		require.FailNow(t, "concurrent index recovery did not complete")
+	}
+}
+
 func TestReloadFromKV(t *testing.T) {
-	t.Run("scan segment indexes by partition", func(t *testing.T) {
+	t.Run("scan all segment indexes once", func(t *testing.T) {
 		collID := int64(100)
 		partID1 := int64(10)
 		partID2 := int64(20)
@@ -69,7 +130,7 @@ func TestReloadFromKV(t *testing.T) {
 				IndexID:      indexID2,
 			},
 		}, nil)
-		catalog.EXPECT().ListPartitionSegmentIndexes(mock.Anything, collID, partID1).Return([]*model.SegmentIndex{
+		catalog.EXPECT().ListSegmentIndexes(mock.Anything, int64(0)).Return([]*model.SegmentIndex{
 			{
 				CollectionID: collID,
 				PartitionID:  partID1,
@@ -77,8 +138,6 @@ func TestReloadFromKV(t *testing.T) {
 				IndexID:      indexID1,
 				BuildID:      buildID1,
 			},
-		}, nil)
-		catalog.EXPECT().ListPartitionSegmentIndexes(mock.Anything, collID, partID2).Return([]*model.SegmentIndex{
 			{
 				CollectionID: collID,
 				PartitionID:  partID2,
@@ -86,12 +145,9 @@ func TestReloadFromKV(t *testing.T) {
 				IndexID:      indexID2,
 				BuildID:      buildID2,
 			},
-		}, nil)
+		}, nil).Once()
 
-		meta, err := newIndexMeta(context.TODO(), catalog, []partitionScanTarget{
-			{collectionID: collID, partitionID: partID1, partitionScoped: true},
-			{collectionID: collID, partitionID: partID2, partitionScoped: true},
-		})
+		meta, err := newIndexMeta(context.TODO(), catalog)
 		assert.NoError(t, err)
 		assert.NotNil(t, meta)
 
@@ -101,14 +157,14 @@ func TestReloadFromKV(t *testing.T) {
 		assert.True(t, ok)
 		_, ok = meta.segmentBuildInfo.Get(buildID2)
 		assert.True(t, ok)
-		catalog.AssertNotCalled(t, "ListSegmentIndexes", mock.Anything, mock.Anything)
+		catalog.AssertNotCalled(t, "ListPartitionSegmentIndexes", mock.Anything, mock.Anything, mock.Anything)
 	})
 
 	t.Run("ListIndexes_fail", func(t *testing.T) {
 		catalog := catalogmocks.NewDataCoordCatalog(t)
 		catalog.EXPECT().ListIndexes(mock.Anything).Return(nil, errors.New("mock"))
 		catalog.EXPECT().ListSegmentIndexes(mock.Anything, mock.Anything).Return(nil, nil).Maybe()
-		_, err := newIndexMeta(context.TODO(), catalog, collectionScanTargets([]int64{0}))
+		_, err := newIndexMeta(context.TODO(), catalog)
 		assert.Error(t, err)
 	})
 
@@ -117,7 +173,7 @@ func TestReloadFromKV(t *testing.T) {
 		catalog.EXPECT().ListIndexes(mock.Anything).Return([]*model.Index{}, nil)
 		catalog.EXPECT().ListSegmentIndexes(mock.Anything, mock.Anything).Return(nil, errors.New("mock"))
 
-		_, err := newIndexMeta(context.TODO(), catalog, collectionScanTargets([]int64{0}))
+		_, err := newIndexMeta(context.TODO(), catalog)
 		assert.Error(t, err)
 	})
 
@@ -139,7 +195,7 @@ func TestReloadFromKV(t *testing.T) {
 			},
 		}, nil)
 
-		meta, err := newIndexMeta(context.TODO(), catalog, collectionScanTargets([]int64{0}))
+		meta, err := newIndexMeta(context.TODO(), catalog)
 		assert.NoError(t, err)
 		assert.NotNil(t, meta)
 	})
@@ -167,7 +223,7 @@ func TestReloadFromKV(t *testing.T) {
 			{SegmentID: 20, CollectionID: collID, IndexID: deadIndexID, BuildID: 200, IndexSerializedSize: deadSize},
 		}, nil)
 
-		meta, err := newIndexMeta(context.TODO(), catalog, collectionScanTargets([]int64{collID}))
+		meta, err := newIndexMeta(context.TODO(), catalog)
 		assert.NoError(t, err)
 		assert.NotNil(t, meta)
 

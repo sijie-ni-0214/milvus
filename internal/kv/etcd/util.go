@@ -44,8 +44,7 @@ func parsePredicateType(pt predicates.PredicateType) (string, error) {
 	}
 }
 
-// getContextWithTimeout returns a context with timeout
-func getContextWithTimeout(ctx context.Context, timeoutDuration time.Duration) (context.Context, context.CancelFunc) {
+func getContextWithoutAuth(ctx context.Context) context.Context {
 	// Use original ctx as base to preserve context values,
 	// but remove RBAC auth info to avoid auth contamination in etcd requests
 	newCtx := ctx
@@ -56,5 +55,10 @@ func getContextWithTimeout(ctx context.Context, timeoutDuration time.Duration) (
 		mdCopy.Delete(util.HeaderToken)
 		newCtx = metadata.NewIncomingContext(ctx, mdCopy)
 	}
-	return context.WithTimeout(newCtx, timeoutDuration)
+	return newCtx
+}
+
+// getContextWithTimeout returns a context with timeout
+func getContextWithTimeout(ctx context.Context, timeoutDuration time.Duration) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(getContextWithoutAuth(ctx), timeoutDuration)
 }

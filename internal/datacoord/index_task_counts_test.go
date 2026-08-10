@@ -57,6 +57,10 @@ func (c *taskCountsCatalog) ListSegmentIndexes(_ context.Context, collectionID i
 	}
 	return tasks, c.err
 }
+func (c *taskCountsCatalog) ListAllSegmentIndexes(context.Context) ([]*model.SegmentIndex, error) {
+	return c.tasks, c.err
+}
+
 func (c *taskCountsCatalog) CreateIndex(context.Context, *model.Index) error    { return c.err }
 func (c *taskCountsCatalog) AlterIndexes(context.Context, []*model.Index) error { return c.err }
 func (c *taskCountsCatalog) CreateSegmentIndex(context.Context, *model.SegmentIndex) error {
@@ -122,7 +126,7 @@ func TestIndexTaskCountsRecovery(t *testing.T) {
 		&model.SegmentIndex{CollectionID: 1, IndexID: 10, BuildID: 100, IndexState: commonpb.IndexState_Finished, IsDeleted: true},
 		&model.SegmentIndex{CollectionID: 1, IndexID: 10, BuildID: 101, IndexState: commonpb.IndexState(100)},
 	)
-	m, err := newIndexMeta(context.Background(), catalog, collectionScanTargets([]int64{1, 2, 3}))
+	m, err := newIndexMeta(context.Background(), catalog)
 	require.NoError(t, err)
 	assertIndexTaskCounts(t, m)
 	require.Equal(t, indexTaskStateCounts{1, 1, 1, 1, 1, 1}, m.indexTaskCountsSnapshot())
@@ -146,7 +150,7 @@ func TestIndexTaskCountsRecovery(t *testing.T) {
 func TestIndexTaskCountsLifecycle(t *testing.T) {
 	ctx := context.Background()
 	catalog := &taskCountsCatalog{}
-	m, err := newIndexMeta(ctx, catalog, collectionScanTargets([]int64{1, 2, 3}))
+	m, err := newIndexMeta(ctx, catalog)
 	require.NoError(t, err)
 	require.NoError(t, m.CreateIndex(ctx, &model.Index{CollectionID: 1, IndexID: 10}))
 	task := &model.SegmentIndex{CollectionID: 1, IndexID: 10, SegmentID: 20, BuildID: 30}
@@ -206,7 +210,7 @@ func TestIndexTaskCountsRecoveryReplacement(t *testing.T) {
 			{CollectionID: 1, IndexID: 10, SegmentID: 20, BuildID: 30, IndexState: commonpb.IndexState_Finished},
 		},
 	}
-	m, err := newIndexMeta(context.Background(), catalog, collectionScanTargets([]int64{1, 2, 3}))
+	m, err := newIndexMeta(context.Background(), catalog)
 	require.NoError(t, err)
 	assertIndexTaskCounts(t, m)
 	require.Equal(t, indexTaskStateCounts{0, 0, 0, 1}, m.indexTaskCountsSnapshot())
@@ -239,7 +243,7 @@ func TestIndexTaskCountsPersistenceFailures(t *testing.T) {
 				indexes: []*model.Index{{CollectionID: 1, IndexID: 10, IsDeleted: name == "remove-indexes"}},
 				tasks:   []*model.SegmentIndex{{CollectionID: 1, IndexID: 10, SegmentID: 20, BuildID: 30, IndexState: commonpb.IndexState_Unissued}},
 			}
-			m, err := newIndexMeta(ctx, catalog, collectionScanTargets([]int64{1, 2, 3}))
+			m, err := newIndexMeta(ctx, catalog)
 			require.NoError(t, err)
 			before := m.indexTaskCountsSnapshot()
 			catalog.err = merr.ErrServiceUnavailable
@@ -255,7 +259,7 @@ func TestIndexTaskCountsPersistenceFailures(t *testing.T) {
 
 func TestIndexTaskCountsRandomized(t *testing.T) {
 	ctx := context.Background()
-	m, err := newIndexMeta(ctx, &taskCountsCatalog{}, nil)
+	m, err := newIndexMeta(ctx, &taskCountsCatalog{})
 	require.NoError(t, err)
 	rng := rand.New(rand.NewSource(42))
 	for i := 0; i < 500; i++ {
@@ -286,7 +290,7 @@ func TestIndexTaskCountsRandomized(t *testing.T) {
 
 func TestIndexTaskCountsConcurrent(t *testing.T) {
 	ctx := context.Background()
-	m, err := newIndexMeta(ctx, &taskCountsCatalog{}, nil)
+	m, err := newIndexMeta(ctx, &taskCountsCatalog{})
 	require.NoError(t, err)
 	const builds = 16
 	require.NoError(t, m.CreateIndex(ctx, &model.Index{CollectionID: 1, IndexID: 10}))
@@ -367,7 +371,7 @@ func BenchmarkIndexTaskCounts(b *testing.B) {
 
 func TestIndexTaskCountsManifestInstallAvoidsDDLLock(t *testing.T) {
 	ctx := context.Background()
-	m, err := newIndexMeta(ctx, &taskCountsCatalog{}, nil)
+	m, err := newIndexMeta(ctx, &taskCountsCatalog{})
 	require.NoError(t, err)
 	require.NoError(t, m.CreateIndex(ctx, &model.Index{CollectionID: 1, IndexID: 10}))
 	require.NoError(t, m.AddSegmentIndex(ctx, &model.SegmentIndex{CollectionID: 1, IndexID: 10, SegmentID: 20, BuildID: 30}))

@@ -418,6 +418,12 @@ func segFormatLabel(seg *datapb.SegmentInfo) string {
 	return formats[0]
 }
 
+// SegmentMetricLabels returns the DataCoordNumSegments label values of seg, for
+// callers that count segments in bulk.
+func SegmentMetricLabels(seg *datapb.SegmentInfo) [5]string {
+	return segMetricLabels(seg)
+}
+
 func segMetricLabels(seg *datapb.SegmentInfo) [5]string {
 	return [5]string{
 		seg.GetState().String(),
