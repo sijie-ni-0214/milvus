@@ -330,6 +330,12 @@ func segFormatLabel(seg *datapb.SegmentInfo) string {
 	return formats[0]
 }
 
+// SegmentMetricLabels returns the DataCoordNumSegments label values of seg, for
+// callers that count segments in bulk.
+func SegmentMetricLabels(seg *datapb.SegmentInfo) [5]string {
+	return segMetricLabels(seg)
+}
+
 func segMetricLabels(seg *datapb.SegmentInfo) [5]string {
 	return [5]string{
 		seg.GetState().String(),
@@ -648,6 +654,50 @@ func (s *metaStore) GcConfirm(ctx context.Context, collectionID, partitionID typ
 // safe for concurrent use.
 type SegmentNormalizer func(segment *datapb.SegmentInfo) (*datapb.SegmentInfo, error)
 
+type allSegmentRecoveryCatalog interface {
+	ListAllSegments(context.Context) ([]*datapb.SegmentInfo, error)
+}
+
+func (s *metaStore) listRecoverySegments(ctx context.Context, collectionIDs []int64) ([][]*datapb.SegmentInfo, error) {
+	if len(collectionIDs) == 0 {
+		return nil, nil
+	}
+	if catalog, ok := s.catalog.(allSegmentRecoveryCatalog); ok {
+		segments, err := catalog.ListAllSegments(ctx)
+		if err != nil {
+			return nil, err
+		}
+		allowed := typeutil.NewSet(collectionIDs...)
+		filtered := make([]*datapb.SegmentInfo, 0, len(segments))
+		for _, segment := range segments {
+			if allowed.Contain(segment.GetCollectionID()) {
+				filtered = append(filtered, segment)
+			}
+		}
+		return [][]*datapb.SegmentInfo{filtered}, nil
+	}
+	pool := conc.NewPool[any](paramtable.Get().MetaStoreCfg.ReadConcurrency.GetAsInt())
+	defer pool.Release()
+	collectionSegments := make([][]*datapb.SegmentInfo, len(collectionIDs))
+	futures := make([]*conc.Future[any], 0, len(collectionIDs))
+	for i, collID := range collectionIDs {
+		i := i
+		collID := collID
+		futures = append(futures, pool.Submit(func() (any, error) {
+			segments, err := s.catalog.ListSegments(ctx, collID)
+			if err != nil {
+				return nil, err
+			}
+			collectionSegments[i] = segments
+			return nil, nil
+		}))
+	}
+	if err := conc.AwaitAll(futures...); err != nil {
+		return nil, err
+	}
+	return collectionSegments, nil
+}
+
 // LoadFromCatalog loads segments and channel checkpoints. A non-nil normalize
 // runs on every segment first; if it fails, no segment is installed.
 func (s *metaStore) LoadFromCatalog(ctx context.Context, collectionIDs []int64, normalize SegmentNormalizer) error {
@@ -664,42 +714,37 @@ func (s *metaStore) LoadFromCatalog(ctx context.Context, collectionIDs []int64, 
 	s.checkpoints = make(map[string]*msgpb.MsgPosition)
 	s.mu.Unlock()
 
-	pool := conc.NewPool[any](paramtable.Get().MetaStoreCfg.ReadConcurrency.GetAsInt())
-	defer pool.Release()
-	collectionSegments := make([][]*datapb.SegmentInfo, len(collectionIDs))
-	futures := make([]*conc.Future[any], 0, len(collectionIDs))
-	for i, collID := range collectionIDs {
-		i := i
-		collID := collID
-		futures = append(futures, pool.Submit(func() (any, error) {
-			segments, err := s.catalog.ListSegments(ctx, collID)
-			if err != nil {
-				return nil, err
-			}
-			if normalize != nil {
-				for j, segment := range segments {
-					if segments[j], err = normalize(segment); err != nil {
-						return nil, err
-					}
-				}
-			}
-			collectionSegments[i] = segments
-			return nil, nil
-		}))
-	}
-	if err := conc.AwaitAll(futures...); err != nil {
+	collectionSegments, err := s.listRecoverySegments(ctx, collectionIDs)
+	if err != nil {
 		return err
 	}
+	aggregates := newSegmentRecoveryMetricAggregates()
 	for _, segments := range collectionSegments {
-		s.LoadSegments(segments)
+		for i, segment := range segments {
+			if normalize != nil {
+				segments[i], err = normalize(segment)
+				if err != nil {
+					return err
+				}
+			}
+			aggregates.Add(segments[i])
+		}
 	}
-
-	s.emitSegmentMetrics()
 
 	channelCPs, err := s.catalog.ListChannelCheckpoint(ctx)
 	if err != nil {
 		return err
 	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	for _, segments := range collectionSegments {
+		s.LoadSegments(segments)
+	}
+	aggregates.PublishSegmentCounts()
+	aggregates.ReplayFileHistogramsAsync()
+
 	s.mu.Lock()
 	for vChannel, pos := range channelCPs {
 		pos.ChannelName = vChannel
@@ -716,27 +761,6 @@ func (s *metaStore) LoadFromCatalog(ctx context.Context, collectionIDs []int64, 
 		mlog.Int("numCheckpoints", len(channelCPs)),
 		mlog.Duration("duration", record.ElapseSpan()))
 	return nil
-}
-
-func (s *metaStore) emitSegmentMetrics() {
-	metrics.DataCoordNumSegments.Reset()
-	s.segments.Load().rangeAll(func(segment *datapb.SegmentInfo) {
-		labels := segMetricLabels(segment)
-		metrics.DataCoordNumSegments.WithLabelValues(labels[:]...).Inc()
-
-		if segment.State == commonpb.SegmentState_Flushed {
-			stats := segment.GetStats()
-			metrics.FlushedSegmentFileNum.WithLabelValues(metrics.InsertFileLabel).Observe(float64(stats.GetInsertBinlogCount()))
-
-			statFileNum := 0
-			for _, fieldBinlog := range segment.GetStatslogs() {
-				statFileNum += len(fieldBinlog.GetBinlogs())
-			}
-			metrics.FlushedSegmentFileNum.WithLabelValues(metrics.StatFileLabel).Observe(float64(statFileNum))
-
-			metrics.FlushedSegmentFileNum.WithLabelValues(metrics.DeleteFileLabel).Observe(float64(stats.GetDeltaBinlogCount()))
-		}
-	})
 }
 
 func (s *metaStore) emitCheckpointMetrics() {

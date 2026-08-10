@@ -199,6 +199,49 @@ func NewIndexMeta(ctx context.Context, catalog metastore.DataCoordCatalog, colle
 
 const segmentIndexCacheRecoveryProgressLogInterval = 100000
 
+type allSegmentIndexRecoveryCatalog interface {
+	ListAllSegmentIndexes(context.Context) ([]*model.SegmentIndex, error)
+}
+
+func (m *IndexMeta) listRecoverySegmentIndexes(collectionIDs []int64) ([][]*model.SegmentIndex, error) {
+	if len(collectionIDs) == 0 {
+		return nil, nil
+	}
+	if catalog, ok := m.Catalog.(allSegmentIndexRecoveryCatalog); ok {
+		indexes, err := catalog.ListAllSegmentIndexes(m.ctx)
+		if err != nil {
+			return nil, err
+		}
+		allowed := typeutil.NewSet(collectionIDs...)
+		filtered := make([]*model.SegmentIndex, 0, len(indexes))
+		for _, index := range indexes {
+			if allowed.Contain(index.CollectionID) {
+				filtered = append(filtered, index)
+			}
+		}
+		return [][]*model.SegmentIndex{filtered}, nil
+	}
+	collectionSegIdxes := make([][]*model.SegmentIndex, len(collectionIDs))
+	pool := conc.NewPool[any](paramtable.Get().MetaStoreCfg.ReadConcurrency.GetAsInt())
+	defer pool.Release()
+	futures := make([]*conc.Future[any], 0, len(collectionIDs))
+	for i, collID := range collectionIDs {
+		i, collID := i, collID
+		futures = append(futures, pool.Submit(func() (any, error) {
+			segIdxes, err := m.Catalog.ListSegmentIndexes(m.ctx, collID)
+			if err != nil {
+				return nil, err
+			}
+			collectionSegIdxes[i] = segIdxes
+			return nil, nil
+		}))
+	}
+	if err := conc.AwaitAll(futures...); err != nil {
+		return nil, err
+	}
+	return collectionSegIdxes, nil
+}
+
 // reloadFromKV loads meta from KV storage
 func (m *IndexMeta) reloadFromKV(collectionIDs []int64) error {
 	record := timerecord.NewTimeRecorder("indexMeta-reloadFromKV")
@@ -207,7 +250,7 @@ func (m *IndexMeta) reloadFromKV(collectionIDs []int64) error {
 	// and they update completely separate data structures so memory updates can also run in parallel.
 	// collectionSegIdxes is hoisted to function scope for the metrics goroutine
 	// launched after g.Wait.
-	collectionSegIdxes := make([][]*model.SegmentIndex, len(collectionIDs))
+	var collectionSegIdxes [][]*model.SegmentIndex
 	g, _ := errgroup.WithContext(m.ctx)
 	g.Go(func() error {
 		fieldIndexScanStart := time.Now()
@@ -235,21 +278,9 @@ func (m *IndexMeta) reloadFromKV(collectionIDs []int64) error {
 		scanStart := time.Now()
 		mlog.Info(m.ctx, "indexMeta segment index catalog scan started",
 			mlog.Int("numCollections", len(collectionIDs)))
-		pool := conc.NewPool[any](paramtable.Get().MetaStoreCfg.ReadConcurrency.GetAsInt())
-		defer pool.Release()
-		futures := make([]*conc.Future[any], 0, len(collectionIDs))
-		for i, collID := range collectionIDs {
-			i, collID := i, collID
-			futures = append(futures, pool.Submit(func() (any, error) {
-				segIdxes, err := m.Catalog.ListSegmentIndexes(m.ctx, collID)
-				if err != nil {
-					return nil, err
-				}
-				collectionSegIdxes[i] = segIdxes
-				return nil, nil
-			}))
-		}
-		if err := conc.AwaitAll(futures...); err != nil {
+		var err error
+		collectionSegIdxes, err = m.listRecoverySegmentIndexes(collectionIDs)
+		if err != nil {
 			return err
 		}
 		totalSegmentIndexCount := 0

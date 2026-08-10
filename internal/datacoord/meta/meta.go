@@ -167,8 +167,8 @@ func NewMeta(ctx context.Context, catalog metastore.DataCoordCatalog, chunkManag
 	mlog.Info(ctx, "datacoord meta recovery started")
 
 	// RootCoord has loaded the collection view before DataCoord starts, so
-	// its IDs (Dropping included) drive per-collection loading in both
-	// MetaStore.LoadFromCatalog and indexMeta.
+	// its IDs (Dropping included) bound recovery in both MetaStore and
+	// indexMeta, including when the catalog supports a global scan.
 	collectionIDs := metaStore.GetCollectionIDs()
 
 	var (
