@@ -27,7 +27,6 @@ import (
 	"github.com/milvus-io/milvus/internal/metastore/mocks"
 	"github.com/milvus-io/milvus/internal/querycoordv2/meta"
 	"github.com/milvus-io/milvus/internal/views/coord/balancer"
-	"github.com/milvus-io/milvus/internal/views/qviews"
 	"github.com/milvus-io/milvus/pkg/v3/proto/messagespb"
 	"github.com/milvus-io/milvus/pkg/v3/proto/querypb"
 	"github.com/milvus-io/milvus/pkg/v3/streaming/util/message"
@@ -35,7 +34,7 @@ import (
 
 func buildAlterLoadConfigBroadcastResult(collectionID int64, vchannels ...string) message.BroadcastResultAlterLoadConfigMessageV2 {
 	if len(vchannels) == 0 {
-		vchannels = []string{"v0", "v1"}
+		vchannels = []string{"control"}
 	}
 	broadcastMsg := message.NewAlterLoadConfigMessageBuilderV2().
 		WithHeader(&messagespb.AlterLoadConfigMessageHeader{
@@ -88,7 +87,6 @@ func TestAlterLoadConfigV2AckCallbackUpdatesQViewsRuntime(t *testing.T) {
 	require.NoError(t, s.alterLoadConfigV2AckCallback(ctx, buildAlterLoadConfigBroadcastResult(100)))
 
 	assert.Contains(t, runtime.loadConfigStore.Snapshot().ConfigsMap(), int64(100))
-	assert.NotNil(t, runtime.shardViewRegistry.Get(qviews.ShardID{ReplicaID: 1000, VChannel: "v0"}))
-	assert.NotNil(t, runtime.shardViewRegistry.Get(qviews.ShardID{ReplicaID: 1000, VChannel: "v1"}))
+	assert.Empty(t, runtime.shardViewRegistry.ShardIDs())
 	assert.Equal(t, []balancer.TriggerScope{{DirtyCollections: []int64{100}}}, fakeBalancer.triggers)
 }

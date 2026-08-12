@@ -35,7 +35,6 @@ import (
 	"github.com/milvus-io/milvus/pkg/v3/proto/querypb"
 	"github.com/milvus-io/milvus/pkg/v3/proto/viewpb"
 	"github.com/milvus-io/milvus/pkg/v3/streaming/util/message"
-	"github.com/milvus-io/milvus/pkg/v3/util/funcutil"
 )
 
 func TestNewQViewsRuntimeRecoversLoadConfigAndQueryViews(t *testing.T) {
@@ -113,7 +112,7 @@ func TestQViewsRuntimePassesReferenceManagerToRegistry(t *testing.T) {
 	require.Equal(t, []qviews.DataVersion{{StreamingVersion: 1, CompactVersion: 1}}, refs.recovered)
 }
 
-func TestQViewsRuntimeLoadManagerEnsuresShardsAndTriggersBalancer(t *testing.T) {
+func TestQViewsRuntimeLoadManagerTriggersBalancer(t *testing.T) {
 	ctx := context.Background()
 	catalog := metastoremocks.NewQueryCoordCatalog(t)
 	catalog.EXPECT().GetCollections(mock.Anything).Return(nil, nil).Once()
@@ -139,8 +138,7 @@ func TestQViewsRuntimeLoadManagerEnsuresShardsAndTriggersBalancer(t *testing.T) 
 	catalog.EXPECT().SaveReplica(mock.Anything, mock.Anything).Return(nil).Once()
 	require.NoError(t, runtime.loadManager.UpdateLoadConfig(ctx, testAlterLoadConfigResult()))
 
-	assert.NotNil(t, runtime.shardViewRegistry.Get(qviews.ShardID{ReplicaID: 1000, VChannel: "v0"}))
-	assert.NotNil(t, runtime.shardViewRegistry.Get(qviews.ShardID{ReplicaID: 1000, VChannel: "v1"}))
+	assert.Empty(t, runtime.shardViewRegistry.ShardIDs())
 	assert.Equal(t, []balancer.TriggerScope{{DirtyCollections: []int64{100}}}, fakeBalancer.triggers)
 }
 
@@ -170,15 +168,11 @@ func testAlterLoadConfigResult() message.BroadcastResultAlterLoadConfigMessageV2
 			},
 		}).
 		WithBody(&messagespb.AlterLoadConfigMessageBody{}).
-		WithBroadcast([]string{"v0", "v1", "by-dev-rootcoord-dml" + funcutil.ControlChannelSuffix}).
+		WithBroadcast([]string{"control"}).
 		MustBuildBroadcast()
 	return message.BroadcastResultAlterLoadConfigMessageV2{
 		Message: message.MustAsBroadcastAlterLoadConfigMessageV2(broadcastMsg),
-		Results: map[string]*message.AppendResult{
-			"v0": {},
-			"v1": {},
-			"by-dev-rootcoord-dml" + funcutil.ControlChannelSuffix: {},
-		},
+		Results: map[string]*message.AppendResult{"control": {}},
 	}
 }
 

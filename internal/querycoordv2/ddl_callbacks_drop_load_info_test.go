@@ -77,13 +77,10 @@ func buildDropLoadConfigBroadcastResult(collectionID int64) message.BroadcastRes
 			CollectionId: collectionID,
 		}).
 		WithBody(&messagespb.DropLoadConfigMessageBody{}).
-		WithBroadcast([]string{"v0", "v1"}).
+		WithBroadcast([]string{"control"}).
 		MustBuildBroadcast()
 	return message.BroadcastResultDropLoadConfigMessageV2{
 		Message: message.MustAsBroadcastDropLoadConfigMessageV2(broadcastMsg),
-		Results: map[string]*message.AppendResult{
-			"v0": {},
-			"v1": {},
-		},
+		Results: map[string]*message.AppendResult{"control": {}},
 	}
 }

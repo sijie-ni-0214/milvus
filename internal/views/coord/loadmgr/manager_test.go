@@ -15,7 +15,6 @@ import (
 	"github.com/milvus-io/milvus/pkg/v3/proto/querypb"
 	"github.com/milvus-io/milvus/pkg/v3/streaming/util/message"
 	"github.com/milvus-io/milvus/pkg/v3/streaming/util/types"
-	"github.com/milvus-io/milvus/pkg/v3/util/funcutil"
 )
 
 func newEmptyLoadConfigStore(t *testing.T, catalog *mocks.QueryCoordCatalog) *LoadConfigStore {
@@ -47,26 +46,20 @@ func sampleAlterLoadConfigResult() message.BroadcastResultAlterLoadConfigMessage
 	broadcastMsg := message.NewAlterLoadConfigMessageBuilderV2().
 		WithHeader(sampleAlterLoadConfigHeader()).
 		WithBody(&messagespb.AlterLoadConfigMessageBody{}).
-		WithBroadcast([]string{"v0", "v1", "by-dev-rootcoord-dml" + funcutil.ControlChannelSuffix}).
+		WithBroadcast([]string{"control"}).
 		MustBuildBroadcast()
 	return message.BroadcastResultAlterLoadConfigMessageV2{
 		Message: message.MustAsBroadcastAlterLoadConfigMessageV2(broadcastMsg),
-		Results: map[string]*message.AppendResult{
-			"v0": {},
-			"v1": {},
-			"by-dev-rootcoord-dml" + funcutil.ControlChannelSuffix: {},
-		},
+		Results: map[string]*message.AppendResult{"control": {}},
 	}
 }
 
 func TestCollectionLoadManager_UpdateLoadConfig(t *testing.T) {
 	catalog := mocks.NewQueryCoordCatalog(t)
 	store := newEmptyLoadConfigStore(t, catalog)
-	var ensured []qviews.ShardID
 	var notified []int64
 	manager := NewCollectionLoadManager(
 		store,
-		func(shardID qviews.ShardID) { ensured = append(ensured, shardID) },
 		func(collectionID int64) { notified = append(notified, collectionID) },
 	)
 
@@ -80,12 +73,6 @@ func TestCollectionLoadManager_UpdateLoadConfig(t *testing.T) {
 	require.Len(t, cfg.Replicas, 2)
 	assert.Equal(t, int64(1000), cfg.Replicas[0].ReplicaID)
 	assert.Equal(t, "rg1", cfg.Replicas[0].ResourceGroup)
-	assert.ElementsMatch(t, []qviews.ShardID{
-		{ReplicaID: 1000, VChannel: "v0"},
-		{ReplicaID: 1000, VChannel: "v1"},
-		{ReplicaID: 1001, VChannel: "v0"},
-		{ReplicaID: 1001, VChannel: "v1"},
-	}, ensured)
 	assert.Equal(t, []int64{100}, notified)
 }
 
@@ -95,7 +82,6 @@ func TestCollectionLoadManager_ReleaseCollectionKeepsRegistryForReconcile(t *tes
 	var notified []int64
 	manager := NewCollectionLoadManager(
 		store,
-		func(qviews.ShardID) {},
 		func(collectionID int64) { notified = append(notified, collectionID) },
 	)
 
@@ -117,7 +103,7 @@ func TestCollectionLoadManager_DiscoverableShardAssignments(t *testing.T) {
 	catalog := mocks.NewQueryCoordCatalog(t)
 	store := newEmptyLoadConfigStore(t, catalog)
 	var assignmentUpdates int
-	manager := NewCollectionLoadManager(store, nil, nil)
+	manager := NewCollectionLoadManager(store, nil)
 	manager.SetShardAssignmentNotifier(func() { assignmentUpdates++ })
 
 	shardID := qviews.ShardID{

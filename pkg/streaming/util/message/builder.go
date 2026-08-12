@@ -174,12 +174,8 @@ func (b *mutableMesasgeBuilder[H, B]) WithVChannel(vchannel string) *mutableMesa
 type OptBuildBroadcast func(*messagespb.BroadcastHeader)
 
 // OptBuildBroadcastAckSyncUp sets the ack sync up of the broadcast message.
-// Whether the broadcast operation is need to be synced up between the streaming node and the coordinator.
-// If set, the broadcast operation will be acked after the checkpoint of current vchannel reach current message.
-// the fast ack operation can not be applied to speed up the broadcast operation, because the ack operation need to be synced up with streaming node.
-// TODO: current implementation doesn't promise the ack sync up semantic,
-// it only promise FastAck operation will not be applied, wait for 3.0 to implement the ack sync up semantic.
-// only for truncate api now.
+// When set, the broadcaster does not use append-result FastAck. The ACK is
+// produced by the StreamingNode consumer-side broadcast ACK path instead.
 func OptBuildBroadcastAckSyncUp() OptBuildBroadcast {
 	return func(bh *messagespb.BroadcastHeader) {
 		bh.AckSyncUp = true
