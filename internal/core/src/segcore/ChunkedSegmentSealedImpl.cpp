@@ -154,6 +154,20 @@ using namespace milvus::cachinglayer;
 
 constexpr auto kCollectionSchemaVersionNotReady = static_cast<ErrorCode>(2046);
 
+struct ChunkedSegmentSealedImpl::ColumnSizeEstimateState {
+    storagev2translator::ColumnSizeEstimateResult
+    Get(milvus_storage::api::ChunkReader& reader) {
+        std::call_once(once_, [&]() {
+            estimate_ = storagev2translator::FetchColumnSizeEstimates(reader);
+        });
+        return estimate_;
+    }
+
+ private:
+    std::once_flag once_;
+    storagev2translator::ColumnSizeEstimateResult estimate_;
+};
+
 namespace {
 
 struct ManifestColumnGroupBuildContext {
@@ -653,35 +667,6 @@ FormatFieldIds(const std::vector<FieldId>& field_ids) {
         ids.push_back(field_id.get());
     }
     return fmt::format("{}", ids);
-}
-
-static storagev2translator::ColumnSizeEstimateResult
-FetchColumnGroupSizeEstimate(
-    milvus_storage::api::Reader& reader,
-    int cg_index,
-    const std::shared_ptr<std::vector<std::string>>& needed_columns,
-    int64_t segment_id) {
-    auto chunk_reader_result =
-        reader.get_chunk_reader(cg_index, needed_columns);
-    AssertInfo(chunk_reader_result.ok(),
-               "get estimate chunk reader failed, segment {}, column group "
-               "index {}, status msg: {}",
-               segment_id,
-               cg_index,
-               chunk_reader_result.status().ToString());
-    auto chunk_reader = std::move(chunk_reader_result).ValueOrDie();
-    return storagev2translator::FetchColumnSizeEstimates(*chunk_reader);
-}
-
-static std::shared_ptr<std::vector<std::string>>
-GetStorageColumnNames(const SchemaPtr& schema_snapshot,
-                      const std::vector<FieldId>& field_ids) {
-    auto columns = std::make_shared<std::vector<std::string>>();
-    columns->reserve(field_ids.size());
-    for (const auto& field_id : field_ids) {
-        columns->push_back(schema_snapshot->get_storage_column_name(field_id));
-    }
-    return columns;
 }
 
 static std::string
@@ -2924,13 +2909,12 @@ ChunkedSegmentSealedImpl::LoadColumnGroups(
         int cg_index;
         std::vector<FieldId> field_ids;
         bool eager_load;
-        storagev2translator::ColumnSizeEstimateResult size_estimate;
+        std::shared_ptr<ColumnSizeEstimateState> size_estimate_state;
     };
     std::vector<FieldGroupTask> tasks;
     for (const auto& pair : cg_field_ids) {
         auto cg_index = pair.first;
         const auto& all_fields = pair.second;
-        const auto task_start = tasks.size();
 
         std::vector<FieldId> eager_fields;
         std::vector<FieldId> lazy_fields;
@@ -2958,21 +2942,13 @@ ChunkedSegmentSealedImpl::LoadColumnGroups(
             }
         }
 
+        auto size_estimate_state = std::make_shared<ColumnSizeEstimateState>();
         if (!eager_fields.empty()) {
-            tasks.push_back({cg_index, std::move(eager_fields), true});
+            tasks.push_back(
+                {cg_index, std::move(eager_fields), true, size_estimate_state});
         }
         for (const auto& fid : lazy_fields) {
-            tasks.push_back({cg_index, {fid}, false});
-        }
-
-        if (task_start != tasks.size()) {
-            auto estimate_columns = GetStorageColumnNames(
-                schema_snapshot, tasks[task_start].field_ids);
-            auto size_estimate = FetchColumnGroupSizeEstimate(
-                *reader, cg_index, estimate_columns, get_segment_id());
-            for (size_t i = task_start; i < tasks.size(); ++i) {
-                tasks[i].size_estimate = size_estimate;
-            }
+            tasks.push_back({cg_index, {fid}, false, size_estimate_state});
         }
         LOG_INFO(
             "[LoadColumnGroups] segment {} cg {} fields={} eager_fields={} "
@@ -3002,8 +2978,8 @@ ChunkedSegmentSealedImpl::LoadColumnGroups(
                                    &segment_load_info,
                                    schema_snapshot,
                                    eager_load = task.eager_load,
-                                   size_estimate =
-                                       std::move(task.size_estimate),
+                                   size_estimate_state =
+                                       std::move(task.size_estimate_state),
                                    op_ctx,
                                    &committer]() mutable {
             CheckCancellation(op_ctx,
@@ -3021,7 +2997,7 @@ ChunkedSegmentSealedImpl::LoadColumnGroups(
                             op_ctx,
                             /*is_replace=*/false,
                             committer,
-                            std::move(size_estimate));
+                            std::move(size_estimate_state));
         });
         load_group_futures.emplace_back(std::move(future));
     }
@@ -8958,35 +8934,22 @@ ChunkedSegmentSealedImpl::LoadColumnGroups(
     milvus::OpContext* op_ctx,
     bool is_replace,
     StagedStateCommitter& committer) {
-    auto reader = committer.runtime()->reader;
-    AssertInfo(reader != nullptr,
-               "reader must exist before estimating manifest column groups, "
-               "segment {}",
-               get_segment_id());
-    std::unordered_map<int, storagev2translator::ColumnSizeEstimateResult>
-        size_estimates;
-    for (const auto& [cg_index, field_ids] : cg_field_ids) {
-        if (size_estimates.find(cg_index) == size_estimates.end()) {
-            auto estimate_columns =
-                GetStorageColumnNames(schema_snapshot, field_ids);
-            size_estimates.emplace(
-                cg_index,
-                FetchColumnGroupSizeEstimate(
-                    *reader, cg_index, estimate_columns, get_segment_id()));
-        }
-    }
-
+    std::unordered_map<int, std::shared_ptr<ColumnSizeEstimateState>>
+        size_estimate_states;
+    size_estimate_states.reserve(cg_field_ids.size());
     auto& pool = ThreadPools::GetThreadPool(milvus::ThreadPoolPriority::MIDDLE);
     std::vector<std::future<void>> load_group_futures;
     for (const auto& [cg_index, field_ids] : cg_field_ids) {
-        auto size_estimate = size_estimates.at(cg_index);
+        auto [state_it, inserted] = size_estimate_states.try_emplace(
+            cg_index, std::make_shared<ColumnSizeEstimateState>());
+        (void)inserted;
         auto future = pool.Submit([this,
                                    column_groups,
                                    properties,
                                    lazy_manifest_reader_enabled,
                                    cg_index,
                                    field_ids,
-                                   size_estimate = std::move(size_estimate),
+                                   size_estimate_state = state_it->second,
                                    &segment_load_info,
                                    schema_snapshot,
                                    eager_load,
@@ -9008,7 +8971,7 @@ ChunkedSegmentSealedImpl::LoadColumnGroups(
                             op_ctx,
                             is_replace,
                             committer,
-                            std::move(size_estimate));
+                            std::move(size_estimate_state));
         });
         load_group_futures.emplace_back(std::move(future));
     }
@@ -9231,7 +9194,7 @@ ChunkedSegmentSealedImpl::LoadColumnGroup(
     milvus::OpContext* op_ctx,
     bool is_replace,
     StagedStateCommitter& committer,
-    storagev2translator::ColumnSizeEstimateResult column_size_estimate) {
+    std::shared_ptr<ColumnSizeEstimateState> size_estimate_state) {
     AssertInfo(index < column_groups->size(),
                "load column group index out of range");
     AssertInfo(!milvus_field_ids.empty(),
@@ -9308,6 +9271,11 @@ ChunkedSegmentSealedImpl::LoadColumnGroup(
     }
 
     auto chunk_reader = std::move(chunk_reader_result).ValueOrDie();
+    std::optional<storagev2translator::ColumnSizeEstimateResult>
+        column_size_estimate;
+    if (size_estimate_state != nullptr) {
+        column_size_estimate = size_estimate_state->Get(*chunk_reader);
+    }
 
     LOG_INFO("[StorageV2] segment {} loads manifest cg index {}",
              this->get_segment_id(),

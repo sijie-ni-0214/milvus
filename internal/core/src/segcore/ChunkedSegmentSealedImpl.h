@@ -93,7 +93,6 @@ namespace milvus::segcore {
 namespace storagev2translator {
 class TimestampIndexCell;
 class PkIndexCell;
-struct ColumnSizeEstimateResult;
 }  // namespace storagev2translator
 
 class TimestampData;
@@ -2036,6 +2035,8 @@ class ChunkedSegmentSealedImpl : public SegmentSealed {
     void
     SynthesizeExternalSystemFields(RuntimeResourceState* runtime);
 
+    struct ColumnSizeEstimateState;
+
     void
     LoadColumnGroups(
         const std::shared_ptr<milvus_storage::api::ColumnGroups>& column_groups,
@@ -2083,7 +2084,7 @@ class ChunkedSegmentSealedImpl : public SegmentSealed {
         milvus::OpContext* op_ctx,
         bool is_replace,
         StagedStateCommitter& committer,
-        storagev2translator::ColumnSizeEstimateResult column_size_estimate);
+        std::shared_ptr<ColumnSizeEstimateState> size_estimate_state);
 
     void
     LoadColumnGroup(
@@ -2412,28 +2413,6 @@ class ChunkedSegmentSealedImpl : public SegmentSealed {
         auto current = CapturePublishedState();
         auto runtime = CloneMutableRuntimeResourceState();
         runtime->reader = std::move(reader);
-        AssertInfo(runtime->reader != nullptr,
-                   "reader must exist before estimating manifest column group, "
-                   "segment {}",
-                   get_segment_id());
-
-        auto estimate_columns = std::make_shared<std::vector<std::string>>();
-        estimate_columns->reserve(field_ids.size());
-        for (const auto& field_id : field_ids) {
-            estimate_columns->push_back(
-                schema_snapshot->get_storage_column_name(field_id));
-        }
-        auto estimate_reader_result =
-            runtime->reader->get_chunk_reader(index, estimate_columns);
-        AssertInfo(estimate_reader_result.ok(),
-                   "get estimate chunk reader failed, segment {}, column "
-                   "group index {}, status msg: {}",
-                   get_segment_id(),
-                   index,
-                   estimate_reader_result.status().ToString());
-        auto estimate_reader = std::move(estimate_reader_result).ValueOrDie();
-        auto size_estimate =
-            storagev2translator::FetchColumnSizeEstimates(*estimate_reader);
 
         auto staged = ClonePublishedState(current);
         staged->schema = schema_snapshot;
@@ -2455,11 +2434,58 @@ class ChunkedSegmentSealedImpl : public SegmentSealed {
                         nullptr,
                         false,
                         committer,
-                        std::move(size_estimate));
+                        nullptr);
 
         auto it = runtime->fields.find(field_ids.front());
         AssertInfo(it != runtime->fields.end(), "test field was not loaded");
         return it->second;
+    }
+
+    std::vector<std::shared_ptr<ChunkedColumnInterface>>
+    TestStageLoadColumnGroupsWithReader(
+        const std::shared_ptr<milvus_storage::api::ColumnGroups>& column_groups,
+        const std::shared_ptr<milvus_storage::api::Properties>& properties,
+        std::vector<std::pair<int, std::vector<FieldId>>> cg_field_ids,
+        const SegmentLoadInfo& segment_load_info,
+        const SchemaPtr& schema_snapshot,
+        std::shared_ptr<milvus_storage::api::Reader> reader,
+        bool eager_load) {
+        auto current = CapturePublishedState();
+        auto runtime = CloneMutableRuntimeResourceState();
+        runtime->reader = std::move(reader);
+
+        auto staged = ClonePublishedState(current);
+        staged->schema = schema_snapshot;
+        staged->load_info =
+            std::make_shared<const SegmentLoadInfo>(segment_load_info);
+        staged->runtime = ToConstRuntimeState(runtime);
+        staged->commit_ts = current->commit_ts;
+        NormalizePublishedState(*staged);
+
+        StagedStateCommitter committer(*this, runtime.get(), staged.get());
+        LoadColumnGroups(column_groups,
+                         properties,
+                         segcore_config_.get_lazy_manifest_reader_enabled(),
+                         cg_field_ids,
+                         segment_load_info,
+                         schema_snapshot,
+                         eager_load,
+                         nullptr,
+                         false,
+                         committer);
+
+        std::vector<std::shared_ptr<ChunkedColumnInterface>> columns;
+        for (const auto& [cg_index, field_ids] : cg_field_ids) {
+            (void)cg_index;
+            for (const auto& field_id : field_ids) {
+                auto it = runtime->fields.find(field_id);
+                AssertInfo(it != runtime->fields.end(),
+                           "test field {} was not loaded",
+                           field_id.get());
+                columns.push_back(it->second);
+            }
+        }
+        return columns;
     }
 
     void
