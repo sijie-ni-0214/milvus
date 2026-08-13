@@ -58,7 +58,8 @@ NewSegmentWithLoadInfo(CCollection collection,
                        CSegmentInterface* newSegment,
                        bool is_sorted_by_pk,
                        const uint8_t* load_info_blob,
-                       const int64_t load_info_length);
+                       const int64_t load_info_length,
+                       bool defer_manifest_metadata);
 /**
  * @brief Dispatch a segment manage load task.
  * This function make segment itself load index & field data according to load info previously set.
@@ -138,7 +139,8 @@ AsyncReopenSegment(CTraceContext c_trace,
                    const int64_t load_info_length,
                    const void* schema_blob,
                    const int64_t schema_length,
-                   const uint64_t schema_version);
+                   const uint64_t schema_version,
+                   bool defer_manifest_metadata);
 
 void
 DeleteSegment(CSegmentInterface c_segment);

@@ -83,6 +83,27 @@ func TestRuntimePrepareRespectsLazyLoadSealedStats(t *testing.T) {
 		require.Len(t, client.Calls, 1)
 		require.True(t, oracleStatsReady(runtime.currentOracle(), version))
 	})
+
+	t.Run("manifest metadata lazy", func(t *testing.T) {
+		setLazyLoadSealedStats(t, false)
+		setLazyManifestMetadataRead(t, true)
+		client := mocks.NewMockDataCoordClient(t)
+		client.EXPECT().GetStreamingNodeQueryViewResources(mock.Anything, mock.Anything).
+			RunAndReturn(func(_ context.Context, req *datapb.GetStreamingNodeQueryViewResourcesRequest, _ ...grpc.CallOption) (*datapb.GetStreamingNodeQueryViewResourcesResponse, error) {
+				return testBM25ResourceResponse(req), nil
+			}).Once()
+
+		runtime := newTestRuntime(t, client)
+		defer runtime.Close()
+		require.NoError(t, runtime.Prepare(context.Background(), testBM25WALView(version)))
+		require.Empty(t, client.Calls)
+		require.False(t, oracleStatsReady(runtime.currentOracle(), version))
+
+		_, _, err := runtime.BuildIDF(context.Background(), version, testBM25OutputFieldID, nil)
+		require.NoError(t, err)
+		require.Len(t, client.Calls, 1)
+		require.True(t, oracleStatsReady(runtime.currentOracle(), version))
+	})
 }
 
 func newTestRuntime(t *testing.T, client *mocks.MockDataCoordClient) *Runtime {
@@ -100,6 +121,16 @@ func setLazyLoadSealedStats(t *testing.T, enabled bool) {
 	t.Helper()
 	params := paramtable.Get()
 	key := params.QueryNodeCfg.IDFLazyLoadSealedStats.Key
+	require.NoError(t, params.Save(key, strconv.FormatBool(enabled)))
+	t.Cleanup(func() {
+		require.NoError(t, params.Reset(key))
+	})
+}
+
+func setLazyManifestMetadataRead(t *testing.T, enabled bool) {
+	t.Helper()
+	params := paramtable.Get()
+	key := params.QueryNodeCfg.TieredLazyManifestMetadataReadEnabled.Key
 	require.NoError(t, params.Save(key, strconv.FormatBool(enabled)))
 	t.Cleanup(func() {
 		require.NoError(t, params.Reset(key))

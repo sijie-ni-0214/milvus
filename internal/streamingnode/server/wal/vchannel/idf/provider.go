@@ -146,7 +146,8 @@ func (r *Runtime) Prepare(ctx context.Context, walView walview.VChannelWALView) 
 		}
 		return nil
 	}
-	lazyLoadSealedStats := paramtable.Get().QueryNodeCfg.IDFLazyLoadSealedStats.GetAsBool()
+	lazyLoadSealedStats := paramtable.Get().QueryNodeCfg.IDFLazyLoadSealedStats.GetAsBool() ||
+		paramtable.Get().QueryNodeCfg.TieredLazyManifestMetadataReadEnabled.GetAsBool()
 	timing := bm25RuntimePrepareTimingSample{startedAt: time.Now()}
 	defer func() {
 		timing.total = time.Since(timing.startedAt)

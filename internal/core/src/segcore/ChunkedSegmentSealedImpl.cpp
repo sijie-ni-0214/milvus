@@ -1788,6 +1788,7 @@ ChunkedSegmentSealedImpl::ClonePublishedState(
     state->index_ready_bitset = current->index_ready_bitset.clone();
     state->binlog_index_bitset = current->binlog_index_bitset.clone();
     state->index_has_raw_data = current->index_has_raw_data;
+    state->deferred_manifest_metadata = current->deferred_manifest_metadata;
     return state;
 }
 
@@ -1817,6 +1818,9 @@ ChunkedSegmentSealedImpl::ApplyDeltaToState(PublishedSegmentState& state,
     if (delta.published_index_has_raw_data.has_value()) {
         state.published_index_has_raw_data =
             *delta.published_index_has_raw_data;
+    }
+    if (delta.deferred_manifest_metadata.has_value()) {
+        state.deferred_manifest_metadata = *delta.deferred_manifest_metadata;
     }
 }
 
@@ -8045,7 +8049,36 @@ ChunkedSegmentSealedImpl::PrepareLoadDiffForReopen(
     }
 
     CheckCancellation(op_ctx, id_, "ChunkedSegmentSealedImpl::ApplyLoadDiff()");
-    if (diff.load_external_manifest) {
+    if (diff.defer_manifest_column_groups) {
+        committer.Commit([&](RuntimeResourceState& runtime,
+                             PublishedSegmentState& staged_state) {
+            for (auto& [_, column] : runtime.fields) {
+                if (column != nullptr) {
+                    column->CancelWarmup();
+                }
+            }
+            runtime.fields.clear();
+            runtime.struct_to_array_offsets.clear();
+            runtime.array_offsets_map.clear();
+            runtime.reader.reset();
+            runtime.timestamps.reset();
+            runtime.timestamp_index.reset();
+            runtime.timestamp_data_accounted_bytes = 0;
+            runtime.timestamp_index_slot.reset();
+            runtime.pk_index_slot.reset();
+            runtime.virtual_pk2offset.reset();
+            runtime.skip_index = std::make_shared<SkipIndex>();
+            runtime.mmap_field_ids.clear();
+            runtime.variable_fields_avg_size.clear();
+            runtime.text_lob_paths.clear();
+            runtime.text_indexes.clear();
+            runtime.json_stats.clear();
+            staged_state.field_data_ready_bitset.reset();
+            staged_state.published_binlog_index_ready_bitset.reset();
+            staged_state.binlog_index_bitset.reset();
+            update_row_count(runtime, segment_load_info.GetNumOfRows());
+        });
+    } else if (diff.load_external_manifest) {
         LoadColumnGroups(segment_load_info, schema_snapshot, op_ctx, committer);
     } else {
         bool has_cg_changes = !diff.column_groups_to_load.empty() ||
@@ -8126,7 +8159,8 @@ ChunkedSegmentSealedImpl::PrepareLoadDiffForReopen(
     }
 
     CheckCancellation(op_ctx, id_, "ChunkedSegmentSealedImpl::ApplyLoadDiff()");
-    if (segment_load_info.HasManifestPath()) {
+    if (segment_load_info.HasManifestPath() &&
+        !diff.defer_manifest_column_groups) {
         InitTextLobPaths(
             segment_load_info.GetManifestPath(), schema_snapshot, committer);
     }
@@ -8357,6 +8391,7 @@ ChunkedSegmentSealedImpl::ReopenSchemaLocked(milvus::OpContext* op_ctx,
     delta.published_binlog_index_ready_bitset =
         staged->published_binlog_index_ready_bitset.clone();
     delta.published_index_has_raw_data = staged->published_index_has_raw_data;
+    delta.deferred_manifest_metadata = current->deferred_manifest_metadata;
     committer.Publish(current, delta, op_ctx, publish_mode);
 
     LOG_INFO("Schema-only reopen segment {} done", id_);
@@ -8374,6 +8409,27 @@ ChunkedSegmentSealedImpl::Reopen(
     milvus::OpContext* op_ctx,
     const milvus::proto::segcore::SegmentLoadInfo& new_load_info,
     SchemaPtr new_schema) {
+    ReopenInternal(op_ctx, new_load_info, std::move(new_schema), false);
+}
+
+void
+ChunkedSegmentSealedImpl::ReopenWithManifestMetadataPolicy(
+    milvus::OpContext* op_ctx,
+    const milvus::proto::segcore::SegmentLoadInfo& new_load_info,
+    SchemaPtr new_schema,
+    bool defer_manifest_metadata) {
+    ReopenInternal(op_ctx,
+                   new_load_info,
+                   std::move(new_schema),
+                   defer_manifest_metadata);
+}
+
+void
+ChunkedSegmentSealedImpl::ReopenInternal(
+    milvus::OpContext* op_ctx,
+    const milvus::proto::segcore::SegmentLoadInfo& new_load_info,
+    SchemaPtr new_schema,
+    bool defer_manifest_metadata) {
     std::lock_guard<std::mutex> reopen_guard(reopen_mutex_);
 
     auto current = CapturePublishedState();
@@ -8391,7 +8447,8 @@ ChunkedSegmentSealedImpl::Reopen(
     auto target_schema = new_schema ? std::move(new_schema) : current_schema;
 
     SegmentLoadInfo current_mutable(*current->load_info);
-    SegmentLoadInfo new_local(new_load_info, target_schema);
+    SegmentLoadInfo new_local(
+        new_load_info, target_schema, defer_manifest_metadata);
     new_local.InheritCachedColumnGroupsFrom(*current->load_info);
     for (auto fid : current->load_info->GetCreatedTextIndexes()) {
         if (field_exists_in_schema(target_schema, fid)) {
@@ -8399,9 +8456,18 @@ ChunkedSegmentSealedImpl::Reopen(
         }
     }
 
-    auto diff = current_mutable.ComputeDiff(new_local);
-    new_local.SetFieldsFilledWithDefault(
-        current_mutable.GetDefaultFilledFieldsForNewInfo(new_local));
+    auto materializing_deferred_manifest =
+        current->deferred_manifest_metadata && !defer_manifest_metadata;
+    auto diff = materializing_deferred_manifest
+                    ? current_mutable.ComputeDiffFromDeferredManifest(new_local)
+                    : current_mutable.ComputeDiff(new_local);
+    if (materializing_deferred_manifest) {
+        new_local.SetFieldsFilledWithDefault(
+            current_mutable.GetFieldsFilledWithDefault());
+    } else {
+        new_local.SetFieldsFilledWithDefault(
+            current_mutable.GetDefaultFilledFieldsForNewInfo(new_local));
+    }
     // Populate manifest cache before publishing; readers do not take
     // reopen_mutex_.
     if (new_local.HasManifestPath() &&
@@ -8433,6 +8499,7 @@ ChunkedSegmentSealedImpl::Reopen(
     delta.published_binlog_index_ready_bitset =
         staged->published_binlog_index_ready_bitset.clone();
     delta.published_index_has_raw_data = staged->published_index_has_raw_data;
+    delta.deferred_manifest_metadata = diff.defer_manifest_column_groups;
     committer.Publish(current, delta, op_ctx);
 
     LOG_INFO("Reopen segment {} done", id_);
@@ -8468,6 +8535,7 @@ ChunkedSegmentSealedImpl::ApplyLoadDiff(milvus::OpContext* op_ctx,
     delta.published_binlog_index_ready_bitset =
         staged->published_binlog_index_ready_bitset.clone();
     delta.published_index_has_raw_data = staged->published_index_has_raw_data;
+    delta.deferred_manifest_metadata = diff.defer_manifest_column_groups;
     committer.Publish(current, delta, op_ctx);
 }
 
@@ -8801,6 +8869,20 @@ ChunkedSegmentSealedImpl::EffectiveCommitTs() const {
 void
 ChunkedSegmentSealedImpl::SetLoadInfo(
     proto::segcore::SegmentLoadInfo load_info) {
+    SetLoadInfoInternal(std::move(load_info), false);
+}
+
+void
+ChunkedSegmentSealedImpl::SetLoadInfoWithManifestMetadataPolicy(
+    proto::segcore::SegmentLoadInfo load_info,
+    bool defer_manifest_metadata) {
+    SetLoadInfoInternal(std::move(load_info), defer_manifest_metadata);
+}
+
+void
+ChunkedSegmentSealedImpl::SetLoadInfoInternal(
+    proto::segcore::SegmentLoadInfo load_info,
+    bool defer_manifest_metadata) {
     std::lock_guard<std::mutex> reopen_guard(reopen_mutex_);
     auto current = CapturePublishedState();
     auto schema_snapshot = current->schema;
@@ -8813,11 +8895,11 @@ ChunkedSegmentSealedImpl::SetLoadInfo(
     // Do not parse manifest here: Load() must be able to observe a
     // pre-cancelled OpContext before any storage/manifest IO happens.
     auto published = std::make_shared<const SegmentLoadInfo>(
-        std::move(load_info), schema_snapshot);
-    PublishStateOnline(BuildNextPublishedState(
-        current,
-        MakeStateDelta(
-            schema_snapshot, published, static_cast<Timestamp>(commit_ts))));
+        std::move(load_info), schema_snapshot, defer_manifest_metadata);
+    auto delta = MakeStateDelta(
+        schema_snapshot, published, static_cast<Timestamp>(commit_ts));
+    delta.deferred_manifest_metadata = defer_manifest_metadata;
+    PublishStateOnline(BuildNextPublishedState(current, delta));
     LOG_INFO(
         "SetLoadInfo for segment {}, num_rows: {}, index count: {}, "
         "storage_version: {}, use_take_for_output: {}, commit_ts: {}",
@@ -9719,7 +9801,8 @@ ChunkedSegmentSealedImpl::Load(milvus::tracer::TraceContext& trace_ctx,
     LOG_INFO("Loading segment {} with {} rows", id_, num_rows);
 
     SegmentLoadInfo mutable_copy(snapshot->load_info->GetProto(),
-                                 snapshot->schema);
+                                 snapshot->schema,
+                                 snapshot->load_info->CanDeferManifestMetadataRead());
     mutable_copy.SetFieldsFilledWithDefault(
         snapshot->load_info->GetFieldsFilledWithDefault());
     for (auto fid : snapshot->load_info->GetCreatedTextIndexes()) {

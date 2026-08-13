@@ -4,13 +4,16 @@ import (
 	"context"
 	"fmt"
 	"path/filepath"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
 	"go.uber.org/atomic"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/milvus-io/milvus-proto/go-api/v3/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v3/msgpb"
@@ -19,9 +22,11 @@ import (
 	"github.com/milvus-io/milvus/internal/querynodev2/pkoracle"
 	"github.com/milvus-io/milvus/internal/querynodev2/segments/state"
 	storage "github.com/milvus-io/milvus/internal/storage"
+	"github.com/milvus-io/milvus/internal/storagev2/packed"
 	"github.com/milvus-io/milvus/internal/util/initcore"
 	"github.com/milvus-io/milvus/internal/util/segcore"
 	"github.com/milvus-io/milvus/pkg/v3/common"
+	"github.com/milvus-io/milvus/pkg/v3/mlog"
 	"github.com/milvus-io/milvus/pkg/v3/proto/datapb"
 	"github.com/milvus-io/milvus/pkg/v3/proto/querypb"
 	"github.com/milvus-io/milvus/pkg/v3/util/indexparams"
@@ -968,6 +973,215 @@ func TestLocalSegmentReopenInjectsDiskIndexLoadParams(t *testing.T) {
 	numLoadThread, ok := getParam(captured.GetIndexInfos()[0].GetIndexParams(), indexparams.NumLoadThreadKey)
 	assert.True(t, ok, "num_load_thread must be injected into DISKANN index params on Reopen")
 	assert.NotEmpty(t, numLoadThread)
+}
+
+func newDeferredManifestSegmentForTest(t *testing.T, csegment segcore.CSegment, loader Loader) *LocalSegment {
+	t.Helper()
+	schema := mock_segcore.GenTestCollectionSchema("deferred-manifest", schemapb.DataType_Int64, false)
+	collection := &Collection{}
+	collection.setSchema(schema, 1, 100, 101)
+	loadInfo := &querypb.SegmentLoadInfo{
+		CollectionID:   10,
+		PartitionID:    30,
+		SegmentID:      20,
+		StorageVersion: storage.StorageV3,
+		ManifestPath:   `{"base_path":"files/insert_log/10/30/20","ver":1}`,
+	}
+	return &LocalSegment{
+		baseSegment: baseSegment{
+			collection:         collection,
+			segmentType:        SegmentTypeSealed,
+			loadInfo:           atomic.NewPointer(loadInfo),
+			version:            atomic.NewInt64(0),
+			resourceUsageCache: atomic.NewPointer[ResourceUsage](nil),
+			needUpdatedVersion: atomic.NewInt64(0),
+		},
+		bm25StatsHolder:    newBM25StatsHolder(),
+		ptrLock:            state.NewLoadStateLock(state.LoadStateDataLoaded),
+		csegment:           csegment,
+		manifestDeferred:   true,
+		manifestLoadInfo:   proto.Clone(loadInfo).(*querypb.SegmentLoadInfo),
+		manifestLoader:     loader,
+		lastDeltaTimestamp: atomic.NewUint64(0),
+		fieldIndexes:       typeutil.NewConcurrentMap[int64, *IndexedFieldInfo](),
+		fieldJSONStats:     make(map[int64]*querypb.JsonStatsInfo),
+		relatedDataSize:    atomic.NewInt64(-1),
+	}
+}
+
+func emptyManifestDeltas(t *testing.T) *storage.DeltaData {
+	t.Helper()
+	deltaData, err := storage.NewDeltaDataWithPkType(0, schemapb.DataType_Int64)
+	require.NoError(t, err)
+	return deltaData
+}
+
+func TestLocalSegmentMaterializeManifestConcurrent(t *testing.T) {
+	paramtable.Init()
+	oldBloomFilter := paramtable.Get().CommonCfg.BloomFilterEnabled.SwapTempValue("false")
+	t.Cleanup(func() { _ = paramtable.Get().CommonCfg.BloomFilterEnabled.SwapTempValue(oldBloomFilter) })
+
+	csegment := mock_segcore.NewMockCSegment(t)
+	reopenCalls := atomic.NewInt32(0)
+	csegment.EXPECT().
+		Reopen(mock.Anything, mock.AnythingOfType("*segcore.ReopenRequest")).
+		Run(func(context.Context, *segcore.ReopenRequest) {
+			reopenCalls.Inc()
+			time.Sleep(20 * time.Millisecond)
+		}).
+		Return(nil).
+		Once()
+	segment := newDeferredManifestSegmentForTest(t, csegment, NewMockLoader(t))
+	segment.manifestHooks.resolveStats = func(*querypb.SegmentLoadInfo) (*packed.StatsResult, error) {
+		return &packed.StatsResult{}, nil
+	}
+	segment.manifestHooks.readDeltas = func(context.Context, *querypb.SegmentLoadInfo, schemapb.DataType) (*storage.DeltaData, error) {
+		return emptyManifestDeltas(t), nil
+	}
+
+	const concurrency = 16
+	var wg sync.WaitGroup
+	errs := make(chan error, concurrency)
+	for range concurrency {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			errs <- segment.materializeManifestIfNeeded(context.Background())
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		require.NoError(t, err)
+	}
+	assert.EqualValues(t, 1, reopenCalls.Load())
+	assert.False(t, segment.ManifestMetadataDeferred())
+}
+
+func TestLocalSegmentRetrieveTriggersManifestMaterialization(t *testing.T) {
+	paramtable.Init()
+	oldBloomFilter := paramtable.Get().CommonCfg.BloomFilterEnabled.SwapTempValue("false")
+	t.Cleanup(func() { _ = paramtable.Get().CommonCfg.BloomFilterEnabled.SwapTempValue(oldBloomFilter) })
+
+	ctx := context.Background()
+	plan := new(segcore.RetrievePlan)
+	csegment := mock_segcore.NewMockCSegment(t)
+	csegment.EXPECT().
+		Reopen(ctx, mock.AnythingOfType("*segcore.ReopenRequest")).
+		Return(nil).
+		Once()
+	csegment.EXPECT().Retrieve(ctx, plan).Return(nil, nil).Once()
+	segment := newDeferredManifestSegmentForTest(t, csegment, NewMockLoader(t))
+	segment.manifestHooks.resolveStats = func(*querypb.SegmentLoadInfo) (*packed.StatsResult, error) {
+		return &packed.StatsResult{}, nil
+	}
+	segment.manifestHooks.readDeltas = func(context.Context, *querypb.SegmentLoadInfo, schemapb.DataType) (*storage.DeltaData, error) {
+		return emptyManifestDeltas(t), nil
+	}
+
+	result, err := segment.retrieve(ctx, plan, mlog.With())
+	require.NoError(t, err)
+	assert.Nil(t, result)
+	assert.False(t, segment.ManifestMetadataDeferred())
+}
+
+func TestLocalSegmentMaterializeManifestReopenRetryKeepsDeletes(t *testing.T) {
+	paramtable.Init()
+	oldBloomFilter := paramtable.Get().CommonCfg.BloomFilterEnabled.SwapTempValue("false")
+	t.Cleanup(func() { _ = paramtable.Get().CommonCfg.BloomFilterEnabled.SwapTempValue(oldBloomFilter) })
+
+	csegment := mock_segcore.NewMockCSegment(t)
+	csegment.EXPECT().
+		Reopen(mock.Anything, mock.AnythingOfType("*segcore.ReopenRequest")).
+		Return(assert.AnError).
+		Once()
+	csegment.EXPECT().
+		Reopen(mock.Anything, mock.AnythingOfType("*segcore.ReopenRequest")).
+		Return(nil).
+		Once()
+	segment := newDeferredManifestSegmentForTest(t, csegment, NewMockLoader(t))
+	segment.manifestHooks.resolveStats = func(*querypb.SegmentLoadInfo) (*packed.StatsResult, error) {
+		return &packed.StatsResult{}, nil
+	}
+	segment.manifestHooks.readDeltas = func(context.Context, *querypb.SegmentLoadInfo, schemapb.DataType) (*storage.DeltaData, error) {
+		return emptyManifestDeltas(t), nil
+	}
+	var applied []uint64
+	segment.manifestHooks.applyDeltas = func(_ context.Context, deltaData *storage.DeltaData) error {
+		applied = append([]uint64(nil), deltaData.DeleteTimestamps()...)
+		return nil
+	}
+
+	pks := storage.NewInt64PrimaryKeys(1)
+	pks.AppendRaw(100)
+	require.NoError(t, segment.LoadDeltaData(context.Background(), mustDeltaData(t, pks, []uint64{1000})))
+	assert.EqualValues(t, 1000, segment.LastDeltaTimestamp())
+	require.ErrorIs(t, segment.materializeManifestIfNeeded(context.Background()), assert.AnError)
+	require.NotNil(t, segment.pendingManifestDeltas)
+	assert.EqualValues(t, 1, segment.pendingManifestDeltas.DeleteRowCount())
+
+	require.NoError(t, segment.materializeManifestIfNeeded(context.Background()))
+	assert.Equal(t, []uint64{1000}, applied)
+	assert.False(t, segment.ManifestMetadataDeferred())
+}
+
+func TestLocalSegmentMaterializeManifestBloomFilterRetryAppliesNewDeletes(t *testing.T) {
+	paramtable.Init()
+	oldBloomFilter := paramtable.Get().CommonCfg.BloomFilterEnabled.SwapTempValue("true")
+	t.Cleanup(func() { _ = paramtable.Get().CommonCfg.BloomFilterEnabled.SwapTempValue(oldBloomFilter) })
+
+	csegment := mock_segcore.NewMockCSegment(t)
+	reopenCalls := atomic.NewInt32(0)
+	csegment.EXPECT().
+		Reopen(mock.Anything, mock.AnythingOfType("*segcore.ReopenRequest")).
+		Run(func(context.Context, *segcore.ReopenRequest) { reopenCalls.Inc() }).
+		Return(nil).
+		Once()
+	loader := NewMockLoader(t)
+	loader.EXPECT().
+		LoadBloomFilterSet(mock.Anything, int64(10), mock.AnythingOfType("*querypb.SegmentLoadInfo")).
+		Return(nil, assert.AnError).
+		Once()
+	loader.EXPECT().
+		LoadBloomFilterSet(mock.Anything, int64(10), mock.AnythingOfType("*querypb.SegmentLoadInfo")).
+		Return([]*pkoracle.BloomFilterSet{pkoracle.NewBloomFilterSet(20, 30, SegmentTypeSealed)}, nil).
+		Once()
+	segment := newDeferredManifestSegmentForTest(t, csegment, loader)
+	segment.manifestHooks.resolveStats = func(*querypb.SegmentLoadInfo) (*packed.StatsResult, error) {
+		return &packed.StatsResult{}, nil
+	}
+	segment.manifestHooks.readDeltas = func(context.Context, *querypb.SegmentLoadInfo, schemapb.DataType) (*storage.DeltaData, error) {
+		return emptyManifestDeltas(t), nil
+	}
+	var appliedBatches [][]uint64
+	segment.manifestHooks.applyDeltas = func(_ context.Context, deltaData *storage.DeltaData) error {
+		appliedBatches = append(appliedBatches, append([]uint64(nil), deltaData.DeleteTimestamps()...))
+		return nil
+	}
+
+	pks := storage.NewInt64PrimaryKeys(1)
+	pks.AppendRaw(100)
+	require.NoError(t, segment.LoadDeltaData(context.Background(), mustDeltaData(t, pks, []uint64{1000})))
+	require.ErrorIs(t, segment.materializeManifestIfNeeded(context.Background()), assert.AnError)
+
+	pks = storage.NewInt64PrimaryKeys(1)
+	pks.AppendRaw(101)
+	require.NoError(t, segment.LoadDeltaData(context.Background(), mustDeltaData(t, pks, []uint64{1100})))
+	assert.EqualValues(t, 1100, segment.LastDeltaTimestamp())
+	require.NoError(t, segment.materializeManifestIfNeeded(context.Background()))
+
+	assert.EqualValues(t, 1, reopenCalls.Load())
+	require.Len(t, appliedBatches, 2)
+	assert.Equal(t, []uint64{1000}, appliedBatches[0])
+	assert.Equal(t, []uint64{1000, 1100}, appliedBatches[1])
+	assert.False(t, segment.ManifestMetadataDeferred())
+}
+
+func mustDeltaData(t *testing.T, pks storage.PrimaryKeys, timestamps []uint64) *storage.DeltaData {
+	t.Helper()
+	deltaData, err := storage.NewDeltaDataWithData(pks, timestamps)
+	require.NoError(t, err)
+	return deltaData
 }
 
 // TestBaseSegment_SkipGrowingBF tests that skipGrowingBF bypasses PK candidate checks.

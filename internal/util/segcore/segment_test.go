@@ -2,16 +2,20 @@ package segcore_test
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
 	"testing"
 
+	"github.com/bytedance/mockey"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"google.golang.org/protobuf/proto"
 
 	"github.com/milvus-io/milvus-proto/go-api/v3/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v3/schemapb"
 	"github.com/milvus-io/milvus/internal/mocks/util/mock_segcore"
 	"github.com/milvus-io/milvus/internal/storage"
+	"github.com/milvus-io/milvus/internal/storagev2/packed"
 	"github.com/milvus-io/milvus/internal/util/initcore"
 	"github.com/milvus-io/milvus/internal/util/segcore"
 	"github.com/milvus-io/milvus/pkg/v3/proto/datapb"
@@ -180,6 +184,82 @@ func TestConvertToSegcoreSegmentLoadInfo_CommitTimestamp(t *testing.T) {
 	assert.NotNil(t, result2)
 	assert.Equal(t, int64(43), result2.GetSegmentID(),
 		"SegmentID must be preserved through conversion when CommitTimestamp is zero")
+}
+
+func TestManifestMetadataDeferrable(t *testing.T) {
+	paramtable.Init()
+	params := paramtable.Get()
+	item := &params.QueryNodeCfg.TieredLazyManifestMetadataReadEnabled
+	original := item.GetValue()
+	t.Cleanup(func() {
+		_ = params.Save(item.Key, original)
+	})
+
+	schema := mock_segcore.GenTestCollectionSchema("lazy-manifest", schemapb.DataType_Int64, false)
+	loadInfo := &querypb.SegmentLoadInfo{
+		StorageVersion: storage.StorageV3,
+		ManifestPath:   `{"base_path":"files/insert_log/1/2/3","ver":1}`,
+	}
+
+	require.NoError(t, params.Save(item.Key, "false"))
+	assert.True(t, segcore.IsManifestMetadataDeferrable(loadInfo, schema))
+	assert.False(t, segcore.CanDeferManifestMetadata(loadInfo, schema))
+
+	require.NoError(t, params.Save(item.Key, "true"))
+	assert.True(t, segcore.CanDeferManifestMetadata(loadInfo, schema))
+
+	t.Run("storage v2", func(t *testing.T) {
+		candidate := proto.Clone(loadInfo).(*querypb.SegmentLoadInfo)
+		candidate.StorageVersion = storage.StorageV2
+		assert.False(t, segcore.IsManifestMetadataDeferrable(candidate, schema))
+	})
+	t.Run("missing manifest", func(t *testing.T) {
+		candidate := proto.Clone(loadInfo).(*querypb.SegmentLoadInfo)
+		candidate.ManifestPath = ""
+		assert.False(t, segcore.IsManifestMetadataDeferrable(candidate, schema))
+	})
+	t.Run("level zero", func(t *testing.T) {
+		candidate := proto.Clone(loadInfo).(*querypb.SegmentLoadInfo)
+		candidate.Level = datapb.SegmentLevel_L0
+		assert.False(t, segcore.IsManifestMetadataDeferrable(candidate, schema))
+	})
+	t.Run("external collection", func(t *testing.T) {
+		externalSchema := proto.Clone(schema).(*schemapb.CollectionSchema)
+		require.NotEmpty(t, externalSchema.GetFields())
+		externalSchema.Fields[0].ExternalField = "source_pk"
+		assert.False(t, segcore.IsManifestMetadataDeferrable(loadInfo, externalSchema))
+	})
+	t.Run("nil inputs", func(t *testing.T) {
+		assert.False(t, segcore.IsManifestMetadataDeferrable(nil, schema))
+		assert.False(t, segcore.IsManifestMetadataDeferrable(loadInfo, nil))
+	})
+}
+
+func TestDeferredManifestConversionSkipsStatsRead(t *testing.T) {
+	loadInfo := &querypb.SegmentLoadInfo{
+		SegmentID:      1,
+		StorageVersion: storage.StorageV3,
+		ManifestPath:   `{"base_path":"files/insert_log/1/2/3","ver":1}`,
+	}
+	manifestRead := false
+	patch := mockey.Mock(packed.GetManifestStats).
+		To(func(string, *indexpb.StorageConfig) (map[string]packed.ManifestStat, error) {
+			manifestRead = true
+			return nil, errors.New("manifest must not be read")
+		}).
+		Build()
+	t.Cleanup(func() { patch.UnPatch() })
+
+	converted := segcore.ConvertToSegcoreSegmentLoadInfoWithOptions(loadInfo, segcore.SegmentLoadInfoConversionOptions{
+		DeferManifestMetadata: true,
+	})
+	require.NotNil(t, converted)
+	assert.False(t, manifestRead)
+	assert.Empty(t, converted.GetTextStatsLogs())
+	assert.Empty(t, converted.GetJsonKeyStatsLogs())
+
+	_ = segcore.ConvertToSegcoreSegmentLoadInfo(loadInfo)
+	assert.True(t, manifestRead)
 }
 
 func TestConvertToSegcoreSegmentLoadInfo(t *testing.T) {

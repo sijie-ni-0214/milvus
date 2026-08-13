@@ -304,10 +304,22 @@ class ChunkedSegmentSealedImpl : public SegmentSealed {
            SchemaPtr new_schema) override;
 
     void
+    ReopenWithManifestMetadataPolicy(
+        milvus::OpContext* op_ctx,
+        const milvus::proto::segcore::SegmentLoadInfo& new_load_info,
+        SchemaPtr new_schema,
+        bool defer_manifest_metadata);
+
+    void
     LazyCheckSchema(SchemaPtr sch, milvus::OpContext* op_ctx) override;
 
     void
     SetLoadInfo(milvus::proto::segcore::SegmentLoadInfo load_info) override;
+
+    void
+    SetLoadInfoWithManifestMetadataPolicy(
+        milvus::proto::segcore::SegmentLoadInfo load_info,
+        bool defer_manifest_metadata);
 
     void
     SetCommitTimestamp(uint64_t ts) override;
@@ -387,6 +399,7 @@ class ChunkedSegmentSealedImpl : public SegmentSealed {
         BitsetType index_ready_bitset;
         BitsetType binlog_index_bitset;
         std::unordered_map<FieldId, bool> index_has_raw_data;
+        bool deferred_manifest_metadata{false};
     };
 
     struct StateDelta {
@@ -398,6 +411,7 @@ class ChunkedSegmentSealedImpl : public SegmentSealed {
         std::optional<BitsetType> published_binlog_index_ready_bitset;
         std::optional<std::unordered_map<FieldId, bool>>
             published_index_has_raw_data;
+        std::optional<bool> deferred_manifest_metadata;
     };
 
     static std::shared_ptr<const RuntimeResourceState>
@@ -2085,6 +2099,18 @@ class ChunkedSegmentSealedImpl : public SegmentSealed {
         bool is_replace,
         StagedStateCommitter& committer,
         std::shared_ptr<ColumnSizeEstimateState> size_estimate_state);
+
+    void
+    ReopenInternal(
+        milvus::OpContext* op_ctx,
+        const milvus::proto::segcore::SegmentLoadInfo& new_load_info,
+        SchemaPtr new_schema,
+        bool defer_manifest_metadata);
+
+    void
+    SetLoadInfoInternal(
+        milvus::proto::segcore::SegmentLoadInfo load_info,
+        bool defer_manifest_metadata);
 
     void
     LoadColumnGroup(

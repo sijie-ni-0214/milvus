@@ -30,6 +30,7 @@ import "C"
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -443,12 +444,28 @@ type LocalSegment struct {
 	rowNum          *atomic.Int64
 	insertCount     *atomic.Int64
 
-	deltaMut           sync.Mutex
-	lastDeltaTimestamp *atomic.Uint64
-	fields             *typeutil.ConcurrentMap[int64, *FieldInfo]
-	fieldIndexes       *typeutil.ConcurrentMap[int64, *IndexedFieldInfo] // indexID -> IndexedFieldInfo
-	fieldJSONStats     map[int64]*querypb.JsonStatsInfo
-	fieldJSONStatsMu   sync.RWMutex
+	manifestMut           sync.Mutex
+	manifestDeferred      bool
+	manifestLoadInfo      *querypb.SegmentLoadInfo
+	pendingManifestDeltas *storage.DeltaData
+	manifestLoader        Loader
+	manifestReopenDone    bool
+	manifestDeltaData     *storage.DeltaData
+	manifestDeltaApplied  bool
+	manifestStats         *packed.StatsResult
+	manifestHooks         manifestMaterializationHooks
+	deltaMut              sync.Mutex
+	lastDeltaTimestamp    *atomic.Uint64
+	fields                *typeutil.ConcurrentMap[int64, *FieldInfo]
+	fieldIndexes          *typeutil.ConcurrentMap[int64, *IndexedFieldInfo] // indexID -> IndexedFieldInfo
+	fieldJSONStats        map[int64]*querypb.JsonStatsInfo
+	fieldJSONStatsMu      sync.RWMutex
+}
+
+type manifestMaterializationHooks struct {
+	resolveStats func(*querypb.SegmentLoadInfo) (*packed.StatsResult, error)
+	readDeltas   func(context.Context, *querypb.SegmentLoadInfo, schemapb.DataType) (*storage.DeltaData, error)
+	applyDeltas  func(context.Context, *storage.DeltaData) error
 }
 
 func NewSegment(ctx context.Context,
@@ -457,6 +474,35 @@ func NewSegment(ctx context.Context,
 	segmentType SegmentType,
 	version int64,
 	loadInfo *querypb.SegmentLoadInfo,
+) (Segment, error) {
+	return newSegment(ctx, collection, manager, segmentType, version, loadInfo, false, nil)
+}
+
+func NewSegmentWithDeferredManifest(ctx context.Context,
+	collection *Collection,
+	manager SegmentManager,
+	segmentType SegmentType,
+	version int64,
+	loadInfo *querypb.SegmentLoadInfo,
+	loader Loader,
+) (Segment, error) {
+	if !segcore.CanDeferManifestMetadata(loadInfo, collection.Schema()) {
+		return NewSegment(ctx, collection, manager, segmentType, version, loadInfo)
+	}
+	if loader == nil {
+		return nil, merr.WrapErrServiceInternalMsg("deferred manifest segment loader is nil")
+	}
+	return newSegment(ctx, collection, manager, segmentType, version, loadInfo, true, loader)
+}
+
+func newSegment(ctx context.Context,
+	collection *Collection,
+	manager SegmentManager,
+	segmentType SegmentType,
+	version int64,
+	loadInfo *querypb.SegmentLoadInfo,
+	deferManifestMetadata bool,
+	manifestLoader Loader,
 ) (Segment, error) {
 	/*
 		CStatus
@@ -493,10 +539,11 @@ func NewSegment(ctx context.Context,
 	if _, err := GetDynamicPool().Submit(func() (any, error) {
 		var err error
 		csegment, err = collection.CreateCSegment(&segcore.CreateCSegmentRequest{
-			SegmentID:   loadInfo.GetSegmentID(),
-			SegmentType: segmentType,
-			IsSorted:    loadInfo.GetIsSorted(),
-			LoadInfo:    loadInfo,
+			SegmentID:             loadInfo.GetSegmentID(),
+			SegmentType:           segmentType,
+			IsSorted:              loadInfo.GetIsSorted(),
+			LoadInfo:              loadInfo,
+			DeferManifestMetadata: deferManifestMetadata,
 		})
 		return nil, err
 	}).Await(); err != nil {
@@ -517,11 +564,16 @@ func NewSegment(ctx context.Context,
 		fieldIndexes:       typeutil.NewConcurrentMap[int64, *IndexedFieldInfo](),
 		fieldJSONStats:     make(map[int64]*querypb.JsonStatsInfo),
 
-		memSize:         atomic.NewInt64(-1),
-		binlogSize:      atomic.NewInt64(0),
-		relatedDataSize: atomic.NewInt64(-1),
-		rowNum:          atomic.NewInt64(-1),
-		insertCount:     atomic.NewInt64(0),
+		memSize:          atomic.NewInt64(-1),
+		binlogSize:       atomic.NewInt64(0),
+		relatedDataSize:  atomic.NewInt64(-1),
+		rowNum:           atomic.NewInt64(-1),
+		insertCount:      atomic.NewInt64(0),
+		manifestDeferred: deferManifestMetadata,
+		manifestLoader:   manifestLoader,
+	}
+	if deferManifestMetadata {
+		segment.manifestLoadInfo = proto.Clone(loadInfo).(*querypb.SegmentLoadInfo)
 	}
 
 	if err := segment.initializeSegment(); err != nil {
@@ -529,6 +581,41 @@ func NewSegment(ctx context.Context,
 		return nil, err
 	}
 	return segment, nil
+}
+
+func appendDeltaData(dst *storage.DeltaData, pks storage.PrimaryKeys, timestamps []typeutil.Timestamp) error {
+	if pks == nil || pks.Len() != len(timestamps) {
+		return merr.WrapErrServiceInternalMsg("invalid delete batch")
+	}
+	for i, ts := range timestamps {
+		if err := dst.Append(pks.Get(i), ts); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func sortDeltaData(deltaData *storage.DeltaData) (*storage.DeltaData, error) {
+	pks := deltaData.DeletePks()
+	timestamps := deltaData.DeleteTimestamps()
+	order := make([]int, len(timestamps))
+	for i := range order {
+		order[i] = i
+	}
+	sort.SliceStable(order, func(i, j int) bool {
+		return timestamps[order[i]] < timestamps[order[j]]
+	})
+
+	sorted, err := storage.NewDeltaDataWithPkType(int64(len(order)), deltaData.PkType())
+	if err != nil {
+		return nil, err
+	}
+	for _, i := range order {
+		if err := sorted.Append(pks.Get(i), timestamps[i]); err != nil {
+			return nil, err
+		}
+	}
+	return sorted, nil
 }
 
 func (s *LocalSegment) initializeSegment() error {
@@ -627,6 +714,26 @@ func (s *LocalSegment) LastDeltaTimestamp() uint64 {
 	return s.lastDeltaTimestamp.Load()
 }
 
+func (s *LocalSegment) ManifestMetadataDeferred() bool {
+	s.manifestMut.Lock()
+	defer s.manifestMut.Unlock()
+	return s.manifestDeferred
+}
+
+func (s *LocalSegment) setManifestGeneration(loadInfo *querypb.SegmentLoadInfo, deferred bool) {
+	s.manifestDeferred = deferred
+	s.manifestReopenDone = false
+	s.manifestDeltaData = nil
+	s.manifestDeltaApplied = false
+	s.manifestStats = nil
+	if deferred {
+		s.manifestLoadInfo = proto.Clone(loadInfo).(*querypb.SegmentLoadInfo)
+		return
+	}
+	s.manifestLoadInfo = nil
+	s.pendingManifestDeltas = nil
+}
+
 // advanceLastDeltaTimestamp moves lastDeltaTimestamp forward to max(current, max(tss)).
 // Consumers (file-level skip in segment_loader.LoadDeltaLogs, dist_handler reporting to
 // QueryCoord) treat this field as a high-water-mark. Using tss[last] on unsorted batches
@@ -720,6 +827,7 @@ func (s *LocalSegment) LoadIndex(ctx context.Context, loadInfo *querypb.SegmentL
 	// lower-level implementation detail.
 	return s.Reopen(ctx, loadInfo)
 }
+
 func (s *LocalSegment) Indexes() []*IndexedFieldInfo {
 	var result []*IndexedFieldInfo
 	s.fieldIndexes.Range(func(key int64, value *IndexedFieldInfo) bool {
@@ -781,6 +889,9 @@ func (s *LocalSegment) syncFieldIndexes(indexInfos []*querypb.FieldIndexInfo) {
 // Search executes a search on the segment.
 // If searchReq.FilterOnly() is true, only executes the filter and returns valid_count (Stage 1 of two-stage search).
 func (s *LocalSegment) Search(ctx context.Context, searchReq *segcore.SearchRequest) (*segcore.SearchResult, error) {
+	if err := s.materializeManifestIfNeeded(ctx); err != nil {
+		return nil, err
+	}
 	filterOnly := searchReq.FilterOnly()
 	log := mlog.WithLazy(
 		mlog.Uint64("mvcc", searchReq.MVCC()),
@@ -816,6 +927,9 @@ func (s *LocalSegment) Search(ctx context.Context, searchReq *segcore.SearchRequ
 }
 
 func (s *LocalSegment) retrieve(ctx context.Context, plan *segcore.RetrievePlan, log *mlog.Logger) (*segcore.RetrieveResult, error) {
+	if err := s.materializeManifestIfNeeded(ctx); err != nil {
+		return nil, err
+	}
 	if !s.ptrLock.PinIf(state.IsNotReleased) {
 		// TODO: check if the segment is readable but not released. too many related logic need to be refactor.
 		return nil, merr.WrapErrSegmentNotLoaded(s.ID(), "segment released")
@@ -870,6 +984,9 @@ func (s *LocalSegment) Retrieve(ctx context.Context, plan *segcore.RetrievePlan)
 }
 
 func (s *LocalSegment) retrieveByOffsets(ctx context.Context, plan *segcore.RetrievePlanWithOffsets, log *mlog.Logger) (*segcore.RetrieveResult, error) {
+	if err := s.materializeManifestIfNeeded(ctx); err != nil {
+		return nil, err
+	}
 	if !s.ptrLock.PinIf(state.IsNotReleased) {
 		// TODO: check if the segment is readable but not released. too many related logic need to be refactor.
 		return nil, merr.WrapErrSegmentNotLoaded(s.ID(), "segment released")
@@ -977,9 +1094,27 @@ func (s *LocalSegment) Delete(ctx context.Context, primaryKeys storage.PrimaryKe
 		return merr.WrapErrSegmentNotLoaded(s.ID(), "segment released")
 	}
 	defer s.ptrLock.Unpin()
+	s.manifestMut.Lock()
+	defer s.manifestMut.Unlock()
 
 	s.deltaMut.Lock()
 	defer s.deltaMut.Unlock()
+	if s.manifestDeferred {
+		if s.pendingManifestDeltas == nil {
+			var err error
+			s.pendingManifestDeltas, err = storage.NewDeltaDataWithPkType(
+				int64(primaryKeys.Len()), primaryKeys.Type(),
+			)
+			if err != nil {
+				return err
+			}
+		}
+		if err := appendDeltaData(s.pendingManifestDeltas, primaryKeys, timestamps); err != nil {
+			return err
+		}
+		s.advanceLastDeltaTimestamp(timestamps)
+		return nil
+	}
 
 	// segcore DeletedRecord::InternalPush is idempotent on (PK, ts):
 	// duplicate deletes against already-deleted rows are discarded internally.
@@ -1083,22 +1218,49 @@ func (s *LocalSegment) LoadDeltaData(ctx context.Context, deltaData *storage.Del
 		return nil
 	}
 
-	pks, tss := deltaData.DeletePks(), deltaData.DeleteTimestamps()
-	rowNum := deltaData.DeleteRowCount()
-
 	if !s.ptrLock.PinIf(state.IsNotReleased) {
 		return merr.WrapErrSegmentNotLoaded(s.ID(), "segment released")
 	}
 	defer s.ptrLock.Unpin()
+	s.manifestMut.Lock()
+	defer s.manifestMut.Unlock()
 
+	s.deltaMut.Lock()
+	defer s.deltaMut.Unlock()
+	if s.manifestDeferred {
+		if s.pendingManifestDeltas == nil {
+			var err error
+			s.pendingManifestDeltas, err = storage.NewDeltaDataWithPkType(
+				deltaData.DeleteRowCount(), deltaData.PkType(),
+			)
+			if err != nil {
+				return err
+			}
+		}
+		if err := appendDeltaData(
+			s.pendingManifestDeltas,
+			deltaData.DeletePks(),
+			deltaData.DeleteTimestamps(),
+		); err != nil {
+			return err
+		}
+		s.advanceLastDeltaTimestamp(deltaData.DeleteTimestamps())
+		return nil
+	}
+	return s.loadDeltaDataLocked(ctx, deltaData)
+}
+
+func (s *LocalSegment) loadDeltaDataLocked(ctx context.Context, deltaData *storage.DeltaData) error {
+	if deltaData.DeleteRowCount() == 0 {
+		return nil
+	}
+	pks, tss := deltaData.DeletePks(), deltaData.DeleteTimestamps()
+	rowNum := deltaData.DeleteRowCount()
 	log := mlog.With(
 		mlog.FieldCollectionID(s.Collection()),
 		mlog.FieldPartitionID(s.Partition()),
 		mlog.FieldSegmentID(s.ID()),
 	)
-
-	s.deltaMut.Lock()
-	defer s.deltaMut.Unlock()
 
 	// See comment in Delete(): segcore dedups at (PK, ts) level, and tss is
 	// NOT sorted across L0 segments (BufferForwarder appends in iteration
@@ -1256,7 +1418,11 @@ func (s *LocalSegment) syncFieldJSONStatsFromLoadInfo(ctx context.Context, loadI
 			mlog.Err(statsResult.Err()))
 		jsonKeyStats = loadInfo.GetJsonKeyStatsLogs()
 	}
+	s.syncFieldJSONStats(ctx, loadInfo, jsonKeyStats)
+}
 
+func (s *LocalSegment) syncFieldJSONStats(ctx context.Context, loadInfo *querypb.SegmentLoadInfo, jsonKeyStats map[int64]*datapb.JsonKeyStats) {
+	jsonStatsInfo := make(map[int64]*querypb.JsonStatsInfo)
 	for fieldID, stats := range jsonKeyStats {
 		if stats == nil {
 			continue
@@ -1284,6 +1450,173 @@ func (s *LocalSegment) syncFieldJSONStatsFromLoadInfo(ctx context.Context, loadI
 	s.fieldJSONStatsMu.Unlock()
 }
 
+func (s *LocalSegment) resolveManifestStats(loadInfo *querypb.SegmentLoadInfo) (*packed.StatsResult, error) {
+	if s.manifestHooks.resolveStats != nil {
+		return s.manifestHooks.resolveStats(loadInfo)
+	}
+	stats := packed.NewStatsResolverFromLoadInfo(loadInfo).TextAndJSONIndexStatsWithBasePaths()
+	if err := stats.Err(); err != nil {
+		return nil, err
+	}
+	return &stats.StatsResult, nil
+}
+
+func (s *LocalSegment) readManifestDeltas(ctx context.Context, loadInfo *querypb.SegmentLoadInfo, pkType schemapb.DataType) (*storage.DeltaData, error) {
+	if s.manifestHooks.readDeltas != nil {
+		return s.manifestHooks.readDeltas(ctx, loadInfo, pkType)
+	}
+	return readInternalV3ManifestDeltas(ctx, loadInfo, pkType)
+}
+
+func (s *LocalSegment) applyManifestDeltas(ctx context.Context, deltaData *storage.DeltaData) error {
+	if s.manifestHooks.applyDeltas != nil {
+		return s.manifestHooks.applyDeltas(ctx, deltaData)
+	}
+	s.deltaMut.Lock()
+	defer s.deltaMut.Unlock()
+	return s.loadDeltaDataLocked(ctx, deltaData)
+}
+
+func (s *LocalSegment) materializeManifest(ctx context.Context) error {
+	if !s.ptrLock.PinIfNotReleased() {
+		return merr.WrapErrSegmentNotLoaded(s.ID(), "segment released during manifest materialization")
+	}
+	defer s.ptrLock.Unpin()
+
+	s.manifestMut.Lock()
+	defer s.manifestMut.Unlock()
+	if !s.manifestDeferred {
+		return nil
+	}
+	loader := s.manifestLoader
+	if loader == nil {
+		return merr.WrapErrServiceInternalMsg("deferred manifest segment %d has no loader", s.ID())
+	}
+
+	loadInfo := s.manifestLoadInfo
+	if loadInfo == nil {
+		return merr.WrapErrServiceInternalMsg("deferred manifest load info is nil")
+	}
+	loadInfo = proto.Clone(loadInfo).(*querypb.SegmentLoadInfo)
+	if !s.manifestReopenDone {
+		if err := prepareIndexLoadParams(loadInfo.GetIndexInfos()); err != nil {
+			return err
+		}
+		stats, err := s.resolveManifestStats(loadInfo)
+		if err != nil {
+			return merr.Wrap(err, "resolve deferred manifest stats")
+		}
+		s.manifestStats = stats
+		helper, err := typeutil.CreateSchemaHelper(s.collection.Schema())
+		if err != nil {
+			return err
+		}
+		pkField, err := helper.GetPrimaryKeyField()
+		if err != nil {
+			return err
+		}
+		deltaData, err := s.readManifestDeltas(ctx, loadInfo, pkField.GetDataType())
+		if err != nil {
+			return merr.Wrap(err, "read deferred manifest deltas")
+		}
+		if s.pendingManifestDeltas != nil {
+			if err := appendDeltaData(
+				deltaData,
+				s.pendingManifestDeltas.DeletePks(),
+				s.pendingManifestDeltas.DeleteTimestamps(),
+			); err != nil {
+				return err
+			}
+		}
+		if deltaData.DeleteRowCount() > 0 {
+			deltaData, err = sortDeltaData(deltaData)
+			if err != nil {
+				return err
+			}
+		}
+
+		schema, schemaVersion := s.collection.SchemaAndSegcoreVersion()
+		if err := s.csegment.Reopen(ctx, &segcore.ReopenRequest{
+			LoadInfo:         loadInfo,
+			Schema:           schema,
+			SchemaVersion:    schemaVersion,
+			PreResolvedStats: s.manifestStats,
+		}); err != nil {
+			return merr.Wrap(err, "materialize deferred manifest")
+		}
+		s.manifestReopenDone = true
+		s.manifestDeltaData = deltaData
+		s.pendingManifestDeltas = nil
+	} else if s.pendingManifestDeltas != nil {
+		if err := appendDeltaData(
+			s.manifestDeltaData,
+			s.pendingManifestDeltas.DeletePks(),
+			s.pendingManifestDeltas.DeleteTimestamps(),
+		); err != nil {
+			return err
+		}
+		s.pendingManifestDeltas = nil
+		s.manifestDeltaApplied = false
+		if s.manifestDeltaData.DeleteRowCount() > 0 {
+			var err error
+			s.manifestDeltaData, err = sortDeltaData(s.manifestDeltaData)
+			if err != nil {
+				return err
+			}
+		}
+	}
+
+	if !s.manifestDeltaApplied {
+		if s.manifestDeltaData != nil && s.manifestDeltaData.DeleteRowCount() > 0 {
+			if err := s.applyManifestDeltas(ctx, s.manifestDeltaData); err != nil {
+				return err
+			}
+		}
+		s.manifestDeltaApplied = true
+	}
+
+	if !s.PkCandidateExist() && paramtable.Get().CommonCfg.BloomFilterEnabled.GetAsBool() {
+		bfs, err := loader.LoadBloomFilterSet(ctx, loadInfo.GetCollectionID(), loadInfo)
+		if err != nil {
+			return merr.Wrap(err, "load deferred manifest bloom filter")
+		}
+		if len(bfs) != 1 {
+			return merr.WrapErrServiceInternalMsg("expected one bloom filter set, got %d", len(bfs))
+		}
+		s.SetPKCandidate(bfs[0])
+	}
+
+	s.syncFieldIndexes(loadInfo.GetIndexInfos())
+	if s.relatedDataSize != nil {
+		s.relatedDataSize.Store(calculateSegmentLogSize(loadInfo))
+	}
+	s.loadInfo.Store(loadInfo)
+	if s.manifestStats == nil {
+		return merr.WrapErrServiceInternalMsg("deferred manifest stats are nil")
+	}
+	s.syncFieldJSONStats(ctx, loadInfo, s.manifestStats.JSONKeyStats)
+	s.manifestDeferred = false
+	s.manifestLoadInfo = nil
+	s.pendingManifestDeltas = nil
+	s.manifestLoader = nil
+	s.manifestReopenDone = false
+	s.manifestDeltaData = nil
+	s.manifestDeltaApplied = false
+	s.manifestStats = nil
+	s.compactLoadInfoForRuntime()
+	return nil
+}
+
+func (s *LocalSegment) materializeManifestIfNeeded(ctx context.Context) error {
+	s.manifestMut.Lock()
+	deferred := s.manifestDeferred
+	s.manifestMut.Unlock()
+	if !deferred {
+		return nil
+	}
+	return s.materializeManifest(ctx)
+}
+
 func (s *LocalSegment) Load(ctx context.Context) error {
 	physicalLoadTiming := PhysicalLoadTimingFromContext(ctx)
 	startedAt := time.Now()
@@ -1293,6 +1626,12 @@ func (s *LocalSegment) Load(ctx context.Context) error {
 	}
 	if err != nil {
 		return err
+	}
+	s.manifestMut.Lock()
+	deferred := s.manifestDeferred
+	s.manifestMut.Unlock()
+	if deferred {
+		return nil
 	}
 	startedAt = time.Now()
 	s.syncFieldJSONStatsFromLoadInfo(ctx, s.LoadInfo())
@@ -1307,6 +1646,16 @@ func (s *LocalSegment) Reopen(ctx context.Context, newLoadInfo *querypb.SegmentL
 		return merr.WrapErrSegmentNotLoaded(s.ID(), "segment released during reopen")
 	}
 	defer s.ptrLock.Unpin()
+	s.manifestMut.Lock()
+	defer s.manifestMut.Unlock()
+	// Keep the creation-time policy until the first query materializes it.
+	deferManifest := s.manifestDeferred
+	if deferManifest && !segcore.IsManifestMetadataDeferrable(newLoadInfo, s.collection.Schema()) {
+		return merr.WrapErrServiceInternalMsg(
+			"deferred manifest segment %d received non-deferrable load info",
+			s.ID(),
+		)
+	}
 
 	// Reopen forwards the SegmentLoadInfo straight to segcore, so it must inject
 	// the QueryNode-local index load params (e.g. DISKANN num_load_thread) that
@@ -1317,9 +1666,10 @@ func (s *LocalSegment) Reopen(ctx context.Context, newLoadInfo *querypb.SegmentL
 
 	schema, schemaVersion := s.collection.SchemaAndSegcoreVersion()
 	err := s.csegment.Reopen(ctx, &segcore.ReopenRequest{
-		LoadInfo:      newLoadInfo,
-		Schema:        schema,
-		SchemaVersion: schemaVersion,
+		LoadInfo:              newLoadInfo,
+		Schema:                schema,
+		SchemaVersion:         schemaVersion,
+		DeferManifestMetadata: deferManifest,
 	})
 	if err != nil {
 		return err
@@ -1329,7 +1679,10 @@ func (s *LocalSegment) Reopen(ctx context.Context, newLoadInfo *querypb.SegmentL
 		s.relatedDataSize.Store(calculateSegmentLogSize(newLoadInfo))
 	}
 	s.loadInfo.Store(newLoadInfo)
-	s.syncFieldJSONStatsFromLoadInfo(ctx, newLoadInfo)
+	s.setManifestGeneration(newLoadInfo, deferManifest)
+	if !deferManifest {
+		s.syncFieldJSONStatsFromLoadInfo(ctx, newLoadInfo)
+	}
 	s.compactLoadInfoForRuntime()
 	return nil
 }

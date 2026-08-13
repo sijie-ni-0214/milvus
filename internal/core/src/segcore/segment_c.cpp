@@ -166,7 +166,8 @@ NewSegmentWithLoadInfo(CCollection collection,
                        CSegmentInterface* newSegment,
                        bool is_sorted_by_pk,
                        const uint8_t* load_info_blob,
-                       const int64_t load_info_length) {
+                       const int64_t load_info_length,
+                       bool defer_manifest_metadata) {
     SCOPE_CGO_CALL_METRIC();
 
     try {
@@ -179,7 +180,16 @@ NewSegmentWithLoadInfo(CCollection collection,
 
         auto segment =
             CreateSegment(col, seg_type, segment_id, is_sorted_by_pk);
-        segment->SetLoadInfo(std::move(load_info));
+        if (defer_manifest_metadata) {
+            auto sealed = dynamic_cast<
+                milvus::segcore::ChunkedSegmentSealedImpl*>(segment.get());
+            AssertInfo(sealed != nullptr,
+                       "only sealed segments can defer manifest metadata");
+            sealed->SetLoadInfoWithManifestMetadataPolicy(
+                std::move(load_info), true);
+        } else {
+            segment->SetLoadInfo(std::move(load_info));
+        }
         *newSegment = segment.release();
         return milvus::SuccessCStatus();
     } catch (std::exception& e) {
@@ -220,7 +230,8 @@ AsyncReopenSegment(CTraceContext c_trace,
                    const int64_t load_info_length,
                    const void* schema_blob,
                    const int64_t schema_length,
-                   const uint64_t schema_version) {
+                   const uint64_t schema_version,
+                   bool defer_manifest_metadata) {
     try {
         AssertInfo(load_info_blob, "load info is null");
         milvus::proto::segcore::SegmentLoadInfo load_info;
@@ -238,10 +249,20 @@ AsyncReopenSegment(CTraceContext c_trace,
             [c_trace,
              segment,
              load_info = std::move(load_info),
-             schema = std::move(schema)](
+             schema = std::move(schema),
+             defer_manifest_metadata](
                 folly::CancellationToken cancel_token) -> bool* {
                 milvus::OpContext op_ctx(cancel_token);
-                segment->Reopen(&op_ctx, load_info, schema);
+                if (auto sealed = dynamic_cast<
+                        milvus::segcore::ChunkedSegmentSealedImpl*>(segment);
+                    sealed != nullptr) {
+                    sealed->ReopenWithManifestMetadataPolicy(
+                        &op_ctx, load_info, schema, defer_manifest_metadata);
+                } else {
+                    AssertInfo(!defer_manifest_metadata,
+                               "only sealed segments can defer manifest metadata");
+                    segment->Reopen(&op_ctx, load_info, schema);
+                }
                 return nullptr;
             },
             milvus::futures::PoolType::kLoad);

@@ -127,6 +127,10 @@ struct LoadDiff {
     // and use LoadColumnGroups(manifest_path) directly in ApplyLoadDiff
     bool load_external_manifest = false;
 
+    // QV may publish a sealed segment before reading Storage V3 manifest
+    // metadata. The first query later reopens from an empty manifest baseline.
+    bool defer_manifest_column_groups = false;
+
     // Whether manifest path has changed (only when both use manifest mode)
     bool manifest_updated = false;
 
@@ -147,7 +151,7 @@ struct LoadDiff {
                !text_indexes_to_load.empty() || !json_stats_to_load.empty() ||
                !json_stats_to_replace.empty() || !json_stats_to_drop.empty() ||
                !text_indexes_to_create.empty() || manifest_updated ||
-               load_external_manifest;
+               load_external_manifest || defer_manifest_column_groups;
     }
 
     [[nodiscard]] bool
@@ -396,6 +400,9 @@ struct LoadDiff {
         if (load_external_manifest) {
             oss << ", load_external_manifest=true";
         }
+        if (defer_manifest_column_groups) {
+            oss << ", defer_manifest_column_groups=true";
+        }
 
         oss << "}";
         return oss.str();
@@ -420,8 +427,12 @@ class SegmentLoadInfo {
      * @brief Construct from a protobuf SegmentLoadInfo (copy)
      * @param info The protobuf SegmentLoadInfo to wrap
      */
-    explicit SegmentLoadInfo(const ProtoType& info, SchemaPtr schema)
-        : info_(info), schema_(std::move(schema)) {
+    explicit SegmentLoadInfo(const ProtoType& info,
+                             SchemaPtr schema,
+                             bool defer_manifest_metadata = false)
+        : info_(info),
+          schema_(std::move(schema)),
+          defer_manifest_metadata_(defer_manifest_metadata) {
         BuildCache();
     }
 
@@ -429,8 +440,12 @@ class SegmentLoadInfo {
      * @brief Construct from a protobuf SegmentLoadInfo (move)
      * @param info The protobuf SegmentLoadInfo to wrap
      */
-    explicit SegmentLoadInfo(ProtoType&& info, SchemaPtr schema)
-        : info_(std::move(info)), schema_(std::move(schema)) {
+    explicit SegmentLoadInfo(ProtoType&& info,
+                             SchemaPtr schema,
+                             bool defer_manifest_metadata = false)
+        : info_(std::move(info)),
+          schema_(std::move(schema)),
+          defer_manifest_metadata_(defer_manifest_metadata) {
         BuildCache();
     }
 
@@ -448,7 +463,8 @@ class SegmentLoadInfo {
           field_index_has_raw_data_(other.field_index_has_raw_data_),
           fields_filled_with_default_(other.fields_filled_with_default_),
           column_groups_(other.column_groups_),
-          created_text_indexes_(other.created_text_indexes_) {
+          created_text_indexes_(other.created_text_indexes_),
+          defer_manifest_metadata_(other.defer_manifest_metadata_) {
         BuildFieldBinlogCache();
     }
 
@@ -467,7 +483,8 @@ class SegmentLoadInfo {
               std::move(other.fields_filled_with_default_)),
           field_binlog_cache_(std::move(other.field_binlog_cache_)),
           column_groups_(std::move(other.column_groups_)),
-          created_text_indexes_(std::move(other.created_text_indexes_)) {
+          created_text_indexes_(std::move(other.created_text_indexes_)),
+          defer_manifest_metadata_(other.defer_manifest_metadata_) {
     }
 
     /**
@@ -487,6 +504,7 @@ class SegmentLoadInfo {
             column_groups_ = other.column_groups_;
             fields_filled_with_default_ = other.fields_filled_with_default_;
             created_text_indexes_ = other.created_text_indexes_;
+            defer_manifest_metadata_ = other.defer_manifest_metadata_;
             BuildFieldBinlogCache();
         }
         return *this;
@@ -511,6 +529,7 @@ class SegmentLoadInfo {
             field_binlog_cache_ = std::move(other.field_binlog_cache_);
             column_groups_ = std::move(other.column_groups_);
             created_text_indexes_ = std::move(other.created_text_indexes_);
+            defer_manifest_metadata_ = other.defer_manifest_metadata_;
         }
         return *this;
     }
@@ -522,6 +541,7 @@ class SegmentLoadInfo {
     Set(const ProtoType& info, SchemaPtr schema) {
         info_ = info;
         schema_ = std::move(schema);
+        defer_manifest_metadata_ = false;
         BuildCache();
     }
 
@@ -532,6 +552,7 @@ class SegmentLoadInfo {
     Set(ProtoType&& info, SchemaPtr schema) {
         info_ = std::move(info);
         schema_ = std::move(schema);
+        defer_manifest_metadata_ = false;
         BuildCache();
     }
 
@@ -1025,6 +1046,9 @@ class SegmentLoadInfo {
     [[nodiscard]] LoadDiff
     ComputeDiff(SegmentLoadInfo& new_info);
 
+    [[nodiscard]] LoadDiff
+    ComputeDiffFromDeferredManifest(SegmentLoadInfo& new_info);
+
     /**
      * @brief Get the LoadDiff from the current SegmentLoadInfo
      *
@@ -1035,6 +1059,9 @@ class SegmentLoadInfo {
      */
     [[nodiscard]] LoadDiff
     GetLoadDiff();
+
+    [[nodiscard]] bool
+    CanDeferManifestMetadataRead() const;
 
     // ==================== Underlying Proto Access ====================
 
@@ -1280,6 +1307,10 @@ class SegmentLoadInfo {
     ComputeDiffColumnGroups(LoadDiff& diff, SegmentLoadInfo& new_info);
 
     void
+    ComputeDiffColumnGroupsFromEmptyManifest(LoadDiff& diff,
+                                             SegmentLoadInfo& new_info);
+
+    void
     ComputeDiffReloadFields(LoadDiff& diff, SegmentLoadInfo& new_info);
 
     void
@@ -1330,6 +1361,8 @@ class SegmentLoadInfo {
     // Field IDs where text indexes were created from raw data (not loaded from files)
     // These should NOT be re-loaded in diff computation
     std::unordered_set<FieldId> created_text_indexes_;
+
+    bool defer_manifest_metadata_{false};
 };
 
 }  // namespace milvus::segcore

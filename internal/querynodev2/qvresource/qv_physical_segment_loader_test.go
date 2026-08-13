@@ -14,7 +14,10 @@ import (
 	"github.com/milvus-io/milvus-proto/go-api/v3/schemapb"
 	"github.com/milvus-io/milvus/internal/querynodev2/qnview"
 	"github.com/milvus-io/milvus/internal/querynodev2/segments"
+	"github.com/milvus-io/milvus/internal/storage"
+	"github.com/milvus-io/milvus/pkg/v3/proto/datapb"
 	"github.com/milvus-io/milvus/pkg/v3/proto/querypb"
+	"github.com/milvus-io/milvus/pkg/v3/util/paramtable"
 )
 
 func TestQueryViewPhysicalSegmentLoader_LoadBorrowsCollectionAndWrapsSegment(t *testing.T) {
@@ -129,4 +132,80 @@ func TestRealQVSegmentLoader_NewSegmentUsesPinnedCollection(t *testing.T) {
 	require.ErrorIs(t, err, assert.AnError)
 	assert.Same(t, localCollection, usedCollection)
 	assert.Zero(t, collections.getCount)
+}
+
+func TestRealQVSegmentLoader_NewSegmentDefersOnlyEligibleManifest(t *testing.T) {
+	paramtable.Init()
+	item := &paramtable.Get().QueryNodeCfg.TieredLazyManifestMetadataReadEnabled
+	original := item.SwapTempValue("true")
+	t.Cleanup(func() { _ = item.SwapTempValue(original) })
+
+	collectionSchema := &schemapb.CollectionSchema{
+		Name: "coll",
+		Fields: []*schemapb.FieldSchema{
+			{FieldID: 100, Name: "pk", DataType: schemapb.DataType_Int64, IsPrimaryKey: true},
+		},
+	}
+	localCollection := segments.NewCollectionWithoutSegcoreForTest(1, collectionSchema)
+	runtime := &queryViewCollectionRuntimeGuard{
+		collection:   localCollection,
+		collectionID: 1,
+		schema:       collectionSchema,
+	}
+	loadInfo := &querypb.SegmentLoadInfo{
+		CollectionID:   1,
+		SegmentID:      10,
+		Level:          datapb.SegmentLevel_Legacy,
+		StorageVersion: storage.StorageV3,
+		ManifestPath:   `{"base_path":"files/insert_log/1/2/10","ver":1}`,
+	}
+
+	deferredCalled := false
+	deferredPatch := mockey.Mock(segments.NewSegmentWithDeferredManifest).
+		To(func(_ context.Context, collection *segments.Collection, _ segments.SegmentManager, _ segments.SegmentType, _ int64, got *querypb.SegmentLoadInfo, _ segments.Loader) (segments.Segment, error) {
+			deferredCalled = true
+			assert.Same(t, localCollection, collection)
+			assert.Same(t, loadInfo, got)
+			return nil, assert.AnError
+		}).
+		Build()
+	t.Cleanup(func() { deferredPatch.UnPatch() })
+
+	eagerCalled := false
+	eagerPatch := mockey.Mock(segments.NewSegment).
+		To(func(context.Context, *segments.Collection, segments.SegmentManager, segments.SegmentType, int64, *querypb.SegmentLoadInfo) (segments.Segment, error) {
+			eagerCalled = true
+			return nil, assert.AnError
+		}).
+		Build()
+	t.Cleanup(func() { eagerPatch.UnPatch() })
+
+	loader := realQVSegmentLoader{loader: segments.NewMockLoader(t)}
+	_, err := loader.NewSegment(context.Background(), runtime, loadInfo)
+	require.ErrorIs(t, err, assert.AnError)
+	assert.True(t, deferredCalled)
+	assert.False(t, eagerCalled)
+
+	loadInfo.StorageVersion = storage.StorageV2
+	deferredCalled = false
+	eagerCalled = false
+	_, err = loader.NewSegment(context.Background(), runtime, loadInfo)
+	require.ErrorIs(t, err, assert.AnError)
+	assert.False(t, deferredCalled)
+	assert.True(t, eagerCalled)
+}
+
+func TestRealQVSegmentLoader_LoadIndexSkipsDeferredManifestSegment(t *testing.T) {
+	loadInfo := &querypb.SegmentLoadInfo{CollectionID: 1, SegmentID: 10}
+	localSegment := &segments.LocalSegment{}
+	deferredPatch := mockey.Mock((*segments.LocalSegment).ManifestMetadataDeferred).
+		Return(true).
+		Build()
+	t.Cleanup(func() { deferredPatch.UnPatch() })
+
+	loader := segments.NewMockLoader(t)
+	real := realQVSegmentLoader{loader: loader}
+	local := &qvLocalSegment{segment: localSegment, collectionID: 1}
+	require.NoError(t, real.LoadIndex(context.Background(), local, loadInfo, 0))
+	loader.AssertNotCalled(t, "LoadIndex")
 }

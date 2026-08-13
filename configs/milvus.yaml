@@ -564,6 +564,7 @@ queryNode:
         scalarIndex: sync
         vectorField: disable # cache warmup for vector field raw data is by default disabled.
         vectorIndex: sync
+      lazyManifestMetadataReadEnabled: false # QV only: defer Storage V3 manifest metadata discovery until the first query.
       lazyManifestReaderEnabled: false # Defer the Storage V3 projected ChunkReader/translator/cache tree for warmup=disable fields without load-time side effects.
       # If evictionEnabled is true, a background thread will run every evictionIntervalMs to determine if an
       # eviction is necessary and the amount of data to evict from memory/disk.

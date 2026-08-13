@@ -674,6 +674,10 @@ SegmentLoadInfo::ComputeDiffReloadFields(LoadDiff& diff,
         return;
     }
 
+    if (new_info.CanDeferManifestMetadataRead()) {
+        return;
+    }
+
     if (!new_info.HasManifestPath()) {
         // Binlog mode: find each field's binlog and add to binlogs_to_replace
         for (const auto& field_id : fields_to_reload) {
@@ -1004,6 +1008,8 @@ SegmentLoadInfo::ComputeDiffJsonKeyStats(LoadDiff& diff,
 LoadDiff
 SegmentLoadInfo::ComputeDiff(SegmentLoadInfo& new_info) {
     LoadDiff diff;
+    const bool defer_manifest_metadata =
+        new_info.CanDeferManifestMetadataRead();
 
     // Handle index changes
     ComputeDiffIndexes(diff, new_info);
@@ -1012,10 +1018,10 @@ SegmentLoadInfo::ComputeDiff(SegmentLoadInfo& new_info) {
     ComputeDiffReloadFields(diff, new_info);
 
     // Compute text index changes
-    ComputeDiffTextIndexes(diff, new_info);
-
-    // Compute JSON key stats changes
-    ComputeDiffJsonKeyStats(diff, new_info);
+    if (!defer_manifest_metadata) {
+        ComputeDiffTextIndexes(diff, new_info);
+        ComputeDiffJsonKeyStats(diff, new_info);
+    }
 
     // Handle field data changes
     // Note: Updates can only happen within the same category:
@@ -1033,6 +1039,8 @@ SegmentLoadInfo::ComputeDiff(SegmentLoadInfo& new_info) {
             if (diff.manifest_updated) {
                 diff.load_external_manifest = true;
             }
+        } else if (defer_manifest_metadata) {
+            diff.defer_manifest_column_groups = true;
         } else {
             ComputeDiffColumnGroups(diff, new_info);
         }
@@ -1044,10 +1052,43 @@ SegmentLoadInfo::ComputeDiff(SegmentLoadInfo& new_info) {
     }
 
     // Compute fields that need default value filling (schema evolution)
-    if (!schema_->is_external_collection()) {
+    if (!schema_->is_external_collection() &&
+        !diff.defer_manifest_column_groups) {
         ComputeDiffDefaultFields(diff, new_info);
     }
 
+    return diff;
+}
+
+void
+SegmentLoadInfo::ComputeDiffColumnGroupsFromEmptyManifest(
+    LoadDiff& diff, SegmentLoadInfo& new_info) {
+    milvus::proto::segcore::SegmentLoadInfo empty_load_info;
+    SegmentLoadInfo empty_info(std::move(empty_load_info), new_info.schema_);
+    empty_info.info_.set_manifest_path("deferred manifest baseline");
+    empty_info.column_groups_ =
+        std::make_shared<milvus_storage::api::ColumnGroups>();
+    empty_info.ComputeDiffColumnGroups(diff, new_info);
+    empty_info.ComputeDiffDefaultFields(diff, new_info);
+}
+
+LoadDiff
+SegmentLoadInfo::ComputeDiffFromDeferredManifest(
+    SegmentLoadInfo& new_info) {
+    LoadDiff diff;
+    ComputeDiffIndexes(diff, new_info);
+    ComputeDiffTextIndexes(diff, new_info);
+    ComputeDiffJsonKeyStats(diff, new_info);
+
+    if (GetManifestPath() != new_info.GetManifestPath()) {
+        diff.manifest_updated = true;
+        diff.new_manifest_path = new_info.GetManifestPath();
+    }
+    if (new_info.schema_->is_external_collection()) {
+        diff.load_external_manifest = true;
+    } else {
+        ComputeDiffColumnGroupsFromEmptyManifest(diff, new_info);
+    }
     return diff;
 }
 
@@ -1059,6 +1100,7 @@ SegmentLoadInfo::GetLoadDiff() {
                "GetLoadDiff called on empty SegmentLoadInfo");
 
     LoadDiff diff;
+    const bool defer_manifest_metadata = CanDeferManifestMetadataRead();
 
     milvus::proto::segcore::SegmentLoadInfo empty_load_info;
 
@@ -1068,10 +1110,10 @@ SegmentLoadInfo::GetLoadDiff() {
     empty_info.ComputeDiffIndexes(diff, *this);
 
     // Handle text index changes
-    empty_info.ComputeDiffTextIndexes(diff, *this);
-
-    // Handle JSON key stats changes
-    empty_info.ComputeDiffJsonKeyStats(diff, *this);
+    if (!defer_manifest_metadata) {
+        empty_info.ComputeDiffTextIndexes(diff, *this);
+        empty_info.ComputeDiffJsonKeyStats(diff, *this);
+    }
 
     // Handle field data changes
     // Note: Updates can only happen within the same category:
@@ -1085,6 +1127,8 @@ SegmentLoadInfo::GetLoadDiff() {
             // ComputeDiffColumnGroups calls std::stoll which would crash.
             // Flag for direct manifest loading in ApplyLoadDiff.
             diff.load_external_manifest = true;
+        } else if (defer_manifest_metadata) {
+            diff.defer_manifest_column_groups = true;
         } else {
             // set mock path for null check
             empty_info.info_.set_manifest_path("mocked manifest path");
@@ -1100,11 +1144,19 @@ SegmentLoadInfo::GetLoadDiff() {
     // Skip for external collections: collect_data_fields() calls std::stoll
     // on column group names, and external collections don't need default fills
     // (all fields are either external or virtual PK).
-    if (!schema_->is_external_collection()) {
+    if (!schema_->is_external_collection() &&
+        !diff.defer_manifest_column_groups) {
         empty_info.ComputeDiffDefaultFields(diff, *this);
     }
 
     return diff;
+}
+
+bool
+SegmentLoadInfo::CanDeferManifestMetadataRead() const {
+    return defer_manifest_metadata_ && HasManifestPath() &&
+           GetStorageVersion() == STORAGE_V3 && schema_ != nullptr &&
+           !schema_->is_external_collection() && column_groups_ == nullptr;
 }
 
 }  // namespace milvus::segcore

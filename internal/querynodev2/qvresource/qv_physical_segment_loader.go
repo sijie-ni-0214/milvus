@@ -9,6 +9,7 @@ import (
 	"github.com/milvus-io/milvus/internal/querynodev2/qnview"
 	"github.com/milvus-io/milvus/internal/querynodev2/segments"
 	"github.com/milvus-io/milvus/internal/storage"
+	"github.com/milvus-io/milvus/internal/util/segcore"
 	"github.com/milvus-io/milvus/pkg/v3/proto/datapb"
 	"github.com/milvus-io/milvus/pkg/v3/proto/querypb"
 	"github.com/milvus-io/milvus/pkg/v3/util/merr"
@@ -117,6 +118,10 @@ type realQVSegmentLoader struct {
 	segmentManager segments.SegmentManager
 }
 
+type deferredManifestLoader interface {
+	LoadDeltaLogsWithoutResourceDeferredManifest(context.Context, segments.Segment, *querypb.SegmentLoadInfo) error
+}
+
 func (l realQVSegmentLoader) NewSegment(ctx context.Context, collection qnview.CollectionRuntime, info *querypb.SegmentLoadInfo) (qvLoadedSegment, error) {
 	if collection == nil {
 		return nil, fmt.Errorf("query view collection runtime is nil")
@@ -125,7 +130,17 @@ func (l realQVSegmentLoader) NewSegment(ctx context.Context, collection qnview.C
 	if localCollection == nil {
 		return nil, merr.WrapErrCollectionNotFound(collection.CollectionID())
 	}
-	segment, err := segments.NewSegment(ctx, localCollection, l.segmentManager, segments.SegmentTypeSealed, 0, info)
+	var segment segments.Segment
+	var err error
+	if segcore.CanDeferManifestMetadata(info, localCollection.Schema()) {
+		segment, err = segments.NewSegmentWithDeferredManifest(
+			ctx, localCollection, l.segmentManager, segments.SegmentTypeSealed, 0, info, l.loader,
+		)
+	} else {
+		segment, err = segments.NewSegment(
+			ctx, localCollection, l.segmentManager, segments.SegmentTypeSealed, 0, info,
+		)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -160,6 +175,12 @@ func (l realQVSegmentLoader) LoadIndex(ctx context.Context, segment qvLoadedSegm
 	if err != nil {
 		return err
 	}
+	if localSegment, ok := local.segment.(*segments.LocalSegment); ok && localSegment.ManifestMetadataDeferred() {
+		// classifySegmentUpdate always pairs Reopen with LoadIndex. Reopen has
+		// already applied the index diff while preserving the deferred manifest
+		// policy, so a second Reopen through LocalSegment.LoadIndex is redundant.
+		return nil
+	}
 	return l.loader.LoadIndex(ctx, local.segment, info, version)
 }
 
@@ -174,6 +195,13 @@ func (l realQVSegmentLoader) LoadDeltaLogs(ctx context.Context, segment qvLoaded
 	}
 	if typeutil.IsExternalCollection(collection.Schema()) {
 		return nil
+	}
+	if localSegment, ok := local.segment.(*segments.LocalSegment); ok && localSegment.ManifestMetadataDeferred() {
+		deferredLoader, ok := l.loader.(deferredManifestLoader)
+		if !ok {
+			return merr.WrapErrServiceInternalMsg("segment loader does not support deferred manifest delta loading")
+		}
+		return deferredLoader.LoadDeltaLogsWithoutResourceDeferredManifest(ctx, local.segment, info)
 	}
 	return l.loader.LoadDeltaLogsWithoutResource(ctx, local.segment, info)
 }
@@ -196,6 +224,9 @@ func (l realQVSegmentLoader) LoadPKCandidate(ctx context.Context, segment qvLoad
 			info.GetPartitionID(),
 			local.segment.Type(),
 		))
+		return nil
+	}
+	if localSegment, ok := local.segment.(*segments.LocalSegment); ok && localSegment.ManifestMetadataDeferred() {
 		return nil
 	}
 	if !paramtable.Get().CommonCfg.BloomFilterEnabled.GetAsBool() {

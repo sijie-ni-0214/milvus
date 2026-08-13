@@ -1084,7 +1084,14 @@ func (loader *segmentLoader) loadSealedSegment(ctx context.Context, loadInfo *qu
 	}()
 
 	collection := segment.GetCollection()
-	indexedFieldInfos, _, textIndexes, unindexedTextFields, jsonKeyStats, _, _ := separateLoadInfoV2(loadInfo, collection.Schema())
+	metadataLoadInfo := loadInfo
+	if segment.ManifestMetadataDeferred() {
+		metadataLoadInfo = typeutil.Clone(loadInfo)
+		metadataLoadInfo.ManifestPath = ""
+		metadataLoadInfo.TextStatsLogs = nil
+		metadataLoadInfo.JsonKeyStatsLogs = nil
+	}
+	indexedFieldInfos, _, textIndexes, unindexedTextFields, jsonKeyStats, _, _ := separateLoadInfoV2(metadataLoadInfo, collection.Schema())
 
 	tr := timerecord.NewTimeRecorder("segmentLoader.loadSealedSegment")
 	mlog.Info(context.TODO(), "Start loading fields...",
@@ -1627,6 +1634,82 @@ func (loader *segmentLoader) LoadDeltaLogs(ctx context.Context, segment Segment,
 
 func (loader *segmentLoader) LoadDeltaLogsWithoutResource(ctx context.Context, segment Segment, loadInfo *querypb.SegmentLoadInfo) error {
 	return loader.loadDeltalogs(ctx, segment, loadInfo)
+}
+
+// LoadDeltaLogsWithoutResourceDeferredManifest keeps the QV load path free of
+// manifest reads while still applying explicit deltalogs.
+func (loader *segmentLoader) LoadDeltaLogsWithoutResourceDeferredManifest(ctx context.Context, segment Segment, loadInfo *querypb.SegmentLoadInfo) error {
+	if loadInfo == nil {
+		return merr.WrapErrServiceInternalMsg("deferred manifest delta load info is nil")
+	}
+	if loadInfo.GetManifestPath() != "" && len(loadInfo.GetDeltalogs()) == 0 {
+		return nil
+	}
+
+	explicit := typeutil.Clone(loadInfo)
+	explicit.ManifestPath = ""
+	explicit.ChildManifestPaths = nil
+	return loader.loadDeltalogs(ctx, segment, explicit)
+}
+
+func readInternalV3ManifestDeltas(ctx context.Context, loadInfo *querypb.SegmentLoadInfo, pkType schemapb.DataType) (*storage.DeltaData, error) {
+	if pkType != schemapb.DataType_Int64 && pkType != schemapb.DataType_VarChar {
+		return nil, merr.WrapErrServiceInternalMsg("unsupported primary key type %s", pkType.String())
+	}
+	deltaData, err := storage.NewDeltaDataWithPkType(0, pkType)
+	if err != nil {
+		return nil, err
+	}
+	readManifest := func(manifestPath string) error {
+		paths, err := packed.GetDeltaLogPathsFromManifest(manifestPath, createStorageConfig())
+		if err != nil {
+			return err
+		}
+		if len(paths) == 0 {
+			return nil
+		}
+		reader, err := storage.NewDeltalogReader(
+			pkType,
+			paths,
+			storage.WithStorageConfig(createStorageConfig()),
+			storage.WithVersion(storage.StorageV3),
+		)
+		if err != nil {
+			return err
+		}
+		defer reader.Close()
+		for {
+			record, err := reader.Next()
+			if err == io.EOF {
+				return nil
+			}
+			if err != nil {
+				return err
+			}
+			for i := 0; i < record.Len(); i++ {
+				var pk storage.PrimaryKey
+				switch pkType {
+				case schemapb.DataType_Int64:
+					pk = storage.NewInt64PrimaryKey(record.Column(0).(*array.Int64).Value(i))
+				case schemapb.DataType_VarChar:
+					pk = storage.NewVarCharPrimaryKey(record.Column(0).(*array.String).Value(i))
+				}
+				ts := typeutil.Timestamp(record.Column(1).(*array.Int64).Value(i))
+				if err := deltaData.Append(pk, ts); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	if err := readManifest(loadInfo.GetManifestPath()); err != nil {
+		return nil, err
+	}
+	for _, manifestPath := range loadInfo.GetChildManifestPaths() {
+		if err := readManifest(manifestPath); err != nil {
+			return nil, err
+		}
+	}
+	return deltaData, nil
 }
 
 func createStorageConfig() *indexpb.StorageConfig {

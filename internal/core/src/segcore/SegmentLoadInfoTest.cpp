@@ -645,6 +645,23 @@ TEST_F(SegmentLoadInfoTest, IndexWithoutFiles) {
 
 // ==================== GetLoadDiff Tests ====================
 
+TEST_F(SegmentLoadInfoTest, DeferredManifestGetLoadDiffDoesNotReadManifest) {
+    proto::segcore::SegmentLoadInfo test_proto;
+    test_proto.set_segmentid(100);
+    test_proto.set_num_of_rows(1000);
+    test_proto.set_storageversion(STORAGE_V3);
+    test_proto.set_manifest_path("/path/that/does/not/exist");
+
+    SegmentLoadInfo info(test_proto, schema_, true);
+    ASSERT_TRUE(info.CanDeferManifestMetadataRead());
+
+    LoadDiff diff;
+    EXPECT_NO_THROW(diff = info.GetLoadDiff());
+    EXPECT_TRUE(diff.defer_manifest_column_groups);
+    EXPECT_TRUE(diff.column_groups_to_load.empty());
+    EXPECT_TRUE(diff.column_groups_to_lazyload.empty());
+}
+
 TEST_F(SegmentLoadInfoTest, GetLoadDiffWithIndexesOnly) {
     // Create info with only indexes (no binlogs, no manifest)
     proto::segcore::SegmentLoadInfo test_proto;
