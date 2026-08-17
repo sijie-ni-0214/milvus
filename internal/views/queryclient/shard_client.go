@@ -16,6 +16,7 @@ import (
 	"github.com/milvus-io/milvus/internal/views/queryclient/reducer"
 	"github.com/milvus-io/milvus/internal/views/qviews"
 	"github.com/milvus-io/milvus/internal/views/viewerror"
+	"github.com/milvus-io/milvus/pkg/v3/mlog"
 	"github.com/milvus-io/milvus/pkg/v3/proto/internalpb"
 	"github.com/milvus-io/milvus/pkg/v3/proto/viewpb"
 	"github.com/milvus-io/milvus/pkg/v3/util/merr"
@@ -209,12 +210,16 @@ func (s *shardViewQueryClient) executeShard(
 	deadNodes := make(map[int64]struct{})
 	var sessionChanged <-chan struct{}
 	for attempt := 0; ; attempt++ {
+		attemptStart := time.Now()
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
 		if s.maxRetries > 0 && attempt >= s.maxRetries && !route.hasUntried(tried) {
 			return nil, lastErr
 		}
+		mlog.Info(ctx, "[load on search] shard query start",
+			mlog.FieldVChannel(vchannel),
+			mlog.Int("attempt", attempt+1))
 
 		candidate, sessionsUpdated, err := route.nextReplica(ctx, tried, sessionChanged, checkLoad)
 		if sessionsUpdated {
@@ -232,6 +237,7 @@ func (s *shardViewQueryClient) executeShard(
 
 		// Phase 1: GetQueryPlan with consistency routing.
 		planReq := params.buildPlanReq(targetShardID)
+		planStart := time.Now()
 		response, err := s.executeGetQueryPlan(ctx, targetShardID, planReq, params)
 		if err != nil {
 			if retryableQueryError(err) {
@@ -240,6 +246,7 @@ func (s *shardViewQueryClient) executeShard(
 			}
 			return nil, err
 		}
+		planDuration := time.Since(planStart)
 
 		plan := response.GetPlan()
 		if err := qviews.RestoreQueryPlanPayloads(response, planReq); err != nil {
@@ -269,12 +276,14 @@ func (s *shardViewQueryClient) executeShard(
 		workNodes := workNodesFromPlan(plan)
 
 		// Phase 2: Fan out to all work nodes concurrently.
+		fanoutStart := time.Now()
 		if params.beforeDispatch != nil {
 			err = params.beforeDispatch(ctx, response, shardID)
 		}
 		if err == nil {
 			err = s.fanOutToWorkNodes(ctx, workNodes, plan, shardID, params.dispatchNode)
 		}
+		fanoutDuration := time.Since(fanoutStart)
 		if err != nil {
 			if retryableQueryError(err) {
 				lastErr = err
@@ -295,6 +304,14 @@ func (s *shardViewQueryClient) executeShard(
 			}
 			return nil, err
 		}
+
+		mlog.Info(ctx, "[load on search] shard query timing",
+			mlog.FieldVChannel(vchannel),
+			mlog.Int("attempt", attempt+1),
+			mlog.Int("workNodeCount", len(workNodes)),
+			mlog.Duration("getQueryPlan", planDuration),
+			mlog.Duration("workNodeFanout", fanoutDuration),
+			mlog.Duration("total", time.Since(attemptStart)))
 
 		return &ShardPlan{
 			ShardID:          shardID,

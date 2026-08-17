@@ -25,6 +25,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/apache/arrow/go/v17/arrow/memory"
 	"github.com/samber/lo"
@@ -3055,6 +3056,7 @@ type pipeline struct {
 	name         string
 	nodes        []*Node
 	traceEnabled bool
+	collectionID int64
 }
 
 func newPipeline(pipeDef *pipelineDef, t *SearchTask) (*pipeline, error) {
@@ -3066,7 +3068,7 @@ func newPipeline(pipeDef *pipelineDef, t *SearchTask) (*pipeline, error) {
 		}
 		nodes[i] = node
 	}
-	p := &pipeline{name: pipeDef.name, nodes: nodes, traceEnabled: t.traceEnabled}
+	p := &pipeline{name: pipeDef.name, nodes: nodes, traceEnabled: t.traceEnabled, collectionID: t.GetCollectionID()}
 	p.markSharedOrganizeInputs()
 	return p, nil
 }
@@ -3114,7 +3116,13 @@ func (p *pipeline) Run(ctx context.Context, span trace.Span, toReduceResults []*
 	for _, node := range p.nodes {
 		var err error
 		mlog.Debug(ctx, "SearchPipeline run node", mlog.String("node", node.name))
+		start := time.Now()
 		msg, err = node.Run(ctx, span, msg)
+		mlog.Info(ctx, "[load on search] proxy pipeline timing",
+			mlog.FieldCollectionID(p.collectionID),
+			mlog.String("pipeline", p.name),
+			mlog.String("operator", node.opName),
+			mlog.Duration("cost", time.Since(start)))
 		if err != nil {
 			mlog.Error(ctx, "Run node failed: ", mlog.String("err", err.Error()))
 			return nil, storageCost, err
