@@ -44,21 +44,43 @@ type collectionDataViewDropper interface {
 }
 
 const (
+	dropCollectionStageTotal                     = "total"
+	dropCollectionStageStartBroadcast            = "start_broadcast"
+	dropCollectionStagePrepare                   = "prepare"
+	dropCollectionStageBroadcast                 = "broadcast"
 	dropCollectionCallbackStageDropLoadConfig    = "drop_load_config"
 	dropCollectionCallbackStageDropIndex         = "drop_index"
 	dropCollectionCallbackStageDropSnapshots     = "drop_snapshots"
+	dropCollectionCallbackStageDropDataView      = "drop_data_view"
 	dropCollectionCallbackStageDropMeta          = "drop_meta"
 	dropCollectionCallbackStageDropVirtual       = "drop_virtual_channel"
 	dropCollectionCallbackStageRefreshPolicyInfo = "refresh_policy_info_cache"
 	dropCollectionCallbackStageExpireCaches      = "expire_caches"
 )
 
+func observeDropCollectionStageDuration(stage string, duration time.Duration) {
+	metrics.RootCoordDropCollectionStageDurationSeconds.WithLabelValues(stage).Observe(duration.Seconds())
+}
+
+func observeDropCollectionStage(stage string, start time.Time) {
+	observeDropCollectionStageDuration(stage, time.Since(start))
+}
+
 func observeDropCollectionCallbackStage(stage string, start time.Time) {
-	metrics.RootCoordDDLCallbackDuration.WithLabelValues("DropCollection", stage).Observe(float64(time.Since(start).Microseconds()) / 1000.0)
+	duration := time.Since(start)
+	metrics.RootCoordDDLCallbackDuration.WithLabelValues("DropCollection", stage).Observe(float64(duration.Microseconds()) / 1000.0)
+	observeDropCollectionStageDuration(stage, duration)
 }
 
 func (c *Core) broadcastDropCollectionV1(ctx context.Context, req *milvuspb.DropCollectionRequest) error {
+	totalStart := time.Now()
+	defer func() {
+		observeDropCollectionStage(dropCollectionStageTotal, totalStart)
+	}()
+
+	stageStart := time.Now()
 	broadcaster, err := c.startBroadcastWithCollectionLock(ctx, req.GetDbName(), req.GetCollectionName())
+	observeDropCollectionStage(dropCollectionStageStartBroadcast, stageStart)
 	if err != nil {
 		return err
 	}
@@ -68,7 +90,10 @@ func (c *Core) broadcastDropCollectionV1(ctx context.Context, req *milvuspb.Drop
 		Core: c,
 		Req:  req,
 	}
-	if err := dropCollectionTask.Prepare(ctx); err != nil {
+	stageStart = time.Now()
+	err = dropCollectionTask.Prepare(ctx)
+	observeDropCollectionStage(dropCollectionStagePrepare, stageStart)
+	if err != nil {
 		return err
 	}
 
@@ -77,7 +102,10 @@ func (c *Core) broadcastDropCollectionV1(ctx context.Context, req *milvuspb.Drop
 		WithBody(dropCollectionTask.body).
 		WithBroadcast(dropCollectionTask.vchannels, message.OptBuildBroadcastAckSyncUp()).
 		MustBuildBroadcast()
-	if _, err := broadcaster.Broadcast(ctx, msg); err != nil {
+	stageStart = time.Now()
+	_, err = broadcaster.Broadcast(ctx, msg)
+	observeDropCollectionStage(dropCollectionStageBroadcast, stageStart)
+	if err != nil {
 		return err
 	}
 	return nil
@@ -166,8 +194,13 @@ func (c *DDLCallback) dropCollectionV1AckCallback(ctx context.Context, result me
 			if !ok {
 				mlog.Warn(ctx, "MixCoord does not support DataView collection deletion",
 					mlog.FieldCollectionID(collectionID))
-			} else if err := dropper.DropCollectionDataView(ctx, collectionID); err != nil {
-				return merr.Wrap(err, "failed to drop collection data view")
+			} else {
+				stageStart = time.Now()
+				err = dropper.DropCollectionDataView(ctx, collectionID)
+				observeDropCollectionCallbackStage(dropCollectionCallbackStageDropDataView, stageStart)
+				if err != nil {
+					return merr.Wrap(err, "failed to drop collection data view")
+				}
 			}
 			continue
 		}

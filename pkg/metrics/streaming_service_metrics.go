@@ -526,7 +526,7 @@ var (
 
 	WALRecoveryDropCollectionStageDurationSeconds = newWALHistogramVec(prometheus.HistogramOpts{
 		Name:    "recovery_drop_collection_stage_duration_seconds",
-		Help:    "Duration of DropCollection observation stages in WAL recovery storage",
+		Help:    "Duration of DropCollection stages in WAL recovery storage",
 		Buckets: secondsBuckets,
 	}, WALChannelLabelName, WALChannelTermLabelName, WALRecoveryStageLabelName)
 
