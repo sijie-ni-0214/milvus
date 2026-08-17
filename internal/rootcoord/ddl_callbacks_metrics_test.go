@@ -21,9 +21,11 @@ func TestObserveCreateCollectionCallbackStageDoesNotPanicOnLabels(t *testing.T) 
 
 func TestObserveDropCollectionCallbackStageDoesNotPanicOnLabels(t *testing.T) {
 	metrics.RootCoordDDLCallbackDuration.Reset()
+	metrics.RootCoordDropCollectionStageDurationSeconds.Reset()
 
 	require.NotPanics(t, func() {
 		observeDropCollectionCallbackStage("drop_virtual_channel", time.Now())
 	})
 	require.Equal(t, 1, testutil.CollectAndCount(metrics.RootCoordDDLCallbackDuration))
+	require.Equal(t, 1, testutil.CollectAndCount(metrics.RootCoordDropCollectionStageDurationSeconds))
 }

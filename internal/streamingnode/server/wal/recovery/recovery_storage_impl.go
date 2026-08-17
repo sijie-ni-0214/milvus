@@ -171,7 +171,7 @@ func newRecoveryStorage(channel types.PChannelInfo, cp *utility.WALCheckpoint, o
 	rs.broadcastAck = newBroadcastAckModule(moduleapi.Runtime{
 		Scheduler: rs.taskScheduler,
 		Notifier:  rs,
-	})
+	}, rs.metrics.ObserveDropCollectionStage)
 	return rs
 }
 

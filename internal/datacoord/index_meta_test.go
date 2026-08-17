@@ -20,6 +20,7 @@ package datacoord
 import (
 	"context"
 	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -51,6 +52,15 @@ type blockingIndexRecoveryCatalog struct {
 	fieldStarted        chan struct{}
 	releaseField        chan struct{}
 	segmentIndexStarted chan struct{}
+}
+
+type alterIndexesTestCatalog struct {
+	metastore.DataCoordCatalog
+	alterIndexes func(context.Context, []*model.Index) error
+}
+
+func (c *alterIndexesTestCatalog) AlterIndexes(ctx context.Context, indexes []*model.Index) error {
+	return c.alterIndexes(ctx, indexes)
 }
 
 func (c *blockingIndexRecoveryCatalog) ListIndexes(ctx context.Context) ([]*model.Index, error) {
@@ -227,11 +237,8 @@ func TestReloadFromKV(t *testing.T) {
 		assert.NoError(t, err)
 		assert.NotNil(t, meta)
 
-		// The gauge goroutine is async; wait for it to finish.
-		assert.Eventually(t, func() bool {
-			val := testutil.ToFloat64(metrics.DataCoordStoredIndexFilesSize.WithLabelValues("", "", collIDLabel))
-			return val == float64(aliveSize)
-		}, time.Second, 10*time.Millisecond,
+		val := testutil.ToFloat64(metrics.DataCoordStoredIndexFilesSize.WithLabelValues("", "", collIDLabel))
+		assert.Equal(t, float64(aliveSize), val,
 			"reload gauge must only count the alive index (size=%d), not the deleted one (size=%d)", aliveSize, deadSize)
 	})
 }
@@ -2654,8 +2661,7 @@ func TestStoredIndexFilesSizeMetric(t *testing.T) {
 			"metric should reflect the updated size after version upgrade")
 	})
 
-	// Index rebuild with a smaller size: the delta is negative, Gauge.Add
-	// accepts negative values so this must decrease the metric, not panic.
+	// Index rebuild with a smaller size must decrease the aggregate.
 	t.Run("FinishTask with smaller size decreases metric", func(t *testing.T) {
 		m := setup(t)
 
@@ -2987,5 +2993,406 @@ func TestSegmentIndexTaskStatesAlwaysPersistToEtcd(t *testing.T) {
 			require.NoError(t, m.BuildIndex(6200))
 			require.NoError(t, m.UpdateIndexState(6200, commonpb.IndexState_Failed, "failed"))
 		})
+	}
+}
+
+func TestMarkIndexAsDeletedUsesStoredSizeAggregate(t *testing.T) {
+	metrics.DataCoordStoredIndexFilesSize.Reset()
+
+	const (
+		collectionID = UniqueID(100)
+		indexID1     = UniqueID(10)
+		indexID2     = UniqueID(20)
+		indexSize1   = uint64(1024)
+		indexSize2   = uint64(2048)
+	)
+	collectionIDLabel := fmt.Sprintf("%d", collectionID)
+
+	catalog := catalogmocks.NewDataCoordCatalog(t)
+	catalog.EXPECT().AlterIndexes(mock.Anything, mock.Anything).Return(nil).Twice()
+
+	m := &indexMeta{
+		ctx:     context.Background(),
+		catalog: catalog,
+		indexes: map[UniqueID]map[UniqueID]*model.Index{
+			collectionID: {
+				indexID1: {CollectionID: collectionID, IndexID: indexID1},
+				indexID2: {CollectionID: collectionID, IndexID: indexID2},
+			},
+		},
+		// Keep segmentIndexes nil on purpose. This test guards against
+		// reintroducing a full segment-index scan in MarkIndexAsDeleted.
+		segmentIndexes: nil,
+	}
+	m.storedIndexSize.activate(collectionID, indexID1)
+	m.storedIndexSize.activate(collectionID, indexID2)
+	m.storedIndexSize.update(context.Background(), collectionID, indexID1, 0, indexSize1)
+	m.storedIndexSize.update(context.Background(), collectionID, indexID2, 0, indexSize2)
+
+	err := m.MarkIndexAsDeleted(context.Background(), collectionID, []UniqueID{indexID1})
+	require.NoError(t, err)
+	assert.Equal(t, float64(indexSize2),
+		testutil.ToFloat64(metrics.DataCoordStoredIndexFilesSize.WithLabelValues("", "", collectionIDLabel)))
+
+	// An empty index ID list means drop all remaining indexes. The aggregate
+	// lookup remains independent of segmentIndexes.
+	err = m.MarkIndexAsDeleted(context.Background(), collectionID, nil)
+	require.NoError(t, err)
+	assert.Equal(t, float64(0),
+		testutil.ToFloat64(metrics.DataCoordStoredIndexFilesSize.WithLabelValues("", "", collectionIDLabel)))
+}
+
+func TestIndexDDLCollectionLockAllowsCrossCollectionCatalogConcurrency(t *testing.T) {
+	const (
+		collectionID1 = UniqueID(100)
+		collectionID2 = UniqueID(200)
+		indexID1      = UniqueID(10)
+		indexID2      = UniqueID(20)
+	)
+
+	firstStarted := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	var releaseFirstOnce sync.Once
+	release := func() { releaseFirstOnce.Do(func() { close(releaseFirst) }) }
+	t.Cleanup(release)
+	secondStarted := make(chan struct{})
+	catalog := &alterIndexesTestCatalog{
+		alterIndexes: func(ctx context.Context, indexes []*model.Index) error {
+			switch indexes[0].CollectionID {
+			case collectionID1:
+				close(firstStarted)
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case <-releaseFirst:
+				}
+			case collectionID2:
+				close(secondStarted)
+			}
+			return nil
+		},
+	}
+	m := &indexMeta{
+		ctx:     context.Background(),
+		catalog: catalog,
+		indexes: map[UniqueID]map[UniqueID]*model.Index{
+			collectionID1: {indexID1: {CollectionID: collectionID1, IndexID: indexID1}},
+			collectionID2: {indexID2: {CollectionID: collectionID2, IndexID: indexID2}},
+		},
+	}
+
+	errCh := make(chan error, 2)
+	go func() {
+		errCh <- m.MarkIndexAsDeleted(context.Background(), collectionID1, []UniqueID{indexID1})
+	}()
+	select {
+	case <-firstStarted:
+	case <-time.After(time.Second):
+		require.FailNow(t, "first collection did not enter catalog")
+	}
+
+	go func() {
+		errCh <- m.MarkIndexAsDeleted(context.Background(), collectionID2, []UniqueID{indexID2})
+	}()
+	secondEnteredWhileFirstBlocked := false
+	select {
+	case <-secondStarted:
+		secondEnteredWhileFirstBlocked = true
+	case <-time.After(time.Second):
+	}
+	release()
+
+	require.NoError(t, <-errCh)
+	require.NoError(t, <-errCh)
+	assert.True(t, secondEnteredWhileFirstBlocked,
+		"catalog writes for different collections must not share the global field-index lock")
+}
+
+func TestIndexDDLCollectionLockSerializesSameCollection(t *testing.T) {
+	const (
+		collectionID = UniqueID(100)
+		indexID1     = UniqueID(10)
+		indexID2     = UniqueID(20)
+	)
+
+	firstStarted := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	var releaseFirstOnce sync.Once
+	release := func() { releaseFirstOnce.Do(func() { close(releaseFirst) }) }
+	t.Cleanup(release)
+	secondInvoked := make(chan struct{})
+	secondStarted := make(chan struct{})
+	catalog := &alterIndexesTestCatalog{
+		alterIndexes: func(ctx context.Context, indexes []*model.Index) error {
+			switch indexes[0].IndexID {
+			case indexID1:
+				close(firstStarted)
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case <-releaseFirst:
+				}
+			case indexID2:
+				close(secondStarted)
+			}
+			return nil
+		},
+	}
+	m := &indexMeta{
+		ctx:     context.Background(),
+		catalog: catalog,
+		indexes: map[UniqueID]map[UniqueID]*model.Index{
+			collectionID: {
+				indexID1: {CollectionID: collectionID, IndexID: indexID1},
+				indexID2: {CollectionID: collectionID, IndexID: indexID2},
+			},
+		},
+	}
+
+	errCh := make(chan error, 2)
+	go func() {
+		errCh <- m.MarkIndexAsDeleted(context.Background(), collectionID, []UniqueID{indexID1})
+	}()
+	select {
+	case <-firstStarted:
+	case <-time.After(time.Second):
+		require.FailNow(t, "first index did not enter catalog")
+	}
+
+	go func() {
+		close(secondInvoked)
+		errCh <- m.MarkIndexAsDeleted(context.Background(), collectionID, []UniqueID{indexID2})
+	}()
+	<-secondInvoked
+	secondEnteredBeforeRelease := false
+	select {
+	case <-secondStarted:
+		secondEnteredBeforeRelease = true
+	case <-time.After(100 * time.Millisecond):
+	}
+	release()
+
+	require.NoError(t, <-errCh)
+	require.NoError(t, <-errCh)
+	assert.False(t, secondEnteredBeforeRelease,
+		"index DDL for the same collection must remain serialized")
+}
+
+func TestStoredIndexSizeMetricConcurrentFinishAndDrop(t *testing.T) {
+	const iterations = 20
+	for i := 0; i < iterations; i++ {
+		metrics.DataCoordStoredIndexFilesSize.Reset()
+
+		const (
+			collectionID   = UniqueID(1)
+			partitionID    = UniqueID(2)
+			indexID        = UniqueID(10)
+			segmentID      = UniqueID(1000)
+			buildID        = UniqueID(10000)
+			serializedSize = uint64(4096)
+		)
+
+		catalog := catalogmocks.NewDataCoordCatalog(t)
+		catalog.EXPECT().AlterSegmentIndexes(mock.Anything, mock.Anything).Return(nil).Once()
+		catalog.EXPECT().AlterIndexes(mock.Anything, mock.Anything).Return(nil).Once()
+
+		segmentIndex := &model.SegmentIndex{
+			SegmentID:    segmentID,
+			CollectionID: collectionID,
+			PartitionID:  partitionID,
+			IndexID:      indexID,
+			BuildID:      buildID,
+			IndexState:   commonpb.IndexState_InProgress,
+		}
+		segmentBuildInfo := newSegmentIndexBuildInfo()
+		segmentBuildInfo.Add(segmentIndex)
+		segmentIndexes := typeutil.NewConcurrentMap[UniqueID, *typeutil.ConcurrentMap[UniqueID, *model.SegmentIndex]]()
+		indexesForSegment := typeutil.NewConcurrentMap[UniqueID, *model.SegmentIndex]()
+		indexesForSegment.Insert(indexID, segmentIndex)
+		segmentIndexes.Insert(segmentID, indexesForSegment)
+
+		m := &indexMeta{
+			ctx:              context.Background(),
+			catalog:          catalog,
+			keyLock:          lock.NewKeyLock[UniqueID](),
+			segmentBuildInfo: segmentBuildInfo,
+			indexes: map[UniqueID]map[UniqueID]*model.Index{
+				collectionID: {indexID: {CollectionID: collectionID, IndexID: indexID}},
+			},
+			segmentIndexes: segmentIndexes,
+		}
+		m.storedIndexSize.activate(collectionID, indexID)
+
+		start := make(chan struct{})
+		errCh := make(chan error, 2)
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			<-start
+			errCh <- m.FinishTask(&workerpb.IndexTaskInfo{
+				BuildID:        buildID,
+				State:          commonpb.IndexState_Finished,
+				IndexFileKeys:  []string{"file1"},
+				SerializedSize: serializedSize,
+			})
+		}()
+		go func() {
+			defer wg.Done()
+			<-start
+			errCh <- m.MarkIndexAsDeleted(context.Background(), collectionID, []UniqueID{indexID})
+		}()
+
+		close(start)
+		wg.Wait()
+		close(errCh)
+		for err := range errCh {
+			require.NoError(t, err)
+		}
+
+		collectionIDLabel := fmt.Sprintf("%d", collectionID)
+		assert.Equal(t, float64(0),
+			testutil.ToFloat64(metrics.DataCoordStoredIndexFilesSize.WithLabelValues("", "", collectionIDLabel)))
+	}
+}
+
+func TestStoredIndexSizeMetricConcurrentAddAndDrop(t *testing.T) {
+	const iterations = 20
+	for i := 0; i < iterations; i++ {
+		metrics.DataCoordStoredIndexFilesSize.Reset()
+
+		const (
+			collectionID   = UniqueID(1)
+			partitionID    = UniqueID(2)
+			indexID        = UniqueID(10)
+			segmentID      = UniqueID(1000)
+			buildID        = UniqueID(10000)
+			serializedSize = uint64(4096)
+		)
+
+		catalog := catalogmocks.NewDataCoordCatalog(t)
+		catalog.EXPECT().CreateSegmentIndex(mock.Anything, mock.Anything).Return(nil).Once()
+		catalog.EXPECT().AlterIndexes(mock.Anything, mock.Anything).Return(nil).Once()
+
+		m := &indexMeta{
+			ctx:              context.Background(),
+			catalog:          catalog,
+			keyLock:          lock.NewKeyLock[UniqueID](),
+			segmentBuildInfo: newSegmentIndexBuildInfo(),
+			indexes: map[UniqueID]map[UniqueID]*model.Index{
+				collectionID: {indexID: {CollectionID: collectionID, IndexID: indexID}},
+			},
+			segmentIndexes: typeutil.NewConcurrentMap[UniqueID, *typeutil.ConcurrentMap[UniqueID, *model.SegmentIndex]](),
+		}
+		m.storedIndexSize.activate(collectionID, indexID)
+
+		start := make(chan struct{})
+		errCh := make(chan error, 2)
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			<-start
+			errCh <- m.AddSegmentIndex(context.Background(), &model.SegmentIndex{
+				SegmentID:           segmentID,
+				CollectionID:        collectionID,
+				PartitionID:         partitionID,
+				IndexID:             indexID,
+				BuildID:             buildID,
+				IndexState:          commonpb.IndexState_Finished,
+				IndexSerializedSize: serializedSize,
+			})
+		}()
+		go func() {
+			defer wg.Done()
+			<-start
+			errCh <- m.MarkIndexAsDeleted(context.Background(), collectionID, []UniqueID{indexID})
+		}()
+
+		close(start)
+		wg.Wait()
+		close(errCh)
+		for err := range errCh {
+			require.NoError(t, err)
+		}
+
+		collectionIDLabel := fmt.Sprintf("%d", collectionID)
+		assert.Equal(t, float64(0),
+			testutil.ToFloat64(metrics.DataCoordStoredIndexFilesSize.WithLabelValues("", "", collectionIDLabel)))
+	}
+}
+
+func TestStoredIndexSizeMetricConcurrentRemoveAndDrop(t *testing.T) {
+	const iterations = 20
+	for i := 0; i < iterations; i++ {
+		metrics.DataCoordStoredIndexFilesSize.Reset()
+
+		const (
+			collectionID   = UniqueID(1)
+			partitionID    = UniqueID(2)
+			indexID        = UniqueID(10)
+			segmentID      = UniqueID(1000)
+			buildID        = UniqueID(10000)
+			serializedSize = uint64(4096)
+		)
+
+		catalog := catalogmocks.NewDataCoordCatalog(t)
+		catalog.EXPECT().DropSegmentIndex(mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(nil).Once()
+		catalog.EXPECT().AlterIndexes(mock.Anything, mock.Anything).Return(nil).Once()
+
+		segmentIndex := &model.SegmentIndex{
+			SegmentID:           segmentID,
+			CollectionID:        collectionID,
+			PartitionID:         partitionID,
+			IndexID:             indexID,
+			BuildID:             buildID,
+			IndexState:          commonpb.IndexState_Finished,
+			IndexSerializedSize: serializedSize,
+		}
+		segmentBuildInfo := newSegmentIndexBuildInfo()
+		segmentBuildInfo.Add(segmentIndex)
+		segmentIndexes := typeutil.NewConcurrentMap[UniqueID, *typeutil.ConcurrentMap[UniqueID, *model.SegmentIndex]]()
+		indexesForSegment := typeutil.NewConcurrentMap[UniqueID, *model.SegmentIndex]()
+		indexesForSegment.Insert(indexID, segmentIndex)
+		segmentIndexes.Insert(segmentID, indexesForSegment)
+
+		m := &indexMeta{
+			ctx:              context.Background(),
+			catalog:          catalog,
+			keyLock:          lock.NewKeyLock[UniqueID](),
+			segmentBuildInfo: segmentBuildInfo,
+			indexes: map[UniqueID]map[UniqueID]*model.Index{
+				collectionID: {indexID: {CollectionID: collectionID, IndexID: indexID}},
+			},
+			segmentIndexes: segmentIndexes,
+		}
+		m.storedIndexSize.activate(collectionID, indexID)
+		m.storedIndexSize.update(context.Background(), collectionID, indexID, 0, serializedSize)
+
+		start := make(chan struct{})
+		errCh := make(chan error, 2)
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			<-start
+			errCh <- m.RemoveSegmentIndex(context.Background(), buildID)
+		}()
+		go func() {
+			defer wg.Done()
+			<-start
+			errCh <- m.MarkIndexAsDeleted(context.Background(), collectionID, []UniqueID{indexID})
+		}()
+
+		close(start)
+		wg.Wait()
+		close(errCh)
+		for err := range errCh {
+			require.NoError(t, err)
+		}
+
+		collectionIDLabel := fmt.Sprintf("%d", collectionID)
+		assert.Equal(t, float64(0),
+			testutil.ToFloat64(metrics.DataCoordStoredIndexFilesSize.WithLabelValues("", "", collectionIDLabel)))
 	}
 }

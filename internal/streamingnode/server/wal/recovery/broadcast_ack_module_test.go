@@ -201,6 +201,38 @@ func TestBroadcastAckRetriesSameTaskAfterFailure(t *testing.T) {
 	assert.Equal(t, msg.TimeTick(), tracker.CompletedPoint().TimeTick)
 }
 
+func TestBroadcastAckObservesDropCollectionStages(t *testing.T) {
+	type observation struct {
+		stage    string
+		duration time.Duration
+	}
+	observations := make([]observation, 0, 3)
+	scheduler := &recordingAckTaskScheduler{}
+	module := newBroadcastAckModule(
+		moduleapi.Runtime{Scheduler: scheduler},
+		func(stage string, duration time.Duration) {
+			observations = append(observations, observation{stage: stage, duration: duration})
+		},
+	)
+	t.Cleanup(module.Close)
+	module.ack = func(context.Context, message.ImmutableMessage) error { return nil }
+	msg := newBroadcastAckMessage(t, message.NewDropCollectionMessageBuilderV1().
+		WithBroadcast([]string{"v1"}).
+		WithHeader(&message.DropCollectionMessageHeader{CollectionId: 1}).
+		WithBody(&msgpb.DropCollectionRequest{}))
+	tracker := messageack.NewTracker(utility.WALCheckpoint{}, nil, nil)
+	module.Accept(tracker.Track(msg))
+
+	require.NoError(t, scheduler.waitTask(t).Execute(context.Background()))
+	require.Len(t, observations, 3)
+	assert.Equal(t, dropCollectionStageAckReadyWait, observations[0].stage)
+	assert.Equal(t, dropCollectionStageAckRPC, observations[1].stage)
+	assert.Equal(t, dropCollectionStageAckTotal, observations[2].stage)
+	for _, observation := range observations {
+		assert.GreaterOrEqual(t, observation.duration, time.Duration(0))
+	}
+}
+
 func TestBroadcastAckAllowsReadyNonConflictingTaskToPass(t *testing.T) {
 	scheduler := &recordingAckTaskScheduler{}
 	module := newBroadcastAckModule(moduleapi.Runtime{Scheduler: scheduler})

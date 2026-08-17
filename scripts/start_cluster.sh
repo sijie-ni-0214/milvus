@@ -28,17 +28,17 @@ if [[ "$OSTYPE" == "linux-gnu"* ]]; then
   export LD_LIBRARY_PATH=$PWD/internal/core/output/lib/:$LD_LIBRARY_PATH
 fi
 
-# echo "Starting mixcoord..."
-# METRICS_PORT=9093 nohup ./bin/milvus run mixcoord --run-with-subprocess >/tmp/mixcoord.log 2>&1 &
+echo "Starting mixcoord..."
+METRICS_PORT=9093 nohup ./bin/milvus run mixcoord --run-with-subprocess >/tmp/mixcoord.log 2>&1 &
 
-echo "Starting datanode..."
-METRICS_PORT=9094 nohup ./bin/milvus run datanode --run-with-subprocess >/tmp/datanode.log 2>&1 &
+# echo "Starting datanode..."
+# METRICS_PORT=9094 nohup ./bin/milvus run datanode --run-with-subprocess >/tmp/datanode.log 2>&1 &
 
-# echo "Starting querynode..."
-# nohup ./bin/milvus run querynode --run-with-subprocess >/tmp/querynode.log 2>&1 &
+# # echo "Starting querynode..."
+# # nohup ./bin/milvus run querynode --run-with-subprocess >/tmp/querynode.log 2>&1 &
 
-echo "Starting streamingnode..."
-METRICS_PORT=9088 nohup ./bin/milvus run streamingnode --run-with-subprocess >/tmp/streamingnode.log 2>&1 &
+# echo "Starting streamingnode..."
+# METRICS_PORT=9088 nohup ./bin/milvus run streamingnode --run-with-subprocess >/tmp/streamingnode.log 2>&1 &
 
 echo "Starting proxy..."
 METRICS_PORT=9091 nohup ./bin/milvus run proxy --run-with-subprocess >/tmp/proxy.log 2>&1 &

@@ -354,7 +354,7 @@ func (m *meta) reloadSegmentIndexesFromManifests(ctx context.Context) error {
 				continue
 			}
 			m.indexMeta.updateSegmentIndex(segIdx)
-			m.indexMeta.addStoredIndexSizeMetric(segIdx.CollectionID, segIdx.IndexID, float64(segIdx.IndexSerializedSize))
+			m.indexMeta.updateStoredIndexSizeMetric(ctx, segIdx.CollectionID, segIdx.IndexID, 0, segIdx.IndexSerializedSize)
 			installed++
 		}
 	}

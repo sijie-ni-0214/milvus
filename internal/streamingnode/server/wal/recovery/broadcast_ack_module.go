@@ -21,29 +21,44 @@ import (
 
 const broadcastAckRetryInterval = 200 * time.Millisecond
 
+const (
+	dropCollectionStageAckReadyWait = "ack_ready_wait"
+	dropCollectionStageAckRPC       = "ack_rpc"
+	dropCollectionStageAckTotal     = "ack_total"
+)
+
 type broadcastAckModule struct {
-	runtime    moduleapi.Runtime
-	ctx        context.Context
-	cancel     context.CancelFunc
-	retryDelay time.Duration
-	closeOnce  sync.Once
-	workerMu   sync.Mutex
-	closed     bool
-	workerWG   sync.WaitGroup
-	ackTaskMu  sync.Mutex
-	ackTasks   []*broadcastAckTask
-	wakeup     chan struct{}
-	ack        func(context.Context, message.ImmutableMessage) error
+	runtime                    moduleapi.Runtime
+	ctx                        context.Context
+	cancel                     context.CancelFunc
+	retryDelay                 time.Duration
+	closeOnce                  sync.Once
+	workerMu                   sync.Mutex
+	closed                     bool
+	workerWG                   sync.WaitGroup
+	ackTaskMu                  sync.Mutex
+	ackTasks                   []*broadcastAckTask
+	wakeup                     chan struct{}
+	ack                        func(context.Context, message.ImmutableMessage) error
+	observeDropCollectionStage func(string, time.Duration)
 }
 
-func newBroadcastAckModule(runtime moduleapi.Runtime) *broadcastAckModule {
+func newBroadcastAckModule(
+	runtime moduleapi.Runtime,
+	observers ...func(string, time.Duration),
+) *broadcastAckModule {
 	ctx, cancel := context.WithCancel(context.Background()) // #nosec G118 -- Close invokes the retained cancel function.
+	var observeDropCollectionStage func(string, time.Duration)
+	if len(observers) > 0 {
+		observeDropCollectionStage = observers[0]
+	}
 	m := &broadcastAckModule{
-		runtime:    runtime,
-		ctx:        ctx,
-		cancel:     cancel,
-		retryDelay: broadcastAckRetryInterval,
-		wakeup:     make(chan struct{}, 1),
+		runtime:                    runtime,
+		ctx:                        ctx,
+		cancel:                     cancel,
+		retryDelay:                 broadcastAckRetryInterval,
+		wakeup:                     make(chan struct{}, 1),
+		observeDropCollectionStage: observeDropCollectionStage,
 		ack: func(ctx context.Context, msg message.ImmutableMessage) error {
 			return streaming.WAL().Broadcast().Ack(ctx, msg)
 		},
@@ -61,9 +76,11 @@ func (m *broadcastAckModule) Accept(
 		return
 	}
 	task := &broadcastAckTask{
-		module:       m,
-		owner:        owner,
-		resourceKeys: normalizeBroadcastAckResourceKeys(owner.Message().BroadcastHeader().ResourceKeys.Collect()),
+		module:           m,
+		owner:            owner,
+		resourceKeys:     normalizeBroadcastAckResourceKeys(owner.Message().BroadcastHeader().ResourceKeys.Collect()),
+		createdAt:        time.Now(),
+		isDropCollection: owner.Message().MessageType() == message.MessageTypeDropCollection,
 	}
 	m.ackTaskMu.Lock()
 	m.ackTasks = append(m.ackTasks, task)
@@ -185,27 +202,44 @@ func (m *broadcastAckModule) compactCompletedTasksLocked() {
 }
 
 type broadcastAckTask struct {
-	module       *broadcastAckModule
-	owner        message.OwnedImmutableMessage
-	resourceKeys []message.ResourceKey
-	exclusive    atomic.Bool
-	poisoned     bool // Published by exclusive.Store after the last consumer releases.
-	inFlight     bool
-	completed    bool
+	module           *broadcastAckModule
+	owner            message.OwnedImmutableMessage
+	resourceKeys     []message.ResourceKey
+	createdAt        time.Time
+	isDropCollection bool
+	exclusive        atomic.Bool
+	poisoned         bool // Published by exclusive.Store after the last consumer releases.
+	inFlight         bool
+	completed        bool
 }
 
 func (t *broadcastAckTask) Execute(ctx context.Context) error {
+	t.observeDropCollectionStage(dropCollectionStageAckReadyWait, time.Since(t.createdAt))
+	defer func() {
+		t.observeDropCollectionStage(dropCollectionStageAckTotal, time.Since(t.createdAt))
+	}()
+
 	if err := ackLegacyCommitImport(ctx, t.owner.Message()); err != nil {
 		t.module.retry(t)
 		return nil
 	}
-	if err := t.module.ack(ctx, t.owner.Message()); err != nil {
+	ackStart := time.Now()
+	err := t.module.ack(ctx, t.owner.Message())
+	t.observeDropCollectionStage(dropCollectionStageAckRPC, time.Since(ackStart))
+	if err != nil {
 		t.module.retry(t)
 		return nil
 	}
 	t.owner.Release()
 	t.module.finishTask(t)
 	return nil
+}
+
+func (t *broadcastAckTask) observeDropCollectionStage(stage string, duration time.Duration) {
+	if !t.isDropCollection || t.module.observeDropCollectionStage == nil {
+		return
+	}
+	t.module.observeDropCollectionStage(stage, duration)
 }
 
 func normalizeBroadcastAckResourceKeys(keys []message.ResourceKey) []message.ResourceKey {
