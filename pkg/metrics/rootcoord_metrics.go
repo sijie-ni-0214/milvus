@@ -55,6 +55,15 @@ var (
 			Buckets:   subMsBuckets,
 		}, []string{functionLabelName, "stage"})
 
+	RootCoordDropCollectionStageDurationSeconds = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Namespace: milvusNamespace,
+			Subsystem: typeutil.RootCoordRole,
+			Name:      "drop_collection_stage_duration_seconds",
+			Help:      "Duration of each DropCollection execution stage; some stages are nested",
+			Buckets:   secondsBuckets,
+		}, []string{"stage"})
+
 	// RootCoordSyncTimeTickLatency records the latency of sync time tick.
 	RootCoordSyncTimeTickLatency = prometheus.NewHistogram(
 		prometheus.HistogramOpts{
@@ -269,6 +278,7 @@ func RegisterMixCoord(registry *prometheus.Registry) {
 	registry.MustRegister(RootCoordDDLReqCounter)
 	registry.MustRegister(RootCoordDDLReqLatency)
 	registry.MustRegister(RootCoordDDLCallbackDuration)
+	registry.MustRegister(RootCoordDropCollectionStageDurationSeconds)
 
 	// for allocator
 	registry.MustRegister(RootCoordIDAllocCounter)
