@@ -67,6 +67,7 @@ type SearchTask struct {
 
 	tr           *timerecord.TimeRecorder
 	scheduleSpan trace.Span
+	queueTime    time.Duration
 }
 
 func NewSearchTask(ctx context.Context,
@@ -126,6 +127,7 @@ func (t *SearchTask) PreExecute() error {
 	// Update task wait time metric before execute
 	nodeID := strconv.FormatInt(t.GetNodeID(), 10)
 	inQueueDuration := t.tr.ElapseSpan()
+	t.queueTime = inQueueDuration
 	inQueueDurationMS := inQueueDuration.Seconds() * 1000
 
 	// Update in queue metric for prometheus.
@@ -171,6 +173,8 @@ func (t *SearchTask) ExecuteOnSegments(selected []segments.Segment) error {
 }
 
 func (t *SearchTask) execute(selected []segments.Segment) error {
+	executeStart := time.Now()
+	timing := searchPhaseTiming{queue: t.queueTime}
 	if t.scheduleSpan != nil {
 		t.scheduleSpan.End()
 	}
@@ -181,6 +185,7 @@ func (t *SearchTask) execute(selected []segments.Segment) error {
 	tr := timerecord.NewTimeRecorderWithTrace(t.ctx, "SearchTask")
 
 	req := t.req
+	prepareStart := time.Now()
 	err := t.combinePlaceHolderGroups()
 	if err != nil {
 		return err
@@ -206,11 +211,13 @@ func (t *SearchTask) execute(selected []segments.Segment) error {
 			return err
 		}
 	}
+	timing.prepareRequest = time.Since(prepareStart)
 
 	var (
 		results          []*segments.SearchResult
 		searchedSegments []segments.Segment
 	)
+	searchStart := time.Now()
 	if selected != nil {
 		searchedSegments = selected
 		results, err = segments.SearchSelectedSegments(t.ctx, searchReq, selected)
@@ -240,6 +247,7 @@ func (t *SearchTask) execute(selected []segments.Segment) error {
 	if err != nil {
 		return err
 	}
+	timing.segmentSearch = time.Since(searchStart)
 
 	// In filter-only mode, extract filter statistics and return early.
 	// This supports two-stage search: stage-1 collects per-segment valid
@@ -324,6 +332,7 @@ func (t *SearchTask) execute(selected []segments.Segment) error {
 	reduceTR := timerecord.NewTimeRecorder("reduce")
 
 	// Mutates results in place; must run before Arrow export.
+	prepareExportStart := time.Now()
 	allSearchCount, err := segcore.PrepareSearchResultsForExport(
 		t.ctx,
 		searchReq.Plan(),
@@ -336,16 +345,19 @@ func (t *SearchTask) execute(selected []segments.Segment) error {
 		mlog.Warn(t.ctx, "failed to prepare search results for export", mlog.Err(err))
 		return err
 	}
+	timing.prepareExport = time.Since(prepareExportStart)
 
 	// Export per-segment results as Arrow DataFrames.
 	var l0InputPlan *chain.DataFrameInputPlan
 	if preparedChains.l0 != nil {
 		l0InputPlan = preparedChains.l0.inputPlan
 	}
+	arrowExportStart := time.Now()
 	segDFs, err := t.exportSearchResultsAsArrow(results, searchReq.Plan(), l0InputPlan)
 	if err != nil {
 		return err
 	}
+	timing.arrowExport = time.Since(arrowExportStart)
 	defer func() {
 		for _, df := range segDFs {
 			if df != nil {
@@ -354,9 +366,11 @@ func (t *SearchTask) execute(selected []segments.Segment) error {
 		}
 	}()
 
+	rerankStart := time.Now()
 	if err := t.applyL0Rerank(segDFs, preparedChains.l0, searchedSegments, searchReq); err != nil {
 		return err
 	}
+	timing.l0Rerank = time.Since(rerankStart)
 
 	groupByOpts := resolveGroupByOptions(segDFs, results)
 	layout, err := t.buildReduceLayout(groupByOpts, preparedChains.l1 != nil)
@@ -365,12 +379,13 @@ func (t *SearchTask) execute(selected []segments.Segment) error {
 	}
 	if layout.PerRequestReduce {
 		for i, reduceRange := range layout.Ranges {
-			reduced, err := t.executeGoReduce(
+			reduced, err := t.executeGoReduceWithTiming(
 				segDFs,
 				reduceRange.ReduceTopK,
 				groupByOpts,
 				reduceRange.NQOffset,
 				reduceRange.NQCount,
+				&timing.reduce,
 			)
 			if err != nil {
 				return err
@@ -385,12 +400,13 @@ func (t *SearchTask) execute(selected []segments.Segment) error {
 				tr,
 				relatedDataSize,
 				allSearchCount,
+				&timing.reduce,
 			); err != nil {
 				return err
 			}
 		}
 	} else {
-		reduced, err := t.executeGoReduce(segDFs, t.topk, groupByOpts, 0, layout.NQ)
+		reduced, err := t.executeGoReduceWithTiming(segDFs, t.topk, groupByOpts, 0, layout.NQ, &timing.reduce)
 		if err != nil {
 			return err
 		}
@@ -415,7 +431,7 @@ func (t *SearchTask) execute(selected []segments.Segment) error {
 				if sliced != reduced && sliced.DF != nil {
 					defer sliced.DF.Release()
 				}
-				return t.materializeAndAssignResult(
+				return t.materializeAndAssignResultWithTiming(
 					i,
 					sliced,
 					results,
@@ -424,6 +440,7 @@ func (t *SearchTask) execute(selected []segments.Segment) error {
 					tr,
 					relatedDataSize,
 					allSearchCount,
+					&timing.reduce,
 				)
 			}(); err != nil {
 				return err
@@ -431,6 +448,24 @@ func (t *SearchTask) execute(selected []segments.Segment) error {
 		}
 	}
 	t.attributeStorageCost(results, searchReq.FeatureBits())
+	timing.total = time.Since(executeStart)
+	mlog.Info(t.ctx, "[load on search] SQN search timing",
+		mlog.FieldCollectionID(req.GetReq().GetCollectionID()),
+		mlog.Int("segmentCount", len(searchedSegments)),
+		mlog.Int("outputFieldCount", len(req.GetReq().GetOutputFieldsId())),
+		mlog.Duration("queue", timing.queue),
+		mlog.Duration("prepareRequest", timing.prepareRequest),
+		mlog.Duration("segmentSearch", timing.segmentSearch),
+		mlog.Duration("prepareExport", timing.prepareExport),
+		mlog.Duration("arrowExport", timing.arrowExport),
+		mlog.Duration("l0Rerank", timing.l0Rerank),
+		mlog.Duration("heapReduce", timing.reduce.heapReduce),
+		mlog.Duration("marshalReduce", timing.reduce.marshalReduce),
+		mlog.Duration("sourceMapping", timing.reduce.sourceMapping),
+		mlog.Duration("fillOutputFields", timing.reduce.fillOutputFields),
+		mlog.Duration("decodeOutputFields", timing.reduce.decodeOutputFields),
+		mlog.Duration("encodeResult", timing.reduce.encodeResult),
+		mlog.Duration("total", timing.total))
 
 	// Reduce metric covers the full Go-reduce pipeline (Arrow export +
 	// heap merge + Late Materialization + proto marshal), aligned with the
@@ -442,6 +477,17 @@ func (t *SearchTask) execute(selected []segments.Segment) error {
 		metrics.BatchReduce).
 		Observe(float64(reduceTR.RecordSpan().Microseconds()) / 1000.0)
 	return nil
+}
+
+type searchPhaseTiming struct {
+	queue          time.Duration
+	prepareRequest time.Duration
+	segmentSearch  time.Duration
+	prepareExport  time.Duration
+	arrowExport    time.Duration
+	l0Rerank       time.Duration
+	reduce         reducePhaseTiming
+	total          time.Duration
 }
 
 func emptySearchResultData(nq, topK int64) *schemapb.SearchResultData {
