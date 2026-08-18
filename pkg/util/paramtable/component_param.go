@@ -1495,7 +1495,7 @@ Large numeric passwords require double quotes to avoid yaml parsing precision is
 	p.StorageZstdConcurrency = ParamItem{
 		Key:          "common.storage.zstd.concurrency",
 		Version:      "2.6.0",
-		DefaultValue: "100",
+		DefaultValue: "1",
 		Doc: `The number of concurrent zstd compress threads for one binlog generation, 0 means use all cores.
 Every concurrent zstd compress thread will use additional memory.
 The default value is 1, which is enough for most cases.`,

@@ -40,5 +40,5 @@ METRICS_PORT=9093 nohup ./bin/milvus run mixcoord --run-with-subprocess >/tmp/mi
 # echo "Starting streamingnode..."
 # METRICS_PORT=9088 nohup ./bin/milvus run streamingnode --run-with-subprocess >/tmp/streamingnode.log 2>&1 &
 
-echo "Starting proxy..."
-METRICS_PORT=9091 nohup ./bin/milvus run proxy --run-with-subprocess >/tmp/proxy.log 2>&1 &
+# echo "Starting proxy..."
+# METRICS_PORT=9091 nohup ./bin/milvus run proxy --run-with-subprocess >/tmp/proxy.log 2>&1 &
