@@ -89,10 +89,10 @@ func hookError(err error) error {
 func updateProxyFunctionCallMetric(fullMethod string, err error) {
 	strs := strings.Split(fullMethod, "/")
 	method := strs[len(strs)-1]
-	if method == "" || !metrics.ShouldObserveProxyFunctionCall(method) {
+	if method == "" {
 		return
 	}
 	status, cause := failMetricLabel(err)
-	metrics.ProxyFunctionCall.WithLabelValues(strconv.FormatInt(paramtable.GetNodeID(), 10), method, metrics.TotalLabel, metrics.CauseNA, "", "").Inc()
-	metrics.ProxyFunctionCall.WithLabelValues(strconv.FormatInt(paramtable.GetNodeID(), 10), method, status, cause, "", "").Inc()
+	metrics.ProxyFunctionCall.WithLabelValues(strconv.FormatInt(paramtable.GetNodeID(), 10), method, metrics.TotalLabel, metrics.CauseNA).Inc()
+	metrics.ProxyFunctionCall.WithLabelValues(strconv.FormatInt(paramtable.GetNodeID(), 10), method, status, cause).Inc()
 }

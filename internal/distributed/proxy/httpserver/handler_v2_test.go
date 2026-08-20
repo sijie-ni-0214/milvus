@@ -4830,7 +4830,7 @@ func TestMethodDelete(t *testing.T) {
 	}
 }
 
-func TestDropCollectionDoesNotRecordProxyFunctionCall(t *testing.T) {
+func TestDropCollectionRecordsProxyFunctionCall(t *testing.T) {
 	paramtable.Init()
 	paramtable.Get().Save(paramtable.Get().QuotaConfig.QuotaAndLimitsEnabled.Key, "false")
 	defer paramtable.Get().Reset(paramtable.Get().QuotaConfig.QuotaAndLimitsEnabled.Key)
@@ -4854,7 +4854,7 @@ func TestDropCollectionDoesNotRecordProxyFunctionCall(t *testing.T) {
 	returnBody := &ReturnErrMsg{}
 	require.NoError(t, json.Unmarshal(w.Body.Bytes(), returnBody))
 	require.EqualValues(t, merr.Code(nil), returnBody.Code)
-	assert.Equal(t, 0, testutil.CollectAndCount(metrics.ProxyFunctionCall))
+	assert.Equal(t, 2, testutil.CollectAndCount(metrics.ProxyFunctionCall))
 }
 
 func TestMethodPost(t *testing.T) {

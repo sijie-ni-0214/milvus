@@ -200,7 +200,7 @@
           },
           "editorMode": "code",
           "exemplar": false,
-          "expr": "sum(increase(milvus_proxy_req_count{app_kubernetes_io_instance=~\"$instance\", app_kubernetes_io_name=\"$app_name\", namespace=\"$namespace\", db_name=~\"$db\", collection_name=~\"$collection\",  status=\"success\"}[1m])) by(function_name) ",
+          "expr": "sum(increase(milvus_proxy_req_count{app_kubernetes_io_instance=~\"$instance\", app_kubernetes_io_name=\"$app_name\", namespace=\"$namespace\", status=\"success\"}[1m])) by(function_name) ",
           "interval": "",
           "legendFormat": "{{function_name}}",
           "range": true,
@@ -209,7 +209,7 @@
       ],
       "thresholds": [],
       "timeRegions": [],
-      "title": "Successful Requests  (in 1m)",
+      "title": "Successful Requests - All Databases/Collections (in 1m)",
       "tooltip": {
         "shared": true,
         "sort": 0,
@@ -297,7 +297,7 @@
           },
           "editorMode": "code",
           "exemplar": true,
-          "expr": "sum(increase(milvus_proxy_req_count{app_kubernetes_io_instance=~\"$instance\", app_kubernetes_io_name=\"$app_name\", namespace=\"$namespace\", db_name=~\"$db\", collection_name=~\"$collection\", status!~\"success|total\"}[1m])) by(function_name) ",
+          "expr": "sum(increase(milvus_proxy_req_count{app_kubernetes_io_instance=~\"$instance\", app_kubernetes_io_name=\"$app_name\", namespace=\"$namespace\", status!~\"success|total\"}[1m])) by(function_name) ",
           "interval": "",
           "legendFormat": "{{function_name}}",
           "range": true,
@@ -306,7 +306,7 @@
       ],
       "thresholds": [],
       "timeRegions": [],
-      "title": "Failed Requests  (in 1m)",
+      "title": "Failed Requests - All Databases/Collections (in 1m)",
       "tooltip": {
         "shared": true,
         "sort": 0,
@@ -15720,7 +15720,7 @@
           "type": "prometheus",
           "uid": "${datasource}"
         },
-        "definition": "label_values(milvus_proxy_req_count{namespace=\"$namespace\", app_kubernetes_io_instance=~\"$instance\", app_kubernetes_io_name=\"$app_name\"},db_name)",
+        "definition": "label_values({__name__=~\"milvus_proxy_(sq|mutation)_latency_count\", namespace=\"$namespace\", app_kubernetes_io_instance=~\"$instance\", app_kubernetes_io_name=\"$app_name\"},db_name)",
         "hide": 0,
         "includeAll": true,
         "multi": false,
@@ -15728,7 +15728,7 @@
         "options": [],
         "query": {
           "qryType": 1,
-          "query": "label_values(milvus_proxy_req_count{namespace=\"$namespace\", app_kubernetes_io_instance=~\"$instance\", app_kubernetes_io_name=\"$app_name\"},db_name)",
+          "query": "label_values({__name__=~\"milvus_proxy_(sq|mutation)_latency_count\", namespace=\"$namespace\", app_kubernetes_io_instance=~\"$instance\", app_kubernetes_io_name=\"$app_name\"},db_name)",
           "refId": "PrometheusVariableQueryEditor-VariableQuery"
         },
         "refresh": 1,
@@ -15748,7 +15748,7 @@
           "type": "prometheus",
           "uid": "${datasource}"
         },
-        "definition": "label_values(milvus_proxy_req_count{namespace=\"$namespace\", app_kubernetes_io_instance=~\"$instance\", app_kubernetes_io_name=\"$app_name\", db_name=\"$db\"},collection_name)",
+        "definition": "label_values({__name__=~\"milvus_proxy_(sq|mutation)_latency_count\", namespace=\"$namespace\", app_kubernetes_io_instance=~\"$instance\", app_kubernetes_io_name=\"$app_name\", db_name=~\"$db\"},collection_name)",
         "hide": 0,
         "includeAll": true,
         "multi": false,
@@ -15756,7 +15756,7 @@
         "options": [],
         "query": {
           "qryType": 1,
-          "query": "label_values(milvus_proxy_req_count{namespace=\"$namespace\", app_kubernetes_io_instance=~\"$instance\", app_kubernetes_io_name=\"$app_name\", db_name=\"$db\"},collection_name)",
+          "query": "label_values({__name__=~\"milvus_proxy_(sq|mutation)_latency_count\", namespace=\"$namespace\", app_kubernetes_io_instance=~\"$instance\", app_kubernetes_io_name=\"$app_name\", db_name=~\"$db\"},collection_name)",
           "refId": "PrometheusVariableQueryEditor-VariableQuery"
         },
         "refresh": 1,
