@@ -285,14 +285,16 @@ var (
 			Buckets:   subMsBuckets, // unit: ms
 		}, []string{nodeIDLabelName})
 
-	// ProxyFunctionCall records the number of times the function of the DDL operation was executed, like `CreateCollection`.
+	// ProxyFunctionCall records the number of times a proxy operation was executed.
+	// Keep the labels bounded: database and collection names are intentionally
+	// excluded because they are user-controlled and create unbounded cardinality.
 	ProxyFunctionCall = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Namespace: milvusNamespace,
 			Subsystem: typeutil.ProxyRole,
 			Name:      "req_count",
 			Help:      "count of operation executed",
-		}, []string{nodeIDLabelName, functionLabelName, statusLabelName, causeLabelName, databaseLabelName, collectionName})
+		}, []string{nodeIDLabelName, functionLabelName, statusLabelName, causeLabelName})
 
 	// ProxyReqLatency records the latency for each grpc request.
 	ProxyGRPCLatency = prometheus.NewHistogramVec(
@@ -562,10 +564,6 @@ var (
 		}, []string{nodeIDLabelName, msgTypeLabelName, databaseLabelName, collectionName})
 )
 
-func ShouldObserveProxyFunctionCall(method string) bool {
-	return method != "DropCollection"
-}
-
 // RegisterProxy registers Proxy metrics
 func RegisterProxy(registry *prometheus.Registry) {
 	registry.MustRegister(ProxyReceivedNQ)
@@ -674,7 +672,6 @@ func proxyCollectionScopedMetrics() []partialMatchDeleter {
 		ProxyCollectionSQLatency,
 		ProxyMutationLatency,
 		ProxyCollectionMutationLatency,
-		ProxyFunctionCall,
 		ProxyFunctionlatency,
 		ProxyReceivedNQ,
 		ProxyReceiveBytes,

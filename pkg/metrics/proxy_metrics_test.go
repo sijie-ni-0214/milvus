@@ -25,29 +25,27 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestCleanupProxyCollectionMetricsCleansProxyFunctionCall(t *testing.T) {
+func TestCleanupProxyCollectionMetricsKeepsGlobalFunctionCall(t *testing.T) {
 	ProxyFunctionCall.Reset()
 	t.Cleanup(ProxyFunctionCall.Reset)
 
 	const (
-		nodeID           = int64(1)
-		nodeIDLabel      = "1"
-		dbName           = "test_db"
-		targetCollection = "target_collection"
-		otherCollection  = "other_collection"
+		nodeID      = int64(1)
+		nodeIDLabel = "1"
+		dbName      = "test_db"
 	)
 
-	ProxyFunctionCall.WithLabelValues(nodeIDLabel, "Search", SuccessLabel, CauseNA, dbName, targetCollection).Inc()
-	ProxyFunctionCall.WithLabelValues(nodeIDLabel, "Insert", FailLabel, CauseSystem, dbName, targetCollection).Inc()
-	ProxyFunctionCall.WithLabelValues(nodeIDLabel, "Search", SuccessLabel, CauseNA, dbName, otherCollection).Inc()
+	ProxyFunctionCall.WithLabelValues(nodeIDLabel, "Search", SuccessLabel, CauseNA).Inc()
+	ProxyFunctionCall.WithLabelValues(nodeIDLabel, "Insert", FailLabel, CauseSystem).Inc()
 
-	CleanupProxyCollectionMetrics(nodeID, dbName, targetCollection)
+	CleanupProxyCollectionMetrics(nodeID, dbName, "target_collection")
 
 	expected := fmt.Sprintf(`
 # HELP milvus_proxy_req_count count of operation executed
 # TYPE milvus_proxy_req_count counter
-milvus_proxy_req_count{cause=%q,collection_name="other_collection",db_name="test_db",function_name="Search",node_id="1",status="success"} 1
-`, CauseNA)
+milvus_proxy_req_count{cause=%q,function_name="Search",node_id="1",status="success"} 1
+milvus_proxy_req_count{cause=%q,function_name="Insert",node_id="1",status="fail"} 1
+`, CauseNA, CauseSystem)
 	require.NoError(t, testutil.CollectAndCompare(
 		ProxyFunctionCall,
 		strings.NewReader(expected),

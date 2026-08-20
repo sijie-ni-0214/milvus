@@ -651,9 +651,9 @@ func TestInterceptorImpl_RecordsOutcomeFromErrorAndResponseStatus(t *testing.T) 
 		t.Run(tc.name, func(t *testing.T) {
 			method := "DescribeCollectionMetric_" + tc.name
 			outcomeCounter := metrics.ProxyFunctionCall.WithLabelValues(
-				nodeID, method, tc.expectStatus, tc.expectCause, request.GetDbName(), request.GetCollectionName())
+				nodeID, method, tc.expectStatus, tc.expectCause)
 			totalCounter := metrics.ProxyFunctionCall.WithLabelValues(
-				nodeID, method, metrics.TotalLabel, metrics.CauseNA, request.GetDbName(), request.GetCollectionName())
+				nodeID, method, metrics.TotalLabel, metrics.CauseNA)
 			latency := metrics.ProxyReqLatency.WithLabelValues(nodeID, method)
 			beforeOutcome := testutil.ToFloat64(outcomeCounter)
 			beforeTotal := testutil.ToFloat64(totalCounter)

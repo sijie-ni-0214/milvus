@@ -110,10 +110,8 @@ func (i *InterceptorImpl[Req, Resp]) Call(ctx context.Context, request Req,
 	defer sp.End()
 	tr := timerecord.NewTimeRecorder(i.method)
 	nodeID := strconv.FormatInt(paramtable.GetNodeID(), 10)
-	dbName := request.GetDbName()
-	collectionName := request.GetCollectionName()
 	metrics.ProxyFunctionCall.WithLabelValues(nodeID, i.method,
-		metrics.TotalLabel, metrics.CauseNA, dbName, collectionName).Inc()
+		metrics.TotalLabel, metrics.CauseNA).Inc()
 	defer func() {
 		metrics.ProxyReqLatency.WithLabelValues(nodeID, i.method).
 			Observe(float64(tr.ElapseSpan().Milliseconds()))
@@ -123,7 +121,7 @@ func (i *InterceptorImpl[Req, Resp]) Call(ctx context.Context, request Req,
 	if err != nil {
 		status, cause := serviceCallMetricLabel(err)
 		metrics.ProxyFunctionCall.WithLabelValues(nodeID, i.method,
-			status, cause, dbName, collectionName).Inc()
+			status, cause).Inc()
 		return i.onError(err)
 	}
 
@@ -131,7 +129,7 @@ func (i *InterceptorImpl[Req, Resp]) Call(ctx context.Context, request Req,
 		if err := i.onResponse(resp); err != nil {
 			status, cause := serviceCallMetricLabel(err)
 			metrics.ProxyFunctionCall.WithLabelValues(nodeID, i.method,
-				status, cause, dbName, collectionName).Inc()
+				status, cause).Inc()
 			return i.onError(err)
 		}
 	}
@@ -139,12 +137,12 @@ func (i *InterceptorImpl[Req, Resp]) Call(ctx context.Context, request Req,
 	if !merr.Ok(resp.GetStatus()) {
 		status, cause := failMetricLabel(merr.Error(resp.GetStatus()))
 		metrics.ProxyFunctionCall.WithLabelValues(nodeID, i.method,
-			status, cause, dbName, collectionName).Inc()
+			status, cause).Inc()
 		return resp, nil
 	}
 
 	metrics.ProxyFunctionCall.WithLabelValues(nodeID, i.method,
-		metrics.SuccessLabel, metrics.CauseNA, dbName, collectionName).Inc()
+		metrics.SuccessLabel, metrics.CauseNA).Inc()
 
 	return resp, nil
 }

@@ -48,7 +48,6 @@ func (suite *StatsInterceptorSuite) TestUnaryRequestStatsInterceptor() {
 		info         *grpc.UnaryServerInfo
 		handler      grpc.UnaryHandler
 		expectLabels [][]string
-		skipMetric   bool
 	}
 
 	dbName := "default"
@@ -68,8 +67,8 @@ func (suite *StatsInterceptorSuite) TestUnaryRequestStatsInterceptor() {
 				return merr.Success(), nil
 			},
 			expectLabels: [][]string{
-				{paramtable.GetStringNodeID(), "CreateCollection", metrics.TotalLabel, metrics.CauseNA, dbName, collection},
-				{paramtable.GetStringNodeID(), "CreateCollection", metrics.SuccessLabel, metrics.CauseNA, dbName, collection},
+				{paramtable.GetStringNodeID(), "CreateCollection", metrics.TotalLabel, metrics.CauseNA},
+				{paramtable.GetStringNodeID(), "CreateCollection", metrics.SuccessLabel, metrics.CauseNA},
 			},
 		},
 		{
@@ -84,7 +83,10 @@ func (suite *StatsInterceptorSuite) TestUnaryRequestStatsInterceptor() {
 			handler: func(ctx context.Context, req any) (interface{}, error) {
 				return merr.Success(), nil
 			},
-			skipMetric: true,
+			expectLabels: [][]string{
+				{paramtable.GetStringNodeID(), "DropCollection", metrics.TotalLabel, metrics.CauseNA},
+				{paramtable.GetStringNodeID(), "DropCollection", metrics.SuccessLabel, metrics.CauseNA},
+			},
 		},
 		{
 			tag: "service_internal",
@@ -99,8 +101,8 @@ func (suite *StatsInterceptorSuite) TestUnaryRequestStatsInterceptor() {
 				return merr.Status(merr.WrapErrServiceInternal("unexpcted")), nil
 			},
 			expectLabels: [][]string{
-				{paramtable.GetStringNodeID(), "CreateCollection", metrics.TotalLabel, metrics.CauseNA, dbName, collection},
-				{paramtable.GetStringNodeID(), "CreateCollection", metrics.FailLabel, metrics.CauseSystem, dbName, collection},
+				{paramtable.GetStringNodeID(), "CreateCollection", metrics.TotalLabel, metrics.CauseNA},
+				{paramtable.GetStringNodeID(), "CreateCollection", metrics.FailLabel, metrics.CauseSystem},
 			},
 		},
 		{
@@ -118,8 +120,8 @@ func (suite *StatsInterceptorSuite) TestUnaryRequestStatsInterceptor() {
 				}, nil
 			},
 			expectLabels: [][]string{
-				{paramtable.GetStringNodeID(), "Insert", metrics.TotalLabel, metrics.CauseNA, dbName, collection},
-				{paramtable.GetStringNodeID(), "Insert", metrics.RetryLabel, metrics.CauseNA, dbName, collection},
+				{paramtable.GetStringNodeID(), "Insert", metrics.TotalLabel, metrics.CauseNA},
+				{paramtable.GetStringNodeID(), "Insert", metrics.RetryLabel, metrics.CauseNA},
 			},
 		},
 		{
@@ -135,9 +137,9 @@ func (suite *StatsInterceptorSuite) TestUnaryRequestStatsInterceptor() {
 				return nil, status.Error(codes.Unauthenticated, "auth check failure, please check api key is correct")
 			},
 			expectLabels: [][]string{
-				{paramtable.GetStringNodeID(), "CreateCollection", metrics.TotalLabel, metrics.CauseNA, dbName, collection},
+				{paramtable.GetStringNodeID(), "CreateCollection", metrics.TotalLabel, metrics.CauseNA},
 				// Unauthenticated is the caller's fault -> rejected, cause=user.
-				{paramtable.GetStringNodeID(), "CreateCollection", metrics.RejectedLabel, metrics.CauseUser, dbName, collection},
+				{paramtable.GetStringNodeID(), "CreateCollection", metrics.RejectedLabel, metrics.CauseUser},
 			},
 		},
 	}
@@ -164,15 +166,37 @@ func (suite *StatsInterceptorSuite) TestUnaryRequestStatsInterceptor() {
 				suite.Require().NoError(observer.(interface{ Write(*dto.Metric) error }).Write(metric))
 				suite.Equal(uint64(1), metric.GetHistogram().GetSampleCount())
 			}
-			if tc.skipMetric {
-				suite.Equal(0, testutil.CollectAndCount(metrics.ProxyFunctionCall))
-				return
-			}
 			for _, labels := range tc.expectLabels {
 				suite.MetricsEqual(metrics.ProxyFunctionCall.WithLabelValues(labels...), 1)
 			}
 		})
 	}
+}
+
+func (suite *StatsInterceptorSuite) TestProxyFunctionCallAggregatesAcrossCollections() {
+	metrics.ProxyFunctionCall.Reset()
+	suite.T().Cleanup(metrics.ProxyFunctionCall.Reset)
+
+	info := &grpc.UnaryServerInfo{
+		FullMethod: milvuspb.MilvusService_CreateCollection_FullMethodName,
+	}
+	handler := func(context.Context, any) (interface{}, error) {
+		return merr.Success(), nil
+	}
+	for _, req := range []*milvuspb.CreateCollectionRequest{
+		{DbName: "db-1", CollectionName: "collection-1"},
+		{DbName: "db-2", CollectionName: "collection-2"},
+	} {
+		_, err := UnaryRequestStatsInterceptor(context.Background(), req, info, handler)
+		suite.NoError(err)
+	}
+
+	nodeID := paramtable.GetStringNodeID()
+	suite.MetricsEqual(metrics.ProxyFunctionCall.WithLabelValues(
+		nodeID, "CreateCollection", metrics.TotalLabel, metrics.CauseNA), 2)
+	suite.MetricsEqual(metrics.ProxyFunctionCall.WithLabelValues(
+		nodeID, "CreateCollection", metrics.SuccessLabel, metrics.CauseNA), 2)
+	suite.Equal(2, testutil.CollectAndCount(metrics.ProxyFunctionCall))
 }
 
 func TestUnaryRequestStatsInterceptor(t *testing.T) {

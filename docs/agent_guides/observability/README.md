@@ -9,6 +9,7 @@ configuration.
 | Guide | Use When |
 |---|---|
 | [mlog - AI Agent Logging Guide](logging.md) | Adding or changing application logs. Covers `mlog` usage, context requirements, fields, levels, and logging rules. |
+| [Collection 级 Prometheus 指标审计](collection-level-metrics-audit.md) | 审查带有 `collection_id` 或 `collection_name` 的指标、基数风险、清理覆盖情况及降基数候选项。 |
 | [WAL Tracing](../streaming-system/wal/tracing.md) | Understanding or changing WAL trace span semantics across append, consume, transaction, broadcast, and replication paths. |
 
 ## Rules of Thumb

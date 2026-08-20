@@ -106,9 +106,9 @@ func (h *HandlersV2) dqlAdmission(handler gin.HandlerFunc) gin.HandlerFunc {
 			// series.
 			if methodTag, ok := routeToMethod[c.FullPath()]; ok {
 				nodeID := strconv.FormatInt(paramtable.GetNodeID(), 10)
-				metrics.ProxyFunctionCall.WithLabelValues(nodeID, methodTag, metrics.TotalLabel, metrics.CauseNA, "", "").Inc()
+				metrics.ProxyFunctionCall.WithLabelValues(nodeID, methodTag, metrics.TotalLabel, metrics.CauseNA).Inc()
 				label, cause := requestutil.ParseMetricLabel(nil, err)
-				metrics.ProxyFunctionCall.WithLabelValues(nodeID, methodTag, label, cause, "", "").Inc()
+				metrics.ProxyFunctionCall.WithLabelValues(nodeID, methodTag, label, cause).Inc()
 			}
 			c.Header("Retry-After", "1")
 			// Retry-After is not CORS-safelisted; expose it so browser
@@ -474,7 +474,6 @@ func wrapperPost(newReq newReqFunc, v2 handlerFuncV2) gin.HandlerFunc {
 			return
 		}
 		dbName := ""
-		collectionName := ""
 		if req != nil {
 			if getter, ok := req.(requestutil.DBNameGetter); ok {
 				dbName = getter.GetDbName()
@@ -484,9 +483,6 @@ func wrapperPost(newReq newReqFunc, v2 handlerFuncV2) gin.HandlerFunc {
 				if dbName == "" {
 					dbName = DefaultDbName
 				}
-			}
-			if getter, ok := req.(requestutil.CollectionNameGetter); ok {
-				collectionName = getter.GetCollectionName()
 			}
 		}
 		ctx := gCtx.Request.Context()
@@ -500,29 +496,20 @@ func wrapperPost(newReq newReqFunc, v2 handlerFuncV2) gin.HandlerFunc {
 		if !ok {
 			return
 		}
-		observeProxyFunctionCall := metrics.ShouldObserveProxyFunctionCall(methodTag)
-		if observeProxyFunctionCall {
-			metrics.ProxyFunctionCall.WithLabelValues(
-				strconv.FormatInt(paramtable.GetNodeID(), 10),
-				methodTag,
-				metrics.TotalLabel,
-				metrics.CauseNA,
-				dbName,
-				collectionName,
-			).Inc()
-		}
+		metrics.ProxyFunctionCall.WithLabelValues(
+			strconv.FormatInt(paramtable.GetNodeID(), 10),
+			methodTag,
+			metrics.TotalLabel,
+			metrics.CauseNA,
+		).Inc()
 		label, cause := requestutil.ParseMetricLabel(resp, err)
 		// set metrics for state code
-		if observeProxyFunctionCall {
-			metrics.ProxyFunctionCall.WithLabelValues(
-				strconv.FormatInt(paramtable.GetNodeID(), 10),
-				methodTag,
-				label,
-				cause,
-				dbName,
-				collectionName,
-			).Inc()
-		}
+		metrics.ProxyFunctionCall.WithLabelValues(
+			strconv.FormatInt(paramtable.GetNodeID(), 10),
+			methodTag,
+			label,
+			cause,
+		).Inc()
 
 		// Mirror the metric's cause into the logs so a failed REST request can be
 		// filtered by error_type. System failures are logged at Warn (actionable);
