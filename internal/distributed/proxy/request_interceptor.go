@@ -60,12 +60,6 @@ func init() {
 func UnaryRequestStatsInterceptor(ctx context.Context, req any, rpcInfo *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
 	stageStart := time.Now()
 	methodTag := FullMethodName2Tag(rpcInfo.FullMethod)
-	observeProxyFunctionCall := metrics.ShouldObserveProxyFunctionCall(methodTag)
-	db, _ := requestutil.GetDbNameFromRequest(req)
-	collection, _ := requestutil.GetCollectionNameFromRequest(req)
-
-	dbName := db.(string)
-	collectionName := collection.(string)
 	nodeID := strconv.FormatInt(paramtable.GetNodeID(), 10)
 	observeProxyGRPCStage(nodeID, methodTag, proxyGRPCStageRequestInfo, stageStart)
 
@@ -82,31 +76,23 @@ func UnaryRequestStatsInterceptor(ctx context.Context, req any, rpcInfo *grpc.Un
 
 	resourceGroup := requestMetrics.ResourceGroup()
 	stageStart = time.Now()
-	if observeProxyFunctionCall {
-		metrics.ProxyFunctionCall.WithLabelValues(
-			nodeID,
-			methodTag,
-			metrics.TotalLabel,
-			metrics.CauseNA,
-			dbName,
-			collectionName,
-			resourceGroup,
-		).Inc()
-	}
+	metrics.ProxyFunctionCall.WithLabelValues(
+		nodeID,
+		methodTag,
+		metrics.TotalLabel,
+		metrics.CauseNA,
+		resourceGroup,
+	).Inc()
 	observeProxyGRPCStage(nodeID, methodTag, proxyGRPCStageRequestMetrics, stageStart)
 	// set metrics for state code
 	stageStart = time.Now()
-	if observeProxyFunctionCall {
-		metrics.ProxyFunctionCall.WithLabelValues(
-			nodeID,
-			methodTag,
-			label,
-			cause,
-			dbName,
-			collectionName,
-			resourceGroup,
-		).Inc()
-	}
+	metrics.ProxyFunctionCall.WithLabelValues(
+		nodeID,
+		methodTag,
+		label,
+		cause,
+		resourceGroup,
+	).Inc()
 	observeProxyGRPCStage(nodeID, methodTag, proxyGRPCStageResponseMetrics, stageStart)
 
 	// Mirror the metric's cause into the logs so a failed request can be
