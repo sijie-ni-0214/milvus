@@ -1,24 +1,28 @@
 # Collection 级 Prometheus 指标审计
 
 本文档记录对携带 `collection_id` 或 `collection_name` 标签的 Prometheus
-指标族所做的源码级审计。本文基于 2026-08-19 的工作树快照，并非永久兼容性
-契约。指标声明或注册发生变化后，应重新执行审计。
+指标族所做的源码级审计。本文基于 2026-08-21 的当前工作树；审计时 HEAD 为
+`aebc786eb19aa0b46a947b219cdd32ccf4aae5bb`。结果以当时的工作树源码为准，并非
+永久兼容性契约。指标声明、注册或写入点发生变化后，应重新执行审计。
 
 当前工作树已经从 `milvus_proxy_req_count` 中移除了 `db_name` 和
 `collection_name`，因此该指标不计入下文清单。
 
 ## 审计范围与统计口径
 
-审计覆盖已注册的 Go Prometheus collector 及其实际写入点。如果一个指标族的
-可变标签中明确包含 `collection_id` 或 `collection_name`，就将其计为
-collection 级指标。
+审计覆盖已注册的 Go Prometheus collector 及其实际写入点，也覆盖经
+`CRegistry` 合并到 `/metrics` 的 C++ Milvus core、Knowhere 和 jemalloc 导出链，
+以及 milvus-storage 经 FFI 投影到 Go collector 的指标。如果一个指标族的可变
+标签中明确包含 `collection_id` 或 `collection_name`，就将其计为 collection
+级指标。
 
 以下内容不计入：
 
 - `*_collection_num` 等只统计 collection 数量、但不标识具体 collection 的指标。
 - 日志字段、JSON metrics 接口、trace，以及只通过 channel 名间接编码
   collection 的标签。
-- 未暴露显式 collection 标签的原生指标。
+- C++ protobuf/config/business struct 中的 `collection_id` 或
+  `collection_name` 字段；它们不是 Prometheus 标签。
 
 Histogram 按一个指标族计数，尽管暴露时会展开为 `_bucket`、`_sum` 和
 `_count` 多组时序。
@@ -34,6 +38,7 @@ Histogram 按一个指标族计数，尽管暴露时会展开为 `_bucket`、`_s
 | QueryCoord | 1 |
 | QueryNode | 21 |
 | QueryView（`qv`） | 1 |
+| C++ 原生导出链（严格口径） | 0 |
 | **合计** | **60** |
 
 在这 60 个指标族中：
@@ -44,6 +49,9 @@ Histogram 按一个指标族计数，尽管暴露时会展开为 `_bucket`、`_s
 - 59 个是 metric vector，1 个是 QueryView 自定义 collector。
 - 包含 22 个 CounterVec、21 个 GaugeVec、16 个 HistogramVec；QueryView
   自定义 collector 输出 Gauge。
+- 严格口径下 60 个指标族全部来自 Go collector；C++ 导出链没有显式
+  `collection_id` 或 `collection_name` 标签。扩展到“通过 shard/channel 间接归因”
+  时，C++ 侧另有 1 个候选指标族，不计入合计。
 
 ## 完整清单
 
@@ -51,131 +59,181 @@ Histogram 按一个指标族计数，尽管暴露时会展开为 `_bucket`、`_s
 
 源码：[`pkg/metrics/proxy_metrics.go`](../../../pkg/metrics/proxy_metrics.go)
 
-带 `collection_name`：
-
-- `milvus_proxy_received_nq`
-- `milvus_proxy_search_vectors_count`
-- `milvus_proxy_insert_vectors_count`
-- `milvus_proxy_upsert_vectors_count`
-- `milvus_proxy_delete_vectors_count`
-- `milvus_proxy_sq_latency`
-- `milvus_proxy_collection_sq_latency`（已废弃）
-- `milvus_proxy_mutation_latency`
-- `milvus_proxy_collection_mutation_latency`（已废弃）
-- `milvus_proxy_receive_bytes_count`
-- `milvus_proxy_retry_search_cnt`
-- `milvus_proxy_retry_search_result_insufficient_cnt`
-- `milvus_proxy_recall_search_cnt`
-- `milvus_proxy_search_sparse_num_non_zeros`
-- `milvus_proxy_function_udf_call_latency`
-- `milvus_proxy_scanned_remote_mb`
-- `milvus_proxy_scanned_total_mb`
-
-带 `collection_id`：
-
-- `milvus_proxy_limiter_rate`
+| 指标名 | 类型 | 完整可变标签 | 源码变量 |
+|---|---|---|---|
+| `milvus_proxy_received_nq` | Counter | `node_id`, `query_type`, `db_name`, `collection_name` | `ProxyReceivedNQ` |
+| `milvus_proxy_search_vectors_count` | Counter | `node_id`, `db_name`, `collection_name` | `ProxySearchVectors` |
+| `milvus_proxy_insert_vectors_count` | Counter | `node_id`, `db_name`, `collection_name` | `ProxyInsertVectors` |
+| `milvus_proxy_upsert_vectors_count` | Counter | `node_id`, `db_name`, `collection_name` | `ProxyUpsertVectors` |
+| `milvus_proxy_delete_vectors_count` | Counter | `node_id`, `db_name`, `collection_name` | `ProxyDeleteVectors` |
+| `milvus_proxy_sq_latency` | Histogram | `node_id`, `query_type`, `db_name`, `collection_name` | `ProxySQLatency` |
+| `milvus_proxy_collection_sq_latency` | Histogram | `node_id`, `query_type`, `db_name`, `collection_name` | `ProxyCollectionSQLatency`（已废弃） |
+| `milvus_proxy_mutation_latency` | Histogram | `node_id`, `msg_type`, `db_name`, `collection_name` | `ProxyMutationLatency` |
+| `milvus_proxy_collection_mutation_latency` | Histogram | `node_id`, `msg_type`, `db_name`, `collection_name` | `ProxyCollectionMutationLatency`（已废弃） |
+| `milvus_proxy_receive_bytes_count` | Counter | `node_id`, `msg_type`, `db_name`, `collection_name` | `ProxyReceiveBytes` |
+| `milvus_proxy_retry_search_cnt` | Counter | `node_id`, `query_type`, `db_name`, `collection_name` | `ProxyRetrySearchCount` |
+| `milvus_proxy_retry_search_result_insufficient_cnt` | Counter | `node_id`, `query_type`, `db_name`, `collection_name` | `ProxyRetrySearchResultInsufficientCount` |
+| `milvus_proxy_recall_search_cnt` | Counter | `node_id`, `query_type`, `db_name`, `collection_name` | `ProxyRecallSearchCount` |
+| `milvus_proxy_search_sparse_num_non_zeros` | Histogram | `node_id`, `collection_name`, `query_type`, `field_id` | `ProxySearchSparseNumNonZeros` |
+| `milvus_proxy_function_udf_call_latency` | Histogram | `node_id`, `collection_name`, `function_type_name`, `function_provider`, `function_name` | `ProxyFunctionlatency` |
+| `milvus_proxy_scanned_remote_mb` | Counter | `node_id`, `msg_type`, `db_name`, `collection_name` | `ProxyScannedRemoteMB` |
+| `milvus_proxy_scanned_total_mb` | Counter | `node_id`, `msg_type`, `db_name`, `collection_name` | `ProxyScannedTotalMB` |
+| `milvus_proxy_limiter_rate` | Gauge | `node_id`, `collection_id`, `msg_type` | `ProxyLimiterRate`；`collection_id` 实际承载多层级 source ID |
 
 ### RootCoord / MixCoord
 
 源码：
 [`pkg/metrics/rootcoord_metrics.go`](../../../pkg/metrics/rootcoord_metrics.go)
 
-带 `collection_name`：
-
-- `milvus_rootcoord_entity_num`
-- `milvus_rootcoord_indexed_entity_num`
-
-带 `collection_id`：
-
-- `milvus_rootcoord_rate_limit_ratio`
+| 指标名 | 类型 | 完整可变标签 | 源码变量 |
+|---|---|---|---|
+| `milvus_rootcoord_entity_num` | Gauge | `db_name`, `collection_name`, `status` | `RootCoordNumEntities` |
+| `milvus_rootcoord_indexed_entity_num` | Gauge | `db_name`, `collection_name`, `index_name`, `is_vector_index` | `RootCoordIndexedNumEntities` |
+| `milvus_rootcoord_rate_limit_ratio` | Gauge | `collection_id` | `RootCoordRateLimitRatio` |
 
 ### DataCoord
 
 源码：
 [`pkg/metrics/datacoord_metrics.go`](../../../pkg/metrics/datacoord_metrics.go)
 
-同时带 `collection_id` 和 `collection_name`：
-
-- `milvus_datacoord_stored_rows_num`
-- `milvus_datacoord_stored_index_files_size`
-
-仅带 `collection_id`：
-
-- `milvus_datacoord_store_level0_segment_size`
-- `milvus_datacoord_l0_delete_entries_num`
-- `milvus_datacoord_bulk_insert_vectors_count`
-- `milvus_datacoord_stored_binlog_size`
-- `milvus_datacoord_segment_binlog_file_count`
-- `milvus_datacoord_index_task_count`（已废弃）
-- `milvus_datacoord_snapshot_active_pins`
+| 指标名 | 类型 | 完整可变标签 | 源码变量 |
+|---|---|---|---|
+| `milvus_datacoord_store_level0_segment_size` | Histogram | `collection_id` | `DataCoordSizeStoredL0Segment` |
+| `milvus_datacoord_l0_delete_entries_num` | Gauge | `db_name`, `collection_id` | `DataCoordL0DeleteEntriesNum` |
+| `milvus_datacoord_stored_rows_num` | Gauge | `db_name`, `collection_id`, `collection_name`, `segment_state` | `DataCoordNumStoredRows` |
+| `milvus_datacoord_bulk_insert_vectors_count` | Counter | `db_name`, `collection_id` | `DataCoordBulkVectors` |
+| `milvus_datacoord_stored_binlog_size` | Gauge | `db_name`, `collection_id`, `segment_state` | `DataCoordStoredBinlogSize` |
+| `milvus_datacoord_segment_binlog_file_count` | Gauge | `collection_id` | `DataCoordSegmentBinLogFileCount` |
+| `milvus_datacoord_stored_index_files_size` | Gauge | `db_name`, `collection_name`, `collection_id` | `DataCoordStoredIndexFilesSize` |
+| `milvus_datacoord_index_task_count` | Gauge | `collection_id`, `index_task_status` | `IndexTaskNum`（已废弃） |
+| `milvus_datacoord_snapshot_active_pins` | Gauge | `collection_id`, `snapshot_name` | `DataCoordSnapshotActivePins` |
 
 ### DataNode
 
 源码：
 [`pkg/metrics/datanode_metrics.go`](../../../pkg/metrics/datanode_metrics.go)
 
-以下指标全部使用 `collection_id`：
-
-- `milvus_datanode_write_data_count`
-- `milvus_datanode_consume_tt_lag_ms`
-- `milvus_datanode_consume_msg_count`
-- `milvus_datanode_growing_source_sync_failure_count`
-- `milvus_datanode_fg_buffer_size`
-- `milvus_datanode_compaction_delete_count`
-- `milvus_datanode_compaction_missing_delete_count`
+| 指标名 | 类型 | 完整可变标签 | 源码变量 |
+|---|---|---|---|
+| `milvus_datanode_write_data_count` | Counter | `node_id`, `data_source`, `data_type`, `collection_id` | `DataNodeWriteDataCount` |
+| `milvus_datanode_consume_tt_lag_ms` | Gauge | `node_id`, `msg_type`, `collection_id` | `DataNodeConsumeTimeTickLag` |
+| `milvus_datanode_consume_msg_count` | Counter | `node_id`, `msg_type`, `collection_id` | `DataNodeConsumeMsgCount` |
+| `milvus_datanode_growing_source_sync_failure_count` | Gauge | `node_id`, `collection_id`, `channel_name` | `DataNodeGrowingSourceSyncFailureCount` |
+| `milvus_datanode_fg_buffer_size` | Gauge | `node_id`, `collection_id` | `DataNodeFlowGraphBufferDataSize` |
+| `milvus_datanode_compaction_delete_count` | Counter | `collection_id` | `DataNodeCompactionDeleteCount` |
+| `milvus_datanode_compaction_missing_delete_count` | Counter | `collection_id` | `DataNodeCompactionMissingDeleteCount` |
 
 ### QueryCoord
 
 源码：
 [`pkg/metrics/querycoord_metrics.go`](../../../pkg/metrics/querycoord_metrics.go)
 
-带 `collection_id`：
-
-- `milvus_querycoord_task_latency`
+| 指标名 | 类型 | 完整可变标签 | 源码变量 |
+|---|---|---|---|
+| `milvus_querycoord_task_latency` | Histogram | `collection_id`, `task_type`, `channel_name` | `QueryCoordTaskLatency` |
 
 ### QueryNode
 
 源码：
 [`pkg/metrics/querynode_metrics.go`](../../../pkg/metrics/querynode_metrics.go)
 
-同时带 `collection_id` 和 `collection_name`：
-
-- `milvus_querynode_entity_num`
-
-仅带 `collection_id`：
-
-- `milvus_querynode_consume_tt_lag_ms`
-- `milvus_querynode_consume_msg_count`
-- `milvus_querynode_skipped_insert_field_count`
-- `milvus_querynode_segment_num`
-- `milvus_querynode_sq_req_count`
-- `milvus_querynode_search_fts_num_tokens`
-- `milvus_querynode_search_hit_segment_num`
-- `milvus_querynode_segment_filter_hit_segment_num`
-- `milvus_querynode_segment_filter_skipped_segment_num`
-- `milvus_querynode_segment_filter_total_segment_num`
-- `milvus_querynode_segment_prune_ratio`
-- `milvus_querynode_segment_prune_bias`
-- `milvus_querynode_segment_prune_latency`
-- `milvus_querynode_entity_size`
-- `milvus_querynode_level_zero_size`
-- `milvus_querynode_partial_result_count`
-- `milvus_querynode_two_stage_search_stage1_latency`
-- `milvus_querynode_two_stage_search_stage2_latency`
-- `milvus_querynode_two_stage_search_fallback_total`
-- `milvus_querynode_global_refine_total`
+| 指标名 | 类型 | 完整可变标签 | 源码变量 |
+|---|---|---|---|
+| `milvus_querynode_consume_tt_lag_ms` | Gauge | `node_id`, `msg_type`, `collection_id` | `QueryNodeConsumeTimeTickLag` |
+| `milvus_querynode_consume_msg_count` | Counter | `node_id`, `msg_type`, `collection_id` | `QueryNodeConsumerMsgCount` |
+| `milvus_querynode_skipped_insert_field_count` | Counter | `node_id`, `collection_id` | `QueryNodeSkippedInsertFieldCount` |
+| `milvus_querynode_segment_num` | Gauge | `node_id`, `collection_id`, `segment_state`, `segment_level` | `QueryNodeNumSegments` |
+| `milvus_querynode_sq_req_count` | Counter | `node_id`, `query_type`, `status`, `scope`, `collection_id` | `QueryNodeSQCount` |
+| `milvus_querynode_search_fts_num_tokens` | Histogram | `node_id`, `collection_id`, `field_id` | `QueryNodeSearchFTSNumTokens` |
+| `milvus_querynode_search_hit_segment_num` | Histogram | `node_id`, `collection_id`, `query_type` | `QueryNodeSearchHitSegmentNum` |
+| `milvus_querynode_segment_filter_hit_segment_num` | Histogram | `node_id`, `collection_id`, `query_type` | `QueryNodeSegmentFilterHitSegmentNum` |
+| `milvus_querynode_segment_filter_skipped_segment_num` | Histogram | `node_id`, `collection_id`, `query_type` | `QueryNodeSegmentFilterSkippedSegmentNum` |
+| `milvus_querynode_segment_filter_total_segment_num` | Histogram | `node_id`, `collection_id`, `query_type` | `QueryNodeSegmentFilterTotalSegmentNum` |
+| `milvus_querynode_segment_prune_ratio` | Gauge | `node_id`, `collection_id`, `segment_prune_label` | `QueryNodeSegmentPruneRatio` |
+| `milvus_querynode_segment_prune_bias` | Gauge | `node_id`, `collection_id`, `segment_prune_label` | `QueryNodeSegmentPruneBias` |
+| `milvus_querynode_segment_prune_latency` | Histogram | `node_id`, `collection_id`, `segment_prune_label` | `QueryNodeSegmentPruneLatency` |
+| `milvus_querynode_entity_num` | Gauge | `db_name`, `collection_name`, `node_id`, `collection_id`, `segment_state` | `QueryNodeNumEntities` |
+| `milvus_querynode_entity_size` | Gauge | `node_id`, `collection_id`, `segment_state` | `QueryNodeEntitiesSize` |
+| `milvus_querynode_level_zero_size` | Gauge | `node_id`, `collection_id`, `channel_name` | `QueryNodeLevelZeroSize` |
+| `milvus_querynode_partial_result_count` | Counter | `node_id`, `query_type`, `collection_id` | `QueryNodePartialResultCount` |
+| `milvus_querynode_two_stage_search_stage1_latency` | Histogram | `node_id`, `collection_id` | `QueryNodeTwoStageFilterLatency` |
+| `milvus_querynode_two_stage_search_stage2_latency` | Histogram | `node_id`, `collection_id` | `QueryNodeTwoStageSearchLatency` |
+| `milvus_querynode_two_stage_search_fallback_total` | Counter | `node_id`, `collection_id`, `reason` | `QueryNodeTwoStageSearchFallbackCount` |
+| `milvus_querynode_global_refine_total` | Counter | `node_id`, `collection_id` | `QueryNodeGlobalRefineCount` |
 
 ### QueryView
 
 源码：[`pkg/metrics/qv_metrics.go`](../../../pkg/metrics/qv_metrics.go)
 
-带 `collection_id`：
-
-- `milvus_qv_view_state_max_age_seconds`
+| 指标名 | 类型 | 完整可变标签 | 源码变量 |
+|---|---|---|---|
+| `milvus_qv_view_state_max_age_seconds` | Gauge（自定义 collector） | `component`, `state`, `rank`, `collection_id`, `replica_id`, `vchannel`, `query_view_version`, `data_version` | `QVViewStateMaxAgeSeconds` |
 
 该指标是 pull collector，而不是持久化 metric vector。其 provider 对每个
 component 只输出状态持续时间最长的 5 个 view，因此尽管它会标识
 collection，对外暴露的基数仍然有界。
+
+### C++ 原生导出链
+
+严格口径下，C++ 侧 collection 级指标族数量为 **0**。当前 `/metrics` 的原生
+指标由 [`internal/util/metrics/c_registry.go`](../../../internal/util/metrics/c_registry.go)
+合并：Knowhere registry 通过 `GetKnowhereMetrics()` 导出，Milvus core registry
+通过 `GetCoreMetrics()` 导出，随后再加入 jemalloc 指标。审计结果如下：
+
+| 导出源 | 最接近 collection 的指标或标签 | 类型/完整可变标签 | 判定 |
+|---|---|---|---|
+| Milvus core caching layer | `internal_cache_shard_disk_usage_bytes` | Gauge；`data_type`, `shard` | `shard` 来自 insert channel，不是显式 collection 身份；仅列为扩展口径候选，不计入 60 |
+| 其他 Milvus core 指标 | `type`, `status`, `pool`, `priority`, `module`, `location`, `data_type` 等 | Counter、Gauge、Histogram | 无 `collection_id` / `collection_name`，不计入 |
+| Knowhere | `module`，部分 latency family 另有 `index_type` | Gauge、Histogram | 无 collection 标签，不计入 |
+| milvus-storage | `milvus_storage_filesystem_*` | 8 个 Go Gauge；`fs` | C++/Rust FFI 只返回 filesystem 累计值，Go 侧按 filesystem key 发布，不计入 |
+| jemalloc | `milvus_jemalloc_*` | 8 个 Gauge；无标签 | 进程级内存指标，不计入 |
+
+`internal_cache_shard_disk_usage_bytes` 的完整链路是：
+
+1. milvus-common caching layer 按 `{data_type, shard}` 动态创建 Gauge；声明可从
+   构建依赖安装头 `internal/core/output/include/cachinglayer/Metrics.h` 核对。
+2. [`CacheMetricAttribution.h`](../../../internal/core/src/segcore/CacheMetricAttribution.h)
+   将 segcore 的 `shard` 直接作为 attribution；
+   [`SegmentLoadInfo.cpp`](../../../internal/core/src/segcore/SegmentLoadInfo.cpp)
+   将其设置为 `GetInsertChannel()`。
+3. CacheSlot 在 cell 加载/卸载时按 `file_bytes` 增减该 Gauge。最后一个 slot handle
+   消失后，过期 series 会在下一次收集时从 family 中移除。
+4. [`monitor_c.cpp`](../../../internal/core/src/monitor/monitor_c.cpp) 的
+   `GetCoreMetrics()` 在序列化 registry 前触发收集和过期 series 清理。
+
+同一份 shard stats 还通过
+[`cache_shard_disk_usage.go`](../../../internal/util/metrics/cache_shard_disk_usage.go)
+进入 QueryNode distribution response，供 QueryCoord 的 shard disk balancer 使用；
+这是 protobuf 控制面数据，不是第二个 Prometheus 指标族。
+
+因此，这个指标可以按 vchannel/shard 定位缓存磁盘占用，但不能直接按
+`collection_id` 聚合。若产品希望把它纳入严格 collection 口径，应新增稳定的
+`collection_id` attribution，并重新评估 `{collection_id, data_type, shard}` 的
+基数和 collection drop/unload 生命周期；不能仅把 `shard` 标签改名为
+`collection_id`。
+
+Knowhere 的 `collection_id` config key、C++ protobuf 的
+`OperationMetrics.collection_metrics`，以及 storage/index metadata 中的
+`collection_id` 都不是 Prometheus label，故没有误计入清单。milvus-storage 的
+filesystem snapshot 则由
+[`filesystem_metrics.go`](../../../internal/storagev2/filesystem_metrics.go) 读取，并由
+[`persistent_store_metrics.go`](../../../pkg/metrics/persistent_store_metrics.go) 仅以
+`fs` 标签发布。
+
+## 定义、写入与清理入口
+
+上述 59 个 metric vector 都已注册，并至少有一个非测试写入点；QueryView
+自定义 collector 也已注册，且安装了生产 provider。主要生命周期入口如下：
+
+| 组件 | 主要写入点 | Collection 清理入口 |
+|---|---|---|
+| Proxy | [`internal/proxy/impl.go`](../../../internal/proxy/impl.go)、[`internal/proxy/task_search.go`](../../../internal/proxy/task_search.go)、[`internal/proxy/task_delete.go`](../../../internal/proxy/task_delete.go)、[`internal/proxy/simple_rate_limiter.go`](../../../internal/proxy/simple_rate_limiter.go)、[`pkg/metrics/grpc_stats_handler.go`](../../../pkg/metrics/grpc_stats_handler.go)、[`pkg/metrics/restful_middleware.go`](../../../pkg/metrics/restful_middleware.go) | `CleanupProxyCollectionMetrics` |
+| RootCoord / MixCoord | [`internal/rootcoord/quota_center.go`](../../../internal/rootcoord/quota_center.go) | `CleanupRootCoordCollectionMetrics`，但当前没有生产调用点 |
+| DataCoord | [`internal/datacoord/meta.go`](../../../internal/datacoord/meta.go)、[`internal/datacoord/index_meta.go`](../../../internal/datacoord/index_meta.go)、[`internal/datacoord/index_size_tracker.go`](../../../internal/datacoord/index_size_tracker.go)、[`internal/datacoord/snapshot_manager.go`](../../../internal/datacoord/snapshot_manager.go) | `CleanupDataCoordWithCollectionID`；snapshot pin 另有精确删除 |
+| DataNode | [`internal/util/flowgraph/input_node.go`](../../../internal/util/flowgraph/input_node.go)、[`internal/flushcommon/writebuffer`](../../../internal/flushcommon/writebuffer)、[`internal/flushcommon/syncmgr`](../../../internal/flushcommon/syncmgr)、[`internal/datanode/compactor`](../../../internal/datanode/compactor) | `CleanupDataNodeCollectionMetrics`；input-node cache 另有精确删除 |
+| QueryCoord | [`internal/querycoordv2/task/scheduler.go`](../../../internal/querycoordv2/task/scheduler.go) | `CleanQueryCoordMetricsWithCollectionID` |
+| QueryNode | [`internal/querynodev2/metrics_info.go`](../../../internal/querynodev2/metrics_info.go)、[`internal/querynodev2/handlers.go`](../../../internal/querynodev2/handlers.go)、[`internal/querynodev2/services.go`](../../../internal/querynodev2/services.go)、[`internal/querynodev2/delegator`](../../../internal/querynodev2/delegator)、[`internal/querynodev2/pipeline`](../../../internal/querynodev2/pipeline) | `CleanupQueryNodeCollectionMetrics` |
+| QueryView | [`internal/views/qviews/observe/metrics_observer.go`](../../../internal/views/qviews/observe/metrics_observer.go) | pull collector 每次只输出 provider 的当前 Top 5，无持久化 vector series |
 
 ## 判定原则
 
@@ -305,8 +363,9 @@ compaction anomaly 等指标的 collection 标签成本较高，Histogram 尤其
 
 collection 级指标的清理逻辑并不完整，且部分实现明确不正确：
 
-1. `CleanupRootCoordCollectionMetrics` 连续删除了两次
-   `RootCoordNumEntities`，从未删除 `RootCoordIndexedNumEntities`。
+1. `CleanupRootCoordCollectionMetrics` 当前没有生产调用点；即使未来接入，它也连续
+   删除了两次 `RootCoordNumEntities`，从未删除
+   `RootCoordIndexedNumEntities`，也没有清理 `RootCoordRateLimitRatio`。
 2. `CleanupDataNodeCollectionMetrics` 调用 `Delete` 清理
    `DataNodeWriteDataCount` 时只提供了 `collection_id`，但该 vector 有 4 个
    可变标签。Prometheus 无法匹配这组标签，因此删除不会生效。
