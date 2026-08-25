@@ -277,6 +277,9 @@ type CoordViewReportAppliedEvent struct {
 }
 
 func (e CoordViewReportAppliedEvent) LogLevel() mlog.Level {
+	if e.ReportedState == qviews.QueryViewStatePreparing {
+		return mlog.DebugLevel
+	}
 	return mlog.InfoLevel
 }
 
@@ -341,7 +344,7 @@ type QueryNodeApplyCoordViewEvent struct {
 }
 
 func (e QueryNodeApplyCoordViewEvent) LogLevel() mlog.Level {
-	return mlog.InfoLevel
+	return mlog.DebugLevel
 }
 
 func (e QueryNodeApplyCoordViewEvent) MarshalLogObject(enc mlog.ObjectEncoder) error {
@@ -389,7 +392,7 @@ type QueryNodeReportViewEvent struct {
 }
 
 func (e QueryNodeReportViewEvent) LogLevel() mlog.Level {
-	return mlog.InfoLevel
+	return mlog.DebugLevel
 }
 
 func (e QueryNodeReportViewEvent) MarshalLogObject(enc mlog.ObjectEncoder) error {
@@ -409,7 +412,7 @@ type QueryNodeReleaseDoneEvent struct {
 }
 
 func (e QueryNodeReleaseDoneEvent) LogLevel() mlog.Level {
-	return mlog.InfoLevel
+	return mlog.DebugLevel
 }
 
 func (e QueryNodeReleaseDoneEvent) TriggerInfo() string {

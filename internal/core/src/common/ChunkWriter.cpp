@@ -937,7 +937,7 @@ create_group_chunk(const std::vector<FieldId>& field_ids,
                                           data + chunk_offsets[i],
                                           chunk_sizes[i],
                                           chunk_mmap_guard);
-        LOG_INFO(
+        LOG_DEBUG(
             "created chunk for field {} with chunk offset: {}, chunk "
             "size: {}, file path: {}",
             field_ids[i].get(),
