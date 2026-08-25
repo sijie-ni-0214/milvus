@@ -132,6 +132,7 @@ type BalanceConfig struct {
 	TargetRowsPerShardNode int64
 
 	// Full-scan interval for the reconcile loop (ticker fallback).
+	// A non-positive value disables the periodic fallback.
 	TickerInterval time.Duration
 }
 

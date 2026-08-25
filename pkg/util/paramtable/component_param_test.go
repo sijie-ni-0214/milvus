@@ -163,6 +163,23 @@ func TestComponentParam_QueryViewTransformLogDrainConcurrency(t *testing.T) {
 	assert.Equal(t, 1, params.QueryNodeCfg.QueryViewTransformLogDrainConcurrency.GetAsInt())
 }
 
+func TestComponentParam_QueryViewFullReconsileInterval(t *testing.T) {
+	Init()
+	params := Get()
+	item := &params.QueryCoordCfg.QueryViewFullReconsileInterval
+	params.Reset(item.Key)
+	t.Cleanup(func() { params.Reset(item.Key) })
+
+	assert.Equal(t, "queryCoord.queryView.fullReconsileInterval", item.Key)
+	assert.Equal(t, "60", item.DefaultValue)
+	assert.True(t, item.Export)
+	assert.Equal(t, time.Minute, item.GetAsDuration(time.Second))
+	params.Save(item.Key, "300")
+	assert.Equal(t, 5*time.Minute, item.GetAsDuration(time.Second))
+	params.Save(item.Key, "0")
+	assert.Zero(t, item.GetAsDuration(time.Second))
+}
+
 func TestComponentParam_TransformLogCatchupConcurrencyPerStream(t *testing.T) {
 	Init()
 	params := Get()

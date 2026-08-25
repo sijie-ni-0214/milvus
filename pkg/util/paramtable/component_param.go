@@ -3160,6 +3160,7 @@ type queryCoordConfig struct {
 
 	AutoWarmupForNonPKIsolationCollection ParamItem `refreshable:"false"`
 	EnableSQNServeSegments                ParamItem `refreshable:"false"`
+	QueryViewFullReconsileInterval        ParamItem `refreshable:"false"`
 }
 
 func (p *queryCoordConfig) init(base *BaseTable) {
@@ -3893,6 +3894,15 @@ Set to 0 to disable the penalty period.`,
 		Export:       true,
 	}
 	p.EnableSQNServeSegments.Init(base.mgr)
+
+	p.QueryViewFullReconsileInterval = ParamItem{
+		Key:          "queryCoord.queryView.fullReconsileInterval",
+		Version:      "3.0.0",
+		DefaultValue: "60",
+		Doc:          "Interval in seconds for periodic QueryView full reconciliation. Set to 0 to disable periodic full reconciliation.",
+		Export:       true,
+	}
+	p.QueryViewFullReconsileInterval.Init(base.mgr)
 }
 
 // /////////////////////////////////////////////////////////////////////////////
