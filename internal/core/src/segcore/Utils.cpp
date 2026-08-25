@@ -1460,7 +1460,7 @@ PrepareSealedIndexLoadConfig(const LoadIndexInfo& load_index_info) {
     config[milvus::LOAD_PRIORITY] = priority_for_load;
     config[milvus::index::INDEX_FILES] = load_index_info.index_files;
 
-    LOG_INFO(
+    LOG_DEBUG(
         "[collection={}][segment={}][field={}][enable_mmap={}][load_"
         "priority={}] load index {}, "
         "mmap_dir_path={}",
