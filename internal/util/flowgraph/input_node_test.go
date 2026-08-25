@@ -82,6 +82,7 @@ func TestNewInputNodeCachesDataNodeMetrics(t *testing.T) {
 	metrics.DataNodeConsumeTimeTickLag.Reset()
 
 	node := NewInputNode(nil, "input_node", 0, 100, typeutil.DataNodeRole, 7, 11, metrics.AllLabel)
+	defer node.Free()
 	assert.NotNil(t, node.consumeMsgCount)
 	assert.NotNil(t, node.consumeTimeTickLag)
 
@@ -90,6 +91,33 @@ func TestNewInputNodeCachesDataNodeMetrics(t *testing.T) {
 
 	assert.Equal(t, float64(1), testutil.ToFloat64(metrics.DataNodeConsumeMsgCount.WithLabelValues("7", metrics.AllLabel, "11")))
 	assert.Equal(t, float64(123), testutil.ToFloat64(metrics.DataNodeConsumeTimeTickLag.WithLabelValues("7", metrics.AllLabel, "11")))
+}
+
+func TestInputNodeAggregateMetricsSurviveCollectionCleanup(t *testing.T) {
+	previousMode := metrics.CollectionLevelMetricsMode()
+	metrics.SetCollectionLevelMetricsMode(metrics.CollectionLevelMetricsModeAggregate)
+	metrics.DataNodeConsumeMsgCount.Reset()
+	metrics.DataNodeConsumeTimeTickLag.Reset()
+	t.Cleanup(func() {
+		metrics.SetCollectionLevelMetricsMode(previousMode)
+		metrics.DataNodeConsumeMsgCount.Reset()
+		metrics.DataNodeConsumeTimeTickLag.Reset()
+	})
+
+	node1 := NewInputNode(nil, "input-node-1", 0, 100, typeutil.DataNodeRole, 701, 711, "insert")
+	node2 := NewInputNode(nil, "input-node-2", 0, 100, typeutil.DataNodeRole, 701, 712, "insert")
+	node1.consumeMsgCount.Inc()
+	node2.consumeMsgCount.Add(2)
+	assert.Equal(t, float64(3), testutil.ToFloat64(
+		metrics.DataNodeConsumeMsgCount.WithLabelValues("701", "insert", metrics.AllLabel)))
+
+	// Releasing one collection must not delete the aggregate series shared by
+	// the other collection.
+	node1.Free()
+	node2.consumeMsgCount.Inc()
+	assert.Equal(t, float64(4), testutil.ToFloat64(
+		metrics.DataNodeConsumeMsgCount.WithLabelValues("701", "insert", metrics.AllLabel)))
+	node2.Free()
 }
 
 func Test_InputNodeSkipMode(t *testing.T) {
