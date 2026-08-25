@@ -1220,14 +1220,16 @@ func (loader *segmentLoader) loadSealedSegment(ctx context.Context, loadInfo *qu
 	tr := timerecord.NewTimeRecorder("segmentLoader.loadSealedSegment")
 	collection := segment.GetCollection()
 	indexedFieldInfos, _, textIndexes, unindexedTextFields, jsonKeyStats, _, _ := separateLoadInfoV2(loadInfo, collection.Schema())
-	mlog.Info(ctx, "Start loading fields...",
-		mlog.Int("indexedFields count", len(indexedFieldInfos)),
-		mlog.Int64s("indexed text fields", lo.Keys(textIndexes)),
-		mlog.Int64s("unindexed text fields", lo.Keys(unindexedTextFields)),
-		mlog.Int64s("indexed json key fields", lo.Keys(jsonKeyStats)),
-		mlog.Int("running pool size", GetLoadPool().Running()),
-		mlog.Int("pool size", GetLoadPool().Cap()),
-	)
+	if mlog.LevelEnabled(mlog.DebugLevel) {
+		mlog.Debug(ctx, "Start loading fields...",
+			mlog.Int("indexedFields count", len(indexedFieldInfos)),
+			mlog.Int64s("indexed text fields", lo.Keys(textIndexes)),
+			mlog.Int64s("unindexed text fields", lo.Keys(unindexedTextFields)),
+			mlog.Int64s("indexed json key fields", lo.Keys(jsonKeyStats)),
+			mlog.Int("running pool size", GetLoadPool().Running()),
+			mlog.Int("pool size", GetLoadPool().Cap()),
+		)
+	}
 	physicalLoadTiming := PhysicalLoadTimingFromContext(ctx)
 	loadSubmittedAt := time.Now()
 	_, err = GetLoadPool().Submit(func() (any, error) {
