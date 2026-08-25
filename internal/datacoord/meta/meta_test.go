@@ -3246,3 +3246,70 @@ func TestUpdateStatusOperator_DroppedIsTerminal(t *testing.T) {
 		})
 	}
 }
+
+func TestGetQuotaInfoAggregatesCollectionMetrics(t *testing.T) {
+	previousMode := metrics.CollectionLevelMetricsMode()
+	metrics.SetCollectionLevelMetricsMode(metrics.CollectionLevelMetricsModeAggregate)
+	t.Cleanup(func() {
+		metrics.SetCollectionLevelMetricsMode(previousMode)
+		metrics.DataCoordStoredBinlogSize.Reset()
+		metrics.DataCoordSegmentBinLogFileCount.Reset()
+		metrics.DataCoordNumStoredRows.Reset()
+		metrics.DataCoordL0DeleteEntriesNum.Reset()
+		// Deletes are no-ops in aggregate mode, so series written earlier in full mode would outlive their prune.
+		metrics.DataCoordL0DeltalogFileNum.Reset()
+		metrics.DataCoordSegmentDeltalogFileCount.Reset()
+		metrics.DataCoordSegmentDeltalogSize.Reset()
+		metrics.DataCoordSegmentDeletedRowsRatio.Reset()
+	})
+
+	meta, err := NewMemoryMeta(t)
+	require.NoError(t, err)
+
+	const databaseName = "aggregate-db"
+	for collectionID, collectionName := range map[int64]string{
+		1: "collection-1",
+		2: "collection-2",
+	} {
+		meta.AddCollection(&CollectionInfo{
+			ID:           collectionID,
+			DatabaseName: databaseName,
+			Schema: &schemapb.CollectionSchema{
+				Name: collectionName,
+			},
+		})
+	}
+
+	segment1 := BuildSegment(1, 10, 100, "channel-1")
+	segment1.NumOfRows = 10
+	segment1.Level = datapb.SegmentLevel_L0
+	segment1.Stats = &datapb.Statistics{InsertBinlogSize: 100, DeleteNumRows: 3, InsertBinlogCount: 1}
+	segment1.Binlogs = []*datapb.FieldBinlog{{
+		FieldID: 1,
+		Binlogs: []*datapb.Binlog{{LogID: 1}},
+	}}
+	require.NoError(t, meta.AddSegment(context.Background(), segment1))
+
+	segment2 := BuildSegment(2, 20, 200, "channel-2")
+	segment2.NumOfRows = 20
+	segment2.Level = datapb.SegmentLevel_L0
+	segment2.Stats = &datapb.Statistics{InsertBinlogSize: 200, DeleteNumRows: 4, InsertBinlogCount: 2}
+	segment2.Binlogs = []*datapb.FieldBinlog{{
+		FieldID: 1,
+		Binlogs: []*datapb.Binlog{{LogID: 2}, {LogID: 3}},
+	}}
+	require.NoError(t, meta.AddSegment(context.Background(), segment2))
+
+	quotaInfo := meta.GetQuotaInfo()
+	require.Equal(t, int64(300), quotaInfo.TotalBinlogSize)
+	assert.Equal(t, float64(300), prometheustestutil.ToFloat64(
+		metrics.DataCoordStoredBinlogSize.WithLabelValues(
+			databaseName, metrics.AllLabel, commonpb.SegmentState_Growing.String())))
+	assert.Equal(t, float64(3), prometheustestutil.ToFloat64(
+		metrics.DataCoordSegmentBinLogFileCount.WithLabelValues(metrics.AllLabel)))
+	assert.Equal(t, float64(30), prometheustestutil.ToFloat64(
+		metrics.DataCoordNumStoredRows.WithLabelValues(
+			databaseName, metrics.AllLabel, metrics.AllLabel, commonpb.SegmentState_Growing.String())))
+	assert.Equal(t, float64(7), prometheustestutil.ToFloat64(
+		metrics.DataCoordL0DeleteEntriesNum.WithLabelValues(databaseName, metrics.AllLabel)))
+}

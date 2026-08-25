@@ -97,13 +97,20 @@ func (c *qvViewStateMaxAgeCollector) Collect(ch chan<- prometheus.Metric) {
 			metric.Component,
 			metric.State,
 			metric.Rank,
-			metric.CollectionID,
+			collectionLevelMetricLabelValue(metric.CollectionID),
 			metric.ReplicaID,
-			metric.VChannel,
+			collectionLevelMetricLabelValue(metric.VChannel),
 			metric.QueryViewVersion,
 			metric.DataVersion,
 		)
 	}
+}
+
+func collectionLevelMetricLabelValue(value string) string {
+	if IsCollectionLevelMetricsAggregateMode() {
+		return AllLabel
+	}
+	return value
 }
 
 func (c *qvViewStateMaxAgeCollector) SetProvider(provider func() []QVViewStateMaxAgeMetric) {

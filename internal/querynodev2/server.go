@@ -111,6 +111,7 @@ type QueryNode struct {
 	queryViewSegments     atomic.Pointer[qnview.SegmentResourceManager]
 	queryViewHandler      atomic.Pointer[qnview.QNQueryViewHandler]
 	manager               *segments.Manager
+	collectionMetricsMu   sync.Mutex
 	clusterManager        cluster.Manager
 	pipelineManager       pipeline.Manager
 	subscribingChannels   *typeutil.ConcurrentSet[string]

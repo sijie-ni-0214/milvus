@@ -504,6 +504,9 @@ func (mr *MilvusRoles) Run() {
 		paramtable.Init()
 		paramtable.SetRole(mr.ServerType)
 	}
+	metrics.SetCollectionLevelMetricsMode(paramtable.Get().CommonCfg.CollectionLevelMetricsMode.GetValue())
+	mlog.Info(context.TODO(), "configured collection and VChannel metrics",
+		mlog.String("mode", metrics.CollectionLevelMetricsMode()))
 	mr.enableEmbeddedQueryNodeIfNeeded(paramtable.Get().QueryCoordCfg.EnableSQNServeSegments.GetAsBool())
 
 	// Persist immutable configurations at startup, such as mqType paramItem
