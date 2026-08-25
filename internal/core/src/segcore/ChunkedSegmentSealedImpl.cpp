@@ -10472,7 +10472,7 @@ ChunkedSegmentSealedImpl::Load(milvus::tracer::TraceContext& trace_ctx,
 
     auto snapshot = CapturePublishedState();
     auto num_rows = snapshot->load_info->GetNumOfRows();
-    LOG_INFO("[xxx] Loading segment {} with {} rows", id_, num_rows);
+    LOG_DEBUG("Loading segment {} with {} rows", id_, num_rows);
 
     SegmentLoadInfo mutable_copy(snapshot->load_info->GetProto(),
                                  snapshot->fields);
@@ -10488,8 +10488,7 @@ ChunkedSegmentSealedImpl::Load(milvus::tracer::TraceContext& trace_ctx,
 
     ApplyLoadDiff(op_ctx, mutable_copy, diff);
 
-    LOG_INFO(
-        "[xxx] Successfully loaded segment {} with {} rows", id_, num_rows);
+    LOG_DEBUG("Successfully loaded segment {} with {} rows", id_, num_rows);
 }
 
 void
