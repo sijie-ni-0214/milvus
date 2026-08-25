@@ -1,9 +1,12 @@
-# Collection 级 Prometheus 指标审计
+# Collection / VChannel 级 Prometheus 指标审计
 
-本文档记录对携带 `collection_id` 或 `collection_name` 标签的 Prometheus
-指标族所做的源码级审计。本文基于 2026-08-21 的当前工作树；审计时 HEAD 为
-`aebc786eb19aa0b46a947b219cdd32ccf4aae5bb`。结果以当时的工作树源码为准，并非
+本文档记录对携带 `collection_id`、`collection_name` 或直接 VChannel 标签的
+Prometheus 指标族所做的源码级审计。本文基于 2026-08-21 的当前工作树；审计时 HEAD 为
+`03e3e16f3e45889ce5d4b94c18cc75980d2742f8`。结果以当时的工作树源码为准，并非
 永久兼容性契约。指标声明、注册或写入点发生变化后，应重新执行审计。
+
+基于本清单实现的 `full` / `aggregate` 降基数模式及全部 71 个指标的行为差异见
+[Collection / VChannel 级 Prometheus 指标降基数模式](collection-level-metrics-mode.md)。
 
 当前工作树已经从 `milvus_proxy_req_count` 中移除了 `db_name` 和
 `collection_name`，因此该指标不计入下文清单。
@@ -14,13 +17,14 @@
 `CRegistry` 合并到 `/metrics` 的 C++ Milvus core、Knowhere 和 jemalloc 导出链，
 以及 milvus-storage 经 FFI 投影到 Go collector 的指标。如果一个指标族的可变
 标签中明确包含 `collection_id` 或 `collection_name`，就将其计为 collection
-级指标。
+级指标。VChannel 扩展口径则要求读取实际 writer，只有确认值为 VChannel 的
+`channel_name` / `vchannel` / `shard` 才计入；同名 PChannel 标签不计入。
 
 以下内容不计入：
 
 - `*_collection_num` 等只统计 collection 数量、但不标识具体 collection 的指标。
-- 日志字段、JSON metrics 接口、trace，以及只通过 channel 名间接编码
-  collection 的标签。
+- 日志字段、JSON metrics 接口、trace，以及没有直接作为 Prometheus label
+  输出的 channel 值。
 - C++ protobuf/config/business struct 中的 `collection_id` 或
   `collection_name` 字段；它们不是 Prometheus 标签。
 
@@ -51,7 +55,45 @@ Histogram 按一个指标族计数，尽管暴露时会展开为 `_bucket`、`_s
   自定义 collector 输出 Gauge。
 - 严格口径下 60 个指标族全部来自 Go collector；C++ 导出链没有显式
   `collection_id` 或 `collection_name` 标签。扩展到“通过 shard/channel 间接归因”
-  时，C++ 侧另有 1 个候选指标族，不计入合计。
+  时，C++ 侧另有 1 个 VChannel 指标族，不计入上述 60 个 collection 合计。
+
+### VChannel 扩展口径
+
+经声明和非测试 writer 逐项核对，共有 **15** 个指标族直接输出 VChannel；其中
+4 个也在上述 60 个 collection 指标中，因此 `collection ∪ VChannel` 去重后共
+**71** 个指标族。
+
+| 组件 | VChannel 指标族数量 |
+|---|---:|
+| DataCoord | 2 |
+| DataNode | 2 |
+| QueryCoord | 3 |
+| QueryNode | 6 |
+| QueryView（`qv`） | 1 |
+| C++ Milvus core caching layer | 1 |
+| **合计** | **15** |
+
+| 指标名 | VChannel 标签 | writer 语义 | 同时是 collection 指标 |
+|---|---|---|---|
+| `milvus_datacoord_channel_checkpoint_unix_seconds` | `channel_name` | DataCoord channel checkpoint map 的 key / `MsgPosition.ChannelName` | 否 |
+| `milvus_datacoord_compaction_latency` | `channel_name` | clustering compaction task 的 `Channel` | 否 |
+| `milvus_datanode_growing_source_sync_failure_count` | `channel_name` | write buffer 的 VChannel | 是 |
+| `milvus_datanode_msg_dispatcher_tt_lag_ms` | `channel_name` | dispatcher target 的 `vchannel` | 否 |
+| `milvus_querycoord_current_target_checkpoint_unix_seconds` | `channel_name` | current target 的 DML channel | 否 |
+| `milvus_querycoord_current_target_all_replicas_checkpoint_unix_seconds` | `channel_name` | all-replica-ready target 的 DML channel | 否 |
+| `milvus_querycoord_task_latency` | `channel_name` | scheduler task 的 `Shard()` | 是 |
+| `milvus_querynode_growing_source_retained_bytes` | `channel_name` | delegator growing source 的 VChannel | 否 |
+| `milvus_querynode_growing_source_retained_segments` | `channel_name` | delegator growing source 的 VChannel | 否 |
+| `milvus_querynode_level_zero_size` | `channel_name` | shard delegator 的 VChannel | 是 |
+| `milvus_querynode_msg_dispatcher_tt_lag_ms` | `channel_name` | dispatcher target 的 `vchannel` | 否 |
+| `milvus_querynode_delete_buffer_size` | `channel_name` | shard delegator delete buffer 的 VChannel | 否 |
+| `milvus_querynode_delete_buffer_row_num` | `channel_name` | shard delegator delete buffer 的 VChannel | 否 |
+| `milvus_qv_view_state_max_age_seconds` | `vchannel` | QueryView `ShardID.VChannel` | 是 |
+| `internal_cache_shard_disk_usage_bytes` | `shard` | segcore insert channel attribution | 否 |
+
+`channel_name` 不能按名字统一处理：RootCoord、Proxy、Streaming Service / WAL 的
+同名标签是 PChannel。`StreamingCoordVChannelTotal` 统计的是 VChannel 数量，但它的
+标签仍是承载这些 VChannel 的 PChannel，也不属于直接 VChannel 标签。
 
 ## 完整清单
 
@@ -182,7 +224,7 @@ collection，对外暴露的基数仍然有界。
 
 | 导出源 | 最接近 collection 的指标或标签 | 类型/完整可变标签 | 判定 |
 |---|---|---|---|
-| Milvus core caching layer | `internal_cache_shard_disk_usage_bytes` | Gauge；`data_type`, `shard` | `shard` 来自 insert channel，不是显式 collection 身份；仅列为扩展口径候选，不计入 60 |
+| Milvus core caching layer | `internal_cache_shard_disk_usage_bytes` | Gauge；`data_type`, `shard` | `shard` 来自 insert VChannel；计入 15 个 VChannel 扩展口径，不计入 60 个严格 collection 口径 |
 | 其他 Milvus core 指标 | `type`, `status`, `pool`, `priority`, `module`, `location`, `data_type` 等 | Counter、Gauge、Histogram | 无 `collection_id` / `collection_name`，不计入 |
 | Knowhere | `module`，部分 latency family 另有 `index_type` | Gauge、Histogram | 无 collection 标签，不计入 |
 | milvus-storage | `milvus_storage_filesystem_*` | 8 个 Go Gauge；`fs` | C++/Rust FFI 只返回 filesystem 累计值，Go 侧按 filesystem key 发布，不计入 |
@@ -206,10 +248,11 @@ collection，对外暴露的基数仍然有界。
 进入 QueryNode distribution response，供 QueryCoord 的 shard disk balancer 使用；
 这是 protobuf 控制面数据，不是第二个 Prometheus 指标族。
 
-因此，这个指标可以按 vchannel/shard 定位缓存磁盘占用，但不能直接按
-`collection_id` 聚合。若产品希望把它纳入严格 collection 口径，应新增稳定的
-`collection_id` attribution，并重新评估 `{collection_id, data_type, shard}` 的
-基数和 collection drop/unload 生命周期；不能仅把 `shard` 标签改名为
+因此，这个指标可以按 VChannel/shard 定位缓存磁盘占用，但不能直接按
+`collection_id` 归因。`aggregate` 模式在 `CRegistry` 解析 C++ Prometheus 文本后，
+将该 family 的 `shard` 改为 `all` 并按 `data_type` 求和；供 QueryCoord shard disk
+balancer 使用的逐 shard protobuf stats 不变。若产品希望把它纳入严格 collection
+口径，应新增稳定的 `collection_id` attribution；不能仅把 `shard` 改名为
 `collection_id`。
 
 Knowhere 的 `collection_id` config key、C++ protobuf 的
