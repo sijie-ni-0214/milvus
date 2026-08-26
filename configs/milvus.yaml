@@ -19,7 +19,7 @@ etcd:
   # Endpoints used to access etcd service. You can change this parameter as the endpoints of your own etcd cluster.
   # Environment variable: ETCD_ENDPOINTS
   # etcd preferentially acquires valid address from environment variable ETCD_ENDPOINTS when Milvus is started.
-  endpoints:  10.15.8.199:22379
+  endpoints:  10.15.1.205:22379
   # Root prefix of the key to where Milvus stores data in etcd.
   # It is recommended to change this parameter before starting Milvus for the first time.
   # To share an etcd instance among multiple Milvus instances, consider changing this to a different value for each Milvus instance before you start them.
@@ -61,7 +61,7 @@ etcd:
   data:
     dir: default.etcd # Embedded Etcd only. please adjust in embedded Milvus: /tmp/milvus/etcdData/
   auth:
-    enabled: true # Whether to enable authentication
+    enabled: false # Whether to enable authentication
     userName: etcdadmin # username for etcd authentication
     password: etcdadmin # password for etcd authentication
 
@@ -480,7 +480,7 @@ proxy:
     allowedChars: $ # Additional characters allowed in role names beyond underscores, letters and numbers. Add '-' to allow hyphens in role names.
   maxTaskNum: 1024 # The maximum number of tasks in the task queue of the proxy.
   enableAutoLoad: false # whether to automatically load an unloaded collection before DQL requests
-  ddlConcurrency: 32 # The concurrent execution number of DDL at proxy.
+  ddlConcurrency: 64 # The concurrent execution number of DDL at proxy.
   dclConcurrency: 16 # The concurrent execution number of DCL at proxy.
   mustUsePartitionKey: false # switch for whether proxy must use partition key for the collection
   resolveAliasForPrivilege: true # switch for whether proxy shall resolve alias to actual collection name during RBAC privilege checks
@@ -677,7 +677,7 @@ queryCoord:
 # Related configuration of queryNode, used to run hybrid search between vector and scalar data.
 queryNode:
   queryView:
-    transformLogDrainConcurrencyRatio: 0.25 # QueryNode-wide TransformLog backlog drain worker count is max(1, floor(CPU count * ratio)). Updates existing worker pools dynamically.
+    transformLogDrainConcurrencyRatio: 40 # QueryNode-wide TransformLog backlog drain worker count is max(1, floor(CPU count * ratio)). Updates existing worker pools dynamically.
   groupBy:
     strictGroupStrategy: per_group # Strict group completion strategy: original or per_group. Independent phase-one and refinement controls still apply to original.
     strictGroupPhase1CandidateWeight: 0 # Strict group phase-one consumer Next limit is topk * group_size * weight; zero disables truncation. Overflow saturates at INT64_MAX. Only group discovery is limited; completion is not. May reduce recall.
@@ -722,7 +722,7 @@ queryNode:
         # Defaults to "sync".
         scalarIndex: disable
         vectorField: disable # cache warmup for vector field raw data is by default disabled.
-        vectorIndex: sync
+        vectorIndex: disable
       # If evictionEnabled is true, a background thread will run every evictionIntervalMs to determine if an
       # eviction is necessary and the amount of data to evict from memory/disk.
       # - If the current memory/disk usage exceeds the high watermark, an eviction will be triggered to evict data from memory/disk
@@ -754,10 +754,10 @@ queryNode:
     knowhereScoreConsistency: false # Enable knowhere strong consistency score computation logic
     chainPoolSizeFactor: 1 # size factor (CPUNum * factor) of the native function-chain pool; isolated from ordinary query field retrieval; values below 1 use 1
     mutatePoolSizeFactor: 2 # size factor (CPUNum * factor) of the online-write cgo pool for segment insert/delete; isolated from the load/management pool so segment loading cannot starve online writes
-    dynamicPoolSizeFactor: 1 # size factor (CPUNum * factor) of the dynamic cgo pool for segment create/release/statistics/index-info
+    dynamicPoolSizeFactor: 40 # size factor (CPUNum * factor) of the dynamic cgo pool for segment create/release/statistics/index-info
     deletePoolSizeFactor: 1 # size factor (CPUNum * factor) of the DeleteBatch dispatch pool
     storageV2:
-      cellTargetSizeBytes: 1048576 # Target average byte size per storage v2 cache cell. Parquet row groups are greedily packed so that rgs_per_cell * avg_row_group_size ≈ this target. Each cell always contains at least one row group and cells never cross file boundaries. Tune larger for bigger batch IO (fewer cells) or smaller to get finer cache granularity. Default 4 MiB.
+      cellTargetSizeBytes: 4194304 # Target average byte size per storage v2 cache cell. Parquet row groups are greedily packed so that rgs_per_cell * avg_row_group_size ≈ this target. Each cell always contains at least one row group and cells never cross file boundaries. Tune larger for bigger batch IO (fewer cells) or smaller to get finer cache granularity. Default 4 MiB.
       asyncLoadReadWindowSizeBytes: 16777216 # Target estimated loaded-byte threshold for one Storage V3 async read window. Each window contains at least one cell, so an oversized cell may exceed the threshold. The value must be positive. Default 16 MiB.
     deleteDumpBatchSize: 10000 # Batch size for delete snapshot dump in segcore.
   fmindexCostRatio: 0.001 # FM-index count-first guard threshold. An FMINDEX-accelerated LIKE (prefix/infix/suffix and general LIKE with interior wildcards) runs through the index only when occ * sa_sample_rate < fmindexCostRatio * total_tokens; otherwise it falls back to the raw-data scan (all paths are exact, this only picks the cheaper one). For the anchored forms the index answer is exact; for general LIKE it is candidate generation followed by an exact recheck of the candidate rows on the original VARCHAR data. The bound prices only FM locate, not the recheck bytes, so it stays row-length invariant only for the anchored forms; very long rows with unselective fragments may be routed to a path slower than the scan. Must be in (0, 1]; larger favors the index. Default 0.001 is the conservative crossover measured in benchmarks.
@@ -787,7 +787,7 @@ queryNode:
     # It defaults to 2.0, which means max read concurrency would be the value of hardware.GetCPUNum * 2.
     # Max read concurrency must greater than or equal to 1, and less than or equal to hardware.GetCPUNum * 100.
     # (0, 100]
-    maxReadConcurrentRatio: 3
+    maxReadConcurrentRatio: 40
     cpuRatio: 10 # ratio used to estimate read task cpu usage.
     maxTimestampLag: 86400
     scheduleReadPolicy:
@@ -814,7 +814,7 @@ queryNode:
   levelZeroForwardPolicy: FilterByBF # delegator level zero deletion forward policy, possible option["FilterByBF", "RemoteLoad"]
   streamingDeltaForwardPolicy: FilterByBF # delegator streaming deletion forward policy, possible option["FilterByBF", "Direct"]
   forwardBatchSize: 4194304 # the batch size delegator uses for forwarding stream delete in loading procedure
-  delegatorPostLoadConcurrencyFactor: 1 # delegator post-load concurrency factor after worker LoadSegments returns. Concurrency is hardware.GetCPUNum * factor
+  delegatorPostLoadConcurrencyFactor: 40 # delegator post-load concurrency factor after worker LoadSegments returns. Concurrency is hardware.GetCPUNum * factor
   exprCache:
     enabled: false # enable expression result cache
     mode: disk # cache mode: 'disk' (sealed only) or 'memory' (sealed and optionally growing)
@@ -861,7 +861,7 @@ indexCoord:
     withCred: false
     nodeID: 0
   segment:
-    minSegmentNumRowsToEnableIndex: 102400 # It's a threshold. When the segment num rows is less than this value, the segment will not be indexed
+    minSegmentNumRowsToEnableIndex: 1024 # It's a threshold. When the segment num rows is less than this value, the segment will not be indexed
 
 indexNode:
   scheduler:
@@ -877,9 +877,9 @@ dataCoord:
     checkInterval: 1 # The interval in seconds with which the channel manager advances channel states
     notifyChannelOperationTimeout: 5 # Timeout notifing channel operations (in seconds).
   segment:
-    maxSize: 1 # The maximum size of a segment, unit: MB. datacoord.segment.maxSize and datacoord.segment.sealProportion together determine if a segment can be sealed.
+    maxSize: 1024 # The maximum size of a segment, unit: MB. datacoord.segment.maxSize and datacoord.segment.sealProportion together determine if a segment can be sealed.
     diskSegmentMaxSize: 2048 # Maximum size of a segment in MB for collection which has Disk index
-    sealProportion: 0.7 # The minimum proportion to datacoord.segment.maxSize to seal a segment. datacoord.segment.maxSize and datacoord.segment.sealProportion together determine if a segment can be sealed.
+    sealProportion: 0.12 # The minimum proportion to datacoord.segment.maxSize to seal a segment. datacoord.segment.maxSize and datacoord.segment.sealProportion together determine if a segment can be sealed.
     sealProportionJitter: 0.1 # segment seal proportion jitter ratio, default value 0.1(10%), if seal proportion is 12%, with jitter=0.1, the actuall applied ratio will be 10.8~12%
     assignmentExpiration: 2000 # Expiration time of the segment assignment, unit: ms
     allocLatestExpireAttempt: 200 # The time attempting to alloc latest lastExpire from rootCoord after restart
@@ -887,8 +887,8 @@ dataCoord:
     # If a segment didn't accept dml records in maxIdleTime and the size of segment is greater than
     # minSizeFromIdleToSealed, Milvus will automatically seal it.
     # The max idle time of segment in seconds, 10*60.
-    maxIdleTime: 60
-    minSizeFromIdleToSealed: 512 # The min size in MB of segment which can be idle from sealed.
+    maxIdleTime: 600
+    minSizeFromIdleToSealed: 16 # The min size in MB of segment which can be idle from sealed.
     # The max number of binlog (which is equal to the binlog file num of primary key) for one segment,
     # the segment will be sealed if the number of binlog file reaches to max value.
     maxBinlogFileNumber: 32
@@ -1123,7 +1123,7 @@ dataNode:
     flowGraph:
       maxQueueLength: 16 # Maximum length of task queue in flowgraph
       maxParallelism: 1024 # Maximum number of tasks executed in parallel in the flowgraph
-    maxParallelSyncMgrTasksPerCPUCore: 100 # The max concurrent sync task number of datanode sync mgr per CPU core
+    maxParallelSyncMgrTasksPerCPUCore: 16 # The max concurrent sync task number of datanode sync mgr per CPU core
     skipMode:
       enable: true # Support skip some timetick message to reduce CPU usage
       skipNum: 4 # Consume one for every n records skipped
@@ -1133,7 +1133,7 @@ dataNode:
     # The maximum size of each binlog file in a segment buffered in memory. Binlog files whose size exceeds this value are then flushed to MinIO or S3 service.
     # Unit: Byte
     # Setting this parameter too small causes the system to store a small amount of data too frequently. Setting it too large increases the system's demand for memory.
-    insertBufSize: 51200
+    insertBufSize: 16777216
     deleteBufBytes: 16777216 # Max buffer size in bytes to flush del for a single channel, default as 16MB
     syncPeriod: 600 # The period to sync segments if buffer is not empty.
   memory:
@@ -1321,11 +1321,14 @@ common:
   defaultPartitionName: _default # Name of the default partition when a collection is created
   defaultIndexName: _default_idx # Name of the index when it is created with name unspecified
   indexSliceSize: 16 # Index slice size in MB
+  arrow:
+    ioThreadPoolCoefficient: 40
+    ioThreadPoolMaxCapacity: 320
   threadCoreCoefficient:
-    highPriority: 100 # This parameter specify how many times the number of threads is the number of cores in high priority pool
-    middlePriority: 100 # Thread-to-core ratio for each of the independent middle priority and search fanout pools; both follow maxThreadsSize.
+    highPriority: 40 # This parameter specify how many times the number of threads is the number of cores in high priority pool
+    middlePriority: 60 # Thread-to-core ratio for each of the independent middle priority and search fanout pools; both follow maxThreadsSize.
     lowPriority: 1 # This parameter specify how many times the number of threads is the number of cores in low priority pool
-    maxThreadsSize: 16 # The maximum number of threads in the thread pool, only effective when greater than 0
+    maxThreadsSize: 320 # The maximum number of threads in the thread pool, only effective when greater than 0
   buildIndexThreadPoolRatio: 0.75
   DiskIndex:
     MaxDegree: 56
@@ -1452,6 +1455,8 @@ common:
     varCharLengthAvg: 256 # average length considered per VarChar/Text field when estimating record size
     dynamicFieldLengthAvg: 512 # average length considered per JSON/Array/Geometry field when estimating record size
     sparseFloatVectorSize: 1200 # fallback size (bytes) used when estimating sparse float vector fields
+  metrics:
+    collectionLevelMode: full # full keeps collection and VChannel values; aggregate replaces them with "all" and suppresses gauges that cannot be aggregated truthfully
   locks:
     metrics:
       enable: false # whether gather statistics for metrics locks
@@ -1508,7 +1513,7 @@ common:
 #   4. DQL result rate protection;
 # If necessary, you can also manually force to deny RW requests.
 quotaAndLimits:
-  enabled: false # `true` to enable quota and limits, `false` to disable.
+  enabled: true # `true` to enable quota and limits, `false` to disable.
   # quotaCenterCollectInterval is the time interval that quotaCenter
   # collects metrics from Proxies, Query cluster and Data cluster.
   # seconds, (0 ~ 65536)
@@ -1747,7 +1752,7 @@ streamingNode:
 queryView:
   idfOracle:
     lazyLoadSealedStats: false # Whether QueryView IDF runtimes defer sealed BM25 resource discovery and stats materialization until the first BM25 search.
-    sealedStatsLoadConcurrencyRatio: 4 # Maximum process-wide concurrency for loading sealed BM25 stats, expressed as a ratio of CPU cores.
+    sealedStatsLoadConcurrencyRatio: 40 # Maximum process-wide concurrency for loading sealed BM25 stats, expressed as a ratio of CPU cores.
   leaseDuration: 5s # Renewable SN Up-view retention after query access. Delays normal Down; non-positive durations disable timed retention. Not refreshable.
   logicalSize:
     source: rowCount # LogicalSize source: rowCount uses physical rows; insertBytes uses ceil(segment insert_binlog_size / bytesPerUnit). Unsupported values use rowCount. Missing size falls back to rows, then segmentBaseCost is added. Sampled once when the DataView manager is initialized; requires coordinator restart.
@@ -1780,7 +1785,7 @@ queryView:
 streaming:
   schemaCacheTTL: 900 # Idle lifetime in seconds of cached schema bodies. Non-positive values disable schema body retention.
   queryView:
-    liveEventDispatchConcurrencyRatioPerPChannel: 0.25 # QueryRuntime live-event worker count per PChannel is max(1, floor(CPU count * ratio)). Updates existing worker pools dynamically.
+    liveEventDispatchConcurrencyRatioPerPChannel: 40 # QueryRuntime live-event worker count per PChannel is max(1, floor(CPU count * ratio)). Updates existing worker pools dynamically.
   # Whether StreamingNode splits oversized logical messages into physical WAL records.
   # Enable this on every StreamingNode and confirm the live update before disabling proxy.splitChunk.
   # Once chunk records have been written, do not roll StreamingNode back to a version that cannot reassemble them. Both parameters support live refresh.
@@ -1889,7 +1894,7 @@ streaming:
       softWatermark: 8g # RecoveryStorage requests VChannel persistence and slows WAL append after the unpublished WAL tail reaches this logical size.
       highWatermark: 16g # RecoveryStorage rejects new DML append after the unpublished WAL tail reaches this logical size.
   transformLog:
-    catchupConcurrencyRatioPerPChannel: 0.25 # TransformLog catch-up worker count for each consumer's PChannel stream is max(1, floor(CPU count * ratio)). Updates existing worker pools dynamically.
+    catchupConcurrencyRatioPerPChannel: 40 # TransformLog catch-up worker count for each consumer's PChannel stream is max(1, floor(CPU count * ratio)). Updates existing worker pools dynamically.
   replication:
     pendingMessagesQueueLength: 128 # The capacity of pending message queue for each replication stream client.
     pendingMessagesQueueMaxSize: 134217728 # The maximum size (in bytes) of pending message queue for each replication stream client. Default is 128MB.
