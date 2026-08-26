@@ -884,6 +884,19 @@ class SegmentInternalInterface : public SegmentInterface {
                                    const int64_t* row_ids,
                                    int64_t count) const;
 
+    // Fetch independent search output fields concurrently on the MIDDLE
+    // storage pool, then publish the completed fields to SearchResult on the
+    // caller thread. Each field uses an independent OpContext so cancellation,
+    // pinned segment state, tracing, and storage accounting remain isolated.
+    // Every field reads read_snapshot; a null one captures a fresh snapshot.
+    void
+    FillSearchResultOutputFields(
+        const query::Plan* plan,
+        const std::vector<FieldId>& field_ids,
+        const std::shared_ptr<const SegmentReadSnapshot>& read_snapshot,
+        SearchResult& results,
+        milvus::OpContext* op_ctx) const;
+
  protected:
     // todo: use an Unified struct for all type in growing/seal segment to store data and valid_data.
     // internal API: return chunk_data in span
