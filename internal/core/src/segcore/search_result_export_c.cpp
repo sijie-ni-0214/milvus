@@ -1484,26 +1484,26 @@ FillFieldsOrderedAsArrowRecordBatchImpl(
             [plan, &requested_field_ids, &cancel_token](
                 milvus::segcore::SegmentInternalInterface* segment,
                 OrderedSegmentFields& materialized) {
+                SearchResult temp_result;
+                temp_result.segment_ = materialized.search_result->segment_;
+                temp_result.seg_offsets_ = materialized.segment_offsets;
+                temp_result.distances_.resize(
+                    materialized.segment_offsets.size(), 0.0f);
                 milvus::OpContext op_ctx(cancel_token);
                 op_ctx.runtime_load_priority =
                     milvus::proto::common::LoadPriority::HIGH;
-                for (auto field_id : requested_field_ids) {
-                    milvus::futures::throwIfCancelled(cancel_token);
-                    auto& field_meta = plan->schema_->operator[](field_id);
-                    materialized.fields[field_id] =
-                        milvus::segcore::BulkSubscriptWithSnapshot(
-                            segment,
-                            materialized.search_result->read_snapshot_,
-                            &op_ctx,
-                            field_id,
-                            field_meta,
-                            materialized.segment_offsets.data(),
-                            materialized.segment_offsets.size());
-                }
+                segment->FillSearchResultOutputFields(
+                    plan,
+                    requested_field_ids,
+                    materialized.search_result->read_snapshot_,
+                    temp_result,
+                    &op_ctx);
+                materialized.fields =
+                    std::move(temp_result.output_fields_data_);
                 materialized.scanned_remote_bytes =
-                    op_ctx.storage_usage.scanned_cold_bytes.load();
+                    temp_result.search_storage_cost_.scanned_remote_bytes;
                 materialized.scanned_total_bytes =
-                    op_ctx.storage_usage.scanned_total_bytes.load();
+                    temp_result.search_storage_cost_.scanned_total_bytes;
             });
 
         auto batch_result = BuildExplicitFieldsBatch(
