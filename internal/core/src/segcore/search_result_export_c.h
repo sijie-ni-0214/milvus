@@ -51,7 +51,8 @@ ExportSearchResultAsArrowRecordBatch(CSearchResult c_search_result,
 //   result_seg_offsets[i] = seg_offset within that segment
 // The output proto FieldsData is assembled in the order of these arrays.
 //
-// Internally: groups by segment, calls FillTargetEntry per segment,
+// Internally: groups by segment on the search executor, calls FillTargetEntry
+// per segment (which fetches independent fields on the MIDDLE storage pool),
 // then uses MergeDataArray to produce the correctly-ordered output.
 // Writes a serialized SearchResultData proto into out_result. Caller owns
 // out_result->proto_blob and must free it after use when proto_size > 0.

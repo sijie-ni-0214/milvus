@@ -802,6 +802,16 @@ class SegmentInternalInterface : public SegmentInterface {
     bulk_subscript_not_exist_field(const milvus::FieldMeta& field_meta,
                                    int64_t count) const;
 
+    // Fetch independent search output fields concurrently on the MIDDLE
+    // storage pool, then publish the completed fields to SearchResult on the
+    // caller thread. Each field uses an independent OpContext so cancellation,
+    // pinned segment state, tracing, and storage accounting remain isolated.
+    void
+    FillSearchResultOutputFields(const query::Plan* plan,
+                                 const std::vector<FieldId>& field_ids,
+                                 SearchResult& results,
+                                 milvus::OpContext* op_ctx) const;
+
  protected:
     // todo: use an Unified struct for all type in growing/seal segment to store data and valid_data.
     // internal API: return chunk_data in span

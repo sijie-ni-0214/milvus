@@ -15,7 +15,6 @@
 #include <arrow/c/bridge.h>
 #include <arrow/c/abi.h>
 #include <folly/CancellationToken.h>
-#include <folly/ScopeGuard.h>
 
 #include <algorithm>
 #include <chrono>
@@ -26,6 +25,7 @@
 #include <map>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "common/EasyAssert.h"
@@ -34,6 +34,7 @@
 #include "log/Log.h"
 #include "common/QueryResult.h"
 #include "common/Types.h"
+#include "futures/Executor.h"
 #include "futures/Future.h"
 #include "monitor/Monitor.h"
 #include "monitor/scope_metric.h"
@@ -43,11 +44,24 @@
 #include "segcore/SegmentReadLease.h"
 #include "segcore/Utils.h"
 #include "segcore/reduce/Reduce.h"
-#include "storage/ThreadPools.h"
+#include "storage/Util.h"
 
 using SearchResult = milvus::SearchResult;
 
 namespace {
+
+template <typename F>
+std::future<void>
+SubmitSearchExecutorTask(F&& task) {
+    auto packaged_task =
+        std::make_shared<std::packaged_task<void()>>(std::forward<F>(task));
+    auto future = packaged_task->get_future();
+    milvus::futures::getSearchCPUExecutor()->add(
+        [packaged_task = std::move(packaged_task)]() mutable {
+            (*packaged_task)();
+        });
+    return future;
+}
 
 // GroupByArrowInfo describes one $group_by_<fieldID> Arrow column to emit.
 // Element type is derived from the plan's search_info_, falling back to
@@ -946,33 +960,24 @@ MaterializeOrderedFields(
         materialize_segment_fields(segment, materialized);
     };
 
-    if (segment_fields.size() > 1) {
-        auto& pool = milvus::ThreadPools::GetThreadPool(
-            milvus::ThreadPoolPriority::MIDDLE);
-        std::vector<std::future<void>> futures;
-        futures.reserve(segment_fields.size());
-        auto futures_guard = folly::makeGuard([&futures]() {
-            for (auto& future : futures) {
-                if (future.valid()) {
-                    try {
-                        future.get();
-                    } catch (...) {
-                    }
-                }
-            }
-        });
+    // Keep the segment fan-out on the search executor. Each segment may wait
+    // for its fields on MIDDLE, so using MIDDLE at both levels could deadlock
+    // when all workers are occupied by parent segment tasks.
+    std::vector<std::future<void>> futures;
+    futures.reserve(segment_fields.size());
+    try {
         for (auto& entry : segment_fields) {
             auto* materialized = &entry.second;
-            futures.emplace_back(pool.Submit([&materialize_one, materialized] {
-                materialize_one(*materialized);
-            }));
+            futures.emplace_back(
+                SubmitSearchExecutorTask([&materialize_one, materialized] {
+                    materialize_one(*materialized);
+                }));
         }
-        for (auto& future : futures) {
-            future.get();
-        }
-    } else {
-        materialize_one(segment_fields.begin()->second);
+    } catch (...) {
+        milvus::storage::DrainFutures(futures);
+        throw;
     }
+    milvus::storage::WaitAllFutures(futures);
 
     std::vector<milvus::segcore::MergeBase> result_pairs(total_rows);
     for (auto& entry : segment_fields) {
@@ -1287,27 +1292,19 @@ FillFieldsOrderedAsArrowRecordBatch(CSearchResult* search_results,
             [plan, &requested_field_ids, &cancel_token](
                 milvus::segcore::SegmentInternalInterface* segment,
                 OrderedSegmentFields& materialized) {
+                SearchResult temp_result;
+                temp_result.seg_offsets_ = materialized.segment_offsets;
+                temp_result.distances_.resize(
+                    materialized.segment_offsets.size(), 0.0f);
                 milvus::OpContext op_ctx(cancel_token);
-                for (auto field_id : requested_field_ids) {
-                    milvus::futures::throwIfCancelled(cancel_token);
-                    auto& field_meta = plan->schema_->operator[](field_id);
-                    std::unique_ptr<milvus::DataArray> data;
-                    if (!segment->is_field_exist(field_id)) {
-                        data = segment->bulk_subscript_not_exist_field(
-                            field_meta, materialized.segment_offsets.size());
-                    } else {
-                        data = segment->bulk_subscript(
-                            &op_ctx,
-                            field_id,
-                            materialized.segment_offsets.data(),
-                            materialized.segment_offsets.size());
-                    }
-                    materialized.fields[field_id] = std::move(data);
-                }
+                segment->FillSearchResultOutputFields(
+                    plan, requested_field_ids, temp_result, &op_ctx);
+                materialized.fields =
+                    std::move(temp_result.output_fields_data_);
                 materialized.scanned_remote_bytes =
-                    op_ctx.storage_usage.scanned_cold_bytes.load();
+                    temp_result.search_storage_cost_.scanned_remote_bytes;
                 materialized.scanned_total_bytes =
-                    op_ctx.storage_usage.scanned_total_bytes.load();
+                    temp_result.search_storage_cost_.scanned_total_bytes;
             });
 
         auto batch_result = BuildExplicitFieldsBatch(
