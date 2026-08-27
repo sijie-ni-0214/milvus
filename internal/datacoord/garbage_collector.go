@@ -385,26 +385,26 @@ func (gc *garbageCollector) work(ctx context.Context) {
 	go func() {
 		defer gc.wg.Done()
 		gc.runRecycleTaskWithPauser(ctx, "meta", gc.option.checkInterval, func(ctx context.Context, signal <-chan gcCmd) {
-			gc.recycleDataViews(ctx, signal)
-			gc.recycleDroppedSegments(ctx, signal)
-			gc.recycleChannelCPMeta(ctx, signal)
-			gc.recycleUnusedIndexes(ctx, signal)
-			gc.recycleUnusedSegIndexes(ctx, signal)
-			gc.recycleUnusedAnalyzeFiles(ctx, signal)
-			gc.recycleUnusedTextIndexFiles(ctx, signal)
-			gc.recycleUnusedJSONIndexFiles(ctx, signal)
-			gc.recycleUnusedJSONStatsFiles(ctx, signal)
-			gc.recycleSnapshots(ctx, signal)
+			runGCStage(ctx, "meta", "recycleDataViews", func() { gc.recycleDataViews(ctx, signal) })
+			runGCStage(ctx, "meta", "recycleDroppedSegments", func() { gc.recycleDroppedSegments(ctx, signal) })
+			runGCStage(ctx, "meta", "recycleChannelCPMeta", func() { gc.recycleChannelCPMeta(ctx, signal) })
+			runGCStage(ctx, "meta", "recycleUnusedIndexes", func() { gc.recycleUnusedIndexes(ctx, signal) })
+			runGCStage(ctx, "meta", "recycleUnusedSegIndexes", func() { gc.recycleUnusedSegIndexes(ctx, signal) })
+			runGCStage(ctx, "meta", "recycleUnusedAnalyzeFiles", func() { gc.recycleUnusedAnalyzeFiles(ctx, signal) })
+			runGCStage(ctx, "meta", "recycleUnusedTextIndexFiles", func() { gc.recycleUnusedTextIndexFiles(ctx, signal) })
+			runGCStage(ctx, "meta", "recycleUnusedJSONIndexFiles", func() { gc.recycleUnusedJSONIndexFiles(ctx, signal) })
+			runGCStage(ctx, "meta", "recycleUnusedJSONStatsFiles", func() { gc.recycleUnusedJSONStatsFiles(ctx, signal) })
+			runGCStage(ctx, "meta", "recycleSnapshots", func() { gc.recycleSnapshots(ctx, signal) })
 		})
 	}()
 	go func() {
 		defer gc.wg.Done()
 		gc.runRecycleTaskWithPauser(ctx, "orphan", gc.option.scanInterval, func(ctx context.Context, signal <-chan gcCmd) {
 			// orphan file not controlled by collection level pause for now
-			gc.recycleUnusedBinlogFiles(ctx)
-			gc.recycleUnusedIndexFilesV0(ctx)
-			gc.recycleUnusedIndexFilesV1(ctx)
-			gc.recycleUnusedImportV3Prefixes(ctx)
+			runGCStage(ctx, "orphan", "recycleUnusedBinlogFiles", func() { gc.recycleUnusedBinlogFiles(ctx) })
+			runGCStage(ctx, "orphan", "recycleUnusedIndexFilesV0", func() { gc.recycleUnusedIndexFilesV0(ctx) })
+			runGCStage(ctx, "orphan", "recycleUnusedIndexFilesV1", func() { gc.recycleUnusedIndexFilesV1(ctx) })
+			runGCStage(ctx, "orphan", "recycleUnusedImportV3Prefixes", func() { gc.recycleUnusedImportV3Prefixes(ctx) })
 		})
 	}()
 	go func() {
@@ -412,7 +412,7 @@ func (gc *garbageCollector) work(ctx context.Context) {
 		// LOB (TEXT column) file GC runs on its own interval
 		lobCheckInterval := Params.DataCoordCfg.GCLOBCheckInterval.GetAsDuration(time.Second)
 		gc.runRecycleTaskWithPauser(ctx, "lob", lobCheckInterval, func(ctx context.Context, signal <-chan gcCmd) {
-			gc.recycleUnusedLOBFiles(ctx)
+			runGCStage(ctx, "lob", "recycleUnusedLOBFiles", func() { gc.recycleUnusedLOBFiles(ctx) })
 		})
 	}()
 	go func() {
@@ -423,6 +423,18 @@ func (gc *garbageCollector) work(ctx context.Context) {
 		defer gc.wg.Done()
 		gc.startControlLoop(ctx)
 	}()
+}
+
+func runGCStage(ctx context.Context, gcType, stage string, task func()) {
+	start := time.Now()
+	defer func() {
+		mlog.Info(ctx, "garbage collector stage done",
+			mlog.String("gcType", gcType),
+			mlog.String("gcStage", stage),
+			mlog.Duration("timeCost", time.Since(start)),
+			mlog.Bool("canceled", ctx.Err() != nil))
+	}()
+	task()
 }
 
 func (gc *garbageCollector) ackSignal(signal <-chan gcCmd) {
@@ -981,9 +993,32 @@ func (gc *garbageCollector) recycleDataViews(ctx context.Context, signal <-chan 
 	start := time.Now()
 	logger := mlog.With(mlog.String("gcName", "recycleDataViews"), mlog.Time("startAt", start))
 	logger.Info(ctx, "start recycleDataViews")
-	defer func() { logger.Info(ctx, "recycleDataViews done", mlog.Duration("timeCost", time.Since(start))) }()
+	collections := gc.meta.GetCollections()
+	totalCollections := len(collections)
+	processedCollections := 0
+	skippedCollections := 0
+	failedCollections := 0
+	defer func() {
+		logger.Info(ctx, "recycleDataViews done",
+			mlog.Int("totalCollections", totalCollections),
+			mlog.Int("processedCollections", processedCollections),
+			mlog.Int("skippedCollections", skippedCollections),
+			mlog.Int("failedCollections", failedCollections),
+			mlog.Duration("timeCost", time.Since(start)))
+	}()
+	progressEvery := max(totalCollections/10, 1)
+	reportProgress := func() {
+		if processedCollections < totalCollections && processedCollections%progressEvery == 0 {
+			logger.Info(ctx, "recycleDataViews progress",
+				mlog.Int("totalCollections", totalCollections),
+				mlog.Int("processedCollections", processedCollections),
+				mlog.Int("skippedCollections", skippedCollections),
+				mlog.Int("failedCollections", failedCollections),
+				mlog.Duration("timeCost", time.Since(start)))
+		}
+	}
 
-	for _, collection := range gc.meta.GetCollections() {
+	for _, collection := range collections {
 		if ctx.Err() != nil {
 			return
 		}
@@ -991,13 +1026,19 @@ func (gc *garbageCollector) recycleDataViews(ctx context.Context, signal <-chan 
 
 		collectionID := collection.ID
 		if gc.collectionGCPaused(collectionID) {
+			skippedCollections++
+			processedCollections++
+			reportProgress()
 			logger.Info(ctx, "skip DataView GC since collection is paused", mlog.FieldCollectionID(collectionID))
 			continue
 		}
 
 		if err := gc.option.dataViewGC.GarbageCollect(ctx, collectionID, 1); err != nil {
+			failedCollections++
 			logger.Warn(ctx, "DataView GC failed", mlog.FieldCollectionID(collectionID), mlog.Err(err))
 		}
+		processedCollections++
+		reportProgress()
 	}
 }
 
@@ -1047,6 +1088,7 @@ func (gc *garbageCollector) recycleDroppedSegments(ctx context.Context, signal <
 		log.Info(ctx, "clear dropped segments done", mlog.Duration("timeCost", time.Since(start)))
 	}()
 
+	metadataScanStart := time.Now()
 	all := gc.meta.SelectSegments(ctx)
 	drops := make(map[int64]*SegmentInfo, 0)
 	compactTo := make(map[int64]*SegmentInfo)
@@ -1062,7 +1104,14 @@ func (gc *garbageCollector) recycleDroppedSegments(ctx context.Context, signal <
 			compactTo[from] = segment
 		}
 	}
+	log.Info(ctx, "recycleDroppedSegments metadata scan done",
+		mlog.Int("totalSegments", len(all)),
+		mlog.Int("droppedSegments", len(drops)),
+		mlog.Int("compactionSources", len(compactTo)),
+		mlog.Int("channels", channels.Len()),
+		mlog.Duration("timeCost", time.Since(metadataScanStart)))
 
+	protectionSetupStart := time.Now()
 	// A Dropped parent can still be the published QueryView frontier. Keep
 	// its descendants too: intermediate lineage is needed to flatten a later
 	// sort/merge before replacing that frontier. Snapshot once per sweep.
@@ -1114,11 +1163,25 @@ func (gc *garbageCollector) recycleDroppedSegments(ctx context.Context, signal <
 	for _, segmentID := range segments {
 		loadedSegments.Insert(segmentID)
 	}
+	log.Info(ctx, "recycleDroppedSegments protection setup done",
+		mlog.Int("indexedCompactTargets", indexedSet.Len()),
+		mlog.Int("loadedSegments", loadedSegments.Len()),
+		mlog.Int("channels", len(channelCPs)),
+		mlog.Duration("timeCost", time.Since(protectionSetupStart)))
 
 	io := packed.NewManifestIOContext(1)
 	defer io.Close()
 	log.Info(ctx, "start to GC segments", mlog.Int("drop_num", len(drops)))
+	candidateStart := time.Now()
+	processedDroppedSegments := 0
+	defer func() {
+		log.Info(ctx, "recycleDroppedSegments candidates done",
+			mlog.Int("droppedSegments", len(drops)),
+			mlog.Int("processedDroppedSegments", processedDroppedSegments),
+			mlog.Duration("timeCost", time.Since(candidateStart)))
+	}()
 	for segmentID, segment := range drops {
+		processedDroppedSegments++
 		if ctx.Err() != nil {
 			// process canceled, stop.
 			return

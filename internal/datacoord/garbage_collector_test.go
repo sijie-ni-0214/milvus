@@ -59,6 +59,7 @@ import (
 	"github.com/milvus-io/milvus/internal/storagev2/packed"
 	"github.com/milvus-io/milvus/pkg/v3/common"
 	"github.com/milvus-io/milvus/pkg/v3/metrics"
+	"github.com/milvus-io/milvus/pkg/v3/mlog"
 	"github.com/milvus-io/milvus/pkg/v3/objectstorage"
 	"github.com/milvus-io/milvus/pkg/v3/proto/datapb"
 	"github.com/milvus-io/milvus/pkg/v3/proto/indexpb"
@@ -6529,4 +6530,29 @@ func TestGarbageCollector_recycleUnusedImportV3Prefixes(t *testing.T) {
 	exist, err = cli.Exist(ctx, livePath)
 	require.NoError(t, err)
 	require.True(t, exist)
+}
+
+func TestRunGCStageLogsDuration(t *testing.T) {
+	logs := mlog.CaptureGlobalLogs(t, &mlog.Config{
+		Level:             "info",
+		Format:            "text",
+		DisableCaller:     true,
+		DisableTimestamp:  true,
+		DisableStacktrace: true,
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	called := false
+	runGCStage(ctx, "meta", "testStage", func() {
+		called = true
+		cancel()
+	})
+
+	require.True(t, called)
+	output := logs.String()
+	assert.Contains(t, output, "garbage collector stage done")
+	assert.Contains(t, output, "gcType=meta")
+	assert.Contains(t, output, "gcStage=testStage")
+	assert.Contains(t, output, "timeCost=")
+	assert.Contains(t, output, "canceled=true")
 }
