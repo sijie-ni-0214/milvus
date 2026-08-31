@@ -269,7 +269,6 @@ func (s *mixCoordImpl) initInternal() error {
 	s.fileResourceObserver.Start()
 	mlog.Info(s.ctx, "MixCoord file resource observer start done",
 		mlog.Duration("duration", time.Since(fileResourceObserverStart)))
-	s.rootcoordServer.StartLegacyMetadataGC()
 	mlog.Info(s.ctx, "MixCoord internal recovery done",
 		mlog.Duration("duration", time.Since(internalRecoveryStart)))
 	return nil
