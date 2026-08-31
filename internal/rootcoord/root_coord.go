@@ -145,7 +145,6 @@ type Core struct {
 	ddlTsLockManager DdlTsLockManager
 
 	metaKVCreator metaKVCreator
-	legacyMetaKV  kv.MetaKv
 
 	proxyCreator       proxyutil.ProxyCreator
 	proxyWatcher       *proxyutil.ProxyWatcher
@@ -429,19 +428,6 @@ func (c *Core) SetMixCoord(s types.MixCoord) error {
 	return nil
 }
 
-// StartLegacyMetadataGC starts the one-shot legacy snapshot and tombstone
-// cleanup after startup-critical metadata recovery has finished. MixCoord calls
-// this only after DataCoord and QueryCoord are ready; standalone RootCoord calls
-// it immediately after its own metadata cache is recovered.
-func (c *Core) StartLegacyMetadataGC() {
-	if c.legacyMetaKV == nil {
-		mlog.Warn(c.ctx, "legacy metadata GC start skipped because metadata KV is not initialized")
-		return
-	}
-	kvmetastore.StartLegacySnapshotGC(c.ctx, c.legacyMetaKV)
-	kvmetastore.StartLegacyTombstoneGC(c.ctx, c.legacyMetaKV)
-}
-
 // Register register rootcoord at etcd
 func (c *Core) Register() error {
 	return nil
@@ -507,17 +493,6 @@ func (c *Core) initMetaTable(initCtx context.Context) error {
 			return err
 		}
 		c.meta = meta
-		c.legacyMetaKV = metaKV
-
-		// Recovery loaders skip legacy tombstones on every affected prefix, so
-		// cleanup can wait until startup-critical metadata scans are complete.
-		// MixCoord defers it further until DataCoord and QueryCoord are ready so
-		// these global walks do not compete for metastore bandwidth.
-		if c.mixCoord == nil {
-			c.StartLegacyMetadataGC()
-		} else {
-			mlog.Info(initCtx, "legacy metadata GC deferred until MixCoord recovery completes")
-		}
 
 		return nil
 	}
