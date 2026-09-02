@@ -555,7 +555,8 @@ IndexFactory::VecIndexLoadResource(
                                      dim,
                                      config);
             has_raw_data =
-                knowhere::IndexStaticFaced<knowhere::fp32>::HasRawData(
+                knowhere::IndexStaticFaced<
+                    knowhere::sparse_u32_f32>::HasRawData(
                     index_type, index_version, config);
             break;
         case milvus::DataType::VECTOR_INT8:

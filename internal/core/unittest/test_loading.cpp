@@ -166,6 +166,26 @@ static const auto kIndexLoadTestValues = ::testing::Values(
          {"mmap", "false"},
          {"field_type", "vector_float"}},
         {2UL * 1024 * 1024 * 1024, 0UL, 1UL * 1024 * 1024 * 1024, 0UL, false}),
+    std::pair<std::map<std::string, std::string>, LoadResourceRequest>(
+        {{"index_type", "SPARSE_INVERTED_INDEX"},
+         {"metric_type", "BM25"},
+         {"mmap", "false"},
+         {"field_type", "VECTOR_SPARSE_U32_F32"}},
+        {2UL * 1024 * 1024 * 1024,
+         0UL,
+         1UL * 1024 * 1024 * 1024,
+         0UL,
+         false}),
+    std::pair<std::map<std::string, std::string>, LoadResourceRequest>(
+        {{"index_type", "SPARSE_INVERTED_INDEX_CC"},
+         {"metric_type", "IP"},
+         {"mmap", "false"},
+         {"field_type", "VECTOR_SPARSE_U32_F32"}},
+        {2UL * 1024 * 1024 * 1024,
+         0UL,
+         1UL * 1024 * 1024 * 1024,
+         0UL,
+         true}),
 #ifdef BUILD_DISK_ANN
     std::pair<std::map<std::string, std::string>, LoadResourceRequest>(
         {{"index_type", "DISKANN"},
