@@ -42,6 +42,8 @@ func NewCompareFailedError(err error) error {
 // BaseKV contains base operations of kv. Include save, load and remove.
 type BaseKV interface {
 	Load(ctx context.Context, key string) (string, error)
+	// MultiLoad returns one value per input key in the same order. A missing key
+	// is represented by an empty value and may also produce ErrIoKeyNotFound.
 	MultiLoad(ctx context.Context, keys []string) ([]string, error)
 	LoadWithPrefix(ctx context.Context, key string) ([]string, []string, error)
 	Save(ctx context.Context, key, value string) error
