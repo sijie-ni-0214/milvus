@@ -178,6 +178,45 @@ func TestComponentParam_DataCoordBumpSchemaVersionCompactionParams(t *testing.T)
 	assert.EqualValues(t, 1, params.DataCoordCfg.BumpSchemaVersionCompactionSlotUsage.GetAsInt64())
 }
 
+func TestComponentParam_DataCoordIndexFileBatchSize(t *testing.T) {
+	base := NewBaseTable(SkipRemote(true), SkipEnv(true))
+	var params ComponentParam
+	params.Init(base)
+	cfg := &params.DataCoordCfg
+
+	assert.Equal(t, "dataCoord.gc.indexFileBatchDelete.batchSize", cfg.GCIndexFileBatchSize.Key)
+	assert.Equal(t, 1000, cfg.GCIndexFileBatchSize.GetAsInt())
+	assert.NoError(t, base.Save(cfg.GCIndexFileBatchSize.Key, "64"))
+	assert.Equal(t, 64, cfg.GCIndexFileBatchSize.GetAsInt())
+	for _, value := range []string{"0", "-1", "1001", "invalid"} {
+		assert.NoError(t, base.Save(cfg.GCIndexFileBatchSize.Key, value))
+		assert.Equal(t, 1000, cfg.GCIndexFileBatchSize.GetAsInt())
+	}
+
+	field, ok := reflect.TypeOf(dataCoordConfig{}).FieldByName("GCIndexFileBatchSize")
+	assert.True(t, ok)
+	assert.Equal(t, "true", field.Tag.Get("refreshable"))
+}
+
+func TestComponentParam_DataCoordDroppedSegmentBatch(t *testing.T) {
+	base := NewBaseTable(SkipRemote(true), SkipEnv(true))
+	var params ComponentParam
+	params.Init(base)
+	cfg := &params.DataCoordCfg
+
+	assert.Equal(t, "dataCoord.gc.droppedSegment.batchDelete.batchSize", cfg.GCDroppedSegmentBatchSize.Key)
+	assert.Equal(t, 1000, cfg.GCDroppedSegmentBatchSize.GetAsInt())
+	assert.NoError(t, base.Save(cfg.GCDroppedSegmentBatchSize.Key, "64"))
+	assert.Equal(t, 64, cfg.GCDroppedSegmentBatchSize.GetAsInt())
+	for _, value := range []string{"0", "-1", "1001", "invalid"} {
+		assert.NoError(t, base.Save(cfg.GCDroppedSegmentBatchSize.Key, value))
+		assert.Equal(t, 1000, cfg.GCDroppedSegmentBatchSize.GetAsInt())
+	}
+	field, ok := reflect.TypeOf(dataCoordConfig{}).FieldByName("GCDroppedSegmentBatchSize")
+	assert.True(t, ok)
+	assert.Equal(t, "true", field.Tag.Get("refreshable"))
+}
+
 func TestComponentParam_DataCoordSnapshotExportCopyConcurrency(t *testing.T) {
 	Init()
 	params := Get()
