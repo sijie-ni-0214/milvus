@@ -36,6 +36,8 @@ type segmentStore interface {
 	AddSegment(ctx context.Context, segment *datapb.SegmentInfo) (int64, error)
 	// DropSegment removes a segment record.
 	DropSegment(ctx context.Context, segment *datapb.SegmentInfo) error
+	// DropSegments removes segment records in one transaction.
+	DropSegments(ctx context.Context, segments []*datapb.SegmentInfo) error
 	// AlterSegments persists new values of segments.
 	AlterSegments(ctx context.Context, segments []*datapb.SegmentInfo, binlogs ...metastore.BinlogsIncrement) (map[int64]int64, error)
 	// SaveDroppedSegmentsInBatch persists dropped segments.
@@ -92,6 +94,16 @@ func (s *catalogSegmentStore) AddSegment(ctx context.Context, segment *datapb.Se
 
 func (s *catalogSegmentStore) DropSegment(ctx context.Context, segment *datapb.SegmentInfo) error {
 	return s.catalog().DropSegment(ctx, segment)
+}
+
+// DropSegments drops the segments one by one: the catalog has no batch drop.
+func (s *catalogSegmentStore) DropSegments(ctx context.Context, segments []*datapb.SegmentInfo) error {
+	for _, segment := range segments {
+		if err := s.catalog().DropSegment(ctx, segment); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (s *catalogSegmentStore) AlterSegments(ctx context.Context, segments []*datapb.SegmentInfo, binlogs ...metastore.BinlogsIncrement) (map[int64]int64, error) {
@@ -202,9 +214,22 @@ func (s *casSegmentStore) AddSegment(ctx context.Context, segment *datapb.Segmen
 }
 
 func (s *casSegmentStore) DropSegment(ctx context.Context, segment *datapb.SegmentInfo) error {
+	return s.DropSegments(ctx, []*datapb.SegmentInfo{segment})
+}
+
+// DropSegments deletes every record against its cached version. A version
+// conflict fails the whole transaction and refreshes the cached copies.
+func (s *casSegmentStore) DropSegments(ctx context.Context, segments []*datapb.SegmentInfo) error {
+	if len(segments) == 0 {
+		return nil
+	}
 	txn := s.persist.Txn(ctx)
-	txn.DeleteIfVersion(s.key(segment), s.version(segment.GetID()))
-	_, err := s.commit(ctx, txn, []*datapb.SegmentInfo{segment}, []int{0})
+	positions := make([]int, 0, len(segments))
+	for i, segment := range segments {
+		txn.DeleteIfVersion(s.key(segment), s.version(segment.GetID()))
+		positions = append(positions, i)
+	}
+	_, err := s.commit(ctx, txn, segments, positions)
 	return err
 }
 

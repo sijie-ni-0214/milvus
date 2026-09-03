@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/cockroachdb/errors"
@@ -932,6 +933,9 @@ type memEntry[V any] struct {
 }
 
 type memPersist[K comparable, V any] struct {
+	// mu serializes transactions like the store would: meta commits writes of
+	// different segments concurrently.
+	mu        sync.RWMutex
 	data      map[K]*memEntry[V]
 	raw       map[string]string
 	nextVer   int64
@@ -961,6 +965,8 @@ func (p *memPersist[K, V]) Txn(ctx context.Context) Txn[K, V] {
 }
 
 func (p *memPersist[K, V]) Scan(ctx context.Context, prefix K) ([]K, []V, []int64, error) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
 	prefixStr := fmt.Sprintf("%v", prefix)
 	var ks []K
 	var vals []V
@@ -981,6 +987,8 @@ func (p *memPersist[K, V]) Scan(ctx context.Context, prefix K) ([]K, []V, []int6
 }
 
 func (p *memPersist[K, V]) Get(ctx context.Context, keys []K) (map[K]TxnResult[V], error) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
 	result := make(map[K]TxnResult[V], len(keys))
 	for _, key := range keys {
 		if entry, ok := p.data[key]; ok {
@@ -1001,6 +1009,8 @@ type memTxn[K comparable, V any] struct {
 
 func (t *memTxn[K, V]) Commit() ([]TxnResult[V], error) {
 	p := t.persist
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	// Validate all ops first (don't partially apply).
 	for _, op := range t.ops {
 		switch op.kind {

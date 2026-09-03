@@ -59,6 +59,105 @@ func TestMinioObjectStoragePutObjectOptions(t *testing.T) {
 	assert.False(t, opts.SendContentMd5)
 }
 
+func TestMinioObjectStorageRemoveObjects(t *testing.T) {
+	t.Run("returns one result per input and preserves typed failures", func(t *testing.T) {
+		var submitted []string
+		mockRemove := mockey.Mock((*minio.Client).RemoveObjectsWithResult).To(
+			func(_ *minio.Client, _ context.Context, bucketName string, objects <-chan minio.ObjectInfo, _ minio.RemoveObjectsOptions) <-chan minio.RemoveObjectResult {
+				assert.Equal(t, "bucket", bucketName)
+				results := make(chan minio.RemoveObjectResult, 3)
+				for object := range objects {
+					submitted = append(submitted, object.Key)
+					result := minio.RemoveObjectResult{ObjectName: object.Key}
+					if object.Key == "slow" {
+						result.Err = minio.ErrorResponse{Code: "SlowDown", Message: "throttled"}
+					}
+					results <- result
+				}
+				close(results)
+				return results
+			},
+		).Build()
+		defer mockRemove.UnPatch()
+
+		objectStorage := &MinioObjectStorage{Client: &minio.Client{}}
+		results := objectStorage.RemoveObjects(context.Background(), "bucket", []string{"ok", "slow", "missing", "ok"})
+
+		require.Len(t, results, 4)
+		assert.Equal(t, []string{"ok", "slow", "missing"}, submitted)
+		assert.NoError(t, results[0].Err)
+		assert.ErrorIs(t, results[1].Err, merr.ErrIoTooManyRequests)
+		assert.NoError(t, results[2].Err)
+		assert.NoError(t, results[3].Err)
+	})
+
+	t.Run("batch-level error fails the whole batch closed", func(t *testing.T) {
+		mockRemove := mockey.Mock((*minio.Client).RemoveObjectsWithResult).To(
+			func(_ *minio.Client, _ context.Context, _ string, objects <-chan minio.ObjectInfo, _ minio.RemoveObjectsOptions) <-chan minio.RemoveObjectResult {
+				for range objects {
+				}
+				results := make(chan minio.RemoveObjectResult, 1)
+				results <- minio.RemoveObjectResult{Err: minio.ErrorResponse{Code: "AccessDenied", Message: "denied"}}
+				close(results)
+				return results
+			},
+		).Build()
+		defer mockRemove.UnPatch()
+
+		objectStorage := &MinioObjectStorage{Client: &minio.Client{}}
+		results := objectStorage.RemoveObjects(context.Background(), "bucket", []string{"a", "b"})
+
+		require.Len(t, results, 2)
+		assert.ErrorIs(t, results[0].Err, merr.ErrIoPermissionDenied)
+		assert.ErrorIs(t, results[1].Err, merr.ErrIoPermissionDenied)
+	})
+
+	t.Run("missing SDK result is not reported as success", func(t *testing.T) {
+		mockRemove := mockey.Mock((*minio.Client).RemoveObjectsWithResult).To(
+			func(_ *minio.Client, _ context.Context, _ string, objects <-chan minio.ObjectInfo, _ minio.RemoveObjectsOptions) <-chan minio.RemoveObjectResult {
+				for range objects {
+				}
+				results := make(chan minio.RemoveObjectResult, 1)
+				results <- minio.RemoveObjectResult{ObjectName: "a"}
+				close(results)
+				return results
+			},
+		).Build()
+		defer mockRemove.UnPatch()
+
+		objectStorage := &MinioObjectStorage{Client: &minio.Client{}}
+		results := objectStorage.RemoveObjects(context.Background(), "bucket", []string{"a", "b"})
+
+		require.Len(t, results, 2)
+		assert.NoError(t, results[0].Err)
+		assert.ErrorIs(t, results[1].Err, merr.ErrIoFailed)
+	})
+
+	t.Run("duplicate SDK result cannot overwrite an earlier failure", func(t *testing.T) {
+		mockRemove := mockey.Mock((*minio.Client).RemoveObjectsWithResult).To(
+			func(_ *minio.Client, _ context.Context, _ string, objects <-chan minio.ObjectInfo, _ minio.RemoveObjectsOptions) <-chan minio.RemoveObjectResult {
+				for range objects {
+				}
+				results := make(chan minio.RemoveObjectResult, 2)
+				results <- minio.RemoveObjectResult{
+					ObjectName: "a",
+					Err:        minio.ErrorResponse{Code: "SlowDown", Message: "throttled"},
+				}
+				results <- minio.RemoveObjectResult{ObjectName: "a"}
+				close(results)
+				return results
+			},
+		).Build()
+		defer mockRemove.UnPatch()
+
+		objectStorage := &MinioObjectStorage{Client: &minio.Client{}}
+		results := objectStorage.RemoveObjects(context.Background(), "bucket", []string{"a"})
+
+		require.Len(t, results, 1)
+		assert.ErrorIs(t, results[0].Err, merr.ErrIoTooManyRequests)
+	})
+}
+
 func TestMinioObjectStorageCopyObjectCrossBucket(t *testing.T) {
 	params := paramtable.Get()
 	key := params.MinioCfg.MultipartCopyThreshold.Key

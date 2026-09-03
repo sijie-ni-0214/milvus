@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	clientv3 "go.etcd.io/etcd/client/v3"
@@ -153,6 +154,121 @@ func TestCASSegmentStoreConflictRefreshesCache(t *testing.T) {
 	require.EqualValues(t, 42, persist.data[storedSegmentKey(100)].value.GetNumOfRows())
 }
 
+func newDroppedTestSegment(id int64) *SegmentInfo {
+	segment := newFlushedTestSegment(id)
+	segment.State = commonpb.SegmentState_Dropped
+	return segment
+}
+
+// failingCommitPersist fails every commit of the wrapped persist.
+type failingCommitPersist struct {
+	OptimisticTxnPersist[string, *datapb.SegmentInfo]
+	err error
+}
+
+func (p *failingCommitPersist) Txn(ctx context.Context) Txn[string, *datapb.SegmentInfo] {
+	return &failingCommitTxn{Txn: p.OptimisticTxnPersist.Txn(ctx), err: p.err}
+}
+
+type failingCommitTxn struct {
+	Txn[string, *datapb.SegmentInfo]
+	err error
+}
+
+func (t *failingCommitTxn) Commit() ([]TxnResult[*datapb.SegmentInfo], error) {
+	return nil, t.err
+}
+
+func TestMetaDropSegments(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("drops the planned dropped segments in one batch", func(t *testing.T) {
+		m, persist := newCASTestMeta(t)
+		require.NoError(t, m.AddSegment(ctx, newDroppedTestSegment(1)))
+		require.NoError(t, m.AddSegment(ctx, newDroppedTestSegment(2)))
+		require.NoError(t, m.AddSegment(ctx, newFlushedTestSegment(3)))
+		candidates := []*SegmentInfo{m.segments.GetSegment(1), m.segments.GetSegment(2), m.segments.GetSegment(3)}
+
+		removed, err := m.DropSegments(ctx, candidates)
+		require.NoError(t, err)
+		require.Equal(t, 2, removed)
+		require.Nil(t, m.GetSegment(ctx, 1))
+		require.Nil(t, m.GetSegment(ctx, 2))
+		require.NotNil(t, m.GetSegment(ctx, 3), "a segment that is not dropped is never removed")
+		require.NotContains(t, persist.data, storedSegmentKey(1))
+		require.NotContains(t, persist.data, storedSegmentKey(2))
+		require.Contains(t, persist.data, storedSegmentKey(3))
+	})
+
+	t.Run("keeps a segment republished since it was planned", func(t *testing.T) {
+		m, persist := newCASTestMeta(t)
+		require.NoError(t, m.AddSegment(ctx, newDroppedTestSegment(1)))
+		planned := m.segments.GetSegment(1)
+		m.segments.SetIsCompacting(1, true)
+
+		removed, err := m.DropSegments(ctx, []*SegmentInfo{planned})
+		require.NoError(t, err)
+		require.Zero(t, removed)
+		require.NotNil(t, m.GetSegment(ctx, 1))
+		require.Contains(t, persist.data, storedSegmentKey(1))
+	})
+
+	t.Run("drops the unchanged siblings of a conflicting segment", func(t *testing.T) {
+		m, persist := newCASTestMeta(t)
+		for _, id := range []int64{1, 2, 3} {
+			require.NoError(t, m.AddSegment(ctx, newDroppedTestSegment(id)))
+		}
+		candidates := []*SegmentInfo{m.segments.GetSegment(1), m.segments.GetSegment(2), m.segments.GetSegment(3)}
+
+		// Another writer rewrites segment 2 and removes segment 3 under the cache.
+		external := newDroppedTestSegment(2)
+		external.NumOfRows = 42
+		cached, _ := m.segments.Version(2)
+		txn := persist.Txn(ctx)
+		txn.PutIfVersion(storedSegmentKey(2), external.SegmentInfo, cached, false)
+		txn.Delete(storedSegmentKey(3))
+		_, err := txn.Commit()
+		require.NoError(t, err)
+
+		removed, err := m.DropSegments(ctx, candidates)
+		require.NoError(t, err)
+		require.Equal(t, 2, removed)
+		require.Nil(t, m.GetSegment(ctx, 1))
+		require.NotContains(t, persist.data, storedSegmentKey(1))
+		require.Nil(t, m.GetSegment(ctx, 3))
+		// The rewritten segment waits for the next GC cycle to plan it again.
+		require.EqualValues(t, 42, m.GetSegment(ctx, 2).GetNumOfRows())
+		require.Contains(t, persist.data, storedSegmentKey(2))
+	})
+
+	t.Run("keeps the cache when the store fails", func(t *testing.T) {
+		m, persist := newCASTestMeta(t)
+		require.NoError(t, m.AddSegment(ctx, newDroppedTestSegment(1)))
+		expected := errors.New("mock commit failure")
+		m.segmentStore = newCASSegmentStore(&failingCommitPersist{OptimisticTxnPersist: persist, err: expected},
+			m.catalog, testSegmentStoreRoot, m.segments)
+
+		removed, err := m.DropSegments(ctx, []*SegmentInfo{m.segments.GetSegment(1)})
+		require.ErrorIs(t, err, expected)
+		require.Zero(t, removed)
+		require.NotNil(t, m.GetSegment(ctx, 1))
+		require.Contains(t, persist.data, storedSegmentKey(1))
+	})
+
+	t.Run("rejects a batch over the transaction limit", func(t *testing.T) {
+		m, _ := newCASTestMeta(t)
+		paramtable.Init()
+		limit := Params.MetaStoreCfg.MaxEtcdTxnNum.GetAsInt()
+		candidates := make([]*SegmentInfo, limit+1)
+		for i := range candidates {
+			candidates[i] = newDroppedTestSegment(int64(i + 1))
+		}
+		removed, err := m.DropSegments(ctx, candidates)
+		require.Error(t, err)
+		require.Zero(t, removed)
+	})
+}
+
 func TestCASSegmentStoreComposesCatalogActions(t *testing.T) {
 	ctx := context.Background()
 	m, persist := newCASTestMeta(t)
@@ -198,10 +314,6 @@ func TestCASSegmentStoreParallelWritersOfDifferentSegments(t *testing.T) {
 	for i := int64(0); i < n; i++ {
 		require.NoError(t, m.AddSegment(ctx, newFlushedTestSegment(100+i)))
 	}
-	// memPersist is not safe for concurrent use; serialize its commits
-	// while the meta-level writers run in parallel.
-	m.segmentStore = &serializedSegmentStore{inner: m.segmentStore}
-
 	var wg sync.WaitGroup
 	for i := int64(0); i < n; i++ {
 		wg.Add(1)
@@ -251,49 +363,6 @@ func TestMergeFieldBinlogsDoesNotAliasInput(t *testing.T) {
 	require.Len(t, first[0].GetBinlogs(), 2)
 	require.Len(t, second[0].GetBinlogs(), 2, "a rerun from the same input must produce the same result")
 	require.Len(t, incoming[0].GetBinlogs(), 1, "the input is never modified")
-}
-
-// serializedSegmentStore serializes a segmentStore for test persists that are
-// not safe for concurrent use.
-type serializedSegmentStore struct {
-	mu    sync.Mutex
-	inner segmentStore
-}
-
-func (s *serializedSegmentStore) ListSegments(ctx context.Context, collectionIDs []int64) ([]*datapb.SegmentInfo, []int64, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.inner.ListSegments(ctx, collectionIDs)
-}
-
-func (s *serializedSegmentStore) AddSegment(ctx context.Context, segment *datapb.SegmentInfo) (int64, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.inner.AddSegment(ctx, segment)
-}
-
-func (s *serializedSegmentStore) DropSegment(ctx context.Context, segment *datapb.SegmentInfo) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.inner.DropSegment(ctx, segment)
-}
-
-func (s *serializedSegmentStore) AlterSegments(ctx context.Context, segments []*datapb.SegmentInfo, binlogs ...metastore.BinlogsIncrement) (map[int64]int64, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.inner.AlterSegments(ctx, segments, binlogs...)
-}
-
-func (s *serializedSegmentStore) SaveDroppedSegmentsInBatch(ctx context.Context, segments []*datapb.SegmentInfo) (map[int64]int64, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.inner.SaveDroppedSegmentsInBatch(ctx, segments)
-}
-
-func (s *serializedSegmentStore) Update(ctx context.Context, actions ...metastore.UpdateAction) (map[int64]int64, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.inner.Update(ctx, actions...)
 }
 
 func newTestEtcdPersist(t *testing.T) (OptimisticTxnPersist[string, *datapb.SegmentInfo], *clientv3.Client, string) {

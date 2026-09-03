@@ -100,12 +100,14 @@ type DataCoordCatalog interface {
 	ListIndexes(ctx context.Context) ([]*model.Index, error)
 	AlterIndexes(ctx context.Context, newIndexes []*model.Index) error
 	DropIndex(ctx context.Context, collID, dropIdxID typeutil.UniqueID) error
+	DropIndexes(ctx context.Context, indexes []*model.Index) error
 
 	CreateSegmentIndex(ctx context.Context, segIdx *model.SegmentIndex) error
 	ListSegmentIndexes(ctx context.Context, collectionID int64) ([]*model.SegmentIndex, error)
 	ListPartitionSegmentIndexes(ctx context.Context, collectionID, partitionID int64) ([]*model.SegmentIndex, error)
 	AlterSegmentIndexes(ctx context.Context, newSegIdxes []*model.SegmentIndex) error
 	DropSegmentIndex(ctx context.Context, collID, partID, segID, buildID typeutil.UniqueID) error
+	DropSegmentIndexes(ctx context.Context, indexes []*model.SegmentIndex) error
 
 	SaveImportJob(ctx context.Context, job *datapb.ImportJob) error
 	ListImportJobs(ctx context.Context) ([]*datapb.ImportJob, error)

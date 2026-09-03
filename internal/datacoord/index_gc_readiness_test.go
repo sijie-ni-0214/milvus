@@ -30,6 +30,7 @@ import (
 	"github.com/milvus-io/milvus-proto/go-api/v3/commonpb"
 	"github.com/milvus-io/milvus/internal/metastore"
 	"github.com/milvus-io/milvus/internal/metastore/model"
+	"github.com/milvus-io/milvus/internal/storage"
 	"github.com/milvus-io/milvus/internal/storagev2/packed"
 	"github.com/milvus-io/milvus/pkg/v3/proto/datapb"
 	"github.com/milvus-io/milvus/pkg/v3/proto/indexpb"
@@ -105,6 +106,21 @@ func (c *indexGCReadinessCatalog) DropSegmentIndex(_ context.Context, _, _, _, b
 	return nil
 }
 
+func (c *indexGCReadinessCatalog) DropSegmentIndexes(_ context.Context, indexes []*model.SegmentIndex) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, index := range indexes {
+		c.events = append(c.events, fmt.Sprintf("drop:%d", index.BuildID))
+	}
+	if c.dropFailure {
+		return errors.New("drop segment-index metadata failed")
+	}
+	for _, index := range indexes {
+		delete(c.stored, index.BuildID)
+	}
+	return nil
+}
+
 func newIndexGCReadinessServer(t *testing.T, secondIndex bool) (*Server, *model.Index, *indexGCReadinessCatalog) {
 	t.Helper()
 	s, index := newIndexReadinessTestServer([]*datapb.SegmentInfo{
@@ -140,14 +156,18 @@ func patchIndexGCReadinessExternalIO(t *testing.T, s *Server, catalog *indexGCRe
 		sort.Slice(indexes, func(i, j int) bool { return indexes[i].IndexID < indexes[j].IndexID })
 		return indexes, map[string]struct{}{"index-artifact": {}}, gcNotBlocked
 	}).Build()
-	files := mockey.Mock((*garbageCollector).removeDroppedSegmentFiles).To(func(_ *garbageCollector, _ context.Context, _ *SegmentInfo, _ map[string]struct{}) error {
+	files := mockey.Mock((*garbageCollector).removeObjectFilesWithResult).To(func(_ *garbageCollector, _ context.Context, paths []string) []storage.RemoveResult {
 		catalog.mu.Lock()
 		catalog.events = append(catalog.events, "files")
 		catalog.mu.Unlock()
-		if fileFailure {
-			return errors.New("remove files failed")
+		results := make([]storage.RemoveResult, len(paths))
+		for i, filePath := range paths {
+			results[i].Path = filePath
+			if fileFailure {
+				results[i].Err = errors.New("remove files failed")
+			}
 		}
-		return nil
+		return results
 	}).Build()
 	t.Cleanup(func() { files.UnPatch(); discovery.UnPatch() })
 }

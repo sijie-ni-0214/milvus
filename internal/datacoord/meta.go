@@ -1034,6 +1034,92 @@ func (m *meta) DropSegment(ctx context.Context, segmentID UniqueID) error {
 	return nil
 }
 
+// DropSegments removes the records of dropped segments GC has recycled in one
+// store transaction and drops them from the cache once it commits. Each
+// candidate must be the cached value GC planned the deletion of its files
+// from: a segment republished since then may reference files the plan did not
+// cover, so it is left for the next GC cycle to plan again. Callers cap the
+// input at the metastore transaction limit.
+//
+// A version conflict means another writer touched one of the records, and the
+// store has refreshed their cached copies. Candidates still cached unchanged
+// are then dropped one by one, so a changed sibling does not hold them back.
+func (m *meta) DropSegments(ctx context.Context, candidates []*SegmentInfo) (int, error) {
+	if len(candidates) == 0 {
+		return 0, nil
+	}
+	maxBatchSize := Params.MetaStoreCfg.MaxEtcdTxnNum.GetAsInt()
+	if maxBatchSize <= 0 {
+		maxBatchSize = 64
+	}
+	if len(candidates) > maxBatchSize {
+		return 0, merr.WrapErrServiceInternalMsg(
+			"segment metadata batch size %d exceeds metastore transaction limit %d",
+			len(candidates), maxBatchSize)
+	}
+
+	segmentIDs := make([]int64, 0, len(candidates))
+	for _, candidate := range candidates {
+		if candidate != nil {
+			segmentIDs = append(segmentIDs, candidate.GetID())
+		}
+	}
+	defer m.lockSegments(segmentIDs...)()
+
+	segments := make([]*SegmentInfo, 0, len(segmentIDs))
+	records := make([]*datapb.SegmentInfo, 0, len(segmentIDs))
+	seen := make(typeutil.UniqueSet, len(segmentIDs))
+	for _, candidate := range candidates {
+		if candidate == nil || seen.Contain(candidate.GetID()) {
+			continue
+		}
+		seen.Insert(candidate.GetID())
+		if m.segments.GetSegment(candidate.GetID()) != candidate || candidate.GetState() != commonpb.SegmentState_Dropped {
+			continue
+		}
+		segments = append(segments, candidate)
+		records = append(records, candidate.SegmentInfo)
+	}
+	if len(segments) == 0 {
+		return 0, nil
+	}
+
+	err := m.store().DropSegments(ctx, records)
+	if err == nil {
+		for _, segment := range segments {
+			m.evictDroppedSegment(segment)
+		}
+		return len(segments), nil
+	}
+	if !errors.Is(err, ErrVersionConflict) {
+		return 0, err
+	}
+	removed := 0
+	var dropErr error
+	for _, segment := range segments {
+		switch m.segments.GetSegment(segment.GetID()) {
+		case nil:
+			// The refresh found the record already gone and dropped it from
+			// the cache, which counted the drop.
+			removed++
+		case segment:
+			if err := m.store().DropSegment(ctx, segment.SegmentInfo); err != nil {
+				dropErr = merr.Combine(dropErr, err)
+				continue
+			}
+			m.evictDroppedSegment(segment)
+			removed++
+		}
+	}
+	return removed, dropErr
+}
+
+// evictDroppedSegment drops a segment whose record is gone from the cache,
+// which counts the drop.
+func (m *meta) evictDroppedSegment(segment *SegmentInfo) {
+	m.segments.DropSegment(segment.GetID())
+}
+
 // GetHealthySegment returns segment info with provided id
 // if not segment is found, nil will be returned
 func (m *meta) GetHealthySegment(ctx context.Context, segID UniqueID) *SegmentInfo {
