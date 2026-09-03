@@ -2376,6 +2376,7 @@ type proxyConfig struct {
 	NameValidationAllowedChars        ParamItem `refreshable:"true"`
 	RoleNameValidationAllowedChars    ParamItem `refreshable:"true"`
 	MaxTaskNum                        ParamItem `refreshable:"false"`
+	EnableAutoLoad                    ParamItem `refreshable:"true"`
 	DDLConcurrency                    ParamItem `refreshable:"true"`
 	DCLConcurrency                    ParamItem `refreshable:"true"`
 	ShardLeaderCacheInterval          ParamItem `refreshable:"false"`
@@ -2610,6 +2611,15 @@ func (p *proxyConfig) init(base *BaseTable) {
 		Export:       true,
 	}
 	p.MaxTaskNum.Init(base.mgr)
+
+	p.EnableAutoLoad = ParamItem{
+		Key:          "proxy.enableAutoLoad",
+		Version:      "3.0.0",
+		DefaultValue: "false",
+		Doc:          "whether to automatically load an unloaded collection before DQL requests",
+		Export:       true,
+	}
+	p.EnableAutoLoad.Init(base.mgr)
 
 	p.DDLConcurrency = ParamItem{
 		Key:          "proxy.ddlConcurrency",

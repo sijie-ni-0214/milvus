@@ -111,6 +111,23 @@ func TestMembershipFilterConfig(t *testing.T) {
 	})
 }
 
+func TestProxyEnableAutoLoad(t *testing.T) {
+	base := NewBaseTable(SkipRemote(true), SkipEnv(true))
+	params := proxyConfig{}
+	params.init(base)
+	item := &params.EnableAutoLoad
+
+	assert.Equal(t, "proxy.enableAutoLoad", item.Key)
+	assert.Equal(t, "false", item.DefaultValue)
+	assert.True(t, item.Export)
+	assert.False(t, item.GetAsBool())
+
+	assert.NoError(t, base.Save(item.Key, "true"))
+	assert.True(t, item.GetAsBool())
+	assert.NoError(t, base.Save(item.Key, "false"))
+	assert.False(t, item.GetAsBool())
+}
+
 func TestComponentParam_StorageIopsParams(t *testing.T) {
 	params := &ComponentParam{}
 	params.Init(NewBaseTable(SkipRemote(true), SkipEnv(true)))

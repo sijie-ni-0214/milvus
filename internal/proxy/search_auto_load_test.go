@@ -25,40 +25,57 @@ import (
 
 	"github.com/bytedance/mockey"
 	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/otel/trace"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
 	"github.com/milvus-io/milvus-proto/go-api/v3/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v3/milvuspb"
+	"github.com/milvus-io/milvus/internal/util/segcore"
 	"github.com/milvus-io/milvus/internal/views/queryclient"
 	"github.com/milvus-io/milvus/pkg/v3/util/merr"
 )
 
-func TestEnsureCollectionReadyForSearchRejectsUnhealthyProxy(t *testing.T) {
+func TestEnsureCollectionReadyRejectsUnhealthyProxy(t *testing.T) {
 	client := &autoLoadViewQueryClient{}
 	node := &Proxy{ctx: context.Background(), viewQueryClient: client}
 	node.UpdateStateCode(commonpb.StateCode_Abnormal)
 
-	err := node.ensureCollectionReadyForSearch(context.Background(), "db", "collection")
+	err := node.ensureCollectionReady(context.Background(), "db", "collection")
 	require.ErrorIs(t, err, merr.ErrServiceNotReady)
 	require.Equal(t, 0, client.checkCalls)
 	require.Equal(t, 0, client.waitCalls)
 }
 
-func TestEnsureCollectionReadyForSearchFastPath(t *testing.T) {
+func TestEnsureCollectionReadySkipsWhenAutoLoadDisabled(t *testing.T) {
+	require.NoError(t, Params.Save(Params.ProxyCfg.EnableAutoLoad.Key, "false"))
+	t.Cleanup(func() { require.NoError(t, Params.Reset(Params.ProxyCfg.EnableAutoLoad.Key)) })
+
+	client := &autoLoadViewQueryClient{checkErr: merr.WrapErrCollectionNotLoaded(100)}
+	node := &Proxy{ctx: context.Background(), viewQueryClient: client}
+	node.UpdateStateCode(commonpb.StateCode_Healthy)
+
+	require.NoError(t, node.ensureCollectionReady(context.Background(), "db", "collection"))
+	require.Equal(t, 0, client.checkCalls)
+	require.Equal(t, 0, client.waitCalls)
+}
+
+func TestEnsureCollectionReadyFastPath(t *testing.T) {
+	enableAutoLoad(t)
 	metaCache := mockSearchCollectionMeta(t, 100, []string{"v0", "v1"})
 	client := &autoLoadViewQueryClient{}
 	node := &Proxy{ctx: context.Background(), metaCache: metaCache, viewQueryClient: client}
 	node.UpdateStateCode(commonpb.StateCode_Healthy)
 
-	require.NoError(t, node.ensureCollectionReadyForSearch(context.Background(), "db", "collection"))
+	require.NoError(t, node.ensureCollectionReady(context.Background(), "db", "collection"))
 	require.Equal(t, 1, client.checkCalls)
 	require.Equal(t, 0, client.waitCalls)
 	require.Equal(t, int64(100), client.collectionID)
 	require.Equal(t, []string{"v0", "v1"}, client.expectedVChannels)
 }
 
-func TestEnsureCollectionReadyForSearchWaitsForAssignment(t *testing.T) {
+func TestEnsureCollectionReadyWaitsForAssignment(t *testing.T) {
+	enableAutoLoad(t)
 	tests := []struct {
 		name          string
 		loadState     commonpb.LoadState
@@ -92,7 +109,7 @@ func TestEnsureCollectionReadyForSearchWaitsForAssignment(t *testing.T) {
 			t.Cleanup(func() { getLoadStateMock.UnPatch() })
 			t.Cleanup(func() { loadCollectionMock.UnPatch() })
 
-			require.NoError(t, node.ensureCollectionReadyForSearch(context.Background(), "db", "collection"))
+			require.NoError(t, node.ensureCollectionReady(context.Background(), "db", "collection"))
 			require.Equal(t, test.expectedLoads, loadCalls)
 			require.Equal(t, 1, client.waitCalls)
 			require.Equal(t, int64(100), client.collectionID)
@@ -101,7 +118,8 @@ func TestEnsureCollectionReadyForSearchWaitsForAssignment(t *testing.T) {
 	}
 }
 
-func TestEnsureCollectionReadyForSearchRequiresLoadPrivilege(t *testing.T) {
+func TestEnsureCollectionReadyRequiresLoadPrivilege(t *testing.T) {
+	enableAutoLoad(t)
 	metaCache := mockSearchCollectionMeta(t, 100, []string{"v0", "v1"})
 	client := &autoLoadViewQueryClient{checkErr: merr.WrapErrCollectionNotLoaded(100)}
 	node := &Proxy{ctx: context.Background(), metaCache: metaCache, viewQueryClient: client}
@@ -128,7 +146,7 @@ func TestEnsureCollectionReadyForSearchRequiresLoadPrivilege(t *testing.T) {
 	defer privilegeMock.UnPatch()
 	defer loadCollectionMock.UnPatch()
 
-	err := node.ensureCollectionReadyForSearch(context.Background(), "db", "collection")
+	err := node.ensureCollectionReady(context.Background(), "db", "collection")
 	require.ErrorIs(t, err, merr.ErrPrivilegeNotPermitted)
 	resultStatus := merr.Status(err)
 	require.Equal(t, merr.Code(merr.ErrPrivilegeNotPermitted), resultStatus.GetCode())
@@ -137,7 +155,8 @@ func TestEnsureCollectionReadyForSearchRequiresLoadPrivilege(t *testing.T) {
 	require.Equal(t, 0, client.waitCalls)
 }
 
-func TestEnsureCollectionReadyForSearchCoalescesConcurrentLoad(t *testing.T) {
+func TestEnsureCollectionReadyCoalescesConcurrentLoad(t *testing.T) {
+	enableAutoLoad(t)
 	const concurrency = 16
 
 	metaCache := mockSearchCollectionMeta(t, 100, []string{"v0", "v1"})
@@ -190,7 +209,7 @@ func TestEnsureCollectionReadyForSearchCoalescesConcurrentLoad(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			<-start
-			errs <- node.ensureCollectionReadyForSearch(ctx, "db", "collection")
+			errs <- node.ensureCollectionReady(ctx, "db", "collection")
 		}()
 	}
 	close(start)
@@ -203,7 +222,8 @@ func TestEnsureCollectionReadyForSearchCoalescesConcurrentLoad(t *testing.T) {
 	require.Equal(t, int32(1), loadCalls.Load())
 }
 
-func TestEnsureCollectionReadyForSearchCallerCancellationDoesNotCancelLoad(t *testing.T) {
+func TestEnsureCollectionReadyCallerCancellationDoesNotCancelLoad(t *testing.T) {
+	enableAutoLoad(t)
 	metaCache := mockSearchCollectionMeta(t, 100, []string{"v0", "v1"})
 	client := &autoLoadViewQueryClient{checkErr: merr.WrapErrCollectionNotLoaded(100)}
 	node := &Proxy{ctx: context.Background(), metaCache: metaCache, viewQueryClient: client}
@@ -245,7 +265,7 @@ func TestEnsureCollectionReadyForSearchCallerCancellationDoesNotCancelLoad(t *te
 	ctx, cancel := context.WithCancel(context.Background())
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- node.ensureCollectionReadyForSearch(ctx, "db", "collection")
+		errCh <- node.ensureCollectionReady(ctx, "db", "collection")
 	}()
 
 	select {
@@ -280,7 +300,8 @@ func TestEnsureCollectionReadyForSearchCallerCancellationDoesNotCancelLoad(t *te
 	}
 }
 
-func TestEnsureCollectionReadyForSearchWaiterCanCancelIndependently(t *testing.T) {
+func TestEnsureCollectionReadyWaiterCanCancelIndependently(t *testing.T) {
+	enableAutoLoad(t)
 	metaCache := mockSearchCollectionMeta(t, 100, []string{"v0", "v1"})
 	client := &autoLoadViewQueryClient{checkErr: merr.WrapErrCollectionNotLoaded(100)}
 	node := &Proxy{ctx: context.Background(), metaCache: metaCache, viewQueryClient: client}
@@ -331,7 +352,7 @@ func TestEnsureCollectionReadyForSearchWaiterCanCancelIndependently(t *testing.T
 
 	leaderErrCh := make(chan error, 1)
 	go func() {
-		leaderErrCh <- node.ensureCollectionReadyForSearch(context.Background(), "db", "collection")
+		leaderErrCh <- node.ensureCollectionReady(context.Background(), "db", "collection")
 	}()
 	select {
 	case <-loadStarted:
@@ -342,7 +363,7 @@ func TestEnsureCollectionReadyForSearchWaiterCanCancelIndependently(t *testing.T
 	waiterCtx, cancelWaiter := context.WithCancel(context.Background())
 	waiterErrCh := make(chan error, 1)
 	go func() {
-		waiterErrCh <- node.ensureCollectionReadyForSearch(waiterCtx, "db", "collection")
+		waiterErrCh <- node.ensureCollectionReady(waiterCtx, "db", "collection")
 	}()
 	require.Eventually(t, func() bool {
 		return stateChecks.Load() >= 3
@@ -371,7 +392,8 @@ func TestEnsureCollectionReadyForSearchWaiterCanCancelIndependently(t *testing.T
 	require.Equal(t, int32(1), loadCalls.Load())
 }
 
-func TestEnsureCollectionReadyForSearchProxyCancellationStopsLoad(t *testing.T) {
+func TestEnsureCollectionReadyProxyCancellationStopsLoad(t *testing.T) {
+	enableAutoLoad(t)
 	metaCache := mockSearchCollectionMeta(t, 100, []string{"v0", "v1"})
 	client := &autoLoadViewQueryClient{checkErr: merr.WrapErrCollectionNotLoaded(100)}
 	nodeCtx, cancelNode := context.WithCancel(context.Background())
@@ -401,7 +423,7 @@ func TestEnsureCollectionReadyForSearchProxyCancellationStopsLoad(t *testing.T) 
 
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- node.ensureCollectionReadyForSearch(context.Background(), "db", "collection")
+		errCh <- node.ensureCollectionReady(context.Background(), "db", "collection")
 	}()
 	select {
 	case <-loadStarted:
@@ -423,7 +445,8 @@ func TestEnsureCollectionReadyForSearchProxyCancellationStopsLoad(t *testing.T) 
 	}
 }
 
-func TestEnsureCollectionReadyForSearchRechecksLoadState(t *testing.T) {
+func TestEnsureCollectionReadyRechecksLoadState(t *testing.T) {
+	enableAutoLoad(t)
 	metaCache := mockSearchCollectionMeta(t, 100, []string{"v0", "v1"})
 	client := &autoLoadViewQueryClient{checkErr: merr.WrapErrCollectionNotLoaded(100)}
 	node := &Proxy{ctx: context.Background(), metaCache: metaCache, viewQueryClient: client}
@@ -452,7 +475,7 @@ func TestEnsureCollectionReadyForSearchRechecksLoadState(t *testing.T) {
 	defer privilegeMock.UnPatch()
 	defer loadCollectionMock.UnPatch()
 
-	require.NoError(t, node.ensureCollectionReadyForSearch(context.Background(), "db", "collection"))
+	require.NoError(t, node.ensureCollectionReady(context.Background(), "db", "collection"))
 	require.Equal(t, 2, stateChecks)
 	require.Equal(t, 0, loadCalls)
 	require.Equal(t, 1, client.waitCalls)
@@ -463,7 +486,7 @@ func TestSearchStopsBeforeExecutionWhenCollectionIsNotReady(t *testing.T) {
 	node.UpdateStateCode(commonpb.StateCode_Healthy)
 	readinessCalls := 0
 	searchCalls := 0
-	readinessMock := mockey.Mock((*Proxy).ensureCollectionReadyForSearch).To(
+	readinessMock := mockey.Mock((*Proxy).ensureCollectionReady).To(
 		func(_ *Proxy, _ context.Context, dbName, collectionName string) error {
 			readinessCalls++
 			require.Equal(t, "db", dbName)
@@ -493,7 +516,7 @@ func TestHybridSearchStopsBeforeExecutionWhenCollectionIsNotReady(t *testing.T) 
 	node.UpdateStateCode(commonpb.StateCode_Healthy)
 	readinessCalls := 0
 	hybridSearchCalls := 0
-	readinessMock := mockey.Mock((*Proxy).ensureCollectionReadyForSearch).To(
+	readinessMock := mockey.Mock((*Proxy).ensureCollectionReady).To(
 		func(_ *Proxy, _ context.Context, dbName, collectionName string) error {
 			readinessCalls++
 			require.Equal(t, "db", dbName)
@@ -516,6 +539,69 @@ func TestHybridSearchStopsBeforeExecutionWhenCollectionIsNotReady(t *testing.T) 
 	require.ErrorIs(t, merr.Error(response.GetStatus()), merr.ErrCollectionNotLoaded)
 	require.Equal(t, 1, readinessCalls)
 	require.Equal(t, 0, hybridSearchCalls)
+}
+
+func TestQueryStopsBeforeExecutionWhenCollectionIsNotReady(t *testing.T) {
+	node := &Proxy{}
+	node.UpdateStateCode(commonpb.StateCode_Healthy)
+	readinessCalls := 0
+	queryCalls := 0
+	readinessMock := mockey.Mock((*Proxy).ensureCollectionReady).To(
+		func(_ *Proxy, _ context.Context, dbName, collectionName string) error {
+			readinessCalls++
+			require.Equal(t, "db", dbName)
+			require.Equal(t, "collection", collectionName)
+			return merr.WrapErrCollectionNotLoaded(100)
+		}).Build()
+	queryMock := mockey.Mock((*Proxy).query).To(
+		func(_ *Proxy, _ context.Context, _ *queryTask, _ trace.Span) (*milvuspb.QueryResults, segcore.StorageCost, error) {
+			queryCalls++
+			return &milvuspb.QueryResults{Status: merr.Success()}, segcore.StorageCost{}, nil
+		}).Build()
+	defer readinessMock.UnPatch()
+	defer queryMock.UnPatch()
+
+	response, err := node.Query(context.Background(), &milvuspb.QueryRequest{
+		DbName:         "db",
+		CollectionName: "collection",
+	})
+	require.NoError(t, err)
+	require.ErrorIs(t, merr.Error(response.GetStatus()), merr.ErrCollectionNotLoaded)
+	require.Equal(t, 1, readinessCalls)
+	require.Equal(t, 0, queryCalls)
+}
+
+func TestQueryExecutesWhenCollectionIsReady(t *testing.T) {
+	node := &Proxy{}
+	previousRateCol := rateCol
+	t.Cleanup(func() { rateCol = previousRateCol })
+	require.NoError(t, node.initRateCollector())
+	node.UpdateStateCode(commonpb.StateCode_Healthy)
+	readinessCalls := 0
+	queryCalls := 0
+	readinessMock := mockey.Mock((*Proxy).ensureCollectionReady).To(
+		func(_ *Proxy, _ context.Context, dbName, collectionName string) error {
+			readinessCalls++
+			require.Equal(t, "db", dbName)
+			require.Equal(t, "collection", collectionName)
+			return nil
+		}).Build()
+	queryMock := mockey.Mock((*Proxy).query).To(
+		func(_ *Proxy, _ context.Context, _ *queryTask, _ trace.Span) (*milvuspb.QueryResults, segcore.StorageCost, error) {
+			queryCalls++
+			return &milvuspb.QueryResults{Status: merr.Success()}, segcore.StorageCost{}, nil
+		}).Build()
+	defer readinessMock.UnPatch()
+	defer queryMock.UnPatch()
+
+	response, err := node.Query(context.Background(), &milvuspb.QueryRequest{
+		DbName:         "db",
+		CollectionName: "collection",
+	})
+	require.NoError(t, err)
+	require.NoError(t, merr.Error(response.GetStatus()))
+	require.Equal(t, 1, readinessCalls)
+	require.Equal(t, 1, queryCalls)
 }
 
 type autoLoadViewQueryClient struct {
@@ -562,4 +648,10 @@ func mockSearchCollectionMeta(t *testing.T, collectionID int64, vchannels []stri
 		getCollectionIDMock.UnPatch()
 	})
 	return metaCache
+}
+
+func enableAutoLoad(t *testing.T) {
+	t.Helper()
+	require.NoError(t, Params.Save(Params.ProxyCfg.EnableAutoLoad.Key, "true"))
+	t.Cleanup(func() { require.NoError(t, Params.Reset(Params.ProxyCfg.EnableAutoLoad.Key)) })
 }

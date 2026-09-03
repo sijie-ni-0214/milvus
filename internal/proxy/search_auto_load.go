@@ -33,9 +33,12 @@ import (
 	"github.com/milvus-io/milvus/pkg/v3/util/merr"
 )
 
-func (node *Proxy) ensureCollectionReadyForSearch(ctx context.Context, dbName, collectionName string) error {
+func (node *Proxy) ensureCollectionReady(ctx context.Context, dbName, collectionName string) error {
 	if err := merr.CheckHealthy(node.GetStateCode()); err != nil {
 		return err
+	}
+	if !Params.ProxyCfg.EnableAutoLoad.GetAsBool() {
+		return nil
 	}
 
 	readiness, ok := node.viewQueryClient.(queryclient.CollectionReadiness)
@@ -70,7 +73,7 @@ func (node *Proxy) ensureCollectionReadyForSearch(ctx context.Context, dbName, c
 		CollectionName: collectionName,
 	})
 	if err := merr.CheckRPCCall(loadState, err); err != nil {
-		return merr.Wrap(err, "check collection load state before search")
+		return merr.Wrap(err, "check collection load state before DQL request")
 	}
 
 	switch loadState.GetState() {
@@ -97,18 +100,18 @@ func (node *Proxy) ensureCollectionReadyForSearch(ctx context.Context, dbName, c
 				CollectionName: collectionName,
 			})
 			if err := merr.CheckRPCCall(loadState, err); err != nil {
-				return struct{}{}, merr.Wrap(err, "recheck collection load state before search")
+				return struct{}{}, merr.Wrap(err, "recheck collection load state before DQL request")
 			}
 
 			switch loadState.GetState() {
 			case commonpb.LoadState_LoadStateNotLoad:
-				mlog.Info(loadCtx, "load collection before search",
+				mlog.Info(loadCtx, "load collection before DQL request",
 					mlog.FieldDbName(dbName),
 					mlog.FieldCollectionName(collectionName),
 					mlog.FieldCollectionID(collectionID))
 				status, err := node.LoadCollection(loadCtx, loadRequest)
 				if err := merr.CheckRPCCall(status, err); err != nil {
-					return struct{}{}, merr.Wrap(err, "load collection before search")
+					return struct{}{}, merr.Wrap(err, "load collection before DQL request")
 				}
 			case commonpb.LoadState_LoadStateLoading, commonpb.LoadState_LoadStateLoaded:
 			case commonpb.LoadState_LoadStateNotExist:
@@ -128,7 +131,7 @@ func (node *Proxy) ensureCollectionReadyForSearch(ctx context.Context, dbName, c
 		}
 	case commonpb.LoadState_LoadStateLoading, commonpb.LoadState_LoadStateLoaded:
 		// The QueryCoord state may precede assignment propagation to this Proxy.
-		// The resolver barrier below is the final search-readiness signal.
+		// The resolver barrier below is the final DQL-readiness signal.
 	case commonpb.LoadState_LoadStateNotExist:
 		return merr.WrapErrCollectionNotFoundWithDB(dbName, collectionName)
 	default:
