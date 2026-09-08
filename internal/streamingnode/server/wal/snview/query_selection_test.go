@@ -34,6 +34,38 @@ func TestUnknownTeardownDetachesEmptyShard(t *testing.T) {
 	}
 }
 
+func TestSNHandler_VChannelIndexTracksReplicaShards(t *testing.T) {
+	h := recoverSNQueryViewHandler(context.Background(), testPChannel, newMockCatalog(), newMockResourceManager(), nil)
+
+	// A vchannel maps to one shard per replica hosting it.
+	replica1 := qviews.ShardID{ReplicaID: 1, VChannel: testVChannel}
+	replica2 := qviews.ShardID{ReplicaID: 2, VChannel: testVChannel}
+	shard1 := h.getOrCreateShard(replica1)
+	shard2 := h.getOrCreateShard(replica2)
+	require.Equal(t, map[qviews.ShardID]struct{}{replica1: {}, replica2: {}}, h.shardsByVChannel[testVChannel])
+
+	// Removing one replica keeps the other indexed; a stale shard is ignored.
+	shard1.onEmpty(shard1)
+	require.Equal(t, map[qviews.ShardID]struct{}{replica2: {}}, h.shardsByVChannel[testVChannel])
+	shard1.onEmpty(shard1)
+	require.Equal(t, map[qviews.ShardID]struct{}{replica2: {}}, h.shardsByVChannel[testVChannel])
+
+	// Removing the last replica drops the vchannel entry.
+	shard2.onEmpty(shard2)
+	require.NotContains(t, h.shardsByVChannel, testVChannel)
+
+	// Recovery indexes the persisted shards.
+	persisted := newSNViewWithState(3, viewpb.QueryViewState_QueryViewStateUp)
+	recovered := recoverSNQueryViewHandler(context.Background(), testPChannel, newMockCatalog(), newMockResourceManager(),
+		[]*viewpb.QueryViewOfShard{persisted.IntoProto()})
+	require.Contains(t, recovered.shardsByVChannel[testVChannel], persisted.ShardID())
+
+	// Handoff drops every shard and the index with it.
+	h.getOrCreateShard(replica1)
+	h.CloseForHandoff()
+	require.Empty(t, h.shardsByVChannel)
+}
+
 func TestUnknownReplicaSkipsShardsWithoutUpViews(t *testing.T) {
 	h, up, _, _, _ := leasedUpView(t, 0)
 	preparing := newPreparingSNView(1).IntoProto()
