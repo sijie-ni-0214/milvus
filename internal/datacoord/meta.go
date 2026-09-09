@@ -831,10 +831,14 @@ func (m *meta) GetQuotaInfo() *metricsinfo.DataCoordQuotaMetrics {
 
 	segments := m.segments.GetSegments()
 	var total int64
-	storedBinlogSize := make(map[string]map[string]int64) // map[collectionID]map[segment_state]size
-	binlogFileCount := make(map[string]int64)             // map[collectionID]count
+	// In aggregate mode these are keyed directly by database / all, rather
+	// than building and discarding collection-level display metrics first.
+	storedBinlogSize := make(map[string]map[string]int64)
+	binlogFileCount := make(map[string]int64)
 	deltalogAggregates := make(map[string]*deltalogAggregate)
 	coll2DbName := make(map[string]string)
+	storedRowsByDB := make(map[string]map[commonpb.SegmentState]int64)
+	l0DeleteEntriesByDB := make(map[string]int64)
 
 	for _, segment := range segments {
 		segmentSize := segment.getSegmentSize()
@@ -852,13 +856,25 @@ func (m *meta) GetQuotaInfo() *metricsinfo.DataCoordQuotaMetrics {
 			coll, ok := m.metaStore.GetCollection(segment.GetCollectionID())
 			if ok {
 				collIDStr := strconv.FormatInt(segment.GetCollectionID(), 10)
-				coll2DbName[collIDStr] = coll.DatabaseName
-				if _, ok := storedBinlogSize[collIDStr]; !ok {
-					storedBinlogSize[collIDStr] = make(map[string]int64)
+				metricKey, fileCountKey := coll.DatabaseName, metrics.AllLabel
+				if !aggregateCollectionMetrics {
+					metricKey, fileCountKey = collIDStr, collIDStr
+					coll2DbName[collIDStr] = coll.DatabaseName
 				}
-
-				storedBinlogSize[collIDStr][segment.GetState().String()] += segmentSize
-				binlogFileCount[collIDStr] += int64(getBinlogFileCount(segment.SegmentInfo))
+				if _, ok := storedBinlogSize[metricKey]; !ok {
+					storedBinlogSize[metricKey] = make(map[string]int64)
+				}
+				storedBinlogSize[metricKey][segment.GetState().String()] += segmentSize
+				binlogFileCount[fileCountKey] += int64(getBinlogFileCount(segment.SegmentInfo))
+				if aggregateCollectionMetrics {
+					if _, ok := storedRowsByDB[coll.DatabaseName]; !ok {
+						storedRowsByDB[coll.DatabaseName] = make(map[commonpb.SegmentState]int64)
+					}
+					storedRowsByDB[coll.DatabaseName][segment.GetState()] += segment.GetNumOfRows()
+					if segment.GetLevel() == datapb.SegmentLevel_L0 {
+						l0DeleteEntriesByDB[coll.DatabaseName] += segment.getDeltaCount()
+					}
+				}
 
 				agg, ok := deltalogAggregates[collIDStr]
 				if !ok {
@@ -868,10 +884,12 @@ func (m *meta) GetQuotaInfo() *metricsinfo.DataCoordQuotaMetrics {
 				agg.observe(segment)
 			}
 
-			if _, ok := collectionRowsNum[segment.GetCollectionID()]; !ok {
-				collectionRowsNum[segment.GetCollectionID()] = make(map[commonpb.SegmentState]int64)
+			if !aggregateCollectionMetrics {
+				if _, ok := collectionRowsNum[segment.GetCollectionID()]; !ok {
+					collectionRowsNum[segment.GetCollectionID()] = make(map[commonpb.SegmentState]int64)
+				}
+				collectionRowsNum[segment.GetCollectionID()][segment.GetState()] += segment.GetNumOfRows()
 			}
-			collectionRowsNum[segment.GetCollectionID()][segment.GetState()] += segment.GetNumOfRows()
 
 			if segment.GetLevel() == datapb.SegmentLevel_L0 {
 				collectionL0RowCounts[segment.GetCollectionID()] += segment.getDeltaCount()
@@ -882,17 +900,7 @@ func (m *meta) GetQuotaInfo() *metricsinfo.DataCoordQuotaMetrics {
 	// Reset to remove dropped collection
 	metrics.DataCoordStoredBinlogSize.Reset()
 	if aggregateCollectionMetrics {
-		storedBinlogSizeByDB := make(map[string]map[string]int64)
-		for collectionID, state2Size := range storedBinlogSize {
-			dbName := coll2DbName[collectionID]
-			if _, ok := storedBinlogSizeByDB[dbName]; !ok {
-				storedBinlogSizeByDB[dbName] = make(map[string]int64)
-			}
-			for state, size := range state2Size {
-				storedBinlogSizeByDB[dbName][state] += size
-			}
-		}
-		for dbName, state2Size := range storedBinlogSizeByDB {
+		for dbName, state2Size := range storedBinlogSize {
 			for state, size := range state2Size {
 				metrics.DataCoordStoredBinlogSize.WithLabelValues(dbName, metrics.AllLabel, state).Set(float64(size))
 			}
@@ -907,11 +915,7 @@ func (m *meta) GetQuotaInfo() *metricsinfo.DataCoordQuotaMetrics {
 	// Reset to remove dropped collection
 	metrics.DataCoordSegmentBinLogFileCount.Reset()
 	if aggregateCollectionMetrics {
-		var totalBinlogFileCount int64
-		for _, size := range binlogFileCount {
-			totalBinlogFileCount += size
-		}
-		metrics.DataCoordSegmentBinLogFileCount.WithLabelValues(metrics.AllLabel).Set(float64(totalBinlogFileCount))
+		metrics.DataCoordSegmentBinLogFileCount.WithLabelValues(metrics.AllLabel).Set(float64(binlogFileCount[metrics.AllLabel]))
 	} else {
 		for collectionID, size := range binlogFileCount {
 			metrics.DataCoordSegmentBinLogFileCount.WithLabelValues(collectionID).Set(float64(size))
@@ -920,19 +924,6 @@ func (m *meta) GetQuotaInfo() *metricsinfo.DataCoordQuotaMetrics {
 
 	metrics.DataCoordNumStoredRows.Reset()
 	if aggregateCollectionMetrics {
-		storedRowsByDB := make(map[string]map[commonpb.SegmentState]int64)
-		for collectionID, statesRows := range collectionRowsNum {
-			coll, ok := m.metaStore.GetCollection(collectionID)
-			if !ok {
-				continue
-			}
-			if _, ok := storedRowsByDB[coll.DatabaseName]; !ok {
-				storedRowsByDB[coll.DatabaseName] = make(map[commonpb.SegmentState]int64)
-			}
-			for state, rows := range statesRows {
-				storedRowsByDB[coll.DatabaseName][state] += rows
-			}
-		}
 		for dbName, statesRows := range storedRowsByDB {
 			for state, rows := range statesRows {
 				metrics.DataCoordNumStoredRows.WithLabelValues(
@@ -952,13 +943,6 @@ func (m *meta) GetQuotaInfo() *metricsinfo.DataCoordQuotaMetrics {
 
 	metrics.DataCoordL0DeleteEntriesNum.Reset()
 	if aggregateCollectionMetrics {
-		l0DeleteEntriesByDB := make(map[string]int64)
-		for collectionID, entriesNum := range collectionL0RowCounts {
-			coll, ok := m.metaStore.GetCollection(collectionID)
-			if ok {
-				l0DeleteEntriesByDB[coll.DatabaseName] += entriesNum
-			}
-		}
 		for dbName, entriesNum := range l0DeleteEntriesByDB {
 			metrics.DataCoordL0DeleteEntriesNum.WithLabelValues(dbName, metrics.AllLabel).Set(float64(entriesNum))
 		}
