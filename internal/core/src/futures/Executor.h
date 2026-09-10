@@ -11,10 +11,19 @@
 
 #pragma once
 
+#include <chrono>
+#include <functional>
+#include <future>
 #include <memory>
+#include <type_traits>
+#include <utility>
+
+#include <folly/CancellationToken.h>
 #include <folly/executors/CPUThreadPoolExecutor.h>
 #include <folly/executors/task_queue/PriorityLifoSemMPMCQueue.h>
 #include <folly/system/HardwareConcurrency.h>
+
+#include "Future.h"
 
 namespace milvus::futures {
 
@@ -32,5 +41,47 @@ getSearchCPUExecutor();
 
 folly::CPUThreadPoolExecutor*
 getLoadCPUExecutor();
+
+folly::CPUThreadPoolExecutor*
+getReduceCPUExecutor();
+
+template <typename F>
+auto
+SubmitReduceTask(const folly::CancellationToken& token, F&& task)
+    -> std::future<std::invoke_result_t<std::decay_t<F>&>> {
+    using Task = std::decay_t<F>;
+    using Result = std::invoke_result_t<Task&>;
+    using TaskMetrics = Metrics<std::chrono::microseconds>;
+
+    auto metrics = std::make_shared<TaskMetrics>(PoolType::kReduce);
+    auto packaged_task = std::make_shared<std::packaged_task<Result()>>(
+        [token,
+         task = Task(std::forward<F>(task)),
+         metrics = std::move(metrics)]() mutable -> Result {
+            if (token.isCancellationRequested()) {
+                metrics->withEarlyCancel();
+                throw folly::FutureCancellation();
+            }
+
+            typename TaskMetrics::ExecutionGuard execution_guard(*metrics);
+            try {
+                return std::invoke(task);
+            } catch (const folly::FutureCancellation&) {
+                metrics->withDuringCancel();
+                throw;
+            } catch (const milvus::SegcoreError& e) {
+                if (e.get_error_code() == milvus::ErrorCode::FollyCancel) {
+                    metrics->withDuringCancel();
+                }
+                throw;
+            }
+        });
+    auto future = packaged_task->get_future();
+    getReduceCPUExecutor()->add(
+        [packaged_task = std::move(packaged_task)]() mutable {
+            (*packaged_task)();
+        });
+    return future;
+}
 
 };  // namespace milvus::futures

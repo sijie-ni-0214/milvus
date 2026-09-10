@@ -27,14 +27,14 @@
 #include "common/Tracer.h"
 #include "common/Utils.h"
 #include "fmt/core.h"
-#include "folly/ScopeGuard.h"
+#include "futures/Executor.h"
 #include "glog/logging.h"
 #include "knowhere/comp/index_param.h"
 #include "knowhere/dataset.h"
 #include "log/Log.h"
 #include "query/PlanImpl.h"
 #include "segcore/SegmentInterface.h"
-#include "storage/ThreadPools.h"
+#include "storage/Util.h"
 
 namespace milvus::segcore {
 
@@ -202,39 +202,24 @@ void
 ReduceHelper::FillPrimaryKey() {
     tracer::AutoSpan span("ReduceHelper::FillPrimaryKey",
                           tracer::GetRootSpan());
-    // Second pass: fill primary keys
-    if (num_segments_ > 1) {
-        // Parallel execution using MIDDLE thread pool for multiple segments
-        auto& pool =
-            ThreadPools::GetThreadPool(milvus::ThreadPoolPriority::MIDDLE);
-        std::vector<std::future<void>> futures;
-        futures.reserve(num_segments_);
+    const auto cancel_token = op_ctx_ != nullptr ? op_ctx_->cancellation_token
+                                                 : folly::CancellationToken();
+    std::vector<std::future<void>> futures;
+    futures.reserve(num_segments_);
+    try {
         for (auto& search_result : search_results_) {
-            auto future = pool.Submit([this, search_result] {
-                auto segment =
-                    static_cast<SegmentInterface*>(search_result->segment_);
-                segment->FillPrimaryKeys(plan_, *search_result, op_ctx_);
-            });
-            futures.emplace_back(std::move(future));
+            futures.emplace_back(milvus::futures::SubmitReduceTask(
+                cancel_token, [this, search_result] {
+                    auto segment =
+                        static_cast<SegmentInterface*>(search_result->segment_);
+                    segment->FillPrimaryKeys(plan_, *search_result, op_ctx_);
+                }));
         }
-        auto futures_guard = folly::makeGuard([&futures]() {
-            for (auto& f : futures) {
-                if (f.valid()) {
-                    try {
-                        f.get();
-                    } catch (...) {
-                    }
-                }
-            }
-        });
-        for (auto& future : futures) {
-            future.get();
-        }
-    } else if (num_segments_ == 1) {
-        auto segment =
-            static_cast<SegmentInterface*>(search_results_[0]->segment_);
-        segment->FillPrimaryKeys(plan_, *search_results_[0], op_ctx_);
+    } catch (...) {
+        storage::DrainFutures(futures);
+        throw;
     }
+    storage::WaitAllFutures(futures);
 }
 
 void
@@ -452,56 +437,39 @@ ReduceHelper::RefineDistances() {
     auto element_size = milvus::GetDataTypeSize(field.get_data_type(), dim);
     auto dense_blob = static_cast<const char*>(placeholder.get_blob());
 
-    if (num_segments_ > 1) {
-        auto& pool =
-            ThreadPools::GetThreadPool(milvus::ThreadPoolPriority::MIDDLE);
-        std::vector<std::future<void>> futures;
-        futures.reserve(num_segments_);
+    const auto cancel_token = op_ctx_ != nullptr ? op_ctx_->cancellation_token
+                                                 : folly::CancellationToken();
+    std::vector<std::future<void>> futures;
+    futures.reserve(num_segments_);
+    try {
         for (auto& search_result : search_results_) {
             if (!IsSearchResultRefineEnabled(search_result)) {
                 continue;
             }
-            auto future = pool.Submit([this,
-                                       search_result,
-                                       field_id,
-                                       is_cosine,
-                                       is_negated,
-                                       dim,
-                                       element_size,
-                                       dense_blob] {
-                RefineOneSegment(search_result,
-                                 field_id,
-                                 is_cosine,
-                                 is_negated,
-                                 dim,
-                                 element_size,
-                                 dense_blob);
-            });
-            futures.emplace_back(std::move(future));
+            futures.emplace_back(milvus::futures::SubmitReduceTask(
+                cancel_token,
+                [this,
+                 search_result,
+                 field_id,
+                 is_cosine,
+                 is_negated,
+                 dim,
+                 element_size,
+                 dense_blob] {
+                    RefineOneSegment(search_result,
+                                     field_id,
+                                     is_cosine,
+                                     is_negated,
+                                     dim,
+                                     element_size,
+                                     dense_blob);
+                }));
         }
-        auto futures_guard = folly::makeGuard([&futures]() {
-            for (auto& f : futures) {
-                if (f.valid()) {
-                    try {
-                        f.get();
-                    } catch (...) {
-                    }
-                }
-            }
-        });
-        for (auto& future : futures) {
-            future.get();
-        }
-    } else if (num_segments_ == 1 &&
-               IsSearchResultRefineEnabled(search_results_[0])) {
-        RefineOneSegment(search_results_[0],
-                         field_id,
-                         is_cosine,
-                         is_negated,
-                         dim,
-                         element_size,
-                         dense_blob);
+    } catch (...) {
+        storage::DrainFutures(futures);
+        throw;
     }
+    storage::WaitAllFutures(futures);
 }
 
 void

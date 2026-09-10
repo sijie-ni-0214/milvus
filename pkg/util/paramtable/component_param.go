@@ -4234,6 +4234,8 @@ type queryNodeConfig struct {
 
 	// CGOPoolSize ratio to MaxReadConcurrency
 	CGOPoolSizeRatio ParamItem `refreshable:"true"`
+	// ReducePoolSize ratio to MaxReadConcurrency
+	ReducePoolSizeRatio ParamItem `refreshable:"true"`
 
 	// MutatePoolSizeFactor controls the size of the online-write CGO pool
 	// (segment Insert/Delete) as CPUNum * factor. The mutate pool is isolated
@@ -5527,6 +5529,14 @@ user-task-polling:
 		Doc:          "cgo pool size ratio to max read concurrency",
 	}
 	p.CGOPoolSizeRatio.Init(base.mgr)
+	p.ReducePoolSizeRatio = ParamItem{
+		Key:          "queryNode.segcore.reducePoolSizeRatio",
+		Version:      "3.0.1",
+		DefaultValue: "2.0",
+		Doc:          "reduce executor pool size ratio to max read concurrency",
+		Export:       true,
+	}
+	p.ReducePoolSizeRatio.Init(base.mgr)
 
 	p.MutatePoolSizeFactor = ParamItem{
 		Key:          "queryNode.segcore.mutatePoolSizeFactor",

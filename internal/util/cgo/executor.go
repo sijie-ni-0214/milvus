@@ -37,6 +37,26 @@ func initExecutor() {
 	pt.Watch(pt.QueryNodeCfg.MaxReadConcurrency.Key, config.NewHandler("cgo.search."+pt.QueryNodeCfg.MaxReadConcurrency.Key, resetSearchThreadNum))
 	pt.Watch(pt.QueryNodeCfg.CGOPoolSizeRatio.Key, config.NewHandler("cgo.search."+pt.QueryNodeCfg.CGOPoolSizeRatio.Key, resetSearchThreadNum))
 
+	// Initialize reduce executor pool.
+	setReduceThreadNum(calculateReducePoolSize(
+		pt.QueryNodeCfg.MaxReadConcurrency.GetAsFloat(),
+		pt.QueryNodeCfg.ReducePoolSizeRatio.GetAsFloat(),
+	))
+
+	resetReduceThreadNum := func(evt *config.Event) {
+		if evt.HasUpdated {
+			pt := paramtable.Get()
+			newSize := calculateReducePoolSize(
+				pt.QueryNodeCfg.MaxReadConcurrency.GetAsFloat(),
+				pt.QueryNodeCfg.ReducePoolSizeRatio.GetAsFloat(),
+			)
+			mlog.Info(context.TODO(), "reset cgo reduce thread num", mlog.Int("thread_num", newSize))
+			setReduceThreadNum(newSize)
+		}
+	}
+	pt.Watch(pt.QueryNodeCfg.MaxReadConcurrency.Key, config.NewHandler("cgo.reduce."+pt.QueryNodeCfg.MaxReadConcurrency.Key, resetReduceThreadNum))
+	pt.Watch(pt.QueryNodeCfg.ReducePoolSizeRatio.Key, config.NewHandler("cgo.reduce."+pt.QueryNodeCfg.ReducePoolSizeRatio.Key, resetReduceThreadNum))
+
 	// Initialize load executor pool.
 	loadPoolSize := hardware.GetCPUNum() * pt.CommonCfg.MiddlePriorityThreadCoreCoefficient.GetAsInt()
 	C.executor_set_load_thread_num(C.int(loadPoolSize))
@@ -58,4 +78,19 @@ func setSearchThreadNum(size int) {
 	}
 	C.executor_set_search_thread_num(C.int(size))
 	C.SegcoreSetPrefetchThreadPoolNum(C.uint32_t(size))
+}
+
+func calculateReducePoolSize(maxReadConcurrency, ratio float64) int {
+	size := int(math.Ceil(maxReadConcurrency * ratio))
+	if size < 1 {
+		return 1
+	}
+	return size
+}
+
+func setReduceThreadNum(size int) {
+	if size <= 0 {
+		size = 1
+	}
+	C.executor_set_reduce_thread_num(C.int(size))
 }

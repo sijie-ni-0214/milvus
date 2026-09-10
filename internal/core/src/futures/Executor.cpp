@@ -42,6 +42,16 @@ getLoadCPUExecutor() {
 }
 
 folly::CPUThreadPoolExecutor*
+getReduceCPUExecutor() {
+    auto thread_num = std::max(1, milvus::CPU_NUM);
+    static folly::CPUThreadPoolExecutor executor(
+        thread_num,
+        folly::CPUThreadPoolExecutor::makeDefaultPriorityQueue(1),
+        std::make_shared<folly::NamedThreadFactory>("MILVUS_REDUCE_"));
+    return &executor;
+}
+
+folly::CPUThreadPoolExecutor*
 getGlobalCPUExecutor() {
     return getSearchCPUExecutor();
 }

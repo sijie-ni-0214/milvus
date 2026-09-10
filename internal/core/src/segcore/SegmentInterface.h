@@ -19,6 +19,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <memory>
 #include <numeric>
 #include <optional>
@@ -84,6 +85,12 @@ struct SegmentStats {
     // we stat the memory size used by the segment,
     // including the insert data and delete data.
     std::atomic<size_t> mem_size{};
+};
+
+struct FetchedSearchFields {
+    std::map<FieldId, std::unique_ptr<DataArray>> fields;
+    int64_t scanned_remote_bytes{0};
+    int64_t scanned_total_bytes{0};
 };
 
 // Monotonic source for SegmentInternalInterface::segment_instance_uid().
@@ -590,6 +597,13 @@ class SegmentInternalInterface : public SegmentInterface {
                     SearchResult& results,
                     milvus::OpContext* op_ctx = nullptr) const override;
 
+    FetchedSearchFields
+    FetchL1InputFields(const query::Plan* plan,
+                       const std::vector<FieldId>& field_ids,
+                       const int64_t* offsets,
+                       int64_t size,
+                       milvus::OpContext* op_ctx = nullptr) const;
+
     // Bring in base class Retrieve overloads to avoid name hiding
     using SegmentInterface::Retrieve;
 
@@ -839,6 +853,12 @@ class SegmentInternalInterface : public SegmentInterface {
                                    int64_t count) const;
 
  protected:
+    void
+    FillSearchResultOutputFields(const query::Plan* plan,
+                                 const std::vector<FieldId>& field_ids,
+                                 SearchResult& results,
+                                 milvus::OpContext* op_ctx) const;
+
     // todo: use an Unified struct for all type in growing/seal segment to store data and valid_data.
     // internal API: return chunk_data in span
     virtual PinWrapper<SpanBase>

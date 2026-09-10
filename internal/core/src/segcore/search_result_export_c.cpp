@@ -15,7 +15,6 @@
 #include <arrow/c/bridge.h>
 #include <arrow/c/abi.h>
 #include <folly/CancellationToken.h>
-#include <folly/ScopeGuard.h>
 
 #include <algorithm>
 #include <chrono>
@@ -34,6 +33,7 @@
 #include "log/Log.h"
 #include "common/QueryResult.h"
 #include "common/Types.h"
+#include "futures/Executor.h"
 #include "futures/Future.h"
 #include "monitor/Monitor.h"
 #include "monitor/scope_metric.h"
@@ -43,7 +43,7 @@
 #include "segcore/SegmentReadLease.h"
 #include "segcore/Utils.h"
 #include "segcore/reduce/Reduce.h"
-#include "storage/ThreadPools.h"
+#include "storage/Util.h"
 
 using SearchResult = milvus::SearchResult;
 
@@ -946,33 +946,21 @@ MaterializeOrderedFields(
         materialize_segment_fields(segment, materialized);
     };
 
-    if (segment_fields.size() > 1) {
-        auto& pool = milvus::ThreadPools::GetThreadPool(
-            milvus::ThreadPoolPriority::MIDDLE);
-        std::vector<std::future<void>> futures;
-        futures.reserve(segment_fields.size());
-        auto futures_guard = folly::makeGuard([&futures]() {
-            for (auto& future : futures) {
-                if (future.valid()) {
-                    try {
-                        future.get();
-                    } catch (...) {
-                    }
-                }
-            }
-        });
+    std::vector<std::future<void>> futures;
+    futures.reserve(segment_fields.size());
+    try {
         for (auto& entry : segment_fields) {
             auto* materialized = &entry.second;
-            futures.emplace_back(pool.Submit([&materialize_one, materialized] {
-                materialize_one(*materialized);
-            }));
+            futures.emplace_back(milvus::futures::SubmitReduceTask(
+                cancel_token, [&materialize_one, materialized] {
+                    materialize_one(*materialized);
+                }));
         }
-        for (auto& future : futures) {
-            future.get();
-        }
-    } else {
-        materialize_one(segment_fields.begin()->second);
+    } catch (...) {
+        milvus::storage::DrainFutures(futures);
+        throw;
     }
+    milvus::storage::WaitAllFutures(futures);
 
     std::vector<milvus::segcore::MergeBase> result_pairs(total_rows);
     for (auto& entry : segment_fields) {
@@ -1288,26 +1276,16 @@ FillFieldsOrderedAsArrowRecordBatch(CSearchResult* search_results,
                 milvus::segcore::SegmentInternalInterface* segment,
                 OrderedSegmentFields& materialized) {
                 milvus::OpContext op_ctx(cancel_token);
-                for (auto field_id : requested_field_ids) {
-                    milvus::futures::throwIfCancelled(cancel_token);
-                    auto& field_meta = plan->schema_->operator[](field_id);
-                    std::unique_ptr<milvus::DataArray> data;
-                    if (!segment->is_field_exist(field_id)) {
-                        data = segment->bulk_subscript_not_exist_field(
-                            field_meta, materialized.segment_offsets.size());
-                    } else {
-                        data = segment->bulk_subscript(
-                            &op_ctx,
-                            field_id,
-                            materialized.segment_offsets.data(),
-                            materialized.segment_offsets.size());
-                    }
-                    materialized.fields[field_id] = std::move(data);
-                }
+                auto fetched = segment->FetchL1InputFields(
+                    plan,
+                    requested_field_ids,
+                    materialized.segment_offsets.data(),
+                    materialized.segment_offsets.size(),
+                    &op_ctx);
+                materialized.fields = std::move(fetched.fields);
                 materialized.scanned_remote_bytes =
-                    op_ctx.storage_usage.scanned_cold_bytes.load();
-                materialized.scanned_total_bytes =
-                    op_ctx.storage_usage.scanned_total_bytes.load();
+                    fetched.scanned_remote_bytes;
+                materialized.scanned_total_bytes = fetched.scanned_total_bytes;
             });
 
         auto batch_result = BuildExplicitFieldsBatch(

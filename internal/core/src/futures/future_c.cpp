@@ -9,6 +9,8 @@
 // is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
 // or implied. See the License for the specific language governing permissions and limitations under the License
 
+#include <algorithm>
+
 #include "Executor.h"
 #include "Future.h"
 #include "folly/executors/CPUThreadPoolExecutor.h"
@@ -67,5 +69,14 @@ executor_set_load_thread_num(int thread_num) {
     milvus::futures::getLoadCPUExecutor()->setNumThreads(thread_num);
     milvus::monitor::internal_cgo_pool_size_load.Set(thread_num);
     LOG_INFO("future executor setup load cpu executor with thread num: {}",
+             thread_num);
+}
+
+extern "C" void
+executor_set_reduce_thread_num(int thread_num) {
+    thread_num = std::max(1, thread_num);
+    milvus::futures::getReduceCPUExecutor()->setNumThreads(thread_num);
+    milvus::monitor::internal_cgo_pool_size_reduce.Set(thread_num);
+    LOG_INFO("future executor setup reduce cpu executor with thread num: {}",
              thread_num);
 }

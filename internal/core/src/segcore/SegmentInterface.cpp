@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <future>
 #include <limits>
 #include <map>
 #include <ratio>
@@ -48,8 +49,54 @@
 #include "query/PlanImpl.h"
 #include "query/PlanNode.h"
 #include "segcore/ConcurrentVector.h"
+#include "storage/ThreadPools.h"
+#include "storage/Util.h"
 
 namespace milvus::segcore {
+
+namespace {
+
+struct FetchedOutputField {
+    FieldId field_id;
+    std::unique_ptr<DataArray> field_data;
+    int64_t scanned_remote_bytes;
+    int64_t scanned_total_bytes;
+};
+
+void
+InheritOpContext(OpContext& target, const OpContext* source) {
+    if (source == nullptr) {
+        return;
+    }
+    target.cancellation_token = source->cancellation_token;
+    target.runtime_load_priority = source->runtime_load_priority;
+    target.coload_fields = source->coload_fields;
+    target.pinned_segment_state = source->pinned_segment_state;
+    target.pinned_state_owner = source->pinned_state_owner;
+    target.trace_context = source->trace_context;
+    target.trace_span = source->trace_span;
+}
+
+template <typename FetchOne>
+std::vector<FetchedOutputField>
+FetchFieldsInMiddle(const std::vector<FieldId>& field_ids,
+                    FetchOne&& fetch_one) {
+    std::vector<std::future<FetchedOutputField>> futures;
+    futures.reserve(field_ids.size());
+    auto& pool = ThreadPools::GetThreadPool(ThreadPoolPriority::MIDDLE);
+    try {
+        for (auto field_id : field_ids) {
+            futures.emplace_back(pool.Submit(
+                [&fetch_one, field_id] { return fetch_one(field_id); }));
+        }
+    } catch (...) {
+        storage::DrainFutures(futures);
+        throw;
+    }
+    return storage::WaitAllFutures(std::move(futures));
+}
+
+}  // namespace
 
 std::shared_ptr<milvus::exec::SimpleGeometryCache>
 SegmentInternalInterface::GetGeometryCache(FieldId field_id) const {
@@ -98,49 +145,102 @@ SegmentInternalInterface::FillPrimaryKeys(const query::Plan* plan,
 }
 
 void
+SegmentInternalInterface::FillSearchResultOutputFields(
+    const query::Plan* plan,
+    const std::vector<FieldId>& field_ids,
+    SearchResult& results,
+    milvus::OpContext* op_ctx) const {
+    auto fetch_one = [this, plan, &results, op_ctx](FieldId field_id) {
+        milvus::OpContext field_ctx;
+        InheritOpContext(field_ctx, op_ctx);
+        segcore::CheckCancellation(
+            &field_ctx, get_segment_id(), field_id.get(), "FillTargetEntry");
+        auto& field_meta = plan->schema_->operator[](field_id);
+        std::unique_ptr<DataArray> field_data;
+        if (plan->schema_->get_dynamic_field_id().has_value() &&
+            plan->schema_->get_dynamic_field_id().value() == field_id &&
+            !plan->target_dynamic_fields_.empty()) {
+            field_data = bulk_subscript(&field_ctx,
+                                        field_id,
+                                        results.seg_offsets_.data(),
+                                        results.seg_offsets_.size(),
+                                        plan->target_dynamic_fields_);
+        } else if (!is_field_exist(field_id)) {
+            field_data = bulk_subscript_not_exist_field(
+                field_meta, results.seg_offsets_.size());
+        } else {
+            field_data = bulk_subscript(&field_ctx,
+                                        field_id,
+                                        results.seg_offsets_.data(),
+                                        results.seg_offsets_.size());
+        }
+
+        return FetchedOutputField{
+            field_id,
+            std::move(field_data),
+            field_ctx.storage_usage.scanned_cold_bytes.load(),
+            field_ctx.storage_usage.scanned_total_bytes.load()};
+    };
+
+    for (auto& fetched : FetchFieldsInMiddle(field_ids, fetch_one)) {
+        results.output_fields_data_[fetched.field_id] =
+            std::move(fetched.field_data);
+        results.search_storage_cost_.scanned_remote_bytes +=
+            fetched.scanned_remote_bytes;
+        results.search_storage_cost_.scanned_total_bytes +=
+            fetched.scanned_total_bytes;
+    }
+}
+
+void
 SegmentInternalInterface::FillTargetEntry(const query::Plan* plan,
                                           SearchResult& results,
                                           milvus::OpContext* op_ctx) const {
     std::shared_lock lck(mutex_);
     AssertInfo(plan, "empty plan");
-    auto size = results.distances_.size();
-    AssertInfo(results.seg_offsets_.size() == size,
+    AssertInfo(results.seg_offsets_.size() == results.distances_.size(),
                "Size of result distances is not equal to size of ids");
 
-    std::unique_ptr<DataArray> field_data;
-    // See FillPrimaryKeys: per-call OpContext so storage_usage stays scoped
-    // to this segment's fills.
-    milvus::OpContext local_ctx;
-    if (op_ctx != nullptr) {
-        local_ctx.cancellation_token = op_ctx->cancellation_token;
-        local_ctx.runtime_load_priority = op_ctx->runtime_load_priority;
-    }
-    // fill other entries except primary key by result_offset
-    for (auto field_id : plan->target_entries_) {
+    FillSearchResultOutputFields(plan, plan->target_entries_, results, op_ctx);
+}
+
+FetchedSearchFields
+SegmentInternalInterface::FetchL1InputFields(
+    const query::Plan* plan,
+    const std::vector<FieldId>& field_ids,
+    const int64_t* offsets,
+    int64_t size,
+    milvus::OpContext* op_ctx) const {
+    std::shared_lock lck(mutex_);
+    AssertInfo(plan, "empty plan");
+    AssertInfo(size >= 0, "field row count must not be negative");
+    AssertInfo(size == 0 || offsets != nullptr,
+               "null offsets for non-empty fields");
+
+    auto fetch_one = [this, plan, offsets, size, op_ctx](FieldId field_id) {
+        milvus::OpContext field_ctx;
+        InheritOpContext(field_ctx, op_ctx);
         segcore::CheckCancellation(
-            op_ctx, get_segment_id(), field_id.get(), "FillTargetEntry");
+            &field_ctx, get_segment_id(), field_id.get(), "FetchL1InputFields");
         auto& field_meta = plan->schema_->operator[](field_id);
-        if (plan->schema_->get_dynamic_field_id().has_value() &&
-            plan->schema_->get_dynamic_field_id().value() == field_id &&
-            !plan->target_dynamic_fields_.empty()) {
-            auto& target_dynamic_fields = plan->target_dynamic_fields_;
-            field_data = bulk_subscript(&local_ctx,
-                                        field_id,
-                                        results.seg_offsets_.data(),
-                                        size,
-                                        target_dynamic_fields);
-        } else if (!is_field_exist(field_id)) {
-            field_data = bulk_subscript_not_exist_field(field_meta, size);
-        } else {
-            field_data = bulk_subscript(
-                &local_ctx, field_id, results.seg_offsets_.data(), size);
-        }
-        results.output_fields_data_[field_id] = std::move(field_data);
+        auto field_data =
+            !is_field_exist(field_id)
+                ? bulk_subscript_not_exist_field(field_meta, size)
+                : bulk_subscript(&field_ctx, field_id, offsets, size);
+        return FetchedOutputField{
+            field_id,
+            std::move(field_data),
+            field_ctx.storage_usage.scanned_cold_bytes.load(),
+            field_ctx.storage_usage.scanned_total_bytes.load()};
+    };
+
+    FetchedSearchFields output;
+    for (auto& fetched : FetchFieldsInMiddle(field_ids, fetch_one)) {
+        output.fields[fetched.field_id] = std::move(fetched.field_data);
+        output.scanned_remote_bytes += fetched.scanned_remote_bytes;
+        output.scanned_total_bytes += fetched.scanned_total_bytes;
     }
-    results.search_storage_cost_.scanned_remote_bytes +=
-        local_ctx.storage_usage.scanned_cold_bytes.load();
-    results.search_storage_cost_.scanned_total_bytes +=
-        local_ctx.storage_usage.scanned_total_bytes.load();
+    return output;
 }
 
 std::unique_ptr<SearchResult>

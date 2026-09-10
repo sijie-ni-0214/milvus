@@ -46,6 +46,9 @@ executor_set_search_thread_num(int thread_num);
 void
 executor_set_load_thread_num(int thread_num);
 
+void
+executor_set_reduce_thread_num(int thread_num);
+
 #ifdef __cplusplus
 }
 #endif

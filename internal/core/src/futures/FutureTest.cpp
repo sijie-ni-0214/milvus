@@ -12,8 +12,11 @@
 #include <folly/CancellationToken.h>
 #include <folly/executors/CPUThreadPoolExecutor.h>
 #include <folly/futures/Future.h>
+#include <folly/ScopeGuard.h>
+#include <folly/system/ThreadName.h>
 #include <gtest/gtest.h>
 #include <stdlib.h>
+#include <atomic>
 #include <chrono>
 #include <exception>
 #include <memory>
@@ -27,11 +30,16 @@
 
 #include "common/EasyAssert.h"
 #include "common/common_type_c.h"
+#include "futures/Executor.h"
 #include "futures/Future.h"
 #include "futures/LeakyResult.h"
 #include "futures/Ready.h"
+#include "futures/future_c.h"
 #include "futures/future_c_types.h"
 #include "gtest/gtest.h"
+#include "monitor/Monitor.h"
+#include "storage/ThreadPools.h"
+#include "storage/Util.h"
 
 using namespace milvus::futures;
 
@@ -225,4 +233,90 @@ TEST(Futures, Future) {
         ASSERT_EQ(s.error_code, milvus::FollyCancel);
         free((char*)(s.error_msg));
     }
+}
+
+TEST(Futures, SubmitReduceTaskUsesReduceExecutor) {
+    auto future = SubmitReduceTask(folly::CancellationToken(), [] {
+        return folly::getCurrentThreadName().value_or("");
+    });
+
+    auto thread_name = future.get();
+    EXPECT_EQ(thread_name.rfind("MILVUS_REDUCE_", 0), 0);
+    EXPECT_EQ(getReduceCPUExecutor()->getNumPriorities(), 1);
+}
+
+TEST(Futures, SubmitReduceTaskHonorsCancellationBeforeExecution) {
+    folly::CancellationSource source;
+    source.requestCancellation();
+    std::atomic<bool> executed{false};
+
+    auto future = SubmitReduceTask(source.getToken(),
+                                   [&executed] { executed.store(true); });
+
+    EXPECT_THROW(future.get(), folly::FutureCancellation);
+    EXPECT_FALSE(executed.load());
+}
+
+TEST(Futures, SubmitReduceTaskPreservesSegcoreError) {
+    auto future = SubmitReduceTask(folly::CancellationToken(), []() -> int {
+        throw milvus::SegcoreError(milvus::NotImplemented,
+                                   "reduce task failed");
+    });
+
+    try {
+        static_cast<void>(future.get());
+        FAIL() << "expected SegcoreError";
+    } catch (const milvus::SegcoreError& error) {
+        EXPECT_EQ(error.get_error_code(), milvus::NotImplemented);
+        EXPECT_STREQ(error.what(), "reduce task failed");
+    }
+}
+
+TEST(Futures, ResizeReduceExecutorClampsAndUpdatesMetric) {
+    auto* executor = getReduceCPUExecutor();
+    const auto original_size = executor->numThreads();
+    auto restore = folly::makeGuard([original_size] {
+        executor_set_reduce_thread_num(static_cast<int>(original_size));
+    });
+
+    executor_set_reduce_thread_num(0);
+    EXPECT_EQ(executor->numThreads(), 1);
+    EXPECT_EQ(milvus::monitor::internal_cgo_pool_size_reduce.Value(), 1);
+
+    executor_set_reduce_thread_num(2);
+    EXPECT_EQ(executor->numThreads(), 2);
+    EXPECT_EQ(milvus::monitor::internal_cgo_pool_size_reduce.Value(), 2);
+}
+
+TEST(Futures, ReduceTasksCanWaitForSaturatedMiddlePool) {
+    auto* reduce_executor = getReduceCPUExecutor();
+    auto& middle_pool =
+        milvus::ThreadPools::GetThreadPool(milvus::ThreadPoolPriority::MIDDLE);
+    const auto original_reduce_size = reduce_executor->numThreads();
+    const auto original_middle_size = middle_pool.GetMaxThreadNum();
+    auto restore = folly::makeGuard([original_reduce_size,
+                                     original_middle_size,
+                                     &middle_pool] {
+        executor_set_reduce_thread_num(static_cast<int>(original_reduce_size));
+        middle_pool.Resize(original_middle_size);
+    });
+
+    executor_set_reduce_thread_num(1);
+    middle_pool.Resize(1);
+    std::atomic<int> completed_fields{0};
+    std::vector<std::future<void>> segment_tasks;
+    for (int segment = 0; segment < 2; ++segment) {
+        segment_tasks.emplace_back(SubmitReduceTask(
+            folly::CancellationToken(), [&middle_pool, &completed_fields] {
+                std::vector<std::future<void>> field_tasks;
+                for (int field = 0; field < 2; ++field) {
+                    field_tasks.emplace_back(middle_pool.Submit(
+                        [&completed_fields] { ++completed_fields; }));
+                }
+                milvus::storage::WaitAllFutures(field_tasks);
+            }));
+    }
+
+    milvus::storage::WaitAllFutures(segment_tasks);
+    EXPECT_EQ(completed_fields.load(), 4);
 }

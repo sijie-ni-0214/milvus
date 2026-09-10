@@ -1562,6 +1562,67 @@ TEST(SearchResultExport, FillOutputFieldsOrdered_Basic) {
     free(const_cast<void*>(c_proto.proto_blob));
 }
 
+TEST(SearchResultExport, FillOutputFieldsOrdered_InterleavesDifferentSegments) {
+    using namespace milvus;
+    using namespace milvus::segcore;
+
+    auto schema = std::make_shared<Schema>();
+    auto pk_fid = schema->AddDebugField("pk", DataType::INT64);
+    schema->set_primary_field_id(pk_fid);
+    auto output_fid = schema->AddDebugField("output_i64", DataType::INT64);
+    auto vec_fid = schema->AddDebugField(
+        "fakevec", DataType::VECTOR_FLOAT, 16, knowhere::metric::L2);
+
+    auto raw_data_a = DataGen(schema, 4, /*seed=*/1);
+    auto raw_data_b = DataGen(schema, 4, /*seed=*/2);
+    auto values_a = raw_data_a.get_col<int64_t>(output_fid);
+    auto values_b = raw_data_b.get_col<int64_t>(output_fid);
+    auto segment_a = CreateSealedWithFieldDataLoaded(schema, raw_data_a);
+    auto segment_b = CreateSealedWithFieldDataLoaded(schema, raw_data_b);
+
+    auto plan_bytes = BuildSimpleVectorSearchPlan(vec_fid, /*topk=*/4);
+    auto plan = milvus::query::CreateSearchPlanByExpr(
+        schema, plan_bytes.data(), plan_bytes.size());
+    plan->target_entries_ = {output_fid};
+
+    SearchResult result_a;
+    AttachSealedRequestLease(result_a, segment_a.get());
+    SearchResult result_b;
+    AttachSealedRequestLease(result_b, segment_b.get());
+    std::vector<CSearchResult> c_results = {
+        reinterpret_cast<CSearchResult>(&result_a),
+        reinterpret_cast<CSearchResult>(&result_b)};
+    int32_t segment_indices[] = {1, 0, 1, 0};
+    int64_t segment_offsets[] = {2, 1, 0, 3};
+
+    CProto c_proto{};
+    auto status =
+        FillOutputFieldsOrdered(c_results.data(),
+                                c_results.size(),
+                                reinterpret_cast<CSearchPlan>(plan.get()),
+                                segment_indices,
+                                segment_offsets,
+                                /*total_rows=*/4,
+                                &c_proto,
+                                nullptr);
+    ASSERT_EQ(status.error_code, 0) << status.error_msg;
+
+    milvus::proto::schema::SearchResultData result_data;
+    ASSERT_TRUE(
+        result_data.ParseFromArray(c_proto.proto_blob, c_proto.proto_size));
+    ASSERT_EQ(result_data.fields_data_size(), 1);
+    const auto& actual =
+        result_data.fields_data(0).scalars().long_data().data();
+    const std::vector<int64_t> expected = {
+        values_b[2], values_a[1], values_b[0], values_a[3]};
+    ASSERT_EQ(actual.size(), expected.size());
+    for (size_t i = 0; i < expected.size(); ++i) {
+        EXPECT_EQ(actual.Get(i), expected[i]);
+    }
+
+    free(const_cast<void*>(c_proto.proto_blob));
+}
+
 TEST(SearchResultExport,
      FillOutputFieldsOrdered_CancellationReturnsFollyCancel) {
     using namespace milvus;

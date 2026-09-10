@@ -25,7 +25,7 @@
 
 namespace milvus::futures {
 
-enum class PoolType { kSearch, kLoad };
+enum class PoolType { kSearch, kLoad, kReduce };
 
 template <class Duration>
 class Metrics;
@@ -114,52 +114,66 @@ class Metrics {
     }
 
  private:
+    template <typename T>
+    T&
+    poolMetric(T& search, T& load, T& reduce) const {
+        switch (pool_type_) {
+            case PoolType::kSearch:
+                return search;
+            case PoolType::kLoad:
+                return load;
+            case PoolType::kReduce:
+                return reduce;
+        }
+        std::abort();
+    }
+
     prometheus::Gauge&
     inflightGauge() const {
-        return pool_type_ == PoolType::kSearch
-                   ? milvus::monitor::internal_cgo_inflight_task_total_search
-                   : milvus::monitor::internal_cgo_inflight_task_total_load;
+        return poolMetric(
+            milvus::monitor::internal_cgo_inflight_task_total_search,
+            milvus::monitor::internal_cgo_inflight_task_total_load,
+            milvus::monitor::internal_cgo_inflight_task_total_reduce);
     }
 
     prometheus::Gauge&
     executingGauge() const {
-        return pool_type_ == PoolType::kSearch
-                   ? milvus::monitor::internal_cgo_executing_task_total_search
-                   : milvus::monitor::internal_cgo_executing_task_total_load;
+        return poolMetric(
+            milvus::monitor::internal_cgo_executing_task_total_search,
+            milvus::monitor::internal_cgo_executing_task_total_load,
+            milvus::monitor::internal_cgo_executing_task_total_reduce);
     }
 
     prometheus::Histogram&
     queueDurationHist() const {
-        return pool_type_ == PoolType::kSearch
-                   ? milvus::monitor::internal_cgo_queue_duration_seconds_search
-                   : milvus::monitor::internal_cgo_queue_duration_seconds_load;
+        return poolMetric(
+            milvus::monitor::internal_cgo_queue_duration_seconds_search,
+            milvus::monitor::internal_cgo_queue_duration_seconds_load,
+            milvus::monitor::internal_cgo_queue_duration_seconds_reduce);
     }
 
     prometheus::Histogram&
     executeDurationHist() const {
-        return pool_type_ == PoolType::kSearch
-                   ? milvus::monitor::
-                         internal_cgo_execute_duration_seconds_search
-                   : milvus::monitor::
-                         internal_cgo_execute_duration_seconds_load;
+        return poolMetric(
+            milvus::monitor::internal_cgo_execute_duration_seconds_search,
+            milvus::monitor::internal_cgo_execute_duration_seconds_load,
+            milvus::monitor::internal_cgo_execute_duration_seconds_reduce);
     }
 
     prometheus::Counter&
     cancelBeforeCounter() const {
-        return pool_type_ == PoolType::kSearch
-                   ? milvus::monitor::
-                         internal_cgo_cancel_before_execute_total_search
-                   : milvus::monitor::
-                         internal_cgo_cancel_before_execute_total_load;
+        return poolMetric(
+            milvus::monitor::internal_cgo_cancel_before_execute_total_search,
+            milvus::monitor::internal_cgo_cancel_before_execute_total_load,
+            milvus::monitor::internal_cgo_cancel_before_execute_total_reduce);
     }
 
     prometheus::Counter&
     cancelDuringCounter() const {
-        return pool_type_ == PoolType::kSearch
-                   ? milvus::monitor::
-                         internal_cgo_cancel_during_execute_total_search
-                   : milvus::monitor::
-                         internal_cgo_cancel_during_execute_total_load;
+        return poolMetric(
+            milvus::monitor::internal_cgo_cancel_during_execute_total_search,
+            milvus::monitor::internal_cgo_cancel_during_execute_total_load,
+            milvus::monitor::internal_cgo_cancel_during_execute_total_reduce);
     }
 
     const PoolType pool_type_;

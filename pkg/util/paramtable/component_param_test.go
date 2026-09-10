@@ -47,6 +47,17 @@ func TestQueryNodeStrictGroupSettings(t *testing.T) {
 	assert.Equal(t, 100, cfg.StrictGroupProbeCandidates.GetAsInt())
 }
 
+func TestQueryNodeReducePoolSizeRatio(t *testing.T) {
+	params := &ComponentParam{}
+	params.Init(NewBaseTable(SkipRemote(true)))
+	ratio := &params.QueryNodeCfg.ReducePoolSizeRatio
+	assert.Equal(t, 2.0, ratio.GetAsFloat())
+	params.Save(ratio.Key, "1.5")
+	assert.Equal(t, 1.5, ratio.GetAsFloat())
+	params.Reset(ratio.Key)
+	assert.Equal(t, 2.0, ratio.GetAsFloat())
+}
+
 func shouldPanic(t *testing.T, name string, f func()) {
 	defer func() { recover() }()
 	f()
