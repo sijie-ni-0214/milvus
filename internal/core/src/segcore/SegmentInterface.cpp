@@ -69,6 +69,105 @@ struct FetchedOutputField {
     int64_t scanned_total_bytes;
 };
 
+// FetchOutputFields materializes output fields concurrently, one task per
+// field. The first field error cancels the sibling reads and is rethrown once
+// every task has finished. Results keep the order of field_ids.
+template <typename FetchField>
+std::vector<FetchedOutputField>
+FetchOutputFields(const std::vector<FieldId>& field_ids,
+                  int64_t segment_id,
+                  milvus::OpContext* op_ctx,
+                  FetchField fetch_field) {
+    if (field_ids.empty()) {
+        return {};
+    }
+
+    // Reserve both containers before starting tasks: an allocation failure
+    // while collecting results must not skip draining tasks that borrow this
+    // frame.
+    std::vector<std::future<FetchedOutputField>> futures;
+    futures.reserve(field_ids.size());
+    std::vector<FetchedOutputField> fetched_fields;
+    fetched_fields.reserve(field_ids.size());
+
+    folly::CancellationSource sibling_cancel_source;
+    const auto field_cancellation_token =
+        op_ctx != nullptr
+            ? folly::cancellation_token_merge(op_ctx->cancellation_token,
+                                              sibling_cancel_source.getToken())
+            : sibling_cancel_source.getToken();
+    std::mutex field_error_mutex;
+    std::exception_ptr first_field_error;
+    auto record_field_error = [&]() {
+        std::lock_guard<std::mutex> lock(field_error_mutex);
+        if (first_field_error == nullptr) {
+            first_field_error = std::current_exception();
+        }
+    };
+
+    // Callers run on the search executor, on SEARCH_FANOUT or inline, never on
+    // MIDDLE. Fan fields out to MIDDLE so a segment never waits for children
+    // queued behind it in the same pool.
+    auto& pool = ThreadPools::GetThreadPool(ThreadPoolPriority::MIDDLE);
+    try {
+        for (auto field_id : field_ids) {
+            futures.emplace_back(pool.Submit([&, field_id]() {
+                try {
+                    milvus::OpContext field_ctx;
+                    field_ctx.cancellation_token = field_cancellation_token;
+                    field_ctx.runtime_load_priority =
+                        milvus::proto::common::LoadPriority::HIGH;
+                    if (op_ctx != nullptr) {
+                        field_ctx.runtime_load_priority =
+                            op_ctx->runtime_load_priority.value_or(
+                                milvus::proto::common::LoadPriority::HIGH);
+                        field_ctx.coload_fields = op_ctx->coload_fields;
+                        field_ctx.pinned_segment_state =
+                            op_ctx->pinned_segment_state;
+                        field_ctx.pinned_state_owner =
+                            op_ctx->pinned_state_owner;
+                        field_ctx.trace_context = op_ctx->trace_context;
+                        field_ctx.trace_span = op_ctx->trace_span;
+                    }
+                    segcore::CheckCancellation(&field_ctx,
+                                               segment_id,
+                                               field_id.get(),
+                                               "FillTargetEntry");
+                    auto field_data = fetch_field(field_id, &field_ctx);
+                    return FetchedOutputField{
+                        field_id,
+                        std::move(field_data),
+                        field_ctx.storage_usage.scanned_cold_bytes.load(),
+                        field_ctx.storage_usage.scanned_total_bytes.load()};
+                } catch (...) {
+                    // Record the original error before cancelling siblings,
+                    // so their cancellation cannot replace the root cause.
+                    record_field_error();
+                    sibling_cancel_source.requestCancellation();
+                    throw;
+                }
+            }));
+        }
+    } catch (...) {
+        sibling_cancel_source.requestCancellation();
+        storage::DrainFutures(futures);
+        throw;
+    }
+
+    for (auto& future : futures) {
+        try {
+            fetched_fields.emplace_back(future.get());
+        } catch (...) {
+            record_field_error();
+            sibling_cancel_source.requestCancellation();
+        }
+    }
+    if (first_field_error != nullptr) {
+        std::rethrow_exception(first_field_error);
+    }
+    return fetched_fields;
+}
+
 }  // namespace
 
 std::shared_ptr<milvus::exec::SimpleGeometryCache>
@@ -154,40 +253,12 @@ SegmentInternalInterface::FillSearchResultOutputFields(
         return;
     }
 
-    folly::CancellationSource sibling_cancel_source;
-    const auto field_cancellation_token =
-        op_ctx != nullptr
-            ? folly::cancellation_token_merge(op_ctx->cancellation_token,
-                                              sibling_cancel_source.getToken())
-            : sibling_cancel_source.getToken();
-
     // Every field reads the request-pinned sealed snapshot, so concurrent
     // reads observe the same published state as the take() fast path.
     const auto snapshot = read_snapshot ? read_snapshot : CaptureReadSnapshot();
     const auto size = results.seg_offsets_.size();
-    auto fetch_one = [this,
-                      plan,
-                      snapshot,
-                      &results,
-                      size,
-                      op_ctx,
-                      field_cancellation_token](FieldId field_id) {
-        milvus::OpContext field_ctx;
-        field_ctx.cancellation_token = field_cancellation_token;
-        field_ctx.runtime_load_priority =
-            milvus::proto::common::LoadPriority::HIGH;
-        if (op_ctx != nullptr) {
-            field_ctx.runtime_load_priority =
-                op_ctx->runtime_load_priority.value_or(
-                    milvus::proto::common::LoadPriority::HIGH);
-            field_ctx.coload_fields = op_ctx->coload_fields;
-            field_ctx.pinned_segment_state = op_ctx->pinned_segment_state;
-            field_ctx.pinned_state_owner = op_ctx->pinned_state_owner;
-            field_ctx.trace_context = op_ctx->trace_context;
-            field_ctx.trace_span = op_ctx->trace_span;
-        }
-        segcore::CheckCancellation(
-            &field_ctx, get_segment_id(), field_id.get(), "FillTargetEntry");
+    auto fetch_one = [this, plan, &snapshot, &results, size](
+                         FieldId field_id, milvus::OpContext* field_ctx) {
         auto& field_meta = plan->schema_->operator[](field_id);
         const std::vector<std::string>* dynamic_field_names =
             (plan->schema_->get_dynamic_field_id().has_value() &&
@@ -195,72 +266,17 @@ SegmentInternalInterface::FillSearchResultOutputFields(
              !plan->target_dynamic_fields_.empty())
                 ? &plan->target_dynamic_fields_
                 : nullptr;
-        auto field_data =
-            BulkSubscriptWithSnapshot(this,
-                                      snapshot,
-                                      &field_ctx,
-                                      field_id,
-                                      field_meta,
-                                      results.seg_offsets_.data(),
-                                      size,
-                                      dynamic_field_names);
-        return FetchedOutputField{
-            field_id,
-            std::move(field_data),
-            field_ctx.storage_usage.scanned_cold_bytes.load(),
-            field_ctx.storage_usage.scanned_total_bytes.load()};
+        return BulkSubscriptWithSnapshot(this,
+                                         snapshot,
+                                         field_ctx,
+                                         field_id,
+                                         field_meta,
+                                         results.seg_offsets_.data(),
+                                         size,
+                                         dynamic_field_names);
     };
-
-    std::vector<std::future<FetchedOutputField>> futures;
-    futures.reserve(field_ids.size());
-    std::mutex field_error_mutex;
-    std::exception_ptr first_field_error;
-    auto record_field_error = [&field_error_mutex, &first_field_error]() {
-        std::lock_guard<std::mutex> lock(field_error_mutex);
-        if (first_field_error == nullptr) {
-            first_field_error = std::current_exception();
-        }
-    };
-
-    // The caller runs one parent task per segment on SEARCH_FANOUT or inline.
-    // Fan fields out to MIDDLE so a segment never waits for children queued
-    // behind it in the same pool.
-    auto& pool = ThreadPools::GetThreadPool(ThreadPoolPriority::MIDDLE);
-    try {
-        for (auto field_id : field_ids) {
-            futures.emplace_back(pool.Submit([fetch_one,
-                                              field_id,
-                                              sibling_cancel_source,
-                                              record_field_error]() mutable {
-                try {
-                    return fetch_one(field_id);
-                } catch (...) {
-                    record_field_error();
-                    sibling_cancel_source.requestCancellation();
-                    throw;
-                }
-            }));
-        }
-    } catch (...) {
-        sibling_cancel_source.requestCancellation();
-        storage::DrainFutures(futures);
-        throw;
-    }
-
-    std::vector<FetchedOutputField> fetched_fields;
-    try {
-        fetched_fields = storage::WaitAllFutures(std::move(futures));
-    } catch (...) {
-        std::exception_ptr field_error;
-        {
-            std::lock_guard<std::mutex> lock(field_error_mutex);
-            field_error = first_field_error;
-        }
-        if (field_error != nullptr) {
-            std::rethrow_exception(field_error);
-        }
-        throw;
-    }
+    auto fetched_fields =
+        FetchOutputFields(field_ids, get_segment_id(), op_ctx, fetch_one);
 
     // Workers only return isolated values. Publish to the shared SearchResult
     // after every future completes so the map and counters stay race-free.
@@ -724,26 +740,28 @@ SegmentInternalInterface::FillTargetEntry(
         return pk_field_id.has_value() && pk_field_id.value() == field_id;
     };
 
-    // Per-call OpContext keeps storage_usage scoped to this segment;
-    // sharing the caller's op_ctx across segments would double-count
-    // bytes. Inherit the caller's cancellation_token and load priority so
-    // in-loop cancellation still propagates.
-    milvus::OpContext local_ctx;
-    local_ctx.runtime_load_priority = milvus::proto::common::LoadPriority::HIGH;
-    if (op_ctx != nullptr) {
-        local_ctx.cancellation_token = op_ctx->cancellation_token;
-        local_ctx.runtime_load_priority =
-            op_ctx->runtime_load_priority.value_or(
-                milvus::proto::common::LoadPriority::HIGH);
-    }
+    std::vector<FieldId> field_ids;
+    field_ids.reserve(plan->field_ids_.size());
     for (auto field_id : plan->field_ids_) {
+        // System fields are needed by reduce even in the PK-only phase.
+        if (SystemProperty::Instance().IsSystem(field_id) || !ignore_non_pk ||
+            is_pk_field(field_id)) {
+            field_ids.push_back(field_id);
+        }
+    }
+
+    // Each field reads through its own OpContext, which keeps storage_usage
+    // scoped to this segment: sharing the caller's op_ctx across segments
+    // would double-count bytes.
+    auto fetch_one = [this, plan, &snapshot, offsets, size](
+                         FieldId field_id, milvus::OpContext* field_ctx)
+        -> std::unique_ptr<DataArray> {
         if (SystemProperty::Instance().IsSystem(field_id)) {
             auto system_type =
                 SystemProperty::Instance().GetSystemFieldType(field_id);
 
             FixedVector<int64_t> output(size);
-            bulk_subscript(
-                &local_ctx, system_type, offsets, size, output.data());
+            bulk_subscript(field_ctx, system_type, offsets, size, output.data());
 
             auto data_array = std::make_unique<DataArray>();
             data_array->set_field_id(field_id.get());
@@ -753,12 +771,7 @@ SegmentInternalInterface::FillTargetEntry(
             auto data = reinterpret_cast<const int64_t*>(output.data());
             auto obj = scalar_array->mutable_long_data();
             obj->mutable_data()->Add(data, data + size);
-            fields_data->AddAllocated(data_array.release());
-            continue;
-        }
-
-        if (ignore_non_pk && !is_pk_field(field_id)) {
-            continue;
+            return data_array;
         }
 
         auto& field_meta = plan->schema_->operator[](field_id);
@@ -770,21 +783,43 @@ SegmentInternalInterface::FillTargetEntry(
                 : nullptr;
         auto col = BulkSubscriptWithSnapshot(this,
                                              snapshot,
-                                             &local_ctx,
+                                             field_ctx,
                                              field_id,
                                              field_meta,
                                              offsets,
                                              size,
                                              dynamic_field_names);
-        if (dynamic_field_names != nullptr) {
-            fields_data->AddAllocated(col.release());
-            continue;
-        }
         // todo(SpadeA): consider vector array?
-        if (field_meta.get_data_type() == DataType::ARRAY) {
+        if (dynamic_field_names == nullptr &&
+            field_meta.get_data_type() == DataType::ARRAY) {
             col->mutable_scalars()->mutable_array_data()->set_element_type(
                 proto::schema::DataType(field_meta.get_element_type()));
         }
+        return col;
+    };
+    auto fetched_fields =
+        FetchOutputFields(field_ids, get_segment_id(), op_ctx, fetch_one);
+
+    // Workers never mutate the result proto. Publish fields in plan order
+    // and account each field's IO once every task has finished.
+    for (auto& fetched : fetched_fields) {
+        auto field_id = fetched.field_id;
+        auto& col = fetched.field_data;
+        results->set_scanned_remote_bytes(results->scanned_remote_bytes() +
+                                          fetched.scanned_remote_bytes);
+        results->set_scanned_total_bytes(results->scanned_total_bytes() +
+                                         fetched.scanned_total_bytes);
+        if (SystemProperty::Instance().IsSystem(field_id)) {
+            fields_data->AddAllocated(col.release());
+            continue;
+        }
+        if (plan->schema_->get_dynamic_field_id().has_value() &&
+            plan->schema_->get_dynamic_field_id().value() == field_id &&
+            !plan->target_dynamic_fields_.empty()) {
+            fields_data->AddAllocated(col.release());
+            continue;
+        }
+        auto& field_meta = plan->schema_->operator[](field_id);
         if (fill_ids && is_pk_field(field_id)) {
             // Reduction needs IDs for merge-sort. Candidate scans defer this
             // materialization until Grep has selected the surviving offsets.
@@ -822,13 +857,6 @@ SegmentInternalInterface::FillTargetEntry(
             fields_data->AddAllocated(col.release());
         }
     }
-    // Add retrieve_storage_cost to results
-    results->set_scanned_remote_bytes(
-        results->scanned_remote_bytes() +
-        local_ctx.storage_usage.scanned_cold_bytes.load());
-    results->set_scanned_total_bytes(
-        results->scanned_total_bytes() +
-        local_ctx.storage_usage.scanned_total_bytes.load());
 }
 
 std::unique_ptr<proto::segcore::RetrieveResults>
