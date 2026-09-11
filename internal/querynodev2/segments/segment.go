@@ -484,7 +484,6 @@ func NewSegment(ctx context.Context,
 			mlog.Err(err))
 		return nil, err
 	}
-	newBaseSegmentDuration := time.Since(newBaseSegmentStart)
 
 	var locker *state.LoadStateLock
 	switch segmentType {
@@ -501,18 +500,8 @@ func NewSegment(ctx context.Context,
 	submitTime := time.Now()
 	var workerStart time.Time
 	var createCSegmentDuration time.Duration
-	logger.Info(ctx, "[xxx] submit create segment",
-		mlog.Duration("newBaseSegmentDuration", newBaseSegmentDuration),
-		mlog.Duration("elapsed", submitTime.Sub(newSegmentStart)),
-		mlog.Any("poolRunning", pool.Running()),
-		mlog.Any("poolCapacity", pool.Cap()))
 	if _, err := pool.Submit(func() (any, error) {
 		workerStart = time.Now()
-		logger.Info(ctx, "[xxx] create segment worker start",
-			mlog.Duration("queueWait", workerStart.Sub(submitTime)),
-			mlog.Duration("elapsed", workerStart.Sub(newSegmentStart)),
-			mlog.Any("poolRunning", pool.Running()),
-			mlog.Any("poolCapacity", pool.Cap()))
 
 		var err error
 		createCSegmentStart := time.Now()
@@ -531,9 +520,6 @@ func NewSegment(ctx context.Context,
 			return nil, err
 		}
 
-		logger.Info(ctx, "[xxx] CreateCSegment done",
-			mlog.Duration("createCSegmentDuration", createCSegmentDuration),
-			mlog.Duration("workerDuration", time.Since(workerStart)))
 		return nil, err
 	}).Await(); err != nil {
 		logger.Warn(ctx, "create segment failed",
@@ -581,9 +567,6 @@ func NewSegment(ctx context.Context,
 			mlog.Err(err))
 		return nil, err
 	}
-	logger.Info(ctx, "[xxx] initialize segment done",
-		mlog.Duration("initializeSegmentDuration", time.Since(initializeSegmentStart)),
-		mlog.Duration("totalDuration", time.Since(newSegmentStart)))
 	return segment, nil
 }
 

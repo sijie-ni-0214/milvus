@@ -639,7 +639,7 @@ func (loader *segmentLoader) requestResource(ctx context.Context, infos ...*quer
 
 	loader.committedResource.Add(result.Resource)
 	// loader.committedLogicalResource.Add(result.LogicalResource)
-	mlog.Info(context.TODO(), "request resource for loading segments (unit in MiB)",
+	mlog.Debug(ctx, "request resource for loading segments (unit in MiB)",
 		mlog.Float64("memory", logutil.ToMB(float64(result.Resource.MemorySize))),
 		mlog.Float64("committedMemory", logutil.ToMB(float64(loader.committedResource.MemorySize))),
 		mlog.Float64("disk", logutil.ToMB(float64(result.Resource.DiskSize))),
@@ -876,7 +876,7 @@ func (loader *segmentLoader) LoadBloomFilterSet(ctx context.Context, collectionI
 			})
 		}
 
-		mlog.Info(context.TODO(), "create lazy bloom filter set done",
+		mlog.Debug(ctx, "create lazy bloom filter set done",
 			mlog.FieldCollectionID(collectionID),
 			mlog.Int("segmentNum", segmentNum),
 			mlog.Duration("totalDuration", time.Since(startTs)))
@@ -1287,7 +1287,7 @@ func (loader *segmentLoader) LoadSegment(ctx context.Context,
 	}
 	pkField := GetPkField(collection.Schema())
 
-	mlog.Info(context.TODO(), "start loading sealed segment", mlog.FieldSegmentID(segment.ID()))
+	mlog.Debug(ctx, "start loading sealed segment", mlog.FieldSegmentID(segment.ID()))
 	if segment.Type() == SegmentTypeSealed {
 		if err := loader.loadSealedSegment(ctx, loadInfo, segment); err != nil {
 			return err

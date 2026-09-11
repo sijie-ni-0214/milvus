@@ -412,7 +412,7 @@ type QueryNodeReleaseDoneEvent struct {
 }
 
 func (e QueryNodeReleaseDoneEvent) LogLevel() mlog.Level {
-	return mlog.DebugLevel
+	return mlog.InfoLevel
 }
 
 func (e QueryNodeReleaseDoneEvent) TriggerInfo() string {
@@ -572,7 +572,10 @@ type QueryNodeSegmentsReadyEvent struct {
 }
 
 func (e QueryNodeSegmentsReadyEvent) LogLevel() mlog.Level {
-	return mlog.InfoLevel
+	if e.From == qviews.QueryViewStatePreparing && e.To == qviews.QueryViewStateReady {
+		return mlog.InfoLevel
+	}
+	return mlog.DebugLevel
 }
 
 func (e QueryNodeSegmentsReadyEvent) TriggerInfo() string {

@@ -63,7 +63,7 @@ func (s *BloomFilterSet) ensureLazyLoaded() {
 	t1 := time.Now()
 	defer func() {
 		d := time.Since(t1)
-		mlog.Info(context.TODO(), "bloom filter ensure loaded",
+		mlog.Debug(context.TODO(), "bloom filter ensure loaded",
 			mlog.Int64("partition", s.partitionID),
 			mlog.FieldSegmentID(s.segmentID),
 			mlog.Duration("duration", d),
