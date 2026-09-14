@@ -6,6 +6,13 @@
 VChannel 标签，两组重叠 4 个。完整标签清单和 writer/cleanup 审计见
 [Collection / VChannel 级 Prometheus 指标审计](collection-level-metrics-audit.md)。
 
+临时例外：为避开 native Gauge 清理对 cache-slot 释放的阻塞，segcore 当前在
+`full` 和 `aggregate` 两种模式下都不传入 cache metric attribution，因此不会
+创建或更新 `internal_cache_shard_disk_usage_bytes` 的时序。下文该指标的常规
+行为暂不生效；QueryNode 也不再产生逐 shard disk stats，QueryCoord shard disk
+balancer 在没有这些统计时不会生成均衡计划。缓存容量记账、加载和淘汰
+不依赖这份 attribution，其他 cache 指标继续更新。
+
 ## 配置和不变量
 
 ```yaml
