@@ -13,18 +13,17 @@
 
 #include <optional>
 #include <string>
-#include <utility>
 
 #include "cachinglayer/Translator.h"
 
 namespace milvus::segcore {
 
 inline std::optional<milvus::cachinglayer::MetricAttribution>
-MetricAttributionFromShard(std::string shard) {
-    if (shard.empty()) {
-        return std::nullopt;
-    }
-    return milvus::cachinglayer::MetricAttribution{std::move(shard)};
+MetricAttributionFromShard(const std::string&) {
+    // Temporarily disable native shard disk tracking: Gauge cleanup can block
+    // cache-slot release. QueryCoord shard disk stats are also unavailable;
+    // cache resource accounting does not depend on this attribution.
+    return std::nullopt;
 }
 
 }  // namespace milvus::segcore
