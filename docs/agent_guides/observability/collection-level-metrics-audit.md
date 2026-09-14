@@ -8,6 +8,13 @@ Prometheus 指标族所做的源码级审计。本文基于 2026-08-21 的当前
 基于本清单实现的 `full` / `aggregate` 降基数模式及全部 71 个指标的行为差异见
 [Collection / VChannel 级 Prometheus 指标降基数模式](collection-level-metrics-mode.md)。
 
+临时例外：当前 segcore 的 `MetricAttributionFromShard` 始终返回空 attribution，
+暂停 `internal_cache_shard_disk_usage_bytes` 的创建和更新，以避开 Gauge 清理
+阻塞 cache-slot 释放的问题。下文保留的 native shard 指标链路描述其常规行为，
+目前在 `full` 和 `aggregate` 下均不生效；相应的 QueryNode 逐 shard disk stats
+也为空，QueryCoord shard disk balancer 在没有统计时不会生成均衡计划。其他
+cache 指标和实际资源记账保持原行为。
+
 当前工作树已经从 `milvus_proxy_req_count` 中移除了 `db_name` 和
 `collection_name`，因此该指标不计入下文清单。
 
