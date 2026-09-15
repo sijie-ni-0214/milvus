@@ -54,6 +54,7 @@ import (
 	"github.com/milvus-io/milvus/pkg/v3/streaming/util/message"
 	"github.com/milvus-io/milvus/pkg/v3/streaming/util/types"
 	"github.com/milvus-io/milvus/pkg/v3/util/merr"
+	"github.com/milvus-io/milvus/pkg/v3/util/stage"
 )
 
 type readinessCatalog struct {
@@ -160,6 +161,23 @@ func TestEnsureCollectionReadyWakesFromStreamingNodeUp(t *testing.T) {
 	}
 	status, err := s.EnsureCollectionReady(ctx, req)
 	require.NoError(t, merr.CheckRPCCall(status, err), "an already-ready collection needs no new notification")
+}
+
+func TestEnsureCollectionReadyReportsObservedPath(t *testing.T) {
+	first, second := "by-dev-rootcoord-dml_100v0", "by-dev-rootcoord-dml_100v1"
+	s, _, _ := newReadinessTestServer(t, testPersistedQueryView(100, qviews.ShardID{ReplicaID: 1000, VChannel: first}))
+	status, err := s.EnsureCollectionReady(context.Background(), readinessRequest(first))
+	require.NoError(t, merr.CheckRPCCall(status, err))
+	require.Equal(t, stage.PathReady, status.GetExtraInfo()[stage.ReadinessPathKey])
+
+	// A loaded config whose expected shard is not Up yet is observed as loading,
+	// and the path survives the caller's own timeout.
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	status, err = s.EnsureCollectionReady(ctx, readinessRequest(first, second))
+	require.NoError(t, err)
+	require.Error(t, merr.Error(status))
+	require.Equal(t, stage.PathLoading, status.GetExtraInfo()[stage.ReadinessPathKey])
 }
 
 func TestEnsureCollectionReadyWaitsForLoadConfigVersion(t *testing.T) {

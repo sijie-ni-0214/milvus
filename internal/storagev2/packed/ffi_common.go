@@ -510,13 +510,18 @@ func openTransaction(manifest ManifestJSON, cProperties *C.LoonProperties, resol
 
 // openManifest reads the manifest of the revision manifest names.
 func openManifest(manifest ManifestJSON, cProperties *C.LoonProperties) (*C.LoonManifest, error) {
+	beginTimer := manifestBegin.Begin()
 	handle, err := openTransaction(manifest, cProperties, C.LOON_TRANSACTION_RESOLVE_FAIL, C.uint32_t(1) /* retry_limit */)
+	beginTimer.End(err)
 	if err != nil {
 		return nil, err
 	}
 	defer C.loon_transaction_destroy(handle)
 	var cManifest *C.LoonManifest
-	if err := HandleLoonFFIResult(C.loon_transaction_get_manifest(handle, &cManifest)); err != nil {
+	getTimer := manifestGet.Begin()
+	err = HandleLoonFFIResult(C.loon_transaction_get_manifest(handle, &cManifest))
+	getTimer.End(err)
+	if err != nil {
 		return nil, err
 	}
 	return cManifest, nil

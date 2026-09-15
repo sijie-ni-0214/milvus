@@ -32,6 +32,7 @@ import (
 	"github.com/milvus-io/milvus/pkg/v3/proto/segcorepb"
 	"github.com/milvus-io/milvus/pkg/v3/util/merr"
 	"github.com/milvus-io/milvus/pkg/v3/util/metautil"
+	"github.com/milvus-io/milvus/pkg/v3/util/stage"
 	"github.com/milvus-io/milvus/pkg/v3/util/tsoutil"
 )
 
@@ -81,13 +82,18 @@ func (req *CreateCSegmentRequest) getCSegmentType() C.SegmentType {
 func CreateCSegment(req *CreateCSegmentRequest) (CSegment, error) {
 	var ptr C.CSegmentInterface
 	var status C.CStatus
+	var createTimer stage.Timer
 	if req.LoadInfo != nil {
+		convertTimer := segmentConvert.Begin()
 		segLoadInfo, err := ConvertToSegcoreSegmentLoadInfo(req.LoadInfo)
+		convertTimer.End(err)
 		if err != nil {
 			return nil, merr.Wrap(err, "failed to convert segment load info")
 		}
 		segLoadInfo.FieldHints = req.FieldHints
+		marshalTimer := segmentMarshal.Begin()
 		loadInfoBlob, err := proto.Marshal(segLoadInfo)
+		marshalTimer.End(err)
 		if err != nil {
 			return nil, err
 		}
@@ -96,6 +102,7 @@ func CreateCSegment(req *CreateCSegmentRequest) (CSegment, error) {
 		if len(req.LoadFields) > 0 {
 			fields = (*C.int64_t)(unsafe.Pointer(&req.LoadFields[0]))
 		}
+		createTimer = segmentCgoCreate.Begin()
 		if req.ExplicitLoadScope && req.SegmentType == SegmentTypeSealed {
 			status = C.NewSealedSegmentWithCollection(req.Collection.rawPointer(), C.int64_t(req.SegmentID), &ptr, C.bool(req.IsSorted), (*C.uint8_t)(unsafe.Pointer(&loadInfoBlob[0])), C.int64_t(len(loadInfoBlob)), fields, C.int64_t(len(req.LoadFields)))
 		} else {
@@ -104,15 +111,21 @@ func CreateCSegment(req *CreateCSegmentRequest) (CSegment, error) {
 			status = C.NewSegmentWithLoadInfo(req.Collection.rawPointer(), req.getCSegmentType(), C.int64_t(req.SegmentID), &ptr, C.bool(req.IsSorted), (*C.uint8_t)(unsafe.Pointer(&loadInfoBlob[0])), C.int64_t(len(loadInfoBlob)))
 		}
 	} else {
+		createTimer = segmentCgoCreate.Begin()
 		status = C.NewSegment(req.Collection.rawPointer(), req.getCSegmentType(), C.int64_t(req.SegmentID), &ptr, C.bool(req.IsSorted))
 	}
-	if err := ConsumeCStatusIntoError(&status); err != nil {
+	createErr := ConsumeCStatusIntoError(&status)
+	createTimer.End(createErr)
+	if err := createErr; err != nil {
 		return nil, err
 	}
 	seg := &cSegmentImpl{id: req.SegmentID, ptr: ptr}
 	if req.LoadInfo != nil {
 		if commitTs := req.LoadInfo.GetCommitTimestamp(); commitTs != 0 {
-			if err := seg.SetCommitTimestamp(commitTs); err != nil {
+			commitTimer := segmentCommit.Begin()
+			commitErr := seg.SetCommitTimestamp(commitTs)
+			commitTimer.End(commitErr)
+			if err := commitErr; err != nil {
 				C.DeleteSegment(ptr)
 				return nil, merr.Wrap(err, "failed to set commit timestamp on segment")
 			}
@@ -734,3 +747,10 @@ func AdoptSealedReadState(base, read CSegment) error {
 	status := C.AdoptSealedSegmentReadState(C.CSegmentInterface(base.RawPointer()), C.CSegmentInterface(read.RawPointer()))
 	return ConsumeCStatusIntoError(&status)
 }
+
+var (
+	segmentConvert   = stage.New("queryNode", "segment_create", "convert_load_info")
+	segmentMarshal   = stage.New("queryNode", "segment_create", "marshal")
+	segmentCgoCreate = stage.New("queryNode", "segment_create", "cgo_create")
+	segmentCommit    = stage.New("queryNode", "segment_create", "commit_timestamp")
+)
