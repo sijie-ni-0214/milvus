@@ -25,6 +25,7 @@ import (
 	"github.com/milvus-io/milvus/pkg/v3/proto/indexpb"
 	"github.com/milvus-io/milvus/pkg/v3/proto/querypb"
 	"github.com/milvus-io/milvus/pkg/v3/util/merr"
+	"github.com/milvus-io/milvus/pkg/v3/util/stage"
 )
 
 // compoundStatsLogIdx is the log index that identifies compound stats format.
@@ -398,7 +399,9 @@ func (r *StatsResolver) loadManifest() error {
 	}
 	r.manifestLoaded = true
 
+	statsTimer := manifestStats.Begin()
 	stats, err := GetManifestStats(r.manifestPath, r.storageConfig, r.talonStage)
+	statsTimer.End(err)
 	if err != nil {
 		r.manifestErr = merr.Wrap(err, "failed to get manifest stats")
 		return r.manifestErr
@@ -463,3 +466,5 @@ func filterBM25Stats(fieldBinlogs []*datapb.FieldBinlog) map[int64][]string {
 	}
 	return result
 }
+
+var manifestStats = stage.New("storage", "manifest", "extract_stats_total")

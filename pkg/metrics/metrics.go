@@ -248,6 +248,7 @@ func Register(r prometheus.Registerer) {
 	r.MustRegister(AdminAuthTotal)
 	r.MustRegister(ThreadPoolCPUSeconds)
 	registerNodeScheduler(r)
+	registerQueryStages(r)
 	metricRegisterer = r
 }
 
