@@ -2867,7 +2867,9 @@ func GetCollectionRateSubLabel(req any) string {
 }
 
 // Search searches the most similar records of requests.
-func (node *Proxy) Search(ctx context.Context, request *milvuspb.SearchRequest) (*milvuspb.SearchResults, error) {
+func (node *Proxy) Search(ctx context.Context, request *milvuspb.SearchRequest) (retResp *milvuspb.SearchResults, retErr error) {
+	ctx, timing := startDQL(ctx, "Search")
+	defer func() { timing.End(retResp.GetStatus(), retErr) }()
 	var err error
 	rsp := &milvuspb.SearchResults{
 		Status: merr.Success(),
@@ -3133,7 +3135,9 @@ func (node *Proxy) search(ctx context.Context, request *milvuspb.SearchRequest, 
 	return qt.Result(), qt.ResultSizeInsufficient(), qt.IsTopkReduce(), qt.IsRecallEvaluation(), nil
 }
 
-func (node *Proxy) HybridSearch(ctx context.Context, request *milvuspb.HybridSearchRequest) (*milvuspb.SearchResults, error) {
+func (node *Proxy) HybridSearch(ctx context.Context, request *milvuspb.HybridSearchRequest) (retResp *milvuspb.SearchResults, retErr error) {
+	ctx, timing := startDQL(ctx, "HybridSearch")
+	defer func() { timing.End(retResp.GetStatus(), retErr) }()
 	var err error
 	rsp := &milvuspb.SearchResults{
 		Status: merr.Success(),
@@ -3919,7 +3923,9 @@ func (node *Proxy) query(ctx context.Context, qt *queryTask, sp trace.Span) (*mi
 }
 
 // Query get the records by primary keys.
-func (node *Proxy) Query(ctx context.Context, request *milvuspb.QueryRequest) (*milvuspb.QueryResults, error) {
+func (node *Proxy) Query(ctx context.Context, request *milvuspb.QueryRequest) (retResp *milvuspb.QueryResults, retErr error) {
+	ctx, timing := startDQL(ctx, "Query")
+	defer func() { timing.End(retResp.GetStatus(), retErr) }()
 	subLabel := GetCollectionRateSubLabel(request)
 	metrics.GetStats(ctx).
 		SetNodeID(paramtable.GetNodeID()).

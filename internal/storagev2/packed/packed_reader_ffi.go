@@ -48,6 +48,7 @@ import (
 	"github.com/milvus-io/milvus/pkg/v3/proto/indexcgopb"
 	"github.com/milvus-io/milvus/pkg/v3/proto/indexpb"
 	"github.com/milvus-io/milvus/pkg/v3/util/merr"
+	"github.com/milvus-io/milvus/pkg/v3/util/stage"
 )
 
 // ExternalReaderContext carries per-collection context needed by the FFI
@@ -429,13 +430,17 @@ func GetManifestHandleWithExtfs(
 	storageConfig *indexpb.StorageConfig,
 	extfs ExternalSpecContext,
 ) (loonManifestHandle *C.LoonManifest, err error) {
+	totalTimer := manifestTotal.Begin()
+	defer totalTimer.EndError(&err)
 	manifest, err := ParseManifestPath(manifestPath)
 	if err != nil {
 		return nil, merr.Wrap(err, "failed to parse manifest path")
 	}
 	mlog.Debug(context.TODO(), "GetManifest", mlog.String("manifestPath", manifestPath), mlog.String("basePath", manifest.BasePath), mlog.Int64("version", manifest.ManifestVersion))
 
+	propertiesTimer := manifestProperties.Begin()
 	cProperties, err := MakePropertiesFromStorageConfig(storageConfig, nil)
+	propertiesTimer.End(err)
 	if err != nil {
 		return nil, err
 	}
@@ -448,3 +453,10 @@ func GetManifestHandleWithExtfs(
 
 // Ensure FFIPackedReader implements array.RecordReader interface
 // var _ array.RecordReader = (*FFIPackedReader)(nil)
+
+var (
+	manifestTotal      = stage.New("storage", "manifest", "total")
+	manifestProperties = stage.New("storage", "manifest", "properties")
+	manifestBegin      = stage.New("storage", "manifest", "transaction_begin")
+	manifestGet        = stage.New("storage", "manifest", "get_manifest")
+)

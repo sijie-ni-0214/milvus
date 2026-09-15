@@ -59,6 +59,7 @@ import (
 	"github.com/milvus-io/milvus/pkg/v3/util/merr"
 	"github.com/milvus-io/milvus/pkg/v3/util/metautil"
 	"github.com/milvus-io/milvus/pkg/v3/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/v3/util/stage"
 	"github.com/milvus-io/milvus/pkg/v3/util/timerecord"
 	"github.com/milvus-io/milvus/pkg/v3/util/typeutil"
 )
@@ -523,6 +524,7 @@ func NewSegment(ctx context.Context,
 		mlog.Any("poolCapacity", pool.Cap()))
 	if _, err := pool.Submit(func() (any, error) {
 		workerStart = time.Now()
+		createPoolWait.Observe(workerStart.Sub(submitTime), stage.Success)
 		logger.Info(ctx, "[xxx] create segment worker start",
 			mlog.Duration("queueWait", workerStart.Sub(submitTime)),
 			mlog.Duration("elapsed", workerStart.Sub(newSegmentStart)),
@@ -588,7 +590,9 @@ func NewSegment(ctx context.Context,
 	}
 
 	initializeSegmentStart := time.Now()
-	if err := segment.initializeSegment(); err != nil {
+	initializeErr := segment.initializeSegment()
+	createInitialize.Observe(time.Since(initializeSegmentStart), stage.Outcome(initializeErr))
+	if err := initializeErr; err != nil {
 		csegment.Release()
 		logger.Warn(ctx, "[xxx] initialize segment failed",
 			mlog.Duration("initializeSegmentDuration", time.Since(initializeSegmentStart)),
@@ -1962,3 +1966,7 @@ func (s *LocalSegment) FlushData(ctx context.Context, startOffset, endOffset int
 		BM25Stats:              bm25Stats,
 	}, nil
 }
+
+var createPoolWait = stage.New("queryNode", "segment_create", "pool_wait")
+
+var createInitialize = stage.New("queryNode", "segment_create", "initialize")

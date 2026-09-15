@@ -17,6 +17,7 @@ import (
 	"github.com/milvus-io/milvus/pkg/v3/streaming/util/message/messageutil"
 	"github.com/milvus-io/milvus/pkg/v3/util/merr"
 	"github.com/milvus-io/milvus/pkg/v3/util/nodescheduler"
+	"github.com/milvus-io/milvus/pkg/v3/util/stage"
 )
 
 type bm25Stats map[int64]*storage.BM25Stats
@@ -419,7 +420,9 @@ func (r *oracleRuntime) PrepareDataVersion(ctx context.Context, target qviews.Da
 	return r.commitDiff(ctx, diff)
 }
 
-func (r *oracleRuntime) ensureMaterialized(ctx context.Context) error {
+func (r *oracleRuntime) ensureMaterialized(ctx context.Context) (retErr error) {
+	timer := bm25Materialized.Begin()
+	defer timer.EndError(&retErr)
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -435,6 +438,7 @@ func (r *oracleRuntime) ensureMaterialized(ctx context.Context) error {
 			return nil
 		}
 		call := r.materialization
+		shared := call != nil
 		if call == nil {
 			materializationCtx, cancel := context.WithCancel(r.ctx)
 			call = &materializationCall{
@@ -451,8 +455,14 @@ func (r *oracleRuntime) ensureMaterialized(ctx context.Context) error {
 		}
 		r.mu.Unlock()
 
+		// Only a caller joining another caller's materialization records a shared wait.
+		var waitTimer stage.Timer
+		if shared {
+			waitTimer = bm25SharedWait.Begin()
+		}
 		select {
 		case <-call.done:
+			waitTimer.End(call.err)
 			if err := ctx.Err(); err != nil {
 				return err
 			}
@@ -464,6 +474,7 @@ func (r *oracleRuntime) ensureMaterialized(ctx context.Context) error {
 			}
 			return call.err
 		case <-ctx.Done():
+			waitTimer.End(ctx.Err())
 			return ctx.Err()
 		}
 	}
@@ -836,3 +847,8 @@ func (p *Provider) fetchResources(ctx context.Context, collectionID int64, vchan
 	}
 	return response, nil
 }
+
+var (
+	bm25Materialized = stage.New("streamingNode", "bm25_stats", "ensure_materialized")
+	bm25SharedWait   = stage.New("streamingNode", "bm25_stats", "shared_wait")
+)
