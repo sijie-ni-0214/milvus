@@ -31,12 +31,24 @@ import (
 
 type (
 	dqlTimingKey struct{}
+	dqlStage     uint8
 	dqlTiming    struct {
-		ctx             context.Context
-		operation, path string
-		started, ready  time.Time
-		timer           stage.Timer
+		ctx                   context.Context
+		operation, path       string
+		started, stageStarted time.Time
+		currentStage          dqlStage
+		stageDurations        [dqlStageCount]time.Duration
+		executionStarted      bool
+		timer                 stage.Timer
 	}
+)
+
+const (
+	dqlStageNone dqlStage = iota
+	dqlStageReadiness
+	dqlStageExecution
+	dqlStageRetryWait
+	dqlStageCount
 )
 
 var dqlRecorders = map[string]*stage.Recorder{
@@ -46,8 +58,22 @@ var dqlRecorders = map[string]*stage.Recorder{
 }
 
 func startDQL(ctx context.Context, operation string) (context.Context, *dqlTiming) {
-	t := &dqlTiming{ctx: ctx, operation: operation, path: stage.PathUnknown, started: time.Now(), timer: dqlRecorders[operation].Begin()}
+	started := time.Now()
+	t := &dqlTiming{
+		ctx:          ctx,
+		operation:    operation,
+		path:         stage.PathUnknown,
+		started:      started,
+		stageStarted: started,
+		currentStage: dqlStageReadiness,
+		timer:        dqlRecorders[operation].Begin(),
+	}
 	return context.WithValue(ctx, dqlTimingKey{}, t), t
+}
+
+func getDQLTiming(ctx context.Context) *dqlTiming {
+	t, _ := ctx.Value(dqlTimingKey{}).(*dqlTiming)
+	return t
 }
 
 // pathRank orders readiness paths from warmest to coldest. A retried request
@@ -72,15 +98,31 @@ func setDQLPath(ctx context.Context, path string) {
 	}
 }
 
-// markDQLReady ends readiness at the latest attempt whose readiness check
-// succeeded; time spent in earlier failed attempts counts as readiness.
-func markDQLReady(ctx context.Context) {
-	if t, ok := ctx.Value(dqlTimingKey{}).(*dqlTiming); ok {
-		t.Ready()
+func (t *dqlTiming) Readiness() { t.switchStage(dqlStageReadiness, time.Now()) }
+func (t *dqlTiming) Ready()     { t.switchStage(dqlStageExecution, time.Now()) }
+func (t *dqlTiming) RetryWait() { t.switchStage(dqlStageRetryWait, time.Now()) }
+func (t *dqlTiming) Stop()      { t.stopStage(time.Now()) }
+
+func (t *dqlTiming) switchStage(next dqlStage, now time.Time) {
+	if t == nil || t.currentStage == next {
+		return
+	}
+	t.stopStage(now)
+	t.currentStage = next
+	t.stageStarted = now
+	if next == dqlStageExecution {
+		t.executionStarted = true
 	}
 }
 
-func (t *dqlTiming) Ready() { t.ready = time.Now() }
+func (t *dqlTiming) stopStage(now time.Time) {
+	if t == nil || t.currentStage == dqlStageNone {
+		return
+	}
+	t.stageDurations[t.currentStage] += max(0, now.Sub(t.stageStarted))
+	t.currentStage = dqlStageNone
+}
+
 func (t *dqlTiming) End(status *commonpb.Status, err error) {
 	if err == nil {
 		err = merr.Error(status)
@@ -89,18 +131,26 @@ func (t *dqlTiming) End(status *commonpb.Status, err error) {
 }
 
 func (t *dqlTiming) finish(ended time.Time, result stage.Result) {
+	t.stopStage(ended)
 	total := ended.Sub(t.started)
-	readiness := total
-	if !t.ready.IsZero() {
-		readiness = t.ready.Sub(t.started)
+	readiness := t.stageDurations[dqlStageReadiness]
+	execution := t.stageDurations[dqlStageExecution]
+	retryWait := t.stageDurations[dqlStageRetryWait]
+	// Attribute the small amount of request-local work outside retryDQL to the
+	// phase the request reached, preserving an exact partition for the cohort.
+	if remainder := total - readiness - execution - retryWait; remainder > 0 {
+		if t.executionStarted {
+			execution += remainder
+		} else {
+			readiness += remainder
+		}
 	}
-	execution := total - readiness
 	cohort := "le1s"
 	if total > time.Second {
 		cohort = "gt1s"
 	}
-	for i, name := range [...]string{"total", "readiness", "execution"} {
-		d := [...]time.Duration{total, readiness, execution}[i]
+	for i, name := range [...]string{"total", "readiness", "execution", "retry_wait"} {
+		d := [...]time.Duration{total, readiness, execution, retryWait}[i]
 		metrics.QueryRequestStageDuration.WithLabelValues(t.operation, t.path, cohort, name, result.String()).Observe(d.Seconds())
 	}
 	if cohort == "gt1s" || result != stage.Success {
@@ -108,7 +158,8 @@ func (t *dqlTiming) finish(ended time.Time, result stage.Result) {
 		if mlog.LevelEnabled(mlog.InfoLevel) && dqlSummaryLimiter.Allow() {
 			metrics.QueryStageItems.WithLabelValues("proxy", t.operation, "slow_summary", "emitted").Inc()
 			mlog.Info(t.ctx, "DQL request stages", mlog.String("operation", t.operation), mlog.String("loadPath", t.path),
-				mlog.String("result", result.String()), mlog.Duration("total", total), mlog.Duration("readiness", readiness), mlog.Duration("execution", execution))
+				mlog.String("result", result.String()), mlog.Duration("total", total), mlog.Duration("readiness", readiness),
+				mlog.Duration("execution", execution), mlog.Duration("retryWait", retryWait))
 		} else {
 			metrics.QueryStageItems.WithLabelValues("proxy", t.operation, "slow_summary", "dropped").Inc()
 		}

@@ -57,27 +57,34 @@ func (node *Proxy) retryDQL(ctx context.Context, dbName, collectionName string, 
 }
 
 func (node *Proxy) retryDQLWithExecutionRetry(ctx context.Context, dbName, collectionName string, execute func(context.Context) (bool, error), retryExecution func(error) bool) error {
+	timing := getDQLTiming(ctx)
 	var terminalErr error
 	err := retry.Handle(ctx, func() (bool, error) {
+		timing.Readiness()
 		terminalErr = nil
 		if err := ctx.Err(); err != nil {
 			return false, context.Cause(ctx)
 		}
 		if err := node.ensureCollectionReady(ctx, dbName, collectionName); err != nil {
 			if node.shouldRetryDQLLoad(err) {
+				timing.RetryWait()
 				return true, err
 			}
 			terminalErr = err
 			return false, err
 		}
-		markDQLReady(ctx)
+		timing.Ready()
 		again, err := execute(ctx)
 		if again || retryExecution(err) {
+			if err != nil {
+				timing.RetryWait()
+			}
 			return true, err
 		}
 		terminalErr = err
 		return false, err
 	})
+	timing.Stop()
 	// retry.Handle may return its previous error when canceled during backoff.
 	if ctx.Err() != nil {
 		return context.Cause(ctx)
