@@ -35,7 +35,7 @@ Status is inspected; a nil Go error is not sufficient to classify success.
 | Component / operation | Stages | Unit and boundary |
 | --- | --- | --- |
 | Proxy / Search, HybridSearch, Query | request | One logical Proxy method, including readiness and early failure |
-| Request cohort histogram | total, readiness, execution | Same completed requests; total = readiness + execution, including zero execution on readiness failure |
+| Request cohort histogram | total, readiness, execution, retry_wait | Same completed requests; total = readiness + execution + retry_wait, including zero execution on readiness failure |
 | Coord / auto_load | shared_lifecycle, load_submit, ready_wait, caller_wait | QueryCoord owns automatic loading. Lifecycle stages count once per singleflight worker; caller_wait counts each EnsureCollectionReady RPC that joined it |
 | Coord / readiness | check | One EnsureCollectionReady fast-path check; `not_ready` when the caller must join a load |
 | Coord / reconcile | trigger_wait, snapshot, plan, apply, total | Coalesced trigger batch's oldest enqueue; one reconciliation for the others |
@@ -63,13 +63,16 @@ Status is inspected; a nil Go error is not sufficient to classify success.
 | QueryNode / search_task | total, prepare_request, segment_search, reduce_total, prepare_export, arrow_export, unattributed | Execution on selected segments; primary sequential phases are prepare_request, segment_search, reduce_total; cleanup/glue is unattributed |
 | QueryNode / reduce | heap_merge, marshal_reduce, fill_output_fields, decode_output_fields, encode_result | One entered reduce/output call; multiple slices may run per task |
 
-`path` is the readiness state QueryCoord observed for this caller and returned
-in `Status.ExtraInfo["readiness_path"]`: unloaded, loading, or ready. It is
-disabled when automatic loading is off and unknown when the coordinator does not
-report it. A retried request keeps the coldest path it observed. It is not an
-assertion that the caller won singleflight or that native caches are warm. `latency_class` is `le1s`/`gt1s`,
-chosen from that same request's total at completion. Comparing readiness and
-execution for `gt1s` accounts for the whole slow-request cohort.
+`retry_wait` is the retry library's backoff and retry-decision interval between
+attempts. `path` is the readiness state QueryCoord observed for this caller and
+returned in `Status.ExtraInfo["readiness_path"]`: unloaded, loading, or ready. It
+is disabled when automatic loading is off and unknown when the coordinator does
+not report it. A retried request keeps the coldest path it observed. It is not an
+assertion that the caller won singleflight or that native caches are warm.
+`latency_class` is `le1s`/`gt1s`, chosen from that same request's total at
+completion. Comparing readiness, execution, and retry_wait for `gt1s` accounts
+for the whole slow-request cohort and forms its exact partition even when one
+logical request makes multiple attempts.
 
 Different rows have different populations and parallelism. Never sum per-segment
 latencies into request latency, sum stage P99s, or average pod P99s. Parent stages

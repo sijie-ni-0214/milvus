@@ -21,6 +21,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bytedance/mockey"
 	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
 	"github.com/stretchr/testify/mock"
@@ -40,22 +41,27 @@ func requestStageSum(t *testing.T, op, path, cohort, name, result string) float6
 	return m.GetHistogram().GetSampleSum()
 }
 
-func TestDQLTimingUsesOnePopulationAndExactPartition(t *testing.T) {
+func TestDQLTimingAccumulatesRetryAttempts(t *testing.T) {
 	_, timer := startDQL(context.Background(), "Search")
 	timer.path = "unloaded"
-	timer.ready = timer.started.Add(1200 * time.Millisecond)
-	before := [3]float64{}
-	for i, s := range []string{"total", "readiness", "execution"} {
+	timer.switchStage(dqlStageExecution, timer.started.Add(10*time.Millisecond))
+	timer.switchStage(dqlStageRetryWait, timer.started.Add(1010*time.Millisecond))
+	timer.switchStage(dqlStageReadiness, timer.started.Add(1210*time.Millisecond))
+	timer.switchStage(dqlStageExecution, timer.started.Add(1230*time.Millisecond))
+	before := [4]float64{}
+	for i, s := range []string{"total", "readiness", "execution", "retry_wait"} {
 		before[i] = requestStageSum(t, "Search", "unloaded", "gt1s", s, "success")
 	}
-	timer.finish(timer.started.Add(2*time.Second), stage.Success)
-	got := [3]float64{}
-	for i, s := range []string{"total", "readiness", "execution"} {
+	timer.finish(timer.started.Add(1260*time.Millisecond), stage.Success)
+	got := [4]float64{}
+	for i, s := range []string{"total", "readiness", "execution", "retry_wait"} {
 		got[i] = requestStageSum(t, "Search", "unloaded", "gt1s", s, "success") - before[i]
 	}
-	require.InDelta(t, 2, got[0], 1e-9)
-	require.InDelta(t, 1.2, got[1], 1e-9)
-	require.InDelta(t, got[0], got[1]+got[2], 1e-9)
+	require.InDelta(t, 1.26, got[0], 1e-9)
+	require.InDelta(t, 0.03, got[1], 1e-9)
+	require.InDelta(t, 1.03, got[2], 1e-9)
+	require.InDelta(t, 0.2, got[3], 1e-9)
+	require.InDelta(t, got[0], got[1]+got[2]+got[3], 1e-9)
 }
 
 func TestDQLTimingCountsEmbeddedErrorBeforeExecution(t *testing.T) {
@@ -105,6 +111,46 @@ func TestDQLRetryRecordsCoordPathAndReadiness(t *testing.T) {
 	require.Equal(t, 2, calls)
 	// The retry found the collection loaded, but this request waited for the load.
 	require.Equal(t, stage.PathUnloaded, timer.path)
-	require.False(t, timer.ready.IsZero())
+	require.True(t, timer.executionStarted)
+	require.Equal(t, dqlStageNone, timer.currentStage)
 	timer.End(merr.Success(), nil)
+}
+
+func TestDQLAutoLoadRetryAccumulatesAttemptTiming(t *testing.T) {
+	enableAutoLoad(t)
+	node := &Proxy{metaCache: mockSearchCollectionMeta(t, 100, []string{"v0"})}
+	node.UpdateStateCode(commonpb.StateCode_Healthy)
+	readinessCalls := 0
+	ready := mockey.Mock((*Proxy).ensureCollectionReady).To(
+		func(*Proxy, context.Context, string, string) error {
+			readinessCalls++
+			if readinessCalls == 1 {
+				time.Sleep(5 * time.Millisecond)
+			} else {
+				time.Sleep(10 * time.Millisecond)
+			}
+			return nil
+		}).Build()
+	defer ready.UnPatch()
+
+	ctx, timing := startDQL(context.Background(), "Query")
+	defer timing.End(merr.Success(), nil)
+	executeCalls := 0
+	err := node.retryDQL(ctx, "db", "collection", nil, func(context.Context) (bool, error) {
+		executeCalls++
+		if executeCalls == 1 {
+			time.Sleep(20 * time.Millisecond)
+			return false, merr.Wrap(merr.ErrQueryViewNotReady, "collection released")
+		}
+		time.Sleep(30 * time.Millisecond)
+		return false, nil
+	})
+	require.NoError(t, err)
+	require.Equal(t, 2, readinessCalls)
+	require.Equal(t, 2, executeCalls)
+	require.Equal(t, dqlStageNone, timing.currentStage)
+	require.GreaterOrEqual(t, timing.stageDurations[dqlStageReadiness], 15*time.Millisecond)
+	require.GreaterOrEqual(t, timing.stageDurations[dqlStageExecution], 50*time.Millisecond)
+	// retry.Handle sleeps at least its default 200ms before the second attempt.
+	require.GreaterOrEqual(t, timing.stageDurations[dqlStageRetryWait], 200*time.Millisecond)
 }

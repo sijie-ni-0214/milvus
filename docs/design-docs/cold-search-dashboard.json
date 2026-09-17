@@ -87,14 +87,14 @@
       },
       "options": {
         "mode": "markdown",
-        "content": "Start with request cohorts. Only readiness + execution and exclusive flush reasons are additive. Node/view/segment/batch populations differ; do not sum their P99s. Native cache wait, native manifest details, client/SDK and transport attribution remain incomplete. See the accompanying design/validation document."
+        "content": "Start with request cohorts. Only readiness + execution + retry_wait and exclusive flush reasons are additive. Node/view/segment/batch populations differ; do not sum their P99s. Native cache wait, native manifest details, client/SDK and transport attribution remain incomplete. See the accompanying design/validation document."
       }
     },
     {
       "id": 1,
       "type": "timeseries",
       "title": "Request stage mean — same completed cohort",
-      "description": "total = readiness + execution for these completed requests. Select gt1s to explain the whole slow cohort. Ready does not mean caches are warm.",
+      "description": "total = readiness + execution + retry_wait for these completed requests. Select gt1s to explain the whole slow cohort. Ready does not mean caches are warm.",
       "datasource": {
         "type": "prometheus",
         "uid": "$DS_PROMETHEUS"
