@@ -123,7 +123,6 @@ ReduceHelper::IsSearchResultRefineEnabled(SearchResult* search_result) const {
 
 void
 ReduceHelper::FilterInvalidSearchResult(SearchResult* search_result) {
-    // const auto t1 = std::chrono::high_resolution_clock::now();
     auto nq = search_result->total_nq_;
     auto topK = search_result->unity_topK_;
     AssertInfo(search_result->seg_offsets_.size() == nq * topK,
@@ -173,24 +172,12 @@ ReduceHelper::FilterInvalidSearchResult(SearchResult* search_result) {
     std::partial_sum(real_topks.begin(),
                      real_topks.end(),
                      search_result->topk_per_nq_prefix_sum_.begin() + 1);
-    // const auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
-    //                           std::chrono::high_resolution_clock::now() - t1)
-    //                           .count();
-    // LOG_INFO(
-    //     "[sss] filter invalid search result done, traceID: {}, "
-    //     "partition: {}, segment: {},  "
-    //     " duration: {} ms",
-    //     milvus::tracer::GetRequestTraceID(),
-    //     segment->get_partition_id(),
-    //     segment->get_segment_id(),
-    //     duration);
 }
 
 void
 ReduceHelper::FilterInvalidSearchResults() {
     tracer::AutoSpan span("ReduceHelper::FilterInvalidSearchResults",
                           tracer::GetRootSpan());
-    const auto t1 = std::chrono::high_resolution_clock::now();
     // First pass: filter invalid results and compact the array sequentially
     uint32_t valid_index = 0;
     for (auto& search_result : search_results_) {
@@ -212,20 +199,12 @@ ReduceHelper::FilterInvalidSearchResults() {
     }
     search_results_.resize(valid_index);
     num_segments_ = search_results_.size();
-    LOG_INFO(
-        "[sss] filter invalid search results done, traceID: {}, "
-        ", duration: {} ms",
-        milvus::tracer::GetRequestTraceID(),
-        std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::high_resolution_clock::now() - t1)
-            .count());
 }
 
 void
 ReduceHelper::FillPrimaryKey() {
     tracer::AutoSpan span("ReduceHelper::FillPrimaryKey",
                           tracer::GetRootSpan());
-    const auto t1 = std::chrono::high_resolution_clock::now();
     // Bound inline PK work before reduction; strings can be costly even when resident.
     bool fanout = false;
     if (num_segments_ > 1) {
@@ -263,39 +242,12 @@ ReduceHelper::FillPrimaryKey() {
                 }
             }
         });
-        const auto submit_time = std::chrono::high_resolution_clock::now();
         for (auto& search_result : search_results_) {
             auto segment =
                 static_cast<SegmentInterface*>(search_result->segment_);
-            LOG_INFO(
-                "[sss][www] fill primary key task enqueue, "
-                "segment: {}, currentThreadNum: {}, maxThreadNum: {}",
-                segment->get_segment_id(),
-                pool.GetThreadNum(),
-                pool.GetMaxThreadNum());
-            auto future =
-                pool.Submit([this, search_result, segment, submit_time, t1] {
-                    const auto fill_start =
-                        std::chrono::high_resolution_clock::now();
-                    segment->FillPrimaryKeys(plan_, *search_result, op_ctx_);
-                    const auto fill_end =
-                        std::chrono::high_resolution_clock::now();
-                    LOG_INFO(
-                        "[sss] fill primary key task done, "
-                        "segment: {}, "
-                        " duration: {} ms, queueDuration: {} ms, "
-                        "fillDuration: {} ms",
-                        segment->get_segment_id(),
-                        std::chrono::duration_cast<std::chrono::milliseconds>(
-                            fill_end - t1)
-                            .count(),
-                        std::chrono::duration_cast<std::chrono::milliseconds>(
-                            fill_start - submit_time)
-                            .count(),
-                        std::chrono::duration_cast<std::chrono::milliseconds>(
-                            fill_end - fill_start)
-                            .count());
-                });
+            auto future = pool.Submit([this, search_result, segment] {
+                segment->FillPrimaryKeys(plan_, *search_result, op_ctx_);
+            });
             futures.emplace_back(std::move(future));
         }
         for (auto& future : futures) {
