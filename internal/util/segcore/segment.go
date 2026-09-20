@@ -718,15 +718,6 @@ func convertJSONKeyStats(src map[int64]*datapb.JsonKeyStats, basePaths map[int64
 			}
 			files = stripped
 		}
-		mlog.Info(context.TODO(), "convertJSONKeyStats",
-			mlog.Int64("fieldID", v.GetFieldID()),
-			mlog.Int64("buildID", v.GetBuildID()),
-			mlog.Int64("version", v.GetVersion()),
-			mlog.String("basePath", basePath),
-			mlog.Int("fileCount", len(files)),
-			mlog.Strings("files", files),
-		)
-
 		result[k] = &segcorepb.JsonKeyStats{
 			FieldID:                v.GetFieldID(),
 			Version:                v.GetVersion(),

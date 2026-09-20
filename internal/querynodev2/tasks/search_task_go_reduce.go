@@ -557,6 +557,7 @@ func lateMaterializeOutputFieldsWithTiming(
 			pos++
 		}
 	}
+	reducesourceMappingStage.Observe(time.Since(mappingStart), stage.Success)
 	if timing != nil {
 		timing.sourceMapping += time.Since(mappingStart)
 	}
@@ -691,9 +692,10 @@ func emptyDF() *chain.DataFrame {
 }
 
 var (
-	reduceheapStage    = stage.New("queryNode", "reduce", "heap_merge")
-	reducemarshalStage = stage.New("queryNode", "reduce", "marshal_reduce")
-	reducefillStage    = stage.New("queryNode", "reduce", "fill_output_fields")
-	reduceencodeStage  = stage.New("queryNode", "reduce", "encode_result")
-	reducedecodeStage  = stage.New("queryNode", "reduce", "decode_output_fields")
+	reducesourceMappingStage = stage.New("queryNode", "reduce", "source_mapping")
+	reduceheapStage          = stage.New("queryNode", "reduce", "heap_merge")
+	reducemarshalStage       = stage.New("queryNode", "reduce", "marshal_reduce")
+	reducefillStage          = stage.New("queryNode", "reduce", "fill_output_fields")
+	reduceencodeStage        = stage.New("queryNode", "reduce", "encode_result")
+	reducedecodeStage        = stage.New("queryNode", "reduce", "decode_output_fields")
 )

@@ -47,6 +47,7 @@
 #include "futures/Future.h"
 #include "segcore/json_stats/JsonKeyStats.h"
 #include "monitor/Monitor.h"
+#include "monitor/QueryMetrics.h"
 #include "pb/schema.pb.h"
 #include "plan/PlanNode.h"
 #include "plan/PlanNodeIdGenerator.h"
@@ -180,9 +181,9 @@ void
 SegmentInternalInterface::FillPrimaryKeys(const query::Plan* plan,
                                           SearchResult& results,
                                           milvus::OpContext* op_ctx) const {
-    const auto t1 = std::chrono::high_resolution_clock::now();
+    milvus::monitor::QueryStageTimer timer(
+        milvus::monitor::QueryStage::FillPrimaryKeys);
     std::shared_lock lck(mutex_);
-    const auto fill_pks_start = std::chrono::high_resolution_clock::now();
     AssertInfo(plan, "empty plan");
     auto size = results.distances_.size();
     AssertInfo(results.seg_offsets_.size() == size,
@@ -228,18 +229,6 @@ SegmentInternalInterface::FillPrimaryKeys(const query::Plan* plan,
         local_ctx.storage_usage.scanned_cold_bytes.load();
     results.search_storage_cost_.scanned_total_bytes +=
         local_ctx.storage_usage.scanned_total_bytes.load();
-    const auto t2 = std::chrono::high_resolution_clock::now();
-    double cost =
-        std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1).count();
-    LOG_INFO(
-        "[sss] fill pks. traceID: {}, segment: {}, duration: {}, "
-        "acquirelockDuration: {}",
-        milvus::tracer::GetRequestTraceID(&local_ctx),
-        get_segment_id(),
-        cost,
-        std::chrono::duration_cast<std::chrono::milliseconds>(t2 -
-                                                              fill_pks_start)
-            .count());
 }
 
 void
