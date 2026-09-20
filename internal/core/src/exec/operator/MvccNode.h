@@ -29,6 +29,7 @@
 #include "exec/operator/Operator.h"
 #include "exec/QueryContext.h"
 #include "log/Log.h"
+#include "monitor/QueryMetrics.h"
 
 namespace milvus {
 namespace exec {
@@ -88,6 +89,7 @@ class PhyMvccNode : public Operator {
         const auto submit_time = std::chrono::steady_clock::now();
         prefetch_future_.emplace(
             folly::via(prefetch_pool.get(), [self, trace_id, submit_time]() {
+                const auto started = milvus::monitor::QueryStageClock::now();
                 milvus::tracer::ScopedRequestTraceID trace_scope(trace_id);
                 auto* query_context =
                     self->operator_context_->get_exec_context()
@@ -95,20 +97,11 @@ class PhyMvccNode : public Operator {
                 auto* op_context = query_context->get_op_context();
                 milvus::tracer::ScopedOpContextTraceID op_trace(op_context,
                                                                 trace_id);
-                const auto start_time = std::chrono::steady_clock::now();
-                const auto queue_duration_us =
-                    std::chrono::duration_cast<std::chrono::microseconds>(
-                        start_time - submit_time)
-                        .count();
-                LOG_INFO(
-                    "[sss][www] milvus prefetch task start, traceID: {}, pool: "
-                    "{}, task: {}, segment: {}, field: {}, queueDurationUs: {}",
-                    trace_id,
-                    "MILVUS_PREFETCH",
-                    "mvcc",
-                    self->segment_->get_segment_id(),
-                    TimestampFieldID.get(),
-                    queue_duration_us);
+                milvus::monitor::ObserveQueryStage(
+                    milvus::monitor::QueryStage::MvccPrefetchQueue,
+                    started - submit_time);
+                milvus::monitor::QueryStageTimer run_timer(
+                    milvus::monitor::QueryStage::MvccPrefetchRun);
                 self->segment_->prefetch_chunks(op_context, TimestampFieldID);
             }));
     }
@@ -118,6 +111,8 @@ class PhyMvccNode : public Operator {
         if (prefetch_future_.has_value()) {
             auto future = std::move(*prefetch_future_);
             prefetch_future_.reset();
+            milvus::monitor::QueryStageTimer wait_timer(
+                milvus::monitor::QueryStage::MvccPrefetchWait);
             std::move(future).get();
         }
     }

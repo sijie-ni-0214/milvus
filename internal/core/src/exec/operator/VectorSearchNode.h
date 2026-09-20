@@ -34,6 +34,7 @@
 #include "exec/QueryContext.h"
 #include "exec/operator/Operator.h"
 #include "log/Log.h"
+#include "monitor/QueryMetrics.h"
 #include "plan/PlanNode.h"
 #include "query/PlanImpl.h"
 #include "segcore/SegmentInterface.h"
@@ -95,28 +96,20 @@ class PhyVectorSearchNode : public Operator {
         }
         prefetch_future_.emplace(
             folly::via(prefetch_pool.get(), [self, submit_time, trace_id]() {
+                const auto started = milvus::monitor::QueryStageClock::now();
                 auto* op_ctx = self->query_context_->get_op_context();
                 milvus::tracer::ScopedRequestTraceID trace_scope(trace_id);
                 milvus::tracer::ScopedOpContextTraceID op_trace(op_ctx,
                                                                 trace_id);
-                const auto start_time = std::chrono::steady_clock::now();
-                const auto queue_duration_us =
-                    std::chrono::duration_cast<std::chrono::microseconds>(
-                        start_time - submit_time)
-                        .count();
-                LOG_INFO(
-                    "[sss][www] milvus prefetch task start, traceID: {}, pool: "
-                    "{}, task: {}, segment: {}, field: {}, queueDurationUs: {}",
-                    trace_id,
-                    "MILVUS_PREFETCH",
-                    "vector_search",
-                    self->segment_->get_segment_id(),
-                    self->search_info_.field_id_.get(),
-                    queue_duration_us);
+                milvus::monitor::ObserveQueryStage(
+                    milvus::monitor::QueryStage::VectorPrefetchQueue,
+                    started - submit_time);
                 if (op_ctx != nullptr &&
                     op_ctx->cancellation_token.isCancellationRequested()) {
                     return;
                 }
+                milvus::monitor::QueryStageTimer run_timer(
+                    milvus::monitor::QueryStage::VectorPrefetchRun);
                 self->segment_->prefetch_vector(op_ctx,
                                                 self->search_info_.field_id_);
             }));
@@ -127,6 +120,8 @@ class PhyVectorSearchNode : public Operator {
         if (prefetch_future_.has_value()) {
             auto future = std::move(*prefetch_future_);
             prefetch_future_.reset();
+            milvus::monitor::QueryStageTimer wait_timer(
+                milvus::monitor::QueryStage::VectorPrefetchWait);
             std::move(future).get();
         }
     }
