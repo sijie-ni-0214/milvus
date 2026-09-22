@@ -81,6 +81,8 @@ type SNQueryViewHandler struct {
 	resMgr           StreamingNodeResourceManager
 	localOptimizer   optimizer.LocalOptimizer
 	leaseDuration    time.Duration
+	// queriesStopped fails new acquisitions once WAL shutdown starts.
+	queriesStopped bool
 }
 
 // recoverSNQueryViewHandler reconstructs the handler from persisted views
@@ -238,6 +240,7 @@ func (h *SNQueryViewHandler) getOrCreateShard(shardID qviews.ShardID) *snShardVi
 			onEmpty:       h.makeOnEmpty(shardID),
 			leaseDuration: h.leaseDuration,
 		}
+		shard.queriesStopped = h.queriesStopped
 		h.addShardLocked(shardID, shard)
 	}
 	return shard
@@ -296,6 +299,10 @@ func (h *SNQueryViewHandler) acquireUpViewForSchema(ctx context.Context, shardID
 			return nil, err
 		}
 		h.mu.Lock()
+		if h.queriesStopped {
+			h.mu.Unlock()
+			return nil, viewerror.NewOnShutdownError("query view handler is shutting down")
+		}
 		var candidates []*snShardView
 		if shard := h.shards[shardID]; shard != nil {
 			candidates = append(candidates, shard)
