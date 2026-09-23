@@ -23,6 +23,7 @@ import (
 
 	"github.com/milvus-io/milvus/internal/querynodev2/segments"
 	"github.com/milvus-io/milvus/pkg/v3/mlog"
+	"github.com/milvus-io/milvus/pkg/v3/util/stage"
 )
 
 const (
@@ -43,6 +44,7 @@ type segmentLoadTimingSample struct {
 	releaseResource time.Duration
 	onLoaded        time.Duration
 	failed          bool
+	result          stage.Result
 }
 
 type durationStats struct {
@@ -65,6 +67,8 @@ func (s durationStats) average(count int64) time.Duration {
 type physicalLoadDetailStats struct {
 	newSegment         durationStats
 	loadSegment        durationStats
+	sealedLoad         durationStats
+	sealedPrepare      durationStats
 	sealedLoadPoolWait durationStats
 	localSegmentLoad   durationStats
 	cSegmentLoad       durationStats
@@ -77,6 +81,8 @@ type physicalLoadDetailStats struct {
 func (s *physicalLoadDetailStats) add(timing segments.PhysicalLoadTiming) {
 	s.newSegment.add(timing.NewSegment)
 	s.loadSegment.add(timing.LoadSegment)
+	s.sealedLoad.add(timing.SealedLoad)
+	s.sealedPrepare.add(timing.SealedPrepare)
 	s.sealedLoadPoolWait.add(timing.SealedLoadPoolWait)
 	s.localSegmentLoad.add(timing.LocalSegmentLoad)
 	s.cSegmentLoad.add(timing.CSegmentLoad)
@@ -117,11 +123,44 @@ type segmentLoadTimingStats struct {
 }
 
 func recordSQNSegmentLoadTiming(ctx context.Context, sample segmentLoadTimingSample) {
+	observeSegmentLoadAttempt(sample)
 	snapshot, ok := sqnSegmentLoadTimingStats.add(time.Now(), sample)
 	if !ok {
 		return
 	}
 	logSQNSegmentLoadTiming(ctx, snapshot)
+}
+
+// All stages have one observation per completed scheduler attempt, including
+// zero for stages that were not reached. Every observation uses the final load
+// outcome. This keeps sum/count comparisons valid across early failures and the
+// final partial logging batch. Parent and child intervals must not be added.
+var segmentLoadAttemptStages = [...]struct {
+	recorder *stage.Recorder
+	duration func(segmentLoadTimingSample) time.Duration
+}{
+	{stage.New("queryNode", "segment_load_attempt", "total"), func(s segmentLoadTimingSample) time.Duration { return s.total }},
+	{stage.New("queryNode", "segment_load_attempt", "reserve_resource"), func(s segmentLoadTimingSample) time.Duration { return s.reserveResource }},
+	{stage.New("queryNode", "segment_load_attempt", "physical_load"), func(s segmentLoadTimingSample) time.Duration { return s.physicalLoad }},
+	{stage.New("queryNode", "segment_load_attempt", "new_segment"), func(s segmentLoadTimingSample) time.Duration { return s.physicalDetail.NewSegment }},
+	{stage.New("queryNode", "segment_load_attempt", "load_segment"), func(s segmentLoadTimingSample) time.Duration { return s.physicalDetail.LoadSegment }},
+	{stage.New("queryNode", "segment_load_attempt", "sealed_load"), func(s segmentLoadTimingSample) time.Duration { return s.physicalDetail.SealedLoad }},
+	{stage.New("queryNode", "segment_load_attempt", "sealed_prepare"), func(s segmentLoadTimingSample) time.Duration { return s.physicalDetail.SealedPrepare }},
+	{stage.New("queryNode", "segment_load_attempt", "load_pool_queue"), func(s segmentLoadTimingSample) time.Duration { return s.physicalDetail.SealedLoadPoolWait }},
+	{stage.New("queryNode", "segment_load_attempt", "local_segment_load"), func(s segmentLoadTimingSample) time.Duration { return s.physicalDetail.LocalSegmentLoad }},
+	{stage.New("queryNode", "segment_load_attempt", "csegment_load"), func(s segmentLoadTimingSample) time.Duration { return s.physicalDetail.CSegmentLoad }},
+	{stage.New("queryNode", "segment_load_attempt", "sync_json_stats"), func(s segmentLoadTimingSample) time.Duration { return s.physicalDetail.SyncJSONStats }},
+	{stage.New("queryNode", "segment_load_attempt", "sealed_post_load"), func(s segmentLoadTimingSample) time.Duration { return s.physicalDetail.SealedPostLoad }},
+	{stage.New("queryNode", "segment_load_attempt", "delta_logs"), func(s segmentLoadTimingSample) time.Duration { return s.physicalDetail.DeltaLogs }},
+	{stage.New("queryNode", "segment_load_attempt", "pk_candidate"), func(s segmentLoadTimingSample) time.Duration { return s.physicalDetail.PKCandidate }},
+	{stage.New("queryNode", "segment_load_attempt", "release_resource"), func(s segmentLoadTimingSample) time.Duration { return s.releaseResource }},
+	{stage.New("queryNode", "segment_load_attempt", "on_loaded"), func(s segmentLoadTimingSample) time.Duration { return s.onLoaded }},
+}
+
+func observeSegmentLoadAttempt(sample segmentLoadTimingSample) {
+	for _, metric := range segmentLoadAttemptStages {
+		metric.recorder.Observe(metric.duration(sample), sample.result)
+	}
 }
 
 func (s *segmentLoadTimingStats) add(now time.Time, sample segmentLoadTimingSample) (segmentLoadTimingSnapshot, bool) {
@@ -190,6 +229,10 @@ func logSQNSegmentLoadTiming(ctx context.Context, snapshot segmentLoadTimingSnap
 		mlog.Duration("maxPhysicalNewSegment", snapshot.physicalDetail.newSegment.max),
 		mlog.Duration("avgPhysicalLoadSegment", snapshot.physicalDetail.loadSegment.average(snapshot.count)),
 		mlog.Duration("maxPhysicalLoadSegment", snapshot.physicalDetail.loadSegment.max),
+		mlog.Duration("avgPhysicalSealedLoad", snapshot.physicalDetail.sealedLoad.average(snapshot.count)),
+		mlog.Duration("maxPhysicalSealedLoad", snapshot.physicalDetail.sealedLoad.max),
+		mlog.Duration("avgPhysicalSealedPrepare", snapshot.physicalDetail.sealedPrepare.average(snapshot.count)),
+		mlog.Duration("maxPhysicalSealedPrepare", snapshot.physicalDetail.sealedPrepare.max),
 		mlog.Duration("avgPhysicalLoadPoolWait", snapshot.physicalDetail.sealedLoadPoolWait.average(snapshot.count)),
 		mlog.Duration("maxPhysicalLoadPoolWait", snapshot.physicalDetail.sealedLoadPoolWait.max),
 		mlog.Duration("avgPhysicalLocalSegmentLoad", snapshot.physicalDetail.localSegmentLoad.average(snapshot.count)),

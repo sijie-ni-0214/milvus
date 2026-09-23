@@ -514,9 +514,10 @@ func (r *segmentResource) prepare(ctx context.Context, b *segmentBinding, collec
 	timing := segmentLoadTimingSample{}
 	defer func() {
 		timing.total = time.Since(startedAt)
-		timing.failed = err != nil
+		timing.result = stage.Outcome(err)
+		timing.failed = timing.result != stage.Success
 		recordSQNSegmentLoadTiming(ctx, timing)
-		totalTimer.End(err)
+		totalTimer.EndResult(timing.result)
 	}()
 	info := proto.Clone(snapshot.LoadInfo).(*querypb.SegmentLoadInfo)
 	selected := make(map[int64]struct{}, len(collection.IndexInfos()))

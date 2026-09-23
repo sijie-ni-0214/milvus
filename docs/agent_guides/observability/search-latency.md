@@ -13,10 +13,11 @@ cancellation). It has 20 explicit finite buckets from 1 microsecond to 600 secon
 plus the implicit `+Inf` bucket. `_count` also counts completed stage attempts.
 
 `internal_core_query_stage_inflight{stage}` tracks active scoped timers, including
-blocked work. The three `*_queue` stages are observed after dequeue and do not
+blocked work. Prefetch/storage-batch queue stages are observed after dequeue;
+the Load worker queue stages are observed at worker completion. They do not
 track queue depth with this gauge. Use the existing executor/pool queue metrics
-for queue depth. There are 20 stage values: at most 40 histograms and 20 gauges,
-940 exported time series per process. Labels contain no collection, segment,
+for queue depth. There are 28 stage values: at most 56 histograms and 28 gauges,
+1316 exported time series per process. Labels contain no collection, segment,
 field, column-group, path or trace identifiers and are unchanged by collection
 metric aggregation mode. Handles and finite buckets are initialized together on
 first use, with no label-map construction on the observation hot path.
@@ -40,6 +41,9 @@ first use, with no label-map construction on the observation hot path.
 | `manifest_read_batch` | Per manifest batch: `ChunkReader::get_chunks`. Includes reader synchronization, remote/local reads and decoding; not pure S3 service latency. Returned Arrow errors are explicitly counted as errors. |
 | `manifest_build_chunk` | Per loaded cell: Arrow normalization, chunk construction and optional mmap-file creation/population. Several cells may build in parallel. |
 | `fill_primary_keys` | Per segment result: the entire PK fill call, including the segment read lock and any cold reads. |
+| `load_indexes_batch`, `load_column_groups_batch` | Whole index/column-group batch wall time in Load or Reopen, including submission and worker waits. |
+| `load_indexes_wait`, `load_column_groups_wait` | WaitAllFutures inside the corresponding batch. Overlaps queue/run work. |
+| `load_index_queue/run`, `load_column_group_queue/run` | Per completed MIDDLE worker: submission to entry, then execution; both share the worker outcome. See [Cold Load](cold-load-stages.md) for the separate per-Load phase population. |
 
 The new native family is exported through the existing core registry,
 `GetCoreMetrics()` and Go `CRegistry`; existing metric names/label sets are retained.

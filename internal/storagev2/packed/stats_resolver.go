@@ -50,6 +50,7 @@ type StatsResolver struct {
 	manifestStats  map[string]ManifestStat
 	manifestLoaded bool
 	manifestErr    error
+	manifestOrigin ManifestReadOrigin
 }
 
 // NewStatsResolver creates a StatsResolver. Pass a non-empty manifestPath
@@ -89,6 +90,11 @@ func NewStatsResolverFromSegmentInfo(info *datapb.SegmentInfo) *StatsResolver {
 
 func (r *StatsResolver) WithStatslogs(s []*datapb.FieldBinlog) *StatsResolver {
 	r.statslogs = s
+	return r
+}
+
+func (r *StatsResolver) WithManifestReadOrigin(origin ManifestReadOrigin) *StatsResolver {
+	r.manifestOrigin = origin
 	return r
 }
 
@@ -377,7 +383,7 @@ func (r *StatsResolver) loadManifest() error {
 	r.manifestLoaded = true
 
 	statsTimer := manifestStats.Begin()
-	stats, err := GetManifestStats(r.manifestPath, r.storageConfig)
+	stats, err := getManifestStats(r.manifestPath, r.storageConfig, r.manifestOrigin)
 	statsTimer.End(err)
 	if err != nil {
 		r.manifestErr = merr.Wrap(err, "failed to get manifest stats")
