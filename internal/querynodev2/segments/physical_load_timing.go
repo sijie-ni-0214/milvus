@@ -26,6 +26,8 @@ import (
 type PhysicalLoadTiming struct {
 	NewSegment         time.Duration
 	LoadSegment        time.Duration
+	SealedLoad         time.Duration
+	SealedPrepare      time.Duration
 	SealedLoadPoolWait time.Duration
 	LocalSegmentLoad   time.Duration
 	CSegmentLoad       time.Duration

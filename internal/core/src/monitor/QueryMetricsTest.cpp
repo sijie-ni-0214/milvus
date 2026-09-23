@@ -10,6 +10,7 @@
 // or implied. See the License for the specific language governing permissions and limitations under the License.
 
 #include "monitor/QueryMetrics.h"
+#include "monitor/SegmentLoadMetrics.h"
 
 #include <gtest/gtest.h>
 #include <chrono>
@@ -138,6 +139,86 @@ TEST(QueryMetrics, ConcurrentTimersDoNotLoseSamplesOrLeakInflight) {
               before.histogram.sample_count + 800);
     EXPECT_DOUBLE_EQ(
         Snapshot(inflight_family, "manifest_group_wait").gauge.value, 0);
+}
+
+TEST(QueryMetrics, LoadPhasesPartitionEachAttemptIncludingSkippedStages) {
+    constexpr auto family = "internal_core_segment_load_duration_seconds";
+    const std::vector<std::string> phases = {"lock_wait",
+                                             "prepare",
+                                             "clone_state",
+                                             "indexes",
+                                             "reload_columns",
+                                             "column_groups",
+                                             "text_lob",
+                                             "field_data",
+                                             "text_indexes",
+                                             "json_stats",
+                                             "default_fields",
+                                             "create_text_indexes",
+                                             "finalize",
+                                             "publish"};
+    for (bool failed : {false, true}) {
+        const auto result = failed ? "error" : "success";
+        std::vector<prometheus::ClientMetric> before;
+        for (const auto& phase : phases) {
+            before.push_back(Snapshot(family, phase, result));
+        }
+        const auto total_before = Snapshot(family, "total", result);
+        try {
+            SegmentLoadTiming timing;
+            SegmentLoadTiming::SwitchTo(&timing, SegmentLoadPhase::Indexes);
+            if (failed) {
+                throw std::runtime_error("load failure");
+            }
+            SegmentLoadTiming::SwitchTo(&timing, SegmentLoadPhase::Publish);
+            timing.End();
+            timing.End();
+        } catch (const std::runtime_error&) {
+        }
+        double sum = 0;
+        for (std::size_t i = 0; i < phases.size(); ++i) {
+            const auto after = Snapshot(family, phases[i], result);
+            EXPECT_EQ(after.histogram.sample_count,
+                      before[i].histogram.sample_count + 1);
+            const auto elapsed =
+                after.histogram.sample_sum - before[i].histogram.sample_sum;
+            if (phases[i] == "column_groups") {
+                EXPECT_DOUBLE_EQ(elapsed, 0);
+            }
+            sum += elapsed;
+        }
+        const auto total = Snapshot(family, "total", result);
+        EXPECT_EQ(total.histogram.sample_count,
+                  total_before.histogram.sample_count + 1);
+        EXPECT_NEAR(
+            sum,
+            total.histogram.sample_sum - total_before.histogram.sample_sum,
+            1e-9);
+    }
+}
+
+TEST(QueryMetrics, QueuedCanceledTaskRecordsQueueAndRunWithSameOutcome) {
+    const auto queue = Snapshot(duration_family, "load_index_queue", "error");
+    const auto run = Snapshot(duration_family, "load_index_run", "error");
+    EXPECT_THROW(
+        {
+            QueryStageTaskTimer timing(
+                QueryStage::LoadIndexQueue,
+                QueryStage::LoadIndexRun,
+                QueryStageClock::now() - std::chrono::milliseconds(5));
+            throw std::runtime_error("canceled before loading");
+        },
+        std::runtime_error);
+    const auto after_queue =
+        Snapshot(duration_family, "load_index_queue", "error");
+    const auto after_run = Snapshot(duration_family, "load_index_run", "error");
+    EXPECT_EQ(after_queue.histogram.sample_count,
+              queue.histogram.sample_count + 1);
+    EXPECT_EQ(after_run.histogram.sample_count, run.histogram.sample_count + 1);
+    EXPECT_GE(after_queue.histogram.sample_sum - queue.histogram.sample_sum,
+              0.005);
+    EXPECT_DOUBLE_EQ(Snapshot(inflight_family, "load_index_run").gauge.value,
+                     0);
 }
 
 }  // namespace

@@ -12,6 +12,7 @@ configuration.
 | [Collection / VChannel 级 Prometheus 指标审计](collection-level-metrics-audit.md) | 审查直接 collection / VChannel 标签、区分 PChannel、核对基数风险和清理覆盖情况。 |
 | [Collection / VChannel 级 Prometheus 指标降基数模式](collection-level-metrics-mode.md) | 配置 `full` / `aggregate` 模式，并逐项核对 71 个受影响指标修改前后的行为。 |
 | [Search latency attribution](search-latency.md) | 定位 Search、V3 冷 reader、预取和批次加载的耗时；核对阶段边界、重叠、基数和 PromQL。 |
+| [Cold Load latency attribution](cold-load-stages.md) | 拆解 LoadInfo/manifest FFI、Go LoadSegment、C++ Load 与 MIDDLE 排队；核对完成样本和阶段包含关系。 |
 | [WAL Tracing](../streaming-system/wal/tracing.md) | Understanding or changing WAL trace span semantics across append, consume, transaction, broadcast, and replication paths. |
 
 ## Rules of Thumb

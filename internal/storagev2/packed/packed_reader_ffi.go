@@ -39,6 +39,7 @@ import "C"
 import (
 	"context"
 	"io"
+	"time"
 	"unsafe"
 
 	"github.com/apache/arrow/go/v17/arrow"
@@ -440,6 +441,16 @@ func GetManifestHandleWithExtfs(
 	extfs ExternalSpecContext,
 	talonStages ...uint32,
 ) (loonManifestHandle *C.LoonManifest, err error) {
+	return getManifestHandleWithTiming(manifestPath, storageConfig, extfs, nil, talonStages...)
+}
+
+func getManifestHandleWithTiming(
+	manifestPath string,
+	storageConfig *indexpb.StorageConfig,
+	extfs ExternalSpecContext,
+	timing *manifestReadTiming,
+	talonStages ...uint32,
+) (loonManifestHandle *C.LoonManifest, err error) {
 	totalTimer := manifestTotal.Begin()
 	defer totalTimer.EndError(&err)
 	manifest, err := ParseManifestPath(manifestPath)
@@ -449,7 +460,11 @@ func GetManifestHandleWithExtfs(
 	mlog.Debug(context.TODO(), "GetManifest", mlog.String("manifestPath", manifestPath), mlog.String("basePath", manifest.BasePath), mlog.Int64("version", manifest.ManifestVersion))
 
 	propertiesTimer := manifestProperties.Begin()
+	propertiesStartedAt := time.Now()
 	cProperties, err := MakePropertiesFromStorageConfig(storageConfig, nil, talonStages...)
+	if timing != nil {
+		timing.durations[manifestReadProperties] = time.Since(propertiesStartedAt)
+	}
 	propertiesTimer.End(err)
 	if err != nil {
 		return nil, err
@@ -458,7 +473,7 @@ func GetManifestHandleWithExtfs(
 	if err := injectExternalSpecProperties(cProperties, extfs.CollectionID, extfs.Source, extfs.Spec); err != nil {
 		return nil, merr.Wrap(err, "inject extfs")
 	}
-	return openManifest(manifest, cProperties)
+	return openManifest(manifest, cProperties, timing)
 }
 
 // Ensure FFIPackedReader implements array.RecordReader interface
