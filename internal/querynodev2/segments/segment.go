@@ -1319,7 +1319,8 @@ func (s *LocalSegment) syncFieldJSONStatsFromLoadInfo(ctx context.Context, loadI
 		return
 	}
 
-	statsResult := packed.NewStatsResolverFromLoadInfo(loadInfo).TextAndJSONIndexStatsWithBasePaths()
+	statsResult := packed.NewStatsResolverFromLoadInfo(loadInfo).
+		WithManifestReadOrigin(packed.ManifestReadPostSync).TextAndJSONIndexStatsWithBasePaths()
 	jsonKeyStats := statsResult.JSONKeyStats
 	if statsResult.Err() != nil {
 		mlog.Warn(ctx, "failed to resolve json key stats from manifest",
