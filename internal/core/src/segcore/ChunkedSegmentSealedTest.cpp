@@ -582,6 +582,55 @@ TEST(test_chunk_segment, PinnedFillTargetEntryMatchesUnpinned) {
               unpinned.search_storage_cost_.scanned_total_bytes);
 }
 
+TEST(test_chunk_segment, ParallelDynamicOutputRetainsPinnedSnapshotAfterDrop) {
+    auto schema = std::make_shared<Schema>();
+    auto pk_id = schema->AddDebugField("pk", DataType::INT64);
+    auto first_id = schema->AddDebugField("$meta", DataType::JSON);
+    schema->set_dynamic_field_id(first_id);
+    auto second_id = schema->AddDebugField("second", DataType::INT64);
+    auto vector_id = schema->AddDebugField(
+        "vec", DataType::VECTOR_FLOAT, 4, knowhere::metric::L2);
+    schema->set_primary_field_id(pk_id);
+
+    auto segment = CreateColdVectorOutputSegment(schema, vector_id, 16);
+    auto* chunked =
+        dynamic_cast<segcore::ChunkedSegmentSealedImpl*>(segment.get());
+    ASSERT_NE(chunked, nullptr);
+    chunked->SetUseTakeForOutputForTesting(false);
+
+    query::Plan plan(schema);
+    plan.target_entries_ = {first_id, second_id};
+    plan.target_dynamic_fields_ = {"key"};
+    auto snapshot = chunked->CaptureReadSnapshot();
+    auto expected = MakeSearchResult({0, 3, 7, 11});
+    ASSERT_NO_THROW(chunked->TestFillTargetEntry(&plan, expected));
+
+    chunked->DropFieldData(first_id);
+    ASSERT_NE(segcore::ChunkedSegmentSealedImpl::ToPublishedState(snapshot),
+              chunked->TestGetPublishedStateSnapshot());
+
+    // Both ordinary result fill and the helper used by ordered Arrow export
+    // must keep reading the generation captured before dynamic field retirement.
+    for (bool direct_helper : {false, true}) {
+        SCOPED_TRACE(direct_helper);
+        auto pinned = MakeSearchResult({0, 3, 7, 11});
+        pinned.segment_ = chunked;
+        pinned.read_snapshot_ = snapshot;
+        if (direct_helper) {
+            ASSERT_NO_THROW(chunked->FillSearchResultOutputFields(
+                &plan, plan.target_entries_, snapshot, pinned, nullptr));
+        } else {
+            ASSERT_NO_THROW(chunked->TestFillTargetEntry(&plan, pinned));
+        }
+        for (auto field_id : plan.target_entries_) {
+            ASSERT_EQ(pinned.output_fields_data_.count(field_id), 1);
+            EXPECT_EQ(
+                pinned.output_fields_data_.at(field_id)->SerializeAsString(),
+                expected.output_fields_data_.at(field_id)->SerializeAsString());
+        }
+    }
+}
+
 TEST(test_chunk_segment, ViewReadStateRetainsColumnsAndSharesDeletes) {
     constexpr int64_t row_count = 16;
     auto schema = std::make_shared<Schema>();
