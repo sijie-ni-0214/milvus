@@ -5,6 +5,8 @@ import (
 	"sync"
 	"time"
 
+	"golang.org/x/sync/errgroup"
+
 	"github.com/milvus-io/milvus/internal/querynodev2/pkoracle"
 	"github.com/milvus-io/milvus/internal/querynodev2/qnview"
 	"github.com/milvus-io/milvus/internal/querynodev2/segments"
@@ -45,31 +47,38 @@ func (l *queryViewPhysicalSegmentLoader) Load(ctx context.Context, info *querypb
 			_ = loaded.Release(context.Background())
 		}
 	}()
-	startedAt = time.Now()
-	err = l.loader.LoadSegment(ctx, loaded, info)
-	physicalloadsegmentStage.Observe(time.Since(startedAt), stage.Outcome(err))
-	if timing != nil {
-		timing.LoadSegment = time.Since(startedAt)
-	}
-	if err != nil {
-		return nil, err
-	}
-	startedAt = time.Now()
-	err = l.loader.LoadDeltaLogs(ctx, loaded, info)
-	physicaldeltaStage.Observe(time.Since(startedAt), stage.Outcome(err))
-	if timing != nil {
-		timing.DeltaLogs = time.Since(startedAt)
-	}
-	if err != nil {
-		return nil, err
-	}
-	startedAt = time.Now()
-	err = l.loader.LoadPKCandidate(ctx, loaded, info)
-	physicalpkStage.Observe(time.Since(startedAt), stage.Outcome(err))
-	if timing != nil {
-		timing.PKCandidate = time.Since(startedAt)
-	}
-	if err != nil {
+	// The PK candidate only reads the stats files named by the load info, so
+	// load it while segcore loads column data instead of after it. The first
+	// failure cancels the other branch.
+	g, gctx := errgroup.WithContext(ctx)
+	g.Go(func() error {
+		startedAt := time.Now()
+		err := l.loader.LoadPKCandidate(gctx, loaded, info)
+		physicalpkStage.Observe(time.Since(startedAt), stage.Outcome(err))
+		if timing != nil {
+			timing.PKCandidate = time.Since(startedAt)
+		}
+		return err
+	})
+	g.Go(func() error {
+		startedAt := time.Now()
+		err := l.loader.LoadSegment(gctx, loaded, info)
+		physicalloadsegmentStage.Observe(time.Since(startedAt), stage.Outcome(err))
+		if timing != nil {
+			timing.LoadSegment = time.Since(startedAt)
+		}
+		if err != nil {
+			return err
+		}
+		startedAt = time.Now()
+		err = l.loader.LoadDeltaLogs(gctx, loaded, info)
+		physicaldeltaStage.Observe(time.Since(startedAt), stage.Outcome(err))
+		if timing != nil {
+			timing.DeltaLogs = time.Since(startedAt)
+		}
+		return err
+	})
+	if err = g.Wait(); err != nil {
 		return nil, err
 	}
 	if err := l.loader.FinalizeLoad(loaded); err != nil {
