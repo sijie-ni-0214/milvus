@@ -1889,9 +1889,10 @@ func TestValidateImportFilePaths(t *testing.T) {
 			}
 			// The legacy local namespace is <root>/<minio.rootPath>/insert_log,
 			// so the cases above must not depend on the configured default.
-			rootKey := paramtable.Get().MinioCfg.RootPath.Key
-			paramtable.Get().Save(rootKey, "files")
-			defer paramtable.Get().Reset(rootKey)
+			// TestMain pins the MinIO root with a temp value, which takes
+			// precedence over Save; swap the temp value instead.
+			originalRoot := paramtable.Get().MinioCfg.RootPath.SwapTempValue("files")
+			defer paramtable.Get().MinioCfg.RootPath.SwapTempValue(originalRoot)
 
 			rootPath, filePath := tt.rootPath, tt.path
 			if tt.storageType == "local" {
