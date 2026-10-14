@@ -131,11 +131,10 @@ func TestNormalizeLocalManifestPath(t *testing.T) {
 func setLocalManifestLegacyPrefix(t *testing.T, prefix string) {
 	t.Helper()
 	paramtable.Init()
-	params := paramtable.Get()
-	key := params.MinioCfg.RootPath.Key
-	original := params.MinioCfg.RootPath.GetValue()
-	require.NoError(t, params.Save(key, prefix))
-	t.Cleanup(func() { require.NoError(t, params.Save(key, original)) })
+	// TestMain pins the MinIO root with a temp value, which takes precedence
+	// over Save; swap the temp value instead.
+	original := paramtable.Get().MinioCfg.RootPath.SwapTempValue(prefix)
+	t.Cleanup(func() { paramtable.Get().MinioCfg.RootPath.SwapTempValue(original) })
 }
 
 func newLocalManifestTestMeta(t *testing.T, catalog *catalogmocks.DataCoordCatalog, cm storage.ChunkManager) *meta {

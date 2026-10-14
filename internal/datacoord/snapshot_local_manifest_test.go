@@ -37,9 +37,10 @@ import (
 func newLocalManifestSnapshot(t *testing.T, layout datapb.SnapshotLayout, manifestPath string) (*snapshotMeta, *datapb.SnapshotInfo, map[string][]byte) {
 	t.Helper()
 	paramtable.Init()
-	oldPrefix := Params.MinioCfg.RootPath.GetValue()
-	require.NoError(t, Params.Save(Params.MinioCfg.RootPath.Key, "files"))
-	t.Cleanup(func() { require.NoError(t, Params.Save(Params.MinioCfg.RootPath.Key, oldPrefix)) })
+	// TestMain pins the MinIO root with a temp value, which takes precedence
+	// over Save; swap the temp value instead.
+	oldPrefix := Params.MinioCfg.RootPath.SwapTempValue("files")
+	t.Cleanup(func() { Params.MinioCfg.RootPath.SwapTempValue(oldPrefix) })
 
 	ctx := context.Background()
 	cm := storage.NewLocalChunkManager(objectstorage.RootPath(t.TempDir()))

@@ -276,11 +276,13 @@ func TestNewLOBGCContext(t *testing.T) {
 func TestLOBGCStorageConfigUsesPrimaryStorageRoot(t *testing.T) {
 	params := Params
 	localRoot := t.TempDir()
-	require.NoError(t, params.Save(params.MinioCfg.RootPath.Key, "files"))
+	// TestMain pins the MinIO root with a temp value, which takes precedence
+	// over Save; swap the temp value instead.
+	originalRoot := params.MinioCfg.RootPath.SwapTempValue("files")
 	require.NoError(t, params.Save(params.LocalStorageCfg.Path.Key, localRoot))
 	t.Cleanup(func() {
 		_ = params.Reset(params.CommonCfg.StorageType.Key)
-		_ = params.Reset(params.MinioCfg.RootPath.Key)
+		params.MinioCfg.RootPath.SwapTempValue(originalRoot)
 		_ = params.Reset(params.LocalStorageCfg.Path.Key)
 	})
 
