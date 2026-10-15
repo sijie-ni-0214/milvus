@@ -267,94 +267,31 @@ func publishesSegmentVersion(segment *datapb.SegmentInfo, actions []metastore.Up
 	return false
 }
 
-// applySegmentEntry stages the kv writes for a segment action.
-//   - ActionAdd    -> segment record + its binlog KVs (a new segment).
-//   - ActionUpdate -> segment record rewrite; the caller supplies the
-//     already-mutated segment value. AlterEncoding selects the encoding:
-//     false -> record-only (SaveDroppedSegmentsInBatch), true -> the legacy
-//     AlterSegments encoding, which for a Dropped segment also writes the
-//     handleDroppedSegment GC-compat binlog KVs.
-//   - anything else (e.g. ActionDelete: physical segment removal) is not
-//     wired yet and is rejected.
+// applySegmentEntry stages the kv writes for a segment action (see
+// SegmentCodec.EncodeAction). The binlog KVs come before the record, and a
+// first-publication record is the commit op: a durable binding must never
+// precede its DataView, so just the record (not its potentially large binlog
+// set) joins the final atomic transaction on the chunked path.
 func (kc *Catalog) applySegmentEntry(ctx context.Context, b *txn.Builder, t metastore.ActionType, e metastore.SegmentEntry, publishesVersion bool) error {
-	if e.Segment == nil {
-		return merr.WrapErrServiceInternalMsg("datacoord catalog: nil segment in UpdateAction")
+	w, err := kc.segmentCodec().EncodeAction(ctx, t, e)
+	if err != nil {
+		return err
 	}
-	// A durable first-publication binding must never precede its DataView.
-	// Keep just the segment record (not its potentially large binlog set) in
-	// the final atomic transaction with the DataView on the chunked path.
-	save := b.Save
+	for _, op := range w.Ops {
+		if op.Delete {
+			b.Remove(op.Key)
+		} else {
+			b.Save(op.Key, op.Value)
+		}
+	}
+	key, value, err := buildSegmentKv(w.Record)
+	if err != nil {
+		return err
+	}
 	if publishesVersion {
-		segmentKey := buildSegmentPath(e.Segment.GetCollectionID(), e.Segment.GetPartitionID(), e.Segment.GetID())
-		save = func(key, value string) {
-			if key == segmentKey {
-				b.CommitSave(key, value)
-			} else {
-				b.Save(key, value)
-			}
-		}
-	}
-	switch t {
-	case metastore.ActionAdd:
-		// C26: honor the caller's increments (including DroppedBinlogFieldIDs
-		// removals) instead of silently overwriting them with a default; a
-		// dropped binlog field whose removal is omitted would be resurrected by
-		// the prefix scan in listBinlogs on restart. Fall back to the full
-		// segment increment only when none is supplied.
-		increments := e.Binlogs
-		if len(increments) == 0 {
-			increments = []metastore.BinlogsIncrement{{Segment: e.Segment}}
-		}
-		kvs, removals, err := kc.buildAlterSegmentsKvs(ctx,
-			[]*datapb.SegmentInfo{e.Segment},
-			increments)
-		if err != nil {
-			return err
-		}
-		for k, v := range kvs {
-			save(k, v)
-		}
-		for _, k := range removals {
-			b.Remove(k)
-		}
-	case metastore.ActionUpdate:
-		if e.AlterEncoding {
-			// Legacy AlterSegments encoding. A nil binlog increment persists no
-			// new binlog KVs (the segment is being retired, not extended); for a
-			// Dropped segment buildAlterSegmentsKvs still emits the
-			// handleDroppedSegment GC-compat write when the segment predates
-			// binlog-prefix persistence, keeping compaction's compactFrom
-			// retirement byte-identical to catalog.AlterSegments.
-			kvs, removals, err := kc.buildAlterSegmentsKvs(ctx, []*datapb.SegmentInfo{e.Segment}, e.Binlogs)
-			if err != nil {
-				return err
-			}
-			for k, v := range kvs {
-				save(k, v)
-			}
-			for _, k := range removals {
-				b.Remove(k)
-			}
-			return nil
-		}
-		kvs, err := buildDroppedSegmentKvs([]*datapb.SegmentInfo{e.Segment})
-		if err != nil {
-			return err
-		}
-		for k, v := range kvs {
-			save(k, v)
-		}
-		if len(e.Binlogs) > 0 {
-			// C26: the record-only (non-AlterEncoding) ActionUpdate persists no
-			// binlog KVs and cannot honor DroppedBinlogFieldIDs removals —
-			// silently dropping them would resurrect zombie binlog entries.
-			// Reject per the Update contract ("reject what you cannot
-			// implement") instead of losing the removals without an error.
-			return merr.WrapErrServiceInternalMsg(
-				"datacoord catalog: binlog increments are not supported on a record-only segment update; use AlterEncoding")
-		}
-	default:
-		return merr.WrapErrServiceInternalMsg("datacoord catalog cannot apply action type %v to a segment", t)
+		b.CommitSave(key, value)
+	} else {
+		b.Save(key, value)
 	}
 	return nil
 }

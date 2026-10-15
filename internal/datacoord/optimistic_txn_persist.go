@@ -4,7 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"strconv"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -15,13 +15,18 @@ import (
 	"github.com/tikv/client-go/v2/txnkv"
 	"github.com/tikv/client-go/v2/txnkv/transaction"
 	"go.etcd.io/etcd/api/v3/mvccpb"
+	"go.etcd.io/etcd/api/v3/v3rpc/rpctypes"
 	clientv3 "go.etcd.io/etcd/client/v3"
 	"go.uber.org/zap"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 
 	etcdkv "github.com/milvus-io/milvus/internal/kv/etcd"
+	"github.com/milvus-io/milvus/internal/kv/tikv"
 	"github.com/milvus-io/milvus/pkg/v3/mlog"
 	"github.com/milvus-io/milvus/pkg/v3/proto/datapb"
+	"github.com/milvus-io/milvus/pkg/v3/util/merr"
 	"github.com/milvus-io/milvus/pkg/v3/util/paramtable"
 	"github.com/milvus-io/milvus/pkg/v3/util/retry"
 )
@@ -33,7 +38,14 @@ var (
 	// DeleteIfVersion) found a different version in the store: the caller's
 	// cached copy is stale and must be refreshed before the write is rebuilt.
 	ErrVersionConflict = errors.New("optimistic txn: version conflict")
+	// errCompareFailed reports that the read-modify-write compares of a batch
+	// failed: a key changed between the read and the commit.
+	errCompareFailed = errors.New("optimistic txn: compare failed")
 )
+
+// maxCompareAttempts bounds the attempts of a batch whose compares keep
+// failing. Every other failure returns at once and is left to the caller.
+const maxCompareAttempts = 20
 
 // OptimisticTxnPersist is a persist layer that uses optimistic transactions.
 type OptimisticTxnPersist[K comparable, V any] interface {
@@ -45,6 +57,10 @@ type OptimisticTxnPersist[K comparable, V any] interface {
 	// Get reads the current value and version of each key. Absent keys are
 	// omitted from the result.
 	Get(ctx context.Context, keys []K) (map[K]TxnResult[V], error)
+	// WalkRaw calls fn with every key and raw value under prefix: the
+	// unversioned records composed next to the typed values (see Txn.Raw).
+	// fn must not keep value after it returns.
+	WalkRaw(ctx context.Context, prefix string, fn func(key string, value []byte) error) error
 }
 
 // Txn collects operations and commits them atomically.
@@ -77,12 +93,56 @@ type Txn[K comparable, V any] interface {
 }
 
 // RawOp is an unversioned put or delete composed into a transaction. Key is
-// the full store key.
+// the full store key; DeletePrefix removes every key under it.
 type RawOp struct {
-	Key    string
-	Value  string
-	Delete bool
-	Commit bool
+	Key          string
+	Value        string
+	Delete       bool
+	DeletePrefix bool
+	Commit       bool
+}
+
+// storeErr marks a store rejection that no retry can heal (an invalid or
+// oversized request) as unrecoverable, so a caller's retry loop does not keep
+// resending it. Other failures stay retriable for the caller.
+func storeErr(err error) error {
+	if isPermanentStoreError(err) {
+		return retry.Unrecoverable(err)
+	}
+	return err
+}
+
+func isPermanentStoreError(err error) bool {
+	var txnTooLarge *tikverr.ErrTxnTooLarge
+	if tikv.IsLocalMutationValidationErr(err) || errors.As(err, &txnTooLarge) {
+		return true
+	}
+	// etcd rejects an invalid or oversized request with InvalidArgument, and
+	// the client refuses to send one over its message limit with
+	// ResourceExhausted, a code etcd also uses for throttling and a full
+	// backend, which do recover.
+	if errors.IsAny(err, rpctypes.ErrTooManyRequests, rpctypes.ErrGRPCRequestTooManyRequests, rpctypes.ErrNoSpace, rpctypes.ErrGRPCNoSpace) {
+		return false
+	}
+	code := status.Code(err)
+	var etcdErr rpctypes.EtcdError
+	if errors.As(err, &etcdErr) {
+		code = etcdErr.Code()
+	}
+	return code == codes.InvalidArgument || code == codes.ResourceExhausted
+}
+
+// requestContext bounds one store round trip like the catalog's MetaKv does.
+func requestContext(ctx context.Context, timeout *paramtable.ParamItem) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(ctx, timeout.GetAsDuration(time.Millisecond))
+}
+
+func decodeStoredValue[V any](marshaler Marshaler[V], key string, data []byte) (V, error) {
+	v, err := marshaler.Unmarshal(data)
+	if err != nil {
+		return v, merr.WrapErrDataIntegrity(err, "decode the persisted value of key %s", key)
+	}
+	return v, nil
 }
 
 // TxnResult is the result of a single operation after commit.
@@ -117,22 +177,6 @@ func storedValueEquals[V any](marshaler Marshaler[V], stored []byte, value V) bo
 		return false
 	}
 	return eq.Equal(current, value)
-}
-
-// --- Segment key helpers ---
-
-const segmentMetaPrefix = "datacoord-meta/s/"
-
-func segmentKey(collectionID, partitionID, segmentID int64) string {
-	return fmt.Sprintf("%s%d/%d/%d", segmentMetaPrefix, collectionID, partitionID, segmentID)
-}
-
-func segmentIDFromKey(key string) (int64, error) {
-	parts := strings.Split(key, "/")
-	if len(parts) == 0 {
-		return 0, fmt.Errorf("invalid segment key: %s", key)
-	}
-	return strconv.ParseInt(parts[len(parts)-1], 10, 64)
 }
 
 // --- SegmentInfo Marshaler (protobuf) ---
@@ -240,7 +284,7 @@ func (t *txnOps[K, V]) planBatches(limit int) ([][]int, error) {
 		return [][]int{all}, nil
 	}
 	if t.atomicOnly {
-		return nil, fmt.Errorf("atomic transaction needs %d ops but the limit is %d", len(t.ops), limit)
+		return nil, merr.WrapErrServiceInternalMsg("atomic transaction needs %d ops but the limit is %d", len(t.ops), limit)
 	}
 	var nonCommit, commit []int
 	for i, op := range t.ops {
@@ -251,7 +295,7 @@ func (t *txnOps[K, V]) planBatches(limit int) ([][]int, error) {
 		}
 	}
 	if len(commit) > limit {
-		return nil, fmt.Errorf("transaction commit set of %d ops exceeds the limit %d", len(commit), limit)
+		return nil, merr.WrapErrServiceInternalMsg("transaction commit set of %d ops exceeds the limit %d", len(commit), limit)
 	}
 	batches := make([][]int, 0, len(nonCommit)/limit+2)
 	for start := 0; start < len(nonCommit); start += limit {
@@ -286,6 +330,10 @@ func (p *etcdPersist[K, V]) Txn(ctx context.Context) Txn[K, V] {
 	return &etcdTxn[K, V]{ctx: ctx, persist: p}
 }
 
+func (p *etcdPersist[K, V]) requestContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	return requestContext(ctx, &paramtable.Get().EtcdCfg.RequestTimeout)
+}
+
 func (p *etcdPersist[K, V]) Scan(ctx context.Context, prefix K) ([]K, []V, []int64, error) {
 	var ks []K
 	var vals []V
@@ -299,7 +347,7 @@ func (p *etcdPersist[K, V]) Scan(ctx context.Context, prefix K) ([]K, []V, []int
 		paramtable.Get().MetaStoreCfg.PaginationSize.GetAsInt(),
 		0,
 		func(keyValue *mvccpb.KeyValue) error {
-			value, err := p.marshaler.Unmarshal(keyValue.Value)
+			value, err := decodeStoredValue(p.marshaler, string(keyValue.Key), keyValue.Value)
 			if err != nil {
 				return err
 			}
@@ -318,20 +366,40 @@ func (p *etcdPersist[K, V]) Scan(ctx context.Context, prefix K) ([]K, []V, []int
 func (p *etcdPersist[K, V]) Get(ctx context.Context, keys []K) (map[K]TxnResult[V], error) {
 	result := make(map[K]TxnResult[V], len(keys))
 	for _, key := range keys {
-		resp, err := p.cli.Get(ctx, string(key))
+		reqCtx, cancel := p.requestContext(ctx)
+		resp, err := p.cli.Get(reqCtx, string(key))
+		cancel()
 		if err != nil {
 			return nil, err
 		}
 		if len(resp.Kvs) == 0 {
 			continue
 		}
-		v, err := p.marshaler.Unmarshal(resp.Kvs[0].Value)
+		v, err := decodeStoredValue(p.marshaler, string(key), resp.Kvs[0].Value)
 		if err != nil {
 			return nil, err
 		}
 		result[key] = TxnResult[V]{Value: v, Version: resp.Kvs[0].ModRevision}
 	}
 	return result, nil
+}
+
+func (p *etcdPersist[K, V]) WalkRaw(ctx context.Context, prefix string, fn func(key string, value []byte) error) error {
+	return etcdkv.WalkPrefix(ctx, p.cli, prefix, paramtable.Get().MetaStoreCfg.PaginationSize.GetAsInt(), 0,
+		func(keyValue *mvccpb.KeyValue) error {
+			return fn(string(keyValue.Key), keyValue.Value)
+		})
+}
+
+func etcdRawOp(op RawOp) clientv3.Op {
+	switch {
+	case op.DeletePrefix:
+		return clientv3.OpDelete(op.Key, clientv3.WithPrefix())
+	case op.Delete:
+		return clientv3.OpDelete(op.Key)
+	default:
+		return clientv3.OpPut(op.Key, op.Value)
+	}
 }
 
 type etcdTxn[K string, V any] struct {
@@ -346,7 +414,7 @@ func (t *etcdTxn[K, V]) Commit() ([]TxnResult[V], error) {
 	// Split ops into batches to avoid exceeding etcd txn op limits.
 	batches, err := t.planBatches(paramtable.Get().MetaStoreCfg.MaxEtcdTxnNum.GetAsInt())
 	if err != nil {
-		return nil, err
+		return nil, retry.Unrecoverable(err)
 	}
 	for _, batch := range batches {
 		if err := t.commitBatch(batch, results); err != nil {
@@ -360,8 +428,10 @@ func (t *etcdTxn[K, V]) commitBatch(batch []int, results []TxnResult[V]) error {
 	commitStart := time.Now()
 	retryCount := 0
 
-	return retry.Do(t.ctx, func() error {
+	err := retry.Do(t.ctx, func() error {
 		retryCount++
+		ctx, cancel := t.persist.requestContext(t.ctx)
+		defer cancel()
 		cmps := make([]clientv3.Cmp, 0, len(batch))
 		putOps := make([]clientv3.Op, 0, len(batch))
 		written := make(map[int]bool, len(batch))
@@ -374,7 +444,7 @@ func (t *etcdTxn[K, V]) commitBatch(batch []int, results []TxnResult[V]) error {
 			keyStr := string(op.key)
 			switch op.kind {
 			case opInsert:
-				resp, err := t.persist.cli.Get(t.ctx, keyStr, clientv3.WithSerializable(), clientv3.WithKeysOnly())
+				resp, err := t.persist.cli.Get(ctx, keyStr, clientv3.WithSerializable(), clientv3.WithKeysOnly())
 				if err != nil {
 					return err
 				}
@@ -392,7 +462,7 @@ func (t *etcdTxn[K, V]) commitBatch(batch []int, results []TxnResult[V]) error {
 				written[i] = true
 
 			case opUpdate:
-				resp, err := t.persist.cli.Get(t.ctx, keyStr, clientv3.WithSerializable())
+				resp, err := t.persist.cli.Get(ctx, keyStr, clientv3.WithSerializable())
 				if err != nil {
 					return err
 				}
@@ -420,7 +490,7 @@ func (t *etcdTxn[K, V]) commitBatch(batch []int, results []TxnResult[V]) error {
 				written[i] = true
 
 			case opUpsert:
-				resp, err := t.persist.cli.Get(t.ctx, keyStr, clientv3.WithSerializable())
+				resp, err := t.persist.cli.Get(ctx, keyStr, clientv3.WithSerializable())
 				if err != nil {
 					return err
 				}
@@ -454,7 +524,7 @@ func (t *etcdTxn[K, V]) commitBatch(batch []int, results []TxnResult[V]) error {
 				written[i] = true
 
 			case opDelete:
-				resp, err := t.persist.cli.Get(t.ctx, keyStr, clientv3.WithSerializable(), clientv3.WithKeysOnly())
+				resp, err := t.persist.cli.Get(ctx, keyStr, clientv3.WithSerializable(), clientv3.WithKeysOnly())
 				if err != nil {
 					return err
 				}
@@ -485,11 +555,7 @@ func (t *etcdTxn[K, V]) commitBatch(batch []int, results []TxnResult[V]) error {
 				written[i] = true
 
 			case opRaw:
-				if op.raw.Delete {
-					putOps = append(putOps, clientv3.OpDelete(op.raw.Key))
-				} else {
-					putOps = append(putOps, clientv3.OpPut(op.raw.Key, op.raw.Value))
-				}
+				putOps = append(putOps, etcdRawOp(op.raw))
 			}
 		}
 		getDur := time.Since(getStart)
@@ -503,9 +569,9 @@ func (t *etcdTxn[K, V]) commitBatch(batch []int, results []TxnResult[V]) error {
 		var txnResp *clientv3.TxnResponse
 		var err error
 		if len(cmps) == 0 {
-			txnResp, err = t.persist.cli.Txn(t.ctx).Then(putOps...).Commit()
+			txnResp, err = t.persist.cli.Txn(ctx).Then(putOps...).Commit()
 		} else {
-			txnResp, err = t.persist.cli.Txn(t.ctx).If(cmps...).Then(putOps...).Commit()
+			txnResp, err = t.persist.cli.Txn(ctx).If(cmps...).Then(putOps...).Commit()
 		}
 		txnDur := time.Since(txnStart)
 
@@ -521,11 +587,25 @@ func (t *etcdTxn[K, V]) commitBatch(batch []int, results []TxnResult[V]) error {
 		}
 
 		if err != nil {
+			if hasVersioned {
+				// The outcome is unknown: the request may have landed. Read it
+				// back, so a landed batch succeeds and one that did not land
+				// leaves the versions its resend compares against.
+				resolveCtx, cancel := t.persist.requestContext(context.WithoutCancel(t.ctx))
+				applied, resolveErr := t.resolveVersionedFailure(resolveCtx, batch, results)
+				cancel()
+				if resolveErr == nil && applied {
+					return nil
+				}
+				if errors.Is(resolveErr, ErrVersionConflict) {
+					return retry.Unrecoverable(resolveErr)
+				}
+			}
 			return err
 		}
 		if !txnResp.Succeeded {
 			if hasVersioned {
-				applied, err := t.resolveVersionedFailure(batch, results)
+				applied, err := t.resolveVersionedFailure(ctx, batch, results)
 				if err != nil {
 					if errors.Is(err, ErrVersionConflict) {
 						return retry.Unrecoverable(err)
@@ -536,7 +616,7 @@ func (t *etcdTxn[K, V]) commitBatch(batch []int, results []TxnResult[V]) error {
 					return nil
 				}
 			}
-			return fmt.Errorf("CAS failed, concurrent modification")
+			return errCompareFailed
 		}
 		for i, w := range written {
 			if w {
@@ -544,7 +624,11 @@ func (t *etcdTxn[K, V]) commitBatch(batch []int, results []TxnResult[V]) error {
 			}
 		}
 		return nil
-	}, retry.AttemptAlways())
+	}, retry.Attempts(maxCompareAttempts), retry.RetryErr(func(err error) bool { return errors.Is(err, errCompareFailed) }))
+	if errors.Is(err, errCompareFailed) {
+		return merr.WrapErrServiceUnavailableErr(err, "optimistic txn batch kept failing its compares after %d attempts", maxCompareAttempts)
+	}
+	return storeErr(err)
 }
 
 // resolveVersionedFailure rereads the keys of the batch's versioned ops after
@@ -555,7 +639,7 @@ func (t *etcdTxn[K, V]) commitBatch(batch []int, results []TxnResult[V]) error {
 // attempt of this batch landed but its response was lost. In that case the
 // unversioned raw ops are idempotently re-applied and the results filled from
 // the store.
-func (t *etcdTxn[K, V]) resolveVersionedFailure(batch []int, results []TxnResult[V]) (bool, error) {
+func (t *etcdTxn[K, V]) resolveVersionedFailure(ctx context.Context, batch []int, results []TxnResult[V]) (bool, error) {
 	unchanged, applied := 0, 0
 	revisions := make(map[int]int64, len(batch))
 	var rawOps []clientv3.Op
@@ -563,17 +647,13 @@ func (t *etcdTxn[K, V]) resolveVersionedFailure(batch []int, results []TxnResult
 		op := t.ops[i]
 		switch {
 		case op.kind == opRaw:
-			if op.raw.Delete {
-				rawOps = append(rawOps, clientv3.OpDelete(op.raw.Key))
-			} else {
-				rawOps = append(rawOps, clientv3.OpPut(op.raw.Key, op.raw.Value))
-			}
+			rawOps = append(rawOps, etcdRawOp(op.raw))
 			continue
 		case !op.versioned():
 			// Mixed batches cannot tell a lost success from a conflict.
 			continue
 		}
-		resp, err := t.persist.cli.Get(t.ctx, string(op.key))
+		resp, err := t.persist.cli.Get(ctx, string(op.key))
 		if err != nil {
 			return false, err
 		}
@@ -601,7 +681,7 @@ func (t *etcdTxn[K, V]) resolveVersionedFailure(batch []int, results []TxnResult
 		return false, errors.Wrapf(ErrVersionConflict, "batch partially applied by another writer")
 	}
 	if len(rawOps) > 0 {
-		if _, err := t.persist.cli.Txn(t.ctx).Then(rawOps...).Commit(); err != nil {
+		if _, err := t.persist.cli.Txn(ctx).Then(rawOps...).Commit(); err != nil {
 			return false, err
 		}
 	}
@@ -635,6 +715,36 @@ func NewOptimisticTxnTiKVPersist[K string, V any](cli *txnkv.Client, marshaler M
 
 func (p *tikvPersist[K, V]) Txn(ctx context.Context) Txn[K, V] {
 	return &tikvTxn[K, V]{ctx: ctx, persist: p}
+}
+
+func (p *tikvPersist[K, V]) requestContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	return requestContext(ctx, &paramtable.Get().TiKVCfg.RequestTimeout)
+}
+
+// tikvScan calls fn with every key and value under prefix in txn.
+func tikvScan(txn *transaction.KVTxn, prefix string, fn func(key, value []byte) error) error {
+	iter, err := txn.Iter([]byte(prefix), tikvkv.PrefixNextKey([]byte(prefix)))
+	if err != nil {
+		return err
+	}
+	defer iter.Close()
+	for iter.Valid() {
+		if err := fn(iter.Key(), iter.Value()); err != nil {
+			return err
+		}
+		if err := iter.Next(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// isTiKVRetriable reports a commit that lost to a concurrent writer or whose
+// outcome is unknown; a retry rereads the versions and recognizes its own
+// landed write.
+func isTiKVRetriable(err error) bool {
+	var latch *tikverr.ErrWriteConflictInLatch
+	return tikverr.IsErrWriteConflict(err) || errors.As(err, &latch) || tikverr.IsErrorUndetermined(err)
 }
 
 func (p *tikvPersist[K, V]) captureCommitTS(txn interface{ SetCommitCallback(func(string, error)) }) *uint64 {
@@ -682,31 +792,22 @@ func (p *tikvPersist[K, V]) Scan(ctx context.Context, prefix K) ([]K, []V, []int
 		return nil, nil, nil, err
 	}
 	defer txn.Rollback()
-	prefixBytes := []byte(prefix)
-	endKey := make([]byte, len(prefixBytes))
-	copy(endKey, prefixBytes)
-	endKey[len(endKey)-1]++
-
-	iter, err := txn.Iter(prefixBytes, endKey)
-	if err != nil {
-		return nil, nil, nil, err
-	}
-	defer iter.Close()
 
 	var ks []K
 	var vals []V
 	var vers []int64
-	for iter.Valid() {
-		v, err := p.marshaler.Unmarshal(iter.Value())
+	err = tikvScan(txn, string(prefix), func(key, value []byte) error {
+		v, err := decodeStoredValue(p.marshaler, string(key), value)
 		if err != nil {
-			return nil, nil, nil, err
+			return err
 		}
-		ks = append(ks, K(iter.Key()))
+		ks = append(ks, K(key))
 		vals = append(vals, v)
 		vers = append(vers, int64(txn.StartTS()))
-		if err := iter.Next(); err != nil {
-			return nil, nil, nil, err
-		}
+		return nil
+	})
+	if err != nil {
+		return nil, nil, nil, err
 	}
 	return ks, vals, vers, nil
 }
@@ -719,14 +820,16 @@ func (p *tikvPersist[K, V]) Get(ctx context.Context, keys []K) (map[K]TxnResult[
 	defer txn.Rollback()
 	result := make(map[K]TxnResult[V], len(keys))
 	for _, key := range keys {
-		val, exists, err := p.tikvKeyExists(ctx, txn, []byte(key))
+		reqCtx, cancel := p.requestContext(ctx)
+		val, exists, err := p.tikvKeyExists(reqCtx, txn, []byte(key))
+		cancel()
 		if err != nil {
 			return nil, err
 		}
 		if !exists {
 			continue
 		}
-		v, err := p.marshaler.Unmarshal(val)
+		v, err := decodeStoredValue(p.marshaler, string(key), val)
 		if err != nil {
 			return nil, err
 		}
@@ -734,6 +837,17 @@ func (p *tikvPersist[K, V]) Get(ctx context.Context, keys []K) (map[K]TxnResult[
 		result[key] = TxnResult[V]{Value: v, Version: int64(txn.StartTS())}
 	}
 	return result, nil
+}
+
+func (p *tikvPersist[K, V]) WalkRaw(ctx context.Context, prefix string, fn func(key string, value []byte) error) error {
+	txn, err := p.cli.Begin()
+	if err != nil {
+		return err
+	}
+	defer txn.Rollback()
+	return tikvScan(txn, prefix, func(key, value []byte) error {
+		return fn(string(key), value)
+	})
 }
 
 type tikvTxn[K string, V any] struct {
@@ -746,6 +860,8 @@ func (t *tikvTxn[K, V]) Commit() ([]TxnResult[V], error) {
 	results := make([]TxnResult[V], len(t.ops))
 
 	err := retry.Do(t.ctx, func() error {
+		ctx, cancel := t.persist.requestContext(t.ctx)
+		defer cancel()
 		txn, err := t.persist.cli.Begin()
 		if err != nil {
 			return err
@@ -758,11 +874,13 @@ func (t *tikvTxn[K, V]) Commit() ([]TxnResult[V], error) {
 			keyBytes := []byte(op.key)
 			switch op.kind {
 			case opRaw:
-				keyBytes = []byte(op.raw.Key)
-				if op.raw.Delete {
-					err = txn.Delete(keyBytes)
-				} else {
-					err = txn.Set(keyBytes, []byte(op.raw.Value))
+				switch {
+				case op.raw.DeletePrefix:
+					err = tikvDeletePrefix(txn, op.raw.Key)
+				case op.raw.Delete:
+					err = txn.Delete([]byte(op.raw.Key))
+				default:
+					err = txn.Set([]byte(op.raw.Key), []byte(op.raw.Value))
 				}
 				if err != nil {
 					return err
@@ -773,7 +891,7 @@ func (t *tikvTxn[K, V]) Commit() ([]TxnResult[V], error) {
 				// The versions handed out by this persist are snapshot or
 				// commit timestamps, so a value committed after the caller's
 				// version is newer than the copy the write was built from.
-				entry, exists, err := t.persist.tikvKeyWithCommitTS(t.ctx, txn, keyBytes)
+				entry, exists, err := t.persist.tikvKeyWithCommitTS(ctx, txn, keyBytes)
 				if err != nil {
 					return err
 				}
@@ -813,7 +931,7 @@ func (t *tikvTxn[K, V]) Commit() ([]TxnResult[V], error) {
 				continue
 			}
 
-			val, exists, err := t.persist.tikvKeyExists(t.ctx, txn, keyBytes)
+			val, exists, err := t.persist.tikvKeyExists(ctx, txn, keyBytes)
 			if err != nil {
 				return err
 			}
@@ -907,7 +1025,7 @@ func (t *tikvTxn[K, V]) Commit() ([]TxnResult[V], error) {
 		}
 
 		cts := t.persist.captureCommitTS(txn)
-		err = txn.Commit(t.ctx)
+		err = txn.Commit(ctx)
 		if err == nil {
 			for i := range t.ops {
 				if results[i].Version == 0 {
@@ -916,11 +1034,32 @@ func (t *tikvTxn[K, V]) Commit() ([]TxnResult[V], error) {
 			}
 		}
 		return err
-	}, retry.AttemptAlways())
+	}, retry.Attempts(maxCompareAttempts), retry.RetryErr(isTiKVRetriable))
+	if isTiKVRetriable(err) {
+		return nil, merr.WrapErrServiceUnavailableErr(err, "optimistic txn kept conflicting after %d attempts", maxCompareAttempts)
+	}
 	if err != nil {
-		return nil, err
+		return nil, storeErr(err)
 	}
 	return results, nil
+}
+
+// tikvDeletePrefix deletes every key under prefix in txn.
+func tikvDeletePrefix(txn *transaction.KVTxn, prefix string) error {
+	var keys [][]byte
+	err := tikvScan(txn, prefix, func(key, _ []byte) error {
+		keys = append(keys, append([]byte(nil), key...))
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	for _, key := range keys {
+		if err := txn.Delete(key); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // ============================================================
@@ -1000,6 +1139,28 @@ func (p *memPersist[K, V]) Get(ctx context.Context, keys []K) (map[K]TxnResult[V
 		}
 	}
 	return result, nil
+}
+
+func (p *memPersist[K, V]) WalkRaw(ctx context.Context, prefix string, fn func(key string, value []byte) error) error {
+	p.mu.RLock()
+	keys := make([]string, 0)
+	for key := range p.raw {
+		if strings.HasPrefix(key, prefix) {
+			keys = append(keys, key)
+		}
+	}
+	sort.Strings(keys)
+	values := make([]string, len(keys))
+	for i, key := range keys {
+		values[i] = p.raw[key]
+	}
+	p.mu.RUnlock()
+	for i, key := range keys {
+		if err := fn(key, []byte(values[i])); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 type memTxn[K comparable, V any] struct {
@@ -1094,9 +1255,16 @@ func (t *memTxn[K, V]) Commit() ([]TxnResult[V], error) {
 			results[i] = TxnResult[V]{Version: ver}
 
 		case opRaw:
-			if op.raw.Delete {
+			switch {
+			case op.raw.DeletePrefix:
+				for key := range p.raw {
+					if strings.HasPrefix(key, op.raw.Key) {
+						delete(p.raw, key)
+					}
+				}
+			case op.raw.Delete:
 				delete(p.raw, op.raw.Key)
-			} else {
+			default:
 				p.raw[op.raw.Key] = op.raw.Value
 			}
 		}

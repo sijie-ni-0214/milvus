@@ -47,8 +47,12 @@ func newFlushedTestSegment(id int64) *SegmentInfo {
 	})
 }
 
+func segmentRecordKey(collectionID, partitionID, segmentID int64) string {
+	return datacoord.SegmentRecordKey(&datapb.SegmentInfo{ID: segmentID, CollectionID: collectionID, PartitionID: partitionID})
+}
+
 func storedSegmentKey(id int64) string {
-	return testSegmentStoreRoot + "/" + segmentKey(1, 2, id)
+	return testSegmentStoreRoot + "/" + segmentRecordKey(1, 2, id)
 }
 
 func TestOptimisticTxnPutIfVersion(t *testing.T) {
@@ -102,7 +106,7 @@ func TestOptimisticTxnPlanBatches(t *testing.T) {
 	require.Error(t, err)
 }
 
-func TestCASSegmentStoreWritesFullRecordsAgainstCachedVersions(t *testing.T) {
+func TestCASSegmentStoreWritesCatalogEncodingAgainstCachedVersions(t *testing.T) {
 	ctx := context.Background()
 	m, persist := newCASTestMeta(t)
 
@@ -114,8 +118,12 @@ func TestCASSegmentStoreWritesFullRecordsAgainstCachedVersions(t *testing.T) {
 	stored := persist.data[storedSegmentKey(100)]
 	require.NotNil(t, stored)
 	require.Equal(t, version, stored.version)
-	// Binlogs are kept inline in the record.
-	require.Len(t, stored.value.GetBinlogs(), 1)
+	// Like the catalog, the record carries no binlogs: they live in per-field
+	// KVs next to it, and the cache keeps the full segment.
+	require.Empty(t, stored.value.GetBinlogs())
+	binlogKey := testSegmentStoreRoot + "/datacoord-meta/binlog/1/2/100/1"
+	require.Contains(t, persist.raw, binlogKey)
+	require.Len(t, m.GetSegment(ctx, 100).GetBinlogs(), 1)
 
 	require.NoError(t, m.UpdateSegmentsInfo(ctx, UpdateStatusOperator(100, commonpb.SegmentState_Dropped)))
 	newVersion, ok := m.segments.Version(100)
@@ -127,6 +135,7 @@ func TestCASSegmentStoreWritesFullRecordsAgainstCachedVersions(t *testing.T) {
 	require.NoError(t, m.DropSegment(ctx, 100))
 	require.Nil(t, m.GetSegment(ctx, 100))
 	require.NotContains(t, persist.data, storedSegmentKey(100))
+	require.NotContains(t, persist.raw, binlogKey, "a drop removes the binlog KVs with the record")
 }
 
 func TestCASSegmentStoreConflictRefreshesCache(t *testing.T) {

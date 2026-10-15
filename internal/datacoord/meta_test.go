@@ -311,7 +311,7 @@ func (suite *MetaReloadSuite) TestReloadFromKV() {
 			{ID: 10, CollectionID: 1, PartitionID: 100, State: commonpb.SegmentState_Flushed},
 			{ID: 20, CollectionID: 2, PartitionID: 200, State: commonpb.SegmentState_Flushed},
 		} {
-			key := testSegmentStoreRoot + "/" + segmentKey(segment.GetCollectionID(), segment.GetPartitionID(), segment.GetID())
+			key := testSegmentStoreRoot + "/" + segmentRecordKey(segment.GetCollectionID(), segment.GetPartitionID(), segment.GetID())
 			txn.PutIfVersion(key, segment, 0, false)
 		}
 		// A sibling catalog prefix that also starts with "s" is not segment metadata.

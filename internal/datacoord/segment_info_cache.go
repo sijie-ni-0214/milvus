@@ -273,6 +273,11 @@ func (s *CachedSegmentsInfo) PublishSegment(segmentID UniqueID, segment *Segment
 		if !live {
 			return segment
 		}
+		// LastExpireTime only advances in memory (allocation, seal); a writer
+		// that cloned the segment earlier must not move it back.
+		if current.GetLastExpireTime() > segment.GetLastExpireTime() {
+			segment.LastExpireTime = current.GetLastExpireTime()
+		}
 		return &SegmentInfo{
 			SegmentInfo:     segment.SegmentInfo,
 			allocations:     current.allocations,

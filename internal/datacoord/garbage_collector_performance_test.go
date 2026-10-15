@@ -142,6 +142,10 @@ func (*gcPerfDroppedSegmentPersist) Get(context.Context, []string) (map[string]T
 	return nil, nil
 }
 
+func (*gcPerfDroppedSegmentPersist) WalkRaw(context.Context, string, func(string, []byte) error) error {
+	return nil
+}
+
 type gcPerfDroppedSegmentTxn struct {
 	txnOps[string, *datapb.SegmentInfo]
 	persist *gcPerfDroppedSegmentPersist
