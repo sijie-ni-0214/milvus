@@ -117,6 +117,7 @@ type Meta struct {
 	Broker               broker.Broker
 	CompactionProtection CompactionProtection
 	quotaMetricsMu       sync.Mutex
+	quotaDisplay         *quotaDisplayCache
 
 	// groupMu guards segmentChangeGroups and its reverse indexes. A write that
 	// also writes segments takes it after their writer locks.
@@ -413,7 +414,7 @@ func getBinlogFileCount(s *datapb.SegmentInfo) int {
 	return cnt
 }
 
-func (m *Meta) GetQuotaInfo() *metricsinfo.DataCoordQuotaMetrics {
+func (m *Meta) getQuotaInfoByScan() *metricsinfo.DataCoordQuotaMetrics {
 	aggregateCollectionMetrics := metrics.IsCollectionLevelMetricsAggregateMode()
 	if aggregateCollectionMetrics {
 		m.quotaMetricsMu.Lock()
@@ -563,7 +564,7 @@ func (m *Meta) GetQuotaInfo() *metricsinfo.DataCoordQuotaMetrics {
 	return info
 }
 
-func (m *Meta) GetAllCollectionNumRows() map[int64]int64 {
+func (m *Meta) getAllCollectionNumRowsByScan() map[int64]int64 {
 	ret := make(map[int64]int64)
 	segments := m.Segments.GetSegments()
 	for _, segment := range segments {

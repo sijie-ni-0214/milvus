@@ -176,8 +176,11 @@ type IMetaTable interface {
 
 // MetaTable is a persistent meta set of all databases, collections and partitions.
 type MetaTable struct {
-	ctx     context.Context
-	catalog metastore.RootCoordCatalog
+	quotaGeneration uint64
+	quotaDirty      map[int64]uint64
+	quotaReset      bool
+	ctx             context.Context
+	catalog         metastore.RootCoordCatalog
 
 	tsoAllocator tso.Allocator
 
@@ -453,6 +456,7 @@ func (mt *MetaTable) reload() error {
 		mlog.Int("numFileResources", len(resources)),
 		mlog.Duration("duration", time.Since(fileResourceCacheStart)))
 
+	mt.resetQuotaMetadataLocked()
 	mlog.Info(mt.ctx, "RootCoord meta table reload done",
 		mlog.Int("numCollections", len(mt.collID2Meta)),
 		mlog.Duration("duration", record.ElapseSpan()))
@@ -517,6 +521,7 @@ func (mt *MetaTable) reloadWithNonDatabase(oldCollections []*model.Collection) e
 				mlog.Duration("duration", time.Since(cacheBuildStart)))
 		}
 	}
+	mt.resetQuotaMetadataLocked()
 	mlog.Info(mt.ctx, "rootcoord legacy collection cache rebuild done",
 		mlog.Int("numCatalogCollections", len(oldCollections)),
 		mlog.Int64("numAvailableCollections", collectionNum),
@@ -960,6 +965,7 @@ func (mt *MetaTable) removeAllNamesIfMatchedInternal(ctx context.Context, dbName
 func (mt *MetaTable) setCollectionLocked(coll *model.Collection) {
 	mt.collID2Meta[coll.CollectionID] = coll
 	mt.collViews.Insert(coll.CollectionID, mt.buildCollectionViewLocked(coll))
+	mt.invalidateQuotaMetadataLocked(coll.CollectionID)
 }
 
 // setDatabaseLocked stores db and publishes its DatabaseInfo view. Every
@@ -967,6 +973,7 @@ func (mt *MetaTable) setCollectionLocked(coll *model.Collection) {
 // The caller must hold ddLock for writing.
 func (mt *MetaTable) setDatabaseLocked(db *model.Database) {
 	mt.dbName2Meta[db.Name] = db
+	mt.quotaGeneration++
 	if mt.dbID2Name == nil {
 		mt.dbID2Name = make(map[int64]string)
 	}
@@ -985,6 +992,7 @@ func (mt *MetaTable) deleteDatabaseLocked(dbName string) {
 		delete(mt.dbID2Name, db.ID)
 	}
 	delete(mt.dbName2Meta, dbName)
+	mt.quotaGeneration++
 	mt.dbViews.Remove(dbName)
 }
 
@@ -993,6 +1001,7 @@ func (mt *MetaTable) deleteDatabaseLocked(dbName string) {
 func (mt *MetaTable) deleteCollectionLocked(collectionID UniqueID) {
 	delete(mt.collID2Meta, collectionID)
 	mt.collViews.Remove(collectionID)
+	mt.invalidateQuotaMetadataLocked(collectionID)
 }
 
 func (mt *MetaTable) removeCollectionByIDInternal(ctx context.Context, collectionID UniqueID) {
