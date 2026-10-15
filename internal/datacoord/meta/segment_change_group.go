@@ -180,8 +180,9 @@ func (m *Meta) PublishGroup(ctx context.Context, g *model.SegmentChangeGroup, al
 	m.groupMu.RLock()
 	loadable := make([]dataview.LoadableSegment, 0, len(g.NewSegmentIDs))
 	retired := append([]int64(nil), g.SupersededSegmentIDs...)
+	members := m.Segments.GetSegmentsByIDs(g.NewSegmentIDs)
 	for _, id := range g.NewSegmentIDs {
-		seg := m.Segments.GetSegment(id)
+		seg := members[id]
 		if seg == nil {
 			m.groupMu.RUnlock()
 			return merr.WrapErrDataIntegrityMsg(

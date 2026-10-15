@@ -57,6 +57,15 @@ func TestCloneSetRatesEnvelope(t *testing.T) {
 	require.Nil(t, cloneSetRatesEnvelope(nil))
 	require.Nil(t, cloneSetRatesEnvelope(&proxypb.SetRatesRequest{}).GetBase())
 	request := setRatesSnapshotForTest(2)
+	request.QuotaProtocol = 1
+	request.QuotaMode = proxypb.QuotaSyncMode_QUOTA_DELTA
+	request.TargetVersion = &proxypb.QuotaRuleVersion{Epoch: 100, Seq: 2}
+	request.BaseVersion = &proxypb.QuotaRuleVersion{Epoch: 100, Seq: 1}
+	request.QuotaSession = "process-1"
+	request.Upserts = []*proxypb.QuotaScopePolicy{{Key: &proxypb.QuotaScopeKey{Scope: internalpb.RateScope_Collection, DatabaseId: 1, CollectionId: 2}, Limiter: &proxypb.Limiter{}}}
+	request.Deletes = []*proxypb.QuotaScopeKey{{Scope: internalpb.RateScope_Collection, DatabaseId: 1, CollectionId: 3}}
+	request.ScopeDefaults = map[int32]*proxypb.Limiter{int32(internalpb.RateScope_Cluster): {}}
+
 	// Unknown fields must survive old clients without sharing mutable header bytes.
 	request.ProtoReflect().SetUnknown([]byte{0xa0, 0x06, 0x01})
 	request.Base.ProtoReflect().SetUnknown([]byte{0xa0, 0x06, 0x02})

@@ -268,6 +268,7 @@ var (
 
 // RegisterRootCoord registers RootCoord metrics
 func RegisterMixCoord(registry *prometheus.Registry) {
+	registry.MustRegister(RootCoordQuotaCalculatedScopes, RootCoordQuotaSync, RootCoordQuotaUnsynced, RootCoordQuotaSnapshotBytes)
 	registry.Register(RootCoordProxyCounter)
 
 	// for time tick
@@ -321,14 +322,14 @@ func CleanupRootCoordDBMetrics(dbName string) {
 	})
 }
 
-func CleanupRootCoordCollectionMetrics(dbName string, collectionName string) {
+func CleanupRootCoordCollectionMetrics(dbName string, collName string) {
 	RootCoordNumEntities.DeletePartialMatch(prometheus.Labels{
 		databaseLabelName: dbName,
-		collectionName:    collectionName,
+		collectionName:    collName,
 	})
 
-	RootCoordNumEntities.DeletePartialMatch(prometheus.Labels{
+	RootCoordIndexedNumEntities.DeletePartialMatch(prometheus.Labels{
 		databaseLabelName: dbName,
-		collectionName:    collectionName,
+		collectionName:    collName,
 	})
 }
