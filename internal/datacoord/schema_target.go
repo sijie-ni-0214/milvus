@@ -4,15 +4,18 @@ import (
 	"context"
 
 	"github.com/milvus-io/milvus-proto/go-api/v3/schemapb"
-	qvresource "github.com/milvus-io/milvus/internal/views/coord/resource"
+	// qvresource "github.com/milvus-io/milvus/internal/views/coord/resource"
 	"github.com/milvus-io/milvus/pkg/v3/mlog"
 	"github.com/milvus-io/milvus/pkg/v3/util/funcutil"
 )
 
 func coordinatorPreparationSchema(ctx context.Context, collectionID int64, published *schemapb.CollectionSchema) (*schemapb.CollectionSchema, error) {
-	return qvresource.PreparationSchema(ctx, collectionID, func(context.Context, int64) (*schemapb.CollectionSchema, error) {
-		return published, nil
-	})
+	/*
+		return qvresource.PreparationSchema(ctx, collectionID, func(context.Context, int64) (*schemapb.CollectionSchema, error) {
+			return published, nil
+		})
+	*/
+	return published, nil
 }
 
 // collectionForPreparation overlays pending intent on an immutable cache

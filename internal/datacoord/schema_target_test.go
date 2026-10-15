@@ -15,13 +15,15 @@ import (
 )
 
 func TestPreparationSchemaOverlay(t *testing.T) {
-	mockey.PatchConvey("pending target drives jobs without mutating published cache", t, func() {
+	mockey.PatchConvey("published schema drives jobs without consulting pending targets", t, func() {
 		m := newEmptyTestMeta()
 		m.preparationSchema = coordinatorPreparationSchema
 		for _, id := range []int64{1, 2, 3} {
 			m.metaStore.PutCollection(&collectionInfo{ID: id, Schema: &schemapb.CollectionSchema{Version: 1}, DatabaseName: "db"})
 		}
+		lookupCount := 0
 		mockey.Mock(broadcast.GetPendingSchemaTarget).To(func(id int64) (*broadcaster.SchemaTarget, error) {
+			lookupCount++
 			switch id {
 			case 1:
 				return &broadcaster.SchemaTarget{Schema: &schemapb.CollectionSchema{Version: 2, Properties: []*commonpb.KeyValuePair{{Key: "collection.ttl.seconds", Value: "60"}}}}, nil
@@ -33,25 +35,27 @@ func TestPreparationSchemaOverlay(t *testing.T) {
 		}).Build()
 		ctx := context.Background()
 		ready := m.collectionsForPreparation(ctx)
-		require.Len(t, ready, 2, "one recovering DDL must not block other collections")
+		require.Len(t, ready, 3)
 		byID := make(map[int64]*collectionInfo)
 		for _, collection := range ready {
 			byID[collection.ID] = collection
 		}
-		require.EqualValues(t, 2, byID[1].Schema.Version)
-		require.Equal(t, "60", byID[1].Properties["collection.ttl.seconds"])
+		require.EqualValues(t, 1, byID[1].Schema.Version)
+		require.Empty(t, byID[1].Properties)
+		require.EqualValues(t, 1, byID[2].Schema.Version)
 		require.Empty(t, m.GetCollection(1).Properties)
 		require.Equal(t, "db", byID[1].DatabaseName)
 		require.EqualValues(t, 1, byID[3].Schema.Version)
 		require.EqualValues(t, 1, m.GetCollection(1).Schema.Version)
 		require.Len(t, m.GetCollections(), 3, "committed metadata enumeration remains complete")
 		_, err := m.collectionForPreparation(ctx, m.GetCollection(2))
-		require.ErrorIs(t, err, merr.ErrServiceNotReady)
+		require.NoError(t, err)
 		handler := &ServerHandler{s: &Server{meta: m}}
 		got, err := handler.GetCollection(ctx, 1)
 		require.NoError(t, err)
-		require.EqualValues(t, 2, got.Schema.Version)
+		require.EqualValues(t, 1, got.Schema.Version)
 		_, err = handler.GetCollection(ctx, 2)
-		require.ErrorIs(t, err, merr.ErrServiceNotReady)
+		require.NoError(t, err)
+		require.Zero(t, lookupCount)
 	})
 }
