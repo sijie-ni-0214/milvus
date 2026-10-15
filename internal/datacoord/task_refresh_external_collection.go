@@ -687,15 +687,14 @@ func applyExternalRefreshPatch(oldSeg *SegmentInfo, incoming *datapb.SegmentInfo
 // segmentIDs under the publication lock, preventing one worker request from
 // observing segment metadata from different update generations.
 func getExternalRefreshSegmentSnapshots(mt *meta, segmentIDs []int64) []*SegmentInfo {
-	mt.pubMu.RLock()
-	defer mt.pubMu.RUnlock()
-
 	result := make([]*SegmentInfo, len(segmentIDs))
-	for i, segmentID := range segmentIDs {
-		if segment := mt.segments.GetSegment(segmentID); segment != nil {
-			result[i] = segment.Clone()
+	mt.segments.ReadConsistent(func() {
+		for i, segmentID := range segmentIDs {
+			if segment := mt.segments.GetSegment(segmentID); segment != nil {
+				result[i] = segment.Clone()
+			}
 		}
-	}
+	})
 	return result
 }
 

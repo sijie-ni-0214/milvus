@@ -75,9 +75,9 @@ func groupUsesPublishCommitTS(source model.SegmentChangeSource) bool {
 // and the parents out.
 //
 // Lock order: segmentManifestLocks -> DataView collection lock -> segment
-// writer locks -> groupMu -> pubMu. The groupMu/pubMu read-locked validation in
-// phase 2 is brief and released before the DataView lock is acquired, so no path
-// holds them while waiting on the DataView lock.
+// writer locks -> groupMu -> segments.pubMu. The phase 2 validation under the
+// groupMu read lock and a consistent segment read is brief and released before
+// the DataView lock is acquired, so no path holds them while waiting on it.
 // Once the manifest locks are held, the DataView-lock holders (flush /
 // Recompute) hold the collection lock only briefly and never request a manifest
 // lock, so the publish wait is bounded (design §5.4.2).
@@ -129,60 +129,61 @@ func (m *meta) publishGroup(ctx context.Context, g *model.SegmentChangeGroup, al
 	coll := m.GetCollection(g.CollectionID)
 	readiness := m.prepareReadiness(coll)
 
-	// Phase 2: read and validate the members under the groupMu and pubMu read
-	// locks and build the loadable projection. They are released before the
-	// DataView lock is acquired, keeping the acquisition order acyclic.
+	// Phase 2: read and validate the members under the groupMu read lock in a
+	// consistent segment read and build the loadable projection. Both end before
+	// the DataView lock is acquired, keeping the acquisition order acyclic.
 	// Ownership is enforced via the stagedSegmentToGroup reverse index (F4: the
 	// change_group_id field is not yet on SegmentInfo).
 	m.groupMu.RLock()
-	m.pubMu.RLock()
-	unlock := func() {
-		m.pubMu.RUnlock()
-		m.groupMu.RUnlock()
-	}
 	loadable := make([]dataview.LoadableSegment, 0, len(g.NewSegmentIDs))
-	for _, id := range g.NewSegmentIDs {
-		seg := m.segments.GetSegment(id)
-		if seg == nil {
-			unlock()
-			return merr.WrapErrDataIntegrityMsg(
-				"segment change group %d publish: member %d is missing from meta (externally dropped?)", g.GroupID, id)
-		}
-		if seg.GetState() == commonpb.SegmentState_Dropped {
-			unlock()
-			return merr.WrapErrDataIntegrityMsg(
-				"segment change group %d publish: member %d was externally dropped", g.GroupID, id)
-		}
-		if owner, ok := m.stagedSegmentToGroup[id]; !ok || owner != g.GroupID {
-			unlock()
-			return merr.WrapErrDataIntegrityMsg(
-				"segment change group %d publish: member %d is not staged by this group", g.GroupID, id)
-		}
-		if len(seg.GetBinlogs()) == 0 && seg.GetManifestPath() == "" {
-			unlock()
-			return merr.WrapErrDataIntegrityMsg(
-				"segment change group %d publish: member %d has no data footprint", g.GroupID, id)
-		}
-		if readiness != nil {
-			if !readiness.schemaReady(seg) {
-				unlock()
-				return merr.WrapErrDataIntegrityMsg(
-					"segment change group %d publish: member %d schema version behind collection at publish (C23)", g.GroupID, id)
+	var phaseErr error
+	m.segments.ReadConsistent(func() {
+		for _, id := range g.NewSegmentIDs {
+			seg := m.segments.GetSegment(id)
+			if seg == nil {
+				phaseErr = merr.WrapErrDataIntegrityMsg(
+					"segment change group %d publish: member %d is missing from meta (externally dropped?)", g.GroupID, id)
+				return
 			}
-			if !readiness.indexReady(seg) {
-				unlock()
-				return merr.WrapErrDataIntegrityMsg(
-					"segment change group %d publish: member %d index state regressed after READY (R5)", g.GroupID, id)
+			if seg.GetState() == commonpb.SegmentState_Dropped {
+				phaseErr = merr.WrapErrDataIntegrityMsg(
+					"segment change group %d publish: member %d was externally dropped", g.GroupID, id)
+				return
 			}
+			if owner, ok := m.stagedSegmentToGroup[id]; !ok || owner != g.GroupID {
+				phaseErr = merr.WrapErrDataIntegrityMsg(
+					"segment change group %d publish: member %d is not staged by this group", g.GroupID, id)
+				return
+			}
+			if len(seg.GetBinlogs()) == 0 && seg.GetManifestPath() == "" {
+				phaseErr = merr.WrapErrDataIntegrityMsg(
+					"segment change group %d publish: member %d has no data footprint", g.GroupID, id)
+				return
+			}
+			if readiness != nil {
+				if !readiness.schemaReady(seg) {
+					phaseErr = merr.WrapErrDataIntegrityMsg(
+						"segment change group %d publish: member %d schema version behind collection at publish (C23)", g.GroupID, id)
+					return
+				}
+				if !readiness.indexReady(seg) {
+					phaseErr = merr.WrapErrDataIntegrityMsg(
+						"segment change group %d publish: member %d index state regressed after READY (R5)", g.GroupID, id)
+					return
+				}
+			}
+			l, err := loadableSegmentOf(seg)
+			if err != nil {
+				phaseErr = err
+				return
+			}
+			loadable = append(loadable, l)
 		}
-		l, err := loadableSegmentOf(seg)
-		if err != nil {
-			unlock()
-			return err
-		}
-		loadable = append(loadable, l)
+	})
+	m.groupMu.RUnlock()
+	if phaseErr != nil {
+		return phaseErr
 	}
-	unlock()
 
 	// Phase 3a: build the post-publish DataView snapshot (acquires the DataView
 	// collection lock; a nil view with no-op callbacks means the collection's

@@ -173,8 +173,11 @@ type IMetaTable interface {
 
 // MetaTable is a persistent meta set of all databases, collections and partitions.
 type MetaTable struct {
-	ctx     context.Context
-	catalog metastore.RootCoordCatalog
+	quotaGeneration uint64
+	quotaDirty      map[int64]uint64
+	quotaReset      bool
+	ctx             context.Context
+	catalog         metastore.RootCoordCatalog
 
 	tsoAllocator tso.Allocator
 
@@ -434,6 +437,7 @@ func (mt *MetaTable) reload() error {
 		mlog.Int("numFileResources", len(resources)),
 		mlog.Duration("duration", time.Since(fileResourceCacheStart)))
 
+	mt.resetQuotaMetadataLocked()
 	mlog.Info(mt.ctx, "RootCoord meta table reload done",
 		mlog.Int("numCollections", len(mt.collID2Meta)),
 		mlog.Duration("duration", record.ElapseSpan()))
@@ -498,6 +502,7 @@ func (mt *MetaTable) reloadWithNonDatabase(oldCollections []*model.Collection) e
 				mlog.Duration("duration", time.Since(cacheBuildStart)))
 		}
 	}
+	mt.resetQuotaMetadataLocked()
 	mlog.Info(mt.ctx, "rootcoord legacy collection cache rebuild done",
 		mlog.Int("numCatalogCollections", len(oldCollections)),
 		mlog.Int64("numAvailableCollections", collectionNum),
@@ -592,6 +597,7 @@ func (mt *MetaTable) createDatabasePrivate(ctx context.Context, db *model.Databa
 	mt.names.createDbIfNotExist(dbName)
 	mt.aliases.createDbIfNotExist(dbName)
 	mt.dbName2Meta[dbName] = db
+	mt.quotaGeneration++
 	if mt.availableCollectionCountByDB == nil {
 		mt.availableCollectionCountByDB = make(map[int64]int)
 	}
@@ -610,6 +616,7 @@ func (mt *MetaTable) AlterDatabase(ctx context.Context, newDB *model.Database, t
 		return err
 	}
 	mt.dbName2Meta[newDB.Name] = newDB
+	mt.quotaGeneration++
 	mlog.Info(ctx, "alter database finished", mlog.String("dbName", newDB.Name), mlog.Uint64("ts", ts))
 	return nil
 }
@@ -659,6 +666,7 @@ func (mt *MetaTable) DropDatabase(ctx context.Context, dbName string, ts typeuti
 	mt.names.dropDb(dbName)
 	mt.aliases.dropDb(dbName)
 	delete(mt.dbName2Meta, dbName)
+	mt.quotaGeneration++
 	delete(mt.availableCollectionCountByDB, db.ID)
 
 	metrics.RootCoordNumOfDatabases.Dec()
@@ -745,7 +753,7 @@ func (mt *MetaTable) AddCollection(ctx context.Context, coll *model.Collection) 
 		return nil
 	}
 
-	mt.collID2Meta[coll.CollectionID] = coll.Clone()
+	mt.putCollectionLocked(coll.CollectionID, coll.Clone())
 	mt.names.insert(coll.DBName, coll.Name, coll.CollectionID)
 	if coll.Available() {
 		mt.increaseAvailableCollectionCountLocked(coll.DBID)
@@ -796,7 +804,7 @@ func (mt *MetaTable) CompleteRestoreCollection(ctx context.Context, collectionID
 	if err := mt.catalog.AlterCollection(ctx, coll, clone, metastore.MODIFY, clone.UpdateTimestamp, false); err != nil {
 		return err
 	}
-	mt.collID2Meta[collectionID] = clone
+	mt.putCollectionLocked(collectionID, clone)
 	mt.increaseAvailableCollectionCountLocked(clone.DBID)
 	return nil
 }
@@ -839,7 +847,7 @@ func (mt *MetaTable) markCollectionDropping(ctx context.Context, collectionID Un
 	clone.State = pb.CollectionState_CollectionDropping
 	clone.UpdateTimestamp = ts
 
-	mt.collID2Meta[collectionID] = clone
+	mt.putCollectionLocked(collectionID, clone)
 	for _, fileResourceID := range coll.FileResourceIds {
 		if mt.fileResourceRefCnt[fileResourceID] > 0 {
 			mt.fileResourceRefCnt[fileResourceID]--
@@ -918,6 +926,7 @@ func (mt *MetaTable) removeAllNamesIfMatchedInternal(ctx context.Context, dbName
 
 func (mt *MetaTable) removeCollectionByIDInternal(ctx context.Context, collectionID UniqueID) {
 	delete(mt.collID2Meta, collectionID)
+	mt.invalidateQuotaMetadataLocked(collectionID)
 	delete(mt.partitionName2ID, collectionID)
 	mlog.Info(ctx, "delete from collID2Meta",
 		mlog.Int64("collectionID", collectionID),
@@ -1385,7 +1394,7 @@ func (mt *MetaTable) AlterCollection(ctx context.Context, result message.Broadca
 	if dbChanged && oldColl.Available() && newColl.Available() {
 		mt.moveAvailableCollectionCountLocked(oldColl.DBID, newColl.DBID)
 	}
-	mt.collID2Meta[header.CollectionId] = newColl
+	mt.putCollectionLocked(header.CollectionId, newColl)
 	mlog.Info(ctx, "alter collection finished",
 		mlog.String("oldDBName", oldColl.DBName),
 		mlog.String("newDBName", newColl.DBName),
@@ -1425,7 +1434,7 @@ func (mt *MetaTable) BeginTruncateCollection(ctx context.Context, collectionID U
 	if err := mt.catalog.AlterCollection(ctx1, oldColl, newColl, metastore.MODIFY, newColl.UpdateTimestamp, false); err != nil {
 		return err
 	}
-	mt.collID2Meta[coll.CollectionID] = newColl
+	mt.putCollectionLocked(coll.CollectionID, newColl)
 	mlog.Info(ctx, "update collID2Meta for begin truncate collection",
 		mlog.Int64("collectionID", coll.CollectionID),
 	)
@@ -1456,7 +1465,7 @@ func (mt *MetaTable) TruncateCollection(ctx context.Context, result message.Broa
 	if err := mt.catalog.AlterCollection(ctx1, oldColl, newColl, metastore.MODIFY, newColl.UpdateTimestamp, false); err != nil {
 		return err
 	}
-	mt.collID2Meta[coll.CollectionID] = newColl
+	mt.putCollectionLocked(coll.CollectionID, newColl)
 	mlog.Info(ctx, "update collID2Meta for truncate collection",
 		mlog.Int64("collectionID", coll.CollectionID),
 	)
@@ -1589,6 +1598,7 @@ func (mt *MetaTable) AddPartition(ctx context.Context, partition *model.Partitio
 	copy(newPartitions, oldPartitions)
 	newPartitions[len(oldPartitions)] = partition.Clone()
 	coll.Partitions = newPartitions
+	mt.invalidateQuotaMetadataLocked(coll.CollectionID)
 
 	// Update partition name index
 	if mt.partitionName2ID[partition.CollectionID] == nil {
@@ -1646,6 +1656,7 @@ func (mt *MetaTable) DropPartition(ctx context.Context, collectionID UniqueID, p
 			copy(newPartitions, coll.Partitions)
 			newPartitions[idx] = clone
 			mt.collID2Meta[collectionID].Partitions = newPartitions
+			mt.invalidateQuotaMetadataLocked(collectionID)
 
 			// Remove from partition name index when dropping
 			if mt.partitionName2ID[collectionID] != nil {
@@ -1700,6 +1711,7 @@ func (mt *MetaTable) RemovePartition(ctx context.Context, collectionID UniqueID,
 	copy(newPartitions[:loc], oldPartitions[:loc])
 	copy(newPartitions[loc:], oldPartitions[loc+1:])
 	coll.Partitions = newPartitions
+	mt.invalidateQuotaMetadataLocked(coll.CollectionID)
 
 	// Remove from partition name index
 	if mt.partitionName2ID[collectionID] != nil {

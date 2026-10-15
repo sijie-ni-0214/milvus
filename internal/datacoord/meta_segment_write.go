@@ -26,7 +26,7 @@ import (
 //     (publishSegments) before releasing the locks.
 //
 // Lock order: segment manifest lock -> index keyLock(buildID) -> segment
-// writer locks -> groupMu -> pubMu. While holding writer locks, never block on
+// writer locks -> groupMu -> segments.pubMu. While holding writer locks, never block on
 // another writer lock outside one lockSegments call.
 
 // store returns the segment store, defaulting to the catalog for a meta built
@@ -67,28 +67,21 @@ func (m *meta) publishSegment(segment *SegmentInfo, version int64) *SegmentInfo 
 }
 
 // publishSegments installs the persisted values of a mutation and returns the
-// values they replaced. A multi-segment mutation is installed under pubMu so a
-// consistent reader observes all of it or none of it.
+// values they replaced. A multi-segment mutation is installed atomically
+// (CachedSegmentsInfo.PublishSegments), so a consistent reader observes all
+// of it or none of it.
 func (m *meta) publishSegments(segments []*SegmentInfo, versions map[int64]int64) map[int64]*SegmentInfo {
-	previous := make(map[int64]*SegmentInfo, len(segments))
-	if len(segments) > 1 {
-		m.pubMu.Lock()
-		defer m.pubMu.Unlock()
-	}
-	for _, segment := range segments {
-		if old, existed := m.segments.PublishSegment(segment.GetID(), segment, versions[segment.GetID()]); existed {
-			previous[segment.GetID()] = old
-		}
-	}
-	return previous
+	return m.segments.PublishSegments(segments, versions)
 }
 
 // selectSegmentsConsistent is SelectSegments for readers that must not observe
 // a half-installed multi-segment mutation.
 func (m *meta) selectSegmentsConsistent(ctx context.Context, filters ...SegmentFilter) []*SegmentInfo {
-	m.pubMu.RLock()
-	defer m.pubMu.RUnlock()
-	return m.SelectSegments(ctx, filters...)
+	var segments []*SegmentInfo
+	m.segments.ReadConsistent(func() {
+		segments = m.SelectSegments(ctx, filters...)
+	})
+	return segments
 }
 
 // lockOperatorSegments builds the update pack of operators under the writer

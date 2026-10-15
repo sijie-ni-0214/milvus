@@ -110,10 +110,6 @@ type meta struct {
 	segmentStoreOnce      sync.Once
 	segmentWriteLocks     *lock.KeyLock[int64]
 	segmentWriteLocksOnce sync.Once
-	// pubMu makes installing a multi-segment mutation into the cache atomic for
-	// readers that need a consistent cut of a collection (loadableProjection).
-	// It is held only around in-memory installs, never across store I/O.
-	pubMu sync.RWMutex
 	// compactingMu serializes the isCompacting check-and-set of segments.
 	compactingMu sync.Mutex
 	// segmentManifestLocks serializes the full StorageV3 manifest commit for a
@@ -143,6 +139,7 @@ type meta struct {
 	// Snapshot Meta
 	snapshotMeta   *snapshotMeta
 	quotaMetricsMu sync.Mutex
+	quotaDisplay   *quotaDisplayCache
 
 	// groupMu guards the segment change group tables below. A composite write
 	// of segments and groups takes it after the segment writer locks and holds
@@ -692,7 +689,7 @@ func (m *meta) reloadCollectionsFromRootcoord(ctx context.Context, broker broker
 			return err
 		}
 
-		m.metaStore.PutCollection(&collectionInfo{
+		m.addCollectionToCache(&collectionInfo{
 			ID:             collectionID,
 			Schema:         descResp.GetSchema(),
 			Partitions:     partitionIDs,
@@ -732,19 +729,32 @@ func (m *meta) reloadCollectionsFromRootcoord(ctx context.Context, broker broker
 	return nil
 }
 
+// addCollectionToCache puts a collection into MetaStore and invalidates its
+// quota statistics, without the per-collection update logs.
+func (m *meta) addCollectionToCache(collection *collectionInfo) {
+	// PutCollection emits the collection-count metric itself.
+	m.metaStore.PutCollection(collection)
+	if m.segments != nil {
+		m.segments.invalidateQuotaCollection(collection.ID)
+	}
+}
+
 // AddCollection adds a collection into MetaStore.
 func (m *meta) AddCollection(collection *collectionInfo) {
 	mlog.Info(m.ctx, "meta update: add collection", mlog.Int64("collectionID", collection.ID))
-	// PutCollection emits the collection-count metric itself.
-	m.metaStore.PutCollection(collection)
+	m.addCollectionToCache(collection)
 	mlog.Info(m.ctx, "meta update: add collection - complete", mlog.Int64("collectionID", collection.ID))
 }
 
 // DropCollection removes a collection from MetaStore.
 func (m *meta) DropCollection(collectionID int64) {
 	mlog.Info(m.ctx, "meta update: drop collection", mlog.Int64("collectionID", collectionID))
+	existed := m.GetCollection(collectionID) != nil
 	// RemoveCollection emits the collection metric cleanup itself.
 	m.metaStore.RemoveCollection(collectionID)
+	if existed && m.segments != nil {
+		m.segments.invalidateQuotaCollection(collectionID)
+	}
 	mlog.Info(m.ctx, "meta update: drop collection - complete", mlog.Int64("collectionID", collectionID))
 }
 
@@ -815,7 +825,7 @@ func getBinlogFileCount(s *datapb.SegmentInfo) int {
 	return cnt
 }
 
-func (m *meta) GetQuotaInfo() *metricsinfo.DataCoordQuotaMetrics {
+func (m *meta) getQuotaInfoByScan() *metricsinfo.DataCoordQuotaMetrics {
 	aggregateCollectionMetrics := metrics.IsCollectionLevelMetricsAggregateMode()
 	if aggregateCollectionMetrics {
 		m.quotaMetricsMu.Lock()
@@ -965,7 +975,7 @@ func (m *meta) GetQuotaInfo() *metricsinfo.DataCoordQuotaMetrics {
 	return info
 }
 
-func (m *meta) GetAllCollectionNumRows() map[int64]int64 {
+func (m *meta) getAllCollectionNumRowsByScan() map[int64]int64 {
 	ret := make(map[int64]int64)
 	segments := m.segments.GetSegments()
 	for _, segment := range segments {

@@ -39,6 +39,15 @@ func resetQuotaDisplayMetrics() {
 }
 
 func TestQuotaInfoAggregatePreservesControlData(t *testing.T) {
+	for _, enabled := range []string{"false", "true"} {
+		t.Run(enabled, func(t *testing.T) {
+			setQuotaTestParam(t, &Params.QuotaConfig.CollectionStatsCacheEnabled, enabled)
+			testQuotaInfoAggregatePreservesControlData(t)
+		})
+	}
+}
+
+func testQuotaInfoAggregatePreservesControlData(t *testing.T) {
 	previous := metrics.CollectionLevelMetricsMode()
 	t.Cleanup(func() {
 		metrics.SetCollectionLevelMetricsMode(previous)
@@ -163,6 +172,50 @@ func BenchmarkQuotaInfoAggregate(b *testing.B) {
 			for b.Loop() {
 				m.GetQuotaInfo()
 			}
+		})
+	}
+}
+
+func TestQuotaIncrementalDisplayLifecycle(t *testing.T) {
+	previous := metrics.CollectionLevelMetricsMode()
+	t.Cleanup(func() { metrics.SetCollectionLevelMetricsMode(previous); resetQuotaDisplayMetrics() })
+	for _, mode := range []string{metrics.CollectionLevelMetricsModeFull, metrics.CollectionLevelMetricsModeAggregate} {
+		t.Run(mode, func(t *testing.T) {
+			metrics.SetCollectionLevelMetricsMode(mode)
+			resetQuotaDisplayMetrics()
+			store := metacache.NewMetaStore(nil)
+			m := &meta{metaStore: store, segments: NewSegmentsInfo(store)}
+			for _, id := range []int64{1, 2} {
+				m.AddCollection(&collectionInfo{ID: id, DatabaseName: "old", Schema: &schemapb.CollectionSchema{Name: strconv.FormatInt(id, 10)}})
+				segment := buildSegment(id, id, id, "channel")
+				segment.Level = datapb.SegmentLevel_L0
+				segment.Stats = &datapb.Statistics{InsertBinlogSize: 100, InsertBinlogCount: 1, DeleteNumRows: 2}
+				m.segments.SetSegment(id, segment, 1)
+			}
+			publish := func() {
+				snapshot := m.segments.ReadQuotaSnapshot(false)
+				m.recordQuotaChanges(snapshot)
+				m.segments.AcknowledgeQuotaSnapshot(snapshot)
+			}
+			publish()
+			m.AddCollection(&collectionInfo{ID: 1, DatabaseName: "new", Schema: &schemapb.CollectionSchema{Name: "renamed"}})
+			publish()
+			m.DropCollection(2)
+			publish()
+			require.Equal(t, 1, testutil.CollectAndCount(metrics.DataCoordStoredBinlogSize))
+			require.Equal(t, 1, testutil.CollectAndCount(metrics.DataCoordNumStoredRows))
+			require.Equal(t, 1, testutil.CollectAndCount(metrics.DataCoordL0DeleteEntriesNum))
+			m.DropCollection(1)
+			publish()
+			require.Zero(t, testutil.CollectAndCount(metrics.DataCoordStoredBinlogSize))
+			require.Zero(t, testutil.CollectAndCount(metrics.DataCoordNumStoredRows))
+			require.Zero(t, testutil.CollectAndCount(metrics.DataCoordL0DeleteEntriesNum))
+			if mode == metrics.CollectionLevelMetricsModeAggregate {
+				require.EqualValues(t, 0, testutil.ToFloat64(metrics.DataCoordSegmentBinLogFileCount.WithLabelValues(metrics.AllLabel)))
+			} else {
+				require.Zero(t, testutil.CollectAndCount(metrics.DataCoordSegmentBinLogFileCount))
+			}
+			require.EqualValues(t, 200, m.segments.ReadQuotaSnapshot(false).TotalBytes)
 		})
 	}
 }
