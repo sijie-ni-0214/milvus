@@ -184,12 +184,16 @@ func (s *CachedSegmentsInfo) GetSegmentsBySelector(filters ...SegmentFilter) []*
 	}
 
 	candidates := s.getCandidates(criterion)
-	result := make([]*SegmentInfo, 0, len(candidates))
+	if candidates == nil {
+		return []*SegmentInfo{}
+	}
+	result := candidates[:0]
 	for _, seg := range candidates {
 		if criterion.Match(seg) {
 			result = append(result, seg)
 		}
 	}
+	clear(candidates[len(result):])
 	return result
 }
 
