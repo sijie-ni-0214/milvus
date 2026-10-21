@@ -912,7 +912,7 @@ func TestDataCoordDroppedSegmentGCLargeScalePerformance(t *testing.T) {
 		channelSync: newChannelSync(),
 		indexMeta:   indexMeta,
 	}
-	m.segmentStore = newCASSegmentStore(segmentPersist, segmentCatalog, "", m.segments)
+	m.segmentStore = newCASSegmentStore(segmentPersist, segmentCatalog, "")
 
 	fileKeys := make([]string, filesPerIndex)
 	for i := range fileKeys {

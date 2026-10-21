@@ -150,6 +150,12 @@ func SegmentRecordKey(segment *datapb.SegmentInfo) string {
 	return buildSegmentPath(segment.GetCollectionID(), segment.GetPartitionID(), segment.GetID())
 }
 
+// SegmentRecordPrefixOf is the key prefix of the segment records of a
+// collection.
+func SegmentRecordPrefixOf(collectionID typeutil.UniqueID) string {
+	return buildCollectionPrefix(collectionID)
+}
+
 // persistedRecord is the record the catalog stores for segment: a clone
 // without binlogs, its V2 row count reconciled from the binlogs, text index
 // logs as file names and JSON key stats as relative paths.

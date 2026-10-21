@@ -2,32 +2,87 @@ package datacoord
 
 import (
 	"context"
+	"math/rand"
 	"slices"
+	"time"
 
+	"github.com/cockroachdb/errors"
+	"github.com/samber/lo"
 	"google.golang.org/protobuf/proto"
 
 	"github.com/milvus-io/milvus/internal/metastore"
+	"github.com/milvus-io/milvus/pkg/v3/mlog"
 	"github.com/milvus-io/milvus/pkg/v3/proto/datapb"
-	"github.com/milvus-io/milvus/pkg/v3/util/lock"
 )
 
 // Segment writes on the optimistic segment store.
 //
-// Readers use the lock-free segment cache directly. A writer
-//  1. takes the writer locks of every segment it changes (lockSegments), so
-//     writers of one segment serialize while writers of different segments
-//     run in parallel;
-//  2. builds the new values from the cached ones;
-//  3. persists them through the segment store, which compares each written
-//     segment against its cached version (casSegmentStore). A conflict means
-//     the store moved under the cache (another process wrote it): the cache is
-//     refreshed and the write fails, to be rebuilt by the caller;
+// The store is the source of truth: readers use the lock-free segment cache,
+// and every write is a compare-and-swap of the stored values it is built on.
+// A writer takes no lock of the segments it changes; writers of different
+// segments run in parallel. It
+//  1. reads the segments it changes and builds their new values on them: the
+//     cached values on its first attempt, the stored values on every attempt
+//     after a conflict (segmentReader);
+//  2. persists them through the segment store, which compares each written
+//     segment against the version it was read at (casSegmentStore), so a
+//     write built on cached values commits only if they are the stored ones.
+//     A conflict means another writer stored one of the segments since: the
+//     write fails with ErrVersionConflict;
+//  3. runs again from step 1 on a conflict (retrySegmentWrite), until it does
+//     not conflict or ctx ends. A write that stored part of itself before
+//     failing publishes that part (publishLanded);
 //  4. publishes the persisted values with their new versions
-//     (publishSegments) before releasing the locks.
+//     (publishSegments). Publications of concurrent writers may arrive out of
+//     order: the cache keeps the newer version.
 //
-// Lock order: segment manifest lock -> index keyLock(buildID) -> segment
-// writer locks -> groupMu -> segments.pubMu. While holding writer locks, never block on
-// another writer lock outside one lockSegments call.
+// Lock order: segment manifest lock -> index keyLock(buildID) -> groupMu ->
+// segments.pubMu.
+
+const (
+	// segmentWriteRetryMinBackoff and segmentWriteRetryMaxBackoff bound the
+	// wait before a write that conflicted runs again; it doubles, jittered.
+	segmentWriteRetryMinBackoff = time.Millisecond
+	segmentWriteRetryMaxBackoff = time.Second
+)
+
+// retrySegmentWrite runs write, which builds a segment write from the segments
+// r reads and commits it, until it does not fail with a version conflict, or
+// ctx ends. The first run reads the cache; a run after a conflict reads the
+// store, so it builds on what the conflicting writer stored whether or not it
+// published it. Writes of one segment rarely conflict, so there is no attempt
+// limit.
+func (m *meta) retrySegmentWrite(ctx context.Context, write func(r *segmentReader) error) error {
+	backoff := segmentWriteRetryMinBackoff
+	fromStore := false
+	for attempt := 1; ; attempt++ {
+		r := &segmentReader{m: m, ctx: ctx, store: fromStore, reads: make(map[int64]segmentRead)}
+		err := write(r)
+		var partial *partialWriteError
+		if errors.As(err, &partial) {
+			m.publishLanded(ctx, partial.landed)
+		}
+		if r.err != nil {
+			// A failed store read returns no segment, so the run did not
+			// commit on it; its outcome is that failure.
+			return r.err
+		}
+		if err == nil || !errors.Is(err, ErrVersionConflict) || ctx.Err() != nil {
+			return err
+		}
+		fromStore = true
+		mlog.Info(ctx, "meta update: segment meta moved under the write, rebuilding it from the store",
+			mlog.Int("attempt", attempt), mlog.Err(err))
+		timer := time.NewTimer(backoff/2 + time.Duration(rand.Int63n(int64(backoff/2)+1)))
+		select {
+		case <-timer.C:
+		case <-ctx.Done():
+			timer.Stop()
+			return err
+		}
+		backoff = min(2*backoff, segmentWriteRetryMaxBackoff)
+	}
+}
 
 // store returns the segment store, defaulting to the catalog for a meta built
 // without one (unit tests construct meta directly).
@@ -38,26 +93,6 @@ func (m *meta) store() segmentStore {
 		}
 	})
 	return m.segmentStore
-}
-
-func (m *meta) getSegmentWriteLocks() *lock.KeyLock[int64] {
-	m.segmentWriteLocksOnce.Do(func() {
-		if m.segmentWriteLocks == nil {
-			m.segmentWriteLocks = lock.NewKeyLock[int64]()
-		}
-	})
-	return m.segmentWriteLocks
-}
-
-// lockSegments takes the writer locks of segmentIDs in ascending order and
-// returns their release.
-func (m *meta) lockSegments(segmentIDs ...int64) func() {
-	ids := slices.Clone(segmentIDs)
-	slices.Sort(ids)
-	ids = slices.Compact(ids)
-	locks := m.getSegmentWriteLocks()
-	lock.LockManyOrdered(locks, ids)
-	return func() { locks.UnlockMany(ids) }
 }
 
 // publishSegment installs the persisted value of one segment.
@@ -74,6 +109,27 @@ func (m *meta) publishSegments(segments []*SegmentInfo, versions map[int64]int64
 	return m.segments.PublishSegments(segments, versions)
 }
 
+// publishLanded installs the segments a failed write stored before it failed
+// (see partialWriteError), as a successful write publishes its own: the cache
+// keeps matching the store, so the rebuilt write, and every other writer of
+// those segments, builds on them.
+func (m *meta) publishLanded(ctx context.Context, landed []landedSegment) {
+	segments := make([]*SegmentInfo, 0, len(landed))
+	versions := make(map[int64]int64, len(landed))
+	for _, l := range landed {
+		segments = append(segments, NewSegmentInfo(proto.Clone(l.segment).(*datapb.SegmentInfo)))
+		versions[l.segment.GetID()] = l.version
+	}
+	previous := m.publishSegments(segments, versions)
+	var manifestUpdates []*SegmentInfo
+	for _, segment := range segments {
+		if prev := previous[segment.GetID()]; prev == nil || prev.GetManifestPath() != segment.GetManifestPath() {
+			manifestUpdates = append(manifestUpdates, segment)
+		}
+	}
+	m.notifyQueryViewSegmentUpdates(ctx, manifestUpdates)
+}
+
 // selectSegmentsConsistent is SelectSegments for readers that must not observe
 // a half-installed multi-segment mutation.
 func (m *meta) selectSegmentsConsistent(ctx context.Context, filters ...SegmentFilter) []*SegmentInfo {
@@ -84,41 +140,155 @@ func (m *meta) selectSegmentsConsistent(ctx context.Context, filters ...SegmentF
 	return segments
 }
 
-// lockOperatorSegments builds the update pack of operators under the writer
-// locks of every segment the operators touch. The touched set is discovered by
-// a run against the unlocked cache; when the locked run touches a segment the
-// discovery run did not (the cache changed in between), it releases and
-// retries. Operators only mutate the pack, so the extra runs have no effect.
-func (m *meta) lockOperatorSegments(operators []UpdateOperator) (*updateSegmentPack, func(), error) {
-	for {
-		discovery := m.newUpdateSegmentPack()
-		if err := discovery.run(operators); err != nil {
-			return nil, nil, err
+// runOperators builds the update pack of operators on the segments r reads.
+func (m *meta) runOperators(r *segmentReader, operators []UpdateOperator) (*updateSegmentPack, error) {
+	pack := m.newUpdateSegmentPack()
+	pack.reader = r
+	if err := pack.run(operators); err != nil {
+		return nil, err
+	}
+	if err := r.failure(); err != nil {
+		return nil, err
+	}
+	return pack, nil
+}
+
+// segmentReader reads the segments one run of a segment write builds on (see
+// retrySegmentWrite): from the cache, or from the store once a run conflicted.
+// The first read of a segment pins its value and version for the rest of the
+// run, so every check of the write sees the value the write compares against.
+//
+// A store read of a segment whose record is still at its cached version
+// returns the cached value, binlogs included; any other is read with its
+// binlog KVs (segmentStore.ReadSegment). The values a run reads from the store
+// are not installed in the cache: the values it stores are, once it commits.
+type segmentReader struct {
+	m     *meta
+	ctx   context.Context
+	store bool
+	reads map[int64]segmentRead
+	// err is the first failed store read. A failed read returns no segment,
+	// so a write checks failure before it commits.
+	err error
+}
+
+// get returns the value of a segment the run builds on and its version, nil
+// and 0 when the segment does not exist. A store read locates the segment by
+// its cached value: a segment the cache does not hold reads as absent, unless
+// the write locates it (getAt).
+func (r *segmentReader) get(segmentID int64) (*SegmentInfo, int64) {
+	if read, ok := r.reads[segmentID]; ok {
+		return read.segment, read.version
+	}
+	segment, version := r.m.segments.GetSegmentWithVersion(segmentID)
+	if r.store && segment != nil {
+		segment, version = r.read(segment.GetCollectionID(), segment.GetPartitionID(), segmentID, segment, version)
+	}
+	return r.pin(segmentID, segment, version)
+}
+
+// getAt is get for a segment the write knows the collection and partition of,
+// such as one it creates: a store read finds it even when the cache does not
+// hold it.
+func (r *segmentReader) getAt(collectionID, partitionID, segmentID int64) (*SegmentInfo, int64) {
+	if read, ok := r.reads[segmentID]; ok {
+		return read.segment, read.version
+	}
+	segment, version := r.m.segments.GetSegmentWithVersion(segmentID)
+	if r.store {
+		segment, version = r.read(collectionID, partitionID, segmentID, segment, version)
+	}
+	return r.pin(segmentID, segment, version)
+}
+
+func (r *segmentReader) read(collectionID, partitionID, segmentID int64, cached *SegmentInfo, version int64) (*SegmentInfo, int64) {
+	segment, version, err := r.m.store().ReadSegment(r.ctx, collectionID, partitionID, segmentID, cached, version)
+	if err != nil {
+		r.fail(err)
+		return nil, 0
+	}
+	return segment, version
+}
+
+func (r *segmentReader) pin(segmentID int64, segment *SegmentInfo, version int64) (*SegmentInfo, int64) {
+	r.reads[segmentID] = segmentRead{segment: segment, version: version}
+	return segment, version
+}
+
+func (r *segmentReader) fail(err error) {
+	if r.err == nil {
+		r.err = err
+	}
+}
+
+// failure returns the error of a failed store read of the run, which a write
+// returns instead of committing.
+func (r *segmentReader) failure() error {
+	return r.err
+}
+
+// selectSegments returns the segments matching filters the run builds on,
+// pinned like get. The cache answers with one consistent cut of it (see
+// selectSegmentsConsistent). The store answers by scanning the collections of
+// the segments the cache matches, so it also returns the segments a writer
+// stored and has not published yet, such as the outputs of a compaction of
+// the matched segments.
+func (r *segmentReader) selectSegments(filters ...SegmentFilter) []*SegmentInfo {
+	matches := func(segment *SegmentInfo) bool {
+		if segment == nil {
+			return false
 		}
-		locked := make(map[int64]struct{}, len(discovery.segments))
-		ids := make([]int64, 0, len(discovery.segments))
-		for id := range discovery.segments {
-			locked[id] = struct{}{}
-			ids = append(ids, id)
-		}
-		unlock := m.lockSegments(ids...)
-		pack := m.newUpdateSegmentPack()
-		if err := pack.run(operators); err != nil {
-			unlock()
-			return nil, nil, err
-		}
-		covered := true
-		for id := range pack.segments {
-			if _, ok := locked[id]; !ok {
-				covered = false
-				break
+		for _, filter := range filters {
+			if !filter.Match(segment) {
+				return false
 			}
 		}
-		if covered {
-			return pack, unlock, nil
-		}
-		unlock()
+		return true
 	}
+	var selected []*SegmentInfo
+	if !r.store {
+		r.m.segments.ReadConsistent(func() {
+			for _, candidate := range r.m.segments.GetSegmentsBySelector(filters...) {
+				if segment, _ := r.get(candidate.GetID()); matches(segment) {
+					selected = append(selected, segment)
+				}
+			}
+		})
+		return selected
+	}
+	var collectionIDs []int64
+	for _, candidate := range r.m.segments.GetSegmentsBySelector(filters...) {
+		collectionIDs = append(collectionIDs, candidate.GetCollectionID())
+	}
+	collectionIDs = lo.Uniq(collectionIDs)
+	slices.Sort(collectionIDs)
+	for _, collectionID := range collectionIDs {
+		segments, versions, err := r.m.store().ScanSegments(r.ctx, collectionID, r.m.segments.GetSegmentWithVersion)
+		if err != nil {
+			r.fail(err)
+			return nil
+		}
+		for i, stored := range segments {
+			if _, ok := r.reads[stored.GetID()]; !ok {
+				r.pin(stored.GetID(), stored, versions[i])
+			}
+			if segment, _ := r.get(stored.GetID()); matches(segment) {
+				selected = append(selected, segment)
+			}
+		}
+	}
+	return selected
+}
+
+// withVersions adds to base the version of each of segments the run builds
+// on, 0 for a segment that does not exist. It is the base of the segments a
+// write creates under IDs no other write uses: an earlier run of the write may
+// have stored them already.
+func (r *segmentReader) withVersions(base map[int64]int64, segments ...*SegmentInfo) map[int64]int64 {
+	for _, segment := range segments {
+		_, base[segment.GetID()] = r.getAt(segment.GetCollectionID(), segment.GetPartitionID(), segment.GetID())
+	}
+	return base
 }
 
 // MutateFunc modifies a *datapb.SegmentInfo in place. Returns true to proceed
@@ -126,7 +296,7 @@ func (m *meta) lockOperatorSegments(operators []UpdateOperator) (*updateSegmentP
 type MutateFunc func(seg *datapb.SegmentInfo) bool
 
 // MutationsOperator adapts per-segment MutateFuncs to an UpdateOperator. The
-// funcs of a segment run in order against its latest cached value; when any of
+// funcs of a segment run in order against the value the write reads; when any of
 // them returns false the segment is left untouched by this operator.
 func MutationsOperator(mutations map[int64][]MutateFunc) UpdateOperator {
 	return func(modPack *updateSegmentPack) bool {
@@ -169,7 +339,7 @@ func AddSegmentsOperator(segments ...*datapb.SegmentInfo) UpdateOperator {
 	return func(modPack *updateSegmentPack) bool {
 		added := false
 		for _, segment := range segments {
-			if modPack.meta.segments.GetSegment(segment.GetID()) != nil {
+			if modPack.peekAt(segment.GetCollectionID(), segment.GetPartitionID(), segment.GetID()) != nil {
 				continue
 			}
 			info := NewSegmentInfo(segment)

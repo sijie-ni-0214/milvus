@@ -146,6 +146,17 @@ func (s *CachedSegmentsInfo) GetSegment(segmentID UniqueID) *SegmentInfo {
 	return v
 }
 
+// GetSegmentWithVersion returns the segment and the store version of that
+// value, read together: a write built from the segment compares against the
+// version. Returns (nil, 0) if not found.
+func (s *CachedSegmentsInfo) GetSegmentWithVersion(segmentID UniqueID) (*SegmentInfo, int64) {
+	v, version, ok := s.segments.LookupWithVersion(segmentID)
+	if !ok {
+		return nil, 0
+	}
+	return v, version
+}
+
 // Version returns the store version of the cached value of segmentID.
 func (s *CachedSegmentsInfo) Version(segmentID UniqueID) (int64, bool) {
 	return s.segments.Version(segmentID)
@@ -300,10 +311,9 @@ func (s *CachedSegmentsInfo) PublishSegment(segmentID UniqueID, segment *Segment
 		}
 	})
 	if !applied {
-		// The cache already holds this or a newer version: a writer published
-		// out of order, which the segment writer locks are meant to prevent.
+		// The cache already holds this or a newer version.
 		currentVersion, _ := s.segments.Version(segmentID)
-		mlog.Warn(context.TODO(), "stale segment publication ignored",
+		mlog.Debug(context.TODO(), "stale segment publication ignored",
 			mlog.FieldSegmentID(segmentID), mlog.Int64("version", version), mlog.Int64("currentVersion", currentVersion))
 		return old, existed
 	}

@@ -35,8 +35,8 @@ var (
 	ErrKeyAlreadyExists = fmt.Errorf("key already exists")
 	ErrKeyNotFound      = fmt.Errorf("key not found")
 	// ErrVersionConflict reports that a versioned write (PutIfVersion /
-	// DeleteIfVersion) found a different version in the store: the caller's
-	// cached copy is stale and must be refreshed before the write is rebuilt.
+	// DeleteIfVersion) found a different version in the store: the value the
+	// write was built from is stale, and the write must be rebuilt.
 	ErrVersionConflict = errors.New("optimistic txn: version conflict")
 	// errCompareFailed reports that the read-modify-write compares of a batch
 	// failed: a key changed between the read and the commit.
@@ -83,12 +83,19 @@ type Txn[K comparable, V any] interface {
 	// Raw composes an unversioned write of another record into the same
 	// transaction (e.g. a catalog-encoded DataView or channel tombstone).
 	Raw(op RawOp)
+	// Group starts a group: the ops added until the next Group call land in
+	// one batch when the transaction has to be split, unless they exceed the
+	// op limit on their own (e.g. a segment record and its binlog KVs).
+	Group()
 	// AtomicOnly makes Commit fail instead of splitting an over-limit
 	// transaction into ordered batches.
 	AtomicOnly()
 	// Commit executes all operations atomically. Returns results in the order ops were added.
 	// On CAS failure of a read-modify-write op, retries automatically (re-reads and
 	// re-applies UpdateFuncs). A stale versioned op fails with ErrVersionConflict.
+	// When a transaction split into ordered batches fails after its first batch,
+	// the results come back with the error: the ops of the batches that landed
+	// carry their versions, the others version 0.
 	Commit() ([]TxnResult[V], error)
 }
 
@@ -223,6 +230,7 @@ type txnOp[K comparable, V any] struct {
 	version    int64         // used by PutIfVersion, DeleteIfVersion
 	raw        RawOp         // used by Raw
 	commit     bool
+	group      int // see Txn.Group
 }
 
 func (op txnOp[K, V]) versioned() bool {
@@ -232,35 +240,45 @@ func (op txnOp[K, V]) versioned() bool {
 // txnOps is the op recorder shared by every backend.
 type txnOps[K comparable, V any] struct {
 	ops        []txnOp[K, V]
+	group      int
 	atomicOnly bool
 }
 
+func (t *txnOps[K, V]) add(op txnOp[K, V]) {
+	op.group = t.group
+	t.ops = append(t.ops, op)
+}
+
 func (t *txnOps[K, V]) Insert(key K, value V) {
-	t.ops = append(t.ops, txnOp[K, V]{kind: opInsert, key: key, value: value})
+	t.add(txnOp[K, V]{kind: opInsert, key: key, value: value})
 }
 
 func (t *txnOps[K, V]) Update(key K, f UpdateFunc[V]) {
-	t.ops = append(t.ops, txnOp[K, V]{kind: opUpdate, key: key, updateFunc: f})
+	t.add(txnOp[K, V]{kind: opUpdate, key: key, updateFunc: f})
 }
 
 func (t *txnOps[K, V]) Upsert(key K, value V, f UpdateFunc[V]) {
-	t.ops = append(t.ops, txnOp[K, V]{kind: opUpsert, key: key, value: value, updateFunc: f})
+	t.add(txnOp[K, V]{kind: opUpsert, key: key, value: value, updateFunc: f})
 }
 
 func (t *txnOps[K, V]) Delete(key K) {
-	t.ops = append(t.ops, txnOp[K, V]{kind: opDelete, key: key})
+	t.add(txnOp[K, V]{kind: opDelete, key: key})
 }
 
 func (t *txnOps[K, V]) PutIfVersion(key K, value V, version int64, commit bool) {
-	t.ops = append(t.ops, txnOp[K, V]{kind: opPutIfVersion, key: key, value: value, version: version, commit: commit})
+	t.add(txnOp[K, V]{kind: opPutIfVersion, key: key, value: value, version: version, commit: commit})
 }
 
 func (t *txnOps[K, V]) DeleteIfVersion(key K, version int64) {
-	t.ops = append(t.ops, txnOp[K, V]{kind: opDeleteIfVersion, key: key, version: version})
+	t.add(txnOp[K, V]{kind: opDeleteIfVersion, key: key, version: version})
 }
 
 func (t *txnOps[K, V]) Raw(op RawOp) {
-	t.ops = append(t.ops, txnOp[K, V]{kind: opRaw, raw: op, commit: op.Commit})
+	t.add(txnOp[K, V]{kind: opRaw, raw: op, commit: op.Commit})
+}
+
+func (t *txnOps[K, V]) Group() {
+	t.group++
 }
 
 func (t *txnOps[K, V]) AtomicOnly() {
@@ -271,7 +289,10 @@ func (t *txnOps[K, V]) AtomicOnly() {
 // mirroring the metastore composite-write contract (kv/txn.Commit): a set that
 // fits is one atomic batch in recorded order; otherwise the non-commit ops are
 // flushed first in recorded order and every commit-marked op lands together in
-// the final batch, which is the visibility marker of the whole write.
+// the final batch, which is the visibility marker of the whole write. The
+// non-commit ops of a group (see Txn.Group) share a batch: a group that does
+// not fit in the current batch starts the next one, and only a group over the
+// limit on its own is split.
 func (t *txnOps[K, V]) planBatches(limit int) ([][]int, error) {
 	if len(t.ops) == 0 {
 		return nil, nil
@@ -286,24 +307,37 @@ func (t *txnOps[K, V]) planBatches(limit int) ([][]int, error) {
 	if t.atomicOnly {
 		return nil, merr.WrapErrServiceInternalMsg("atomic transaction needs %d ops but the limit is %d", len(t.ops), limit)
 	}
-	var nonCommit, commit []int
-	for i, op := range t.ops {
-		if op.commit {
-			commit = append(commit, i)
-		} else {
-			nonCommit = append(nonCommit, i)
+	var batches [][]int
+	var batch, commit []int
+	for start := 0; start < len(t.ops); {
+		end := start + 1
+		for end < len(t.ops) && t.ops[end].group == t.ops[start].group {
+			end++
 		}
+		var group []int
+		for i := start; i < end; i++ {
+			if t.ops[i].commit {
+				commit = append(commit, i)
+			} else {
+				group = append(group, i)
+			}
+		}
+		if len(batch) > 0 && len(batch)+len(group) > limit {
+			batches = append(batches, batch)
+			batch = nil
+		}
+		for len(group) > limit {
+			batches = append(batches, group[:limit])
+			group = group[limit:]
+		}
+		batch = append(batch, group...)
+		start = end
+	}
+	if len(batch) > 0 {
+		batches = append(batches, batch)
 	}
 	if len(commit) > limit {
 		return nil, merr.WrapErrServiceInternalMsg("transaction commit set of %d ops exceeds the limit %d", len(commit), limit)
-	}
-	batches := make([][]int, 0, len(nonCommit)/limit+2)
-	for start := 0; start < len(nonCommit); start += limit {
-		end := start + limit
-		if end > len(nonCommit) {
-			end = len(nonCommit)
-		}
-		batches = append(batches, nonCommit[start:end])
 	}
 	if len(commit) > 0 {
 		batches = append(batches, commit)
@@ -416,9 +450,13 @@ func (t *etcdTxn[K, V]) Commit() ([]TxnResult[V], error) {
 	if err != nil {
 		return nil, retry.Unrecoverable(err)
 	}
-	for _, batch := range batches {
+	for i, batch := range batches {
 		if err := t.commitBatch(batch, results); err != nil {
-			return nil, err
+			if i == 0 {
+				return nil, err
+			}
+			// The batches before this one landed.
+			return results, err
 		}
 	}
 	return results, nil
@@ -591,9 +629,7 @@ func (t *etcdTxn[K, V]) commitBatch(batch []int, results []TxnResult[V]) error {
 				// The outcome is unknown: the request may have landed. Read it
 				// back, so a landed batch succeeds and one that did not land
 				// leaves the versions its resend compares against.
-				resolveCtx, cancel := t.persist.requestContext(context.WithoutCancel(t.ctx))
-				applied, resolveErr := t.resolveVersionedFailure(resolveCtx, batch, results)
-				cancel()
+				applied, resolveErr := t.resolveUnknownOutcome(batch, results)
 				if resolveErr == nil && applied {
 					return nil
 				}
@@ -629,6 +665,28 @@ func (t *etcdTxn[K, V]) commitBatch(batch []int, results []TxnResult[V]) error {
 		return merr.WrapErrServiceUnavailableErr(err, "optimistic txn batch kept failing its compares after %d attempts", maxCompareAttempts)
 	}
 	return storeErr(err)
+}
+
+// resolveUnknownOutcome reads a batch whose commit outcome is unknown back
+// until the store answers, or the transaction's context ends. A batch that
+// landed unseen would fail a write that took effect, and leave the cache
+// behind the store until a later write of its segments reads them back.
+func (t *etcdTxn[K, V]) resolveUnknownOutcome(batch []int, results []TxnResult[V]) (bool, error) {
+	backoff := 10 * time.Millisecond
+	for {
+		ctx, cancel := t.persist.requestContext(context.WithoutCancel(t.ctx))
+		applied, err := t.resolveVersionedFailure(ctx, batch, results)
+		cancel()
+		if err == nil || errors.Is(err, ErrVersionConflict) {
+			return applied, err
+		}
+		select {
+		case <-time.After(backoff):
+		case <-t.ctx.Done():
+			return applied, err
+		}
+		backoff = min(2*backoff, time.Second)
+	}
 }
 
 // resolveVersionedFailure rereads the keys of the batch's versioned ops after

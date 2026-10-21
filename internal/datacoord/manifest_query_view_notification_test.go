@@ -79,8 +79,6 @@ func TestManifestPublicationNotifiesQueryViews(t *testing.T) {
 			recompute := mockey.Mock((*meta).recomputeDataView).To(func(got *meta, ctx context.Context, collectionID int64) {
 				require.Same(t, m, got)
 				require.EqualValues(t, 1, collectionID)
-				require.True(t, m.getSegmentWriteLocks().TryLock(10), "recompute must run after publication outside the segment writer lock")
-				m.getSegmentWriteLocks().Unlock(10)
 				require.True(t, m.segments.pubMu.TryLock(), "recompute must run after publication outside segments.pubMu")
 				m.segments.pubMu.Unlock()
 				require.True(t, m.getSegmentManifestLocks().TryLock(10), "recompute must run outside manifest lock")

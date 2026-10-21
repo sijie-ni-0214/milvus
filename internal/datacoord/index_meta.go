@@ -1468,8 +1468,8 @@ func (m *indexMeta) RemoveSegmentIndex(ctx context.Context, buildID UniqueID) er
 // and reconciles its metrics, after its catalog record has been removed. The
 // caller must hold keyLock for segIdx.BuildID. RemoveSegmentIndex, which owns
 // the catalog removal itself, uses this combined form; the manifest-commit
-// staging below uses the same two halves but runs the record removal under
-// the segment writer lock and defers the gauge until it is released, so the
+// staging below uses the same two halves but runs the record removal at
+// publication and defers the gauge until the publication is done, so the
 // two paths cannot drift.
 func (m *indexMeta) removeSegmentIndexInMemory(segIdx *model.SegmentIndex) {
 	m.subtractStoredIndexSizeOnRemoval(segIdx)
@@ -1478,11 +1478,10 @@ func (m *indexMeta) removeSegmentIndexInMemory(segIdx *model.SegmentIndex) {
 
 // subtractStoredIndexSizeOnRemoval is the metric half of
 // removeSegmentIndexInMemory. It is split out because the manifest-commit
-// install defers it until the segment writer lock is released (see
+// install defers it until the publication is done (see
 // stagedSegmentIndexMutation): it takes the read side of the per-collection
 // index DDL lock, whose write side every index DDL holds across an etcd round
-// trip, so blocking on it inside the writer lock would stall every writer of
-// the segment behind that round trip.
+// trip, so blocking on it would hold the publication behind that round trip.
 func (m *indexMeta) subtractStoredIndexSizeOnRemoval(segIdx *model.SegmentIndex) {
 	// Reclaim size only when the index is still alive (segment-drop case);
 	// MarkIndexAsDeleted already subtracted otherwise.
@@ -1492,7 +1491,7 @@ func (m *indexMeta) subtractStoredIndexSizeOnRemoval(segIdx *model.SegmentIndex)
 
 // removeSegmentIndexRecordInMemory is the record half: it mutates only the
 // in-memory segment-index maps and the memory-only task counters. It never
-// acquires fieldIndexLock, so it is safe to run inside a segment writer lock critical section.
+// acquires fieldIndexLock, so it is safe to run during the publication.
 func (m *indexMeta) removeSegmentIndexRecordInMemory(segIdx *model.SegmentIndex) {
 	if segIndexes, ok := m.segmentIndexes.Get(segIdx.SegmentID); ok {
 		// A newer build of the same index may have replaced this record.
@@ -1522,14 +1521,13 @@ var errSegmentIndexRecordGone = errors.New("segment index record no longer exist
 // record is the locked task projection used to validate manifest contents.
 //
 // install performs in-memory changes only — it never acquires fieldIndexLock, so
-// the manifest commit may run it inside its segment writer lock critical section. It returns
+// the manifest commit may run it during its publication. It returns
 // the observability update it deferred (never nil): the stored-index-size gauge
 // must serialize against MarkIndexAsDeleted via the per-collection index DDL
 // lock, whose write side every index DDL (CreateIndex, AlterIndex,
 // MarkIndexAsDeleted, RemoveIndex) holds across an etcd round trip. The caller
-// MUST run the returned closure only after releasing the writer lock —
-// acquiring that lock inside it would let one slow DDL stall every writer of the
-// segment — and before
+// MUST run the returned closure only after the publication — acquiring that
+// lock during it would let one slow DDL hold the publication — and before
 // releasing keyLock(BuildID), so the install-then-metric sequence stays ordered
 // against the next writer of the same build.
 type stagedSegmentIndexMutation struct {
@@ -1550,7 +1548,7 @@ type stagedSegmentIndexMutation struct {
 //
 // Precondition: the caller holds keyLock(mut.BuildID) across this projection,
 // the returned install, and the deferred metric closure install returns. It is
-// acquired by the caller rather than here so that it is ordered before the segment writer lock,
+// acquired by the caller rather than here so that it is held across the whole commit,
 // matching every other SegmentIndex writer; see CommitSegmentManifest's
 // lock-order note.
 func (m *indexMeta) stageSegmentIndexMutation(mut SegmentIndexMutation) (*stagedSegmentIndexMutation, error) {
@@ -1609,8 +1607,8 @@ func (m *indexMeta) stageSegmentIndexMutation(mut SegmentIndexMutation) (*staged
 	staged.install = func() func() {
 		m.updateSegmentIndex(finished)
 		// recordFinishedTask is observability only, but its stored-size gauge
-		// takes the collection index DDL lock, so the whole step is deferred out
-		// of the writer lock.
+		// takes the collection index DDL lock, so the whole step is deferred
+		// until the publication is done.
 		return func() { m.recordFinishedTask(previous, finished, previousSize, mut.FinishedTask) }
 	}
 	return staged, nil

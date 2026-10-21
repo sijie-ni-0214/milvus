@@ -38,7 +38,7 @@ import (
 // publication unit of batch segment changes. The in-memory table lives on
 // `meta` and is guarded by groupMu: the group record composes into the same
 // store txn as segment writes (see UpdateSegmentsInfoAndChangeGroups), which
-// takes groupMu after the writer locks of the segments it changes. This is the
+// holds groupMu while it validates and persists the group actions. This is the
 // layer that later batch pipelines
 // (import, compaction, copy, ...) call to stage and publish their outputs, and
 // that the DataView integration (PR #52537) extends by composing a DataView
@@ -574,24 +574,14 @@ func (m *meta) updateSegmentsInfoAndChangeGroups(ctx context.Context, dataView *
 				"UpdateSegmentsInfoAndChangeGroups only accepts segment change group actions, got %T", action.Entry)
 		}
 	}
-	for {
-		err := m.updateSegmentsInfoAndChangeGroupsOnce(ctx, dataView, groupActions, operators)
-		if err != nil && errors.Is(err, ErrVersionConflict) && ctx.Err() == nil {
-			// The store moved under the cache, which is refreshed by now:
-			// rebuild the whole write from it.
-			mlog.Warn(ctx, "meta update: segment meta moved under the cache, rebuilding the segment change group write", mlog.Err(err))
-			continue
-		}
-		return err
-	}
+	// A conflict means another writer stored a segment since: the whole write
+	// is rebuilt on the stored segments.
+	return m.retrySegmentWrite(ctx, func(r *segmentReader) error {
+		return m.updateSegmentsInfoAndChangeGroupsOnce(ctx, r, dataView, groupActions, operators)
+	})
 }
 
-func (m *meta) updateSegmentsInfoAndChangeGroupsOnce(ctx context.Context, dataView *viewpb.DataViewOfCollection, groupActions []metastore.UpdateAction, operators []UpdateOperator) error {
-	updatePack, unlock, err := m.lockOperatorSegments(operators)
-	if err != nil {
-		return err
-	}
-	defer unlock()
+func (m *meta) updateSegmentsInfoAndChangeGroupsOnce(ctx context.Context, r *segmentReader, dataView *viewpb.DataViewOfCollection, groupActions []metastore.UpdateAction, operators []UpdateOperator) error {
 	m.groupMu.Lock()
 	defer m.groupMu.Unlock()
 	m.ensureSegmentChangeGroupStoreLocked()
@@ -683,8 +673,10 @@ func (m *meta) updateSegmentsInfoAndChangeGroupsOnce(ctx context.Context, dataVi
 	}
 	groupActions = normalized
 
-	// The operators already ran against the cache under the writer locks of
-	// the segments they touch (lockOperatorSegments).
+	updatePack, err := m.runOperators(r, operators)
+	if err != nil {
+		return err
+	}
 	if err := commitL0ManifestUpdates(ctx, m.manifestCommitExecutor, updatePack.l0ManifestUpdates); err != nil {
 		return err
 	}
@@ -771,7 +763,7 @@ func (m *meta) updateSegmentsInfoAndChangeGroupsOnce(ctx context.Context, dataVi
 			// is already retired; nil (GC'd) and Dropped are both idempotent
 			// skips. Treating a GC'd parent as "not retired" would spuriously
 			// fail the publish.
-			if inMeta := m.segments.GetSegment(id); inMeta == nil || inMeta.GetState() == commonpb.SegmentState_Dropped {
+			if inMeta, _ := r.get(id); inMeta == nil || inMeta.GetState() == commonpb.SegmentState_Dropped {
 				continue // already retired or GC'd
 			}
 			segment, ok := updatePack.segments[id]
@@ -879,18 +871,21 @@ func (m *meta) updateSegmentsInfoAndChangeGroupsOnce(ctx context.Context, dataVi
 		actions = append(actions, action)
 	}
 
+	if err := r.failure(); err != nil {
+		return err
+	}
 	// The composite write must keep retrying: the store rewrites the same
 	// actions (a retry whose earlier attempt landed finds its own values), so
 	// an in-function retry converges to a durable COMMITTED group + visible
 	// members without replaying caller-side effects — same as the flush
 	// semantics (UpdateSegmentsInfoAndDataView). A version conflict is not
-	// retried here: the caller rebuilds the write from the refreshed cache.
+	// retried here: the caller rebuilds the write.
 	// retry.Do short-circuits InputError-typed errors unless an explicit
 	// RetryErr predicate is supplied, so AttemptAlways alone is not enough.
 	var versions map[int64]int64
 	if err := retry.Do(ctx, func() error {
 		var err error
-		versions, err = m.store().Update(ctx, actions...)
+		versions, err = m.store().Update(ctx, updatePack.versions(), actions...)
 		return err
 	}, retry.AttemptAlways(), retry.MaxSleepTime(10*time.Second),
 		retry.RetryErr(func(err error) bool { return !errors.Is(err, ErrVersionConflict) })); err != nil {

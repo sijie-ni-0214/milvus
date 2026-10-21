@@ -19,7 +19,7 @@ package datacoord
 import "context"
 
 // notifyQueryViewSegmentUpdates runs after catalog and in-memory publication,
-// outside segment/manifest locks. New Manifest requirements reach QueryNodes
+// outside the manifest locks. New Manifest requirements reach QueryNodes
 // through a new DataView and QueryView rather than a SegmentMeta subscription.
 func (m *meta) notifyQueryViewSegmentUpdates(ctx context.Context, segments []*SegmentInfo) {
 	collections := make(map[int64]struct{})

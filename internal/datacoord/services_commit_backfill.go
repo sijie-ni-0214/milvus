@@ -108,8 +108,8 @@ func (s *Server) CommitBackfillResult(ctx context.Context, req *datapb.CommitBac
 
 	// Split the units into the two dispatch paths and apply them directly:
 	// every V2 column-group upsert in bounded batches of UpdateSegmentsInfo
-	// (each batch one catalog transaction holding segment writer locks for at most
-	// maxBackfillCommitBatch records), and the V3 manifest commits in bounded
+	// (each batch one catalog transaction of at most maxBackfillCommitBatch
+	// records), and the V3 manifest commits in bounded
 	// batches of CommitSegmentManifests (each batch one all-or-nothing catalog
 	// transaction). A failed batch does not cancel later batches; per-segment
 	// statuses reflect batch-level outcomes.

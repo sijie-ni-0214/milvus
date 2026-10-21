@@ -44,6 +44,17 @@ func (c *Cache[K, V]) Lookup(key K) (V, bool) {
 	return entry.value, true
 }
 
+// LookupWithVersion returns the cached value and its version, read together.
+// Returns (zero, 0, false) if not found or tombstone.
+func (c *Cache[K, V]) LookupWithVersion(key K) (V, int64, bool) {
+	var zero V
+	entry, ok := c.entries.Get(key)
+	if !ok || entry.deleted {
+		return zero, 0, false
+	}
+	return entry.value, entry.version, true
+}
+
 // Insert creates or overwrites an entry with the given version.
 // If version > 0, rejects if current version >= given version
 // (stale write protection, including tombstones).

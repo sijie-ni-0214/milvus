@@ -368,7 +368,7 @@ func applyExternalCollectionSegmentUpdateAtFence(
 
 	validationOperator := func(modPack *updateSegmentPack) bool {
 		for segmentID := range baselineSegmentMap {
-			existing := modPack.meta.segments.GetSegment(segmentID)
+			existing := modPack.Peek(segmentID)
 			incoming := upsertSegmentMap[segmentID]
 			kept := keptSegmentMap[segmentID]
 
@@ -420,7 +420,7 @@ func applyExternalCollectionSegmentUpdateAtFence(
 			if _, isPatch := baselineSegmentMap[segmentID]; isPatch {
 				continue
 			}
-			existing := modPack.meta.segments.GetSegment(segmentID)
+			existing := modPack.Peek(segmentID)
 			if existing == nil {
 				continue
 			}
@@ -443,7 +443,7 @@ func applyExternalCollectionSegmentUpdateAtFence(
 	// ownership plan this list is limited to its immutable baseline.
 	dropOperator := func(modPack *updateSegmentPack) bool {
 		for _, segmentID := range segmentsToDrop {
-			current := modPack.meta.segments.GetSegment(segmentID)
+			current := modPack.Peek(segmentID)
 			if current == nil || current.GetState() == commonpb.SegmentState_Dropped {
 				continue
 			}

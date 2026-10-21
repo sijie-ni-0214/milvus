@@ -19,7 +19,7 @@ A Proxy started with `versionedRatesEnabled` rejects rate-checked requests with 
 
 ## Statistics publication
 
-DataCoord segment writes stay lock-free on the segment cache. A writer holds the per-segment writer locks, persists through the optimistic segment store and publishes the new values with a versioned compare-and-swap (`PublishSegment`). Only an accepted publication counts: a stale version, a tombstone or an aborted update invalidates nothing.
+DataCoord segment writes stay lock-free on the segment cache. A writer persists through the optimistic segment store, compared against the versions it read (a conflict rebuilds the write), and publishes the new values with a versioned compare-and-swap (`PublishSegment`). Only an accepted publication counts: a stale version, a tombstone or an aborted update invalidates nothing.
 
 After a segment is published, it invalidates its old and new collections. The dirty table is guarded by a small leaf mutex. While no statistics reader exists, an atomic tracking flag skips that bookkeeping, so the flags-off write path takes no additional lock. A refresh reads a collection's dirty generation before copying its segment pointers. It therefore attaches a generation only to a snapshot at least as new as the writes that generation covers. A write it may have missed leaves a newer generation for the next refresh.
 

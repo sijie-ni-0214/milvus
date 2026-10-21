@@ -787,7 +787,7 @@ func (s *Server) SaveBinlogPaths(ctx context.Context, req *datapb.SaveBinlogPath
 	// with SegmentMeta in one catalog txn (flush atomicity): the snapshot is
 	// prepared under the DataView Collection lock, composed into the same
 	// Update, and loaded into the manager memory only after the txn commits.
-	// Lock order is DataView Collection lock -> segment writer locks -> segments.pubMu
+	// Lock order is DataView Collection lock -> segments.pubMu
 	// (inside UpdateSegmentsInfoAndDataView); the queue worker's Recompute takes
 	// DataView lock -> segments.pubMu.RLock via loadableProjection, so no deadlock. On failure the lock is aborted and the StreamingNode retries
 	// the whole SaveBinlogPaths until the DataView version is durably
