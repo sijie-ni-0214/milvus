@@ -1581,6 +1581,9 @@ class ChunkedSegmentSealedImpl : public SegmentSealed {
     prefetch_chunks_locked(milvus::OpContext* op_ctx, FieldId field_id) const;
 
     void
+    prewarm_chunks(milvus::OpContext* op_ctx, FieldId field_id) const;
+
+    void
     fill_empty_field(const FieldMeta& field_meta,
                      const SealedFieldLayoutPtr& schema_snapshot,
                      const SegmentLoadInfo& segment_load_info,

@@ -586,6 +586,8 @@ proxy:
 
 # Related configuration of queryCoord, used to manage topology and load balancing for the query nodes, and handoff from growing segments to sealed segments.
 queryCoord:
+  # Enable only after the complete cluster supports load warmup hints.
+  enableLoadCollectionWarmupHint: false
   enableSQNServeSegments: true
   collectionBalanceSegmentBatchSize: 100
   queryNodeTaskParallelismFactor: 100

@@ -141,6 +141,7 @@
 #include "segcore/DeletedRecord.h"
 #include "segcore/SegmentSealed.h"
 #include "segcore/TimestampIndex.h"
+#include "segcore/memory_planner.h"
 #include "segcore/storagev1translator/ChunkTranslator.h"
 #include "segcore/storagev1translator/DefaultValueChunkTranslator.h"
 #include "segcore/storagev2translator/SystemIndexTranslator.h"
@@ -3877,6 +3878,33 @@ ChunkedSegmentSealedImpl::prefetch_chunks(milvus::OpContext* op_ctx,
                                           FieldId field_id) const {
     std::shared_lock lck(mutex_);
     prefetch_chunks_locked(op_ctx, field_id);
+}
+
+// Prewarm pins a field's chunks in runs of about one load batch, estimated as
+// batch bytes / storage v2 cell target bytes (a storage v1 chunk is a whole
+// binlog, so a run may span its field). Pinners of a cell share its load and
+// its failure, so a search needing a chunk waits for, and fails with, only that
+// chunk's run rather than the whole field, while reads stay batch-sized.
+void
+ChunkedSegmentSealedImpl::prewarm_chunks(milvus::OpContext* op_ctx,
+                                         FieldId field_id) const {
+    auto column = get_column(field_id);
+    if (column == nullptr) {
+        return;
+    }
+    const int64_t chunks_per_run =
+        std::max<int64_t>(1,
+                          FieldDataLoadBatchSplitTargetBytes() /
+                              storagev2translator::GetCellTargetSizeBytes());
+    const auto num_chunks = column->num_chunks();
+    for (int64_t begin = 0; begin < num_chunks; begin += chunks_per_run) {
+        CheckCancellation(op_ctx, id_, field_id.get(), "Prewarm");
+        std::vector<int64_t> chunk_ids(
+            std::min(chunks_per_run, num_chunks - begin));
+        std::iota(chunk_ids.begin(), chunk_ids.end(), begin);
+        std::shared_lock lck(mutex_);
+        column->PrefetchChunks(op_ctx, chunk_ids);
+    }
 }
 
 std::shared_ptr<milvus::exec::SimpleGeometryCache>
@@ -11832,6 +11860,9 @@ ChunkedSegmentSealedImpl::prefetch_vector(milvus::OpContext* op_ctx,
     }
 }
 
+// Prewarm loads every cache cell of the given fields (all fields when empty):
+// field data, indexes (text indexes included) and JSON stats, plus the
+// segment-wide PK and timestamp indexes.
 void
 ChunkedSegmentSealedImpl::Prewarm(
     milvus::OpContext* op_ctx,
@@ -11845,8 +11876,11 @@ ChunkedSegmentSealedImpl::Prewarm(
         }
     }
 
+    PinPkIndex(runtime, op_ctx);
+    PinTimestampIndex(runtime, op_ctx);
     for (auto field_id : field_ids) {
-        prefetch_chunks(op_ctx, field_id);
+        prewarm_chunks(op_ctx, field_id);
+        GetJsonStats(op_ctx, field_id);
         if (runtime == nullptr) {
             continue;
         }

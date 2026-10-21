@@ -276,6 +276,8 @@ message LoadCollectionRequest {
     common.LoadPriority priority = 10;
     optional bool load_all_fields = 11;
     bool skip_load_dynamic_field = 12;
+    // Asks QueryNodes to warm the loaded data in the background until release.
+    bool warmup_hint = 13;
 }
 
 message ReleaseCollectionRequest {
