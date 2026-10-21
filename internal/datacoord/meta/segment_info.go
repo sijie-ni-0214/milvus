@@ -268,7 +268,7 @@ func (s *SegmentsInfo) GetSegments() []*SegmentInfo {
 	return result
 }
 
-func (s *SegmentsInfo) getCandidates(criterion *segmentCriterion) map[UniqueID]*SegmentInfo {
+func (s *SegmentsInfo) getCandidates(criterion *segmentCriterion) []*SegmentInfo {
 	var protos map[int64]*datapb.SegmentInfo
 	switch {
 	case criterion.collectionID > 0 && criterion.channel != "":
@@ -286,9 +286,9 @@ func (s *SegmentsInfo) getCandidates(criterion *segmentCriterion) map[UniqueID]*
 	default:
 		protos = s.store.GetAllSegments()
 	}
-	result := make(map[UniqueID]*SegmentInfo, len(protos))
+	result := make([]*SegmentInfo, 0, len(protos))
 	for id, segProto := range protos {
-		result[id] = s.assemble(segProto, s.dcStateOf(id))
+		result = append(result, s.assemble(segProto, s.dcStateOf(id)))
 	}
 	return result
 }
@@ -301,12 +301,13 @@ func (s *SegmentsInfo) GetSegmentsBySelector(filters ...SegmentFilter) []*Segmen
 
 	// apply criterion
 	candidates := s.getCandidates(criterion)
-	result := make([]*SegmentInfo, 0, len(candidates))
+	result := candidates[:0]
 	for _, segment := range candidates {
 		if criterion.Match(segment) {
 			result = append(result, segment)
 		}
 	}
+	clear(candidates[len(result):])
 	return result
 }
 
