@@ -103,7 +103,7 @@ func (m *meta) publishSegment(segment *SegmentInfo, version int64) *SegmentInfo 
 
 // publishSegments installs the persisted values of a mutation and returns the
 // values they replaced. A multi-segment mutation is installed atomically
-// (CachedSegmentsInfo.PublishSegments), so a consistent reader observes all
+// (SegmentsInfo.PublishSegments), so a consistent reader observes all
 // of it or none of it.
 func (m *meta) publishSegments(segments []*SegmentInfo, versions map[int64]int64) map[int64]*SegmentInfo {
 	return m.segments.PublishSegments(segments, versions)

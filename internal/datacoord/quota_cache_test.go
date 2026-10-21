@@ -106,7 +106,7 @@ func TestQuotaCacheFollowsMetaWrites(t *testing.T) {
 }
 
 func TestQuotaCacheDirtyAndAcknowledgement(t *testing.T) {
-	s := NewCachedSegmentsInfo()
+	s := NewSegmentsInfo()
 	for _, id := range []int64{1, 2} {
 		segment := buildSegment(id, id, id, "channel")
 		segment.NumOfRows = 10
@@ -143,7 +143,7 @@ func TestQuotaCacheDirtyAndAcknowledgement(t *testing.T) {
 // A multi-segment mutation (a compaction replacing its input) is published
 // atomically: a refresh counts exactly one side of it.
 func TestQuotaCacheCompactionPublication(t *testing.T) {
-	s := NewCachedSegmentsInfo()
+	s := NewSegmentsInfo()
 	first := buildSegment(1, 1, 1, "channel")
 	first.State = commonpb.SegmentState_Flushed
 	first.Stats = &datapb.Statistics{InsertBinlogSize: 100}
@@ -169,7 +169,7 @@ func TestQuotaCacheCompactionPublication(t *testing.T) {
 }
 
 func TestQuotaCachePublishesWhileCollectionKeepsChanging(t *testing.T) {
-	s := NewCachedSegmentsInfo()
+	s := NewSegmentsInfo()
 	segment := buildSegment(1, 1, 1, "channel")
 	segment.NumOfRows = 10
 	s.SetSegment(1, segment, 1)
@@ -192,7 +192,7 @@ func TestQuotaCachePublishesWhileCollectionKeepsChanging(t *testing.T) {
 // A wholesale rewrite that moves a segment to another collection invalidates
 // both collections.
 func TestQuotaCacheSegmentChangesCollection(t *testing.T) {
-	s := NewCachedSegmentsInfo()
+	s := NewSegmentsInfo()
 	s.SetSegment(1, buildSegment(1, 1, 1, "channel"), 1)
 	s.AcknowledgeQuotaSnapshot(s.ReadQuotaSnapshot(true))
 	s.SetSegment(1, buildSegment(2, 1, 1, "channel"), 2)
@@ -202,7 +202,7 @@ func TestQuotaCacheSegmentChangesCollection(t *testing.T) {
 }
 
 func TestQuotaCacheRollbackRequiresNewBaseline(t *testing.T) {
-	s := NewCachedSegmentsInfo()
+	s := NewSegmentsInfo()
 	s.SetSegment(1, buildSegment(1, 1, 1, "channel"), 1)
 	before := s.ReadQuotaSnapshot(false)
 	s.AcknowledgeQuotaSnapshot(before)
@@ -224,7 +224,7 @@ func TestQuotaCacheRollbackRequiresNewBaseline(t *testing.T) {
 func BenchmarkQuotaCacheIdle(b *testing.B) {
 	for _, collections := range []int{1000, 100000} {
 		b.Run(strconv.Itoa(collections), func(b *testing.B) {
-			s := NewCachedSegmentsInfo()
+			s := NewSegmentsInfo()
 			for i := 1; i <= collections; i++ {
 				id := int64(i)
 				s.SetSegment(id, buildSegment(id, id, id, "channel"), 1)

@@ -19,6 +19,7 @@ package datacoord
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/bytedance/mockey"
 	"github.com/stretchr/testify/require"
@@ -79,8 +80,13 @@ func TestManifestPublicationNotifiesQueryViews(t *testing.T) {
 			recompute := mockey.Mock((*meta).recomputeDataView).To(func(got *meta, ctx context.Context, collectionID int64) {
 				require.Same(t, m, got)
 				require.EqualValues(t, 1, collectionID)
-				require.True(t, m.segments.pubMu.TryLock(), "recompute must run after publication outside segments.pubMu")
-				m.segments.pubMu.Unlock()
+				consistent := make(chan struct{})
+				go m.segments.ReadConsistent(func() { close(consistent) })
+				select {
+				case <-consistent:
+				case <-time.After(10 * time.Second):
+					t.Fatal("recompute must run after publication, outside the publication lock")
+				}
 				require.True(t, m.getSegmentManifestLocks().TryLock(10), "recompute must run outside manifest lock")
 				m.getSegmentManifestLocks().Unlock(10)
 				require.Equal(t, newManifest, m.GetSegment(ctx, 10).GetManifestPath())

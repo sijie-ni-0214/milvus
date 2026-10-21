@@ -21,6 +21,7 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/milvus-io/milvus-proto/go-api/v3/commonpb"
 	"github.com/milvus-io/milvus/internal/storagev2/packed"
@@ -50,9 +51,11 @@ func TestPublishedManifestSnapshot(t *testing.T) {
 	require.ElementsMatch(t, []string{"collection10/v1", "collection20/v1", "collection20/v2", packed.MarshalManifestPath("files/insert_log/30/1/10", 0)}, got)
 	// Returned strings are detached from later metadata publication; no clones of
 	// schemas/binlogs/index metadata are necessary.
-	s.meta.segments.pubMu.Lock()
-	fixtures[0].ManifestPath = "collection10/v2"
-	s.meta.segments.pubMu.Unlock()
+	// A multi-segment publication takes the publication lock, so it also shows
+	// that enumeration holds no lock afterwards.
+	republished := proto.Clone(fixtures[0]).(*datapb.SegmentInfo)
+	republished.ManifestPath = "collection10/v2"
+	s.meta.segments.PublishSegments([]*SegmentInfo{NewSegmentInfo(republished), NewSegmentInfo(fixtures[1])}, nil)
 	require.Contains(t, got, "collection10/v1")
 	// A caller can take the write lock after enumeration; no lock spans Talon I/O.
 	ctx, cancel := context.WithCancel(context.Background())

@@ -24,11 +24,10 @@ import (
 	"github.com/milvus-io/milvus/pkg/v3/metrics"
 	"github.com/milvus-io/milvus/pkg/v3/proto/datapb"
 	"github.com/milvus-io/milvus/pkg/v3/util/metricsinfo"
-	"github.com/milvus-io/milvus/pkg/v3/util/typeutil"
 )
 
 // collectionQuotaCache keeps absolute per-collection quota statistics for the
-// segments of CachedSegmentsInfo and recomputes only invalidated collections.
+// segments of SegmentsInfo and recomputes only invalidated collections.
 //
 // Writers publish a segment first and invalidate its collection afterwards;
 // a refresh reads the dirty generation of a collection before it copies the
@@ -36,7 +35,7 @@ import (
 // snapshot at least as new as the writes that generation covers, and a write
 // it may have missed leaves a newer generation for the next refresh.
 // Multi-segment mutations are installed with PublishSegments; the pointer copy
-// runs under pubMu.RLock, so it never observes half of one.
+// runs under ReadConsistent, so it never observes half of one.
 type collectionQuotaCache struct {
 	// tracking skips invalidation bookkeeping while no reader uses the cache.
 	// It changes only under dirtyMu.
@@ -47,7 +46,8 @@ type collectionQuotaCache struct {
 	dirty      map[int64]uint64
 
 	// mu serializes refresh/publication and acknowledgement. Writers never take
-	// it. Lock order: mu -> CachedSegmentsInfo.pubMu -> dirtyMu.
+	// it. Lock order: mu -> the store's publication lock (ReadConsistent) ->
+	// dirtyMu.
 	mu                sync.Mutex
 	revision          uint64
 	baseline          uint64
@@ -59,7 +59,7 @@ type collectionQuotaCache struct {
 
 // invalidateQuota runs after an accepted cache mutation of old (nil on insert)
 // into current (nil on drop).
-func (s *CachedSegmentsInfo) invalidateQuota(old, current *SegmentInfo) {
+func (s *SegmentsInfo) invalidateQuota(old, current *datapb.SegmentInfo) {
 	if old != nil {
 		s.invalidateQuotaCollection(old.GetCollectionID())
 	}
@@ -70,7 +70,7 @@ func (s *CachedSegmentsInfo) invalidateQuota(old, current *SegmentInfo) {
 
 // invalidateQuotaCollection invalidates a collection whose quota statistics or
 // display labels changed without a segment publication.
-func (s *CachedSegmentsInfo) invalidateQuotaCollection(id int64) {
+func (s *SegmentsInfo) invalidateQuotaCollection(id int64) {
 	q := &s.quota
 	if !q.tracking.Load() {
 		return
@@ -125,12 +125,12 @@ func computeCollectionQuota(segments []*SegmentInfo, generation uint64) *metrics
 }
 
 // refreshQuota visits only collections invalidated since their last refresh.
-// Published SegmentInfo objects are immutable; copying the local pointer list
-// under pubMu.RLock gives a consistent collection snapshot. New writes can
+// Published segment protos are immutable; reading the segments of a collection
+// under ReadConsistent gives a consistent collection snapshot. New writes can
 // proceed while that snapshot is reduced. A hot collection may publish a
 // historical snapshot, retaining its newer dirty generation for the next
 // refresh. The caller holds quota.mu.
-func (s *CachedSegmentsInfo) refreshQuota() int {
+func (s *SegmentsInfo) refreshQuota() int {
 	cache := &s.quota
 	cache.dirtyMu.Lock()
 	if !cache.tracking.Load() {
@@ -139,10 +139,8 @@ func (s *CachedSegmentsInfo) refreshQuota() int {
 		cache.tracking.Store(true)
 		// Collections indexed after this pass invalidate themselves, as
 		// tracking is now on.
-		s.coll2Segments.Range(func(id int64, ids *typeutil.ConcurrentMap[int64, struct{}]) bool {
-			if ids.Len() > 0 {
-				cache.dirty[id] = cache.generation
-			}
+		s.store.RangeSegmentCollections(func(id int64) bool {
+			cache.dirty[id] = cache.generation
 			return true
 		})
 	}
@@ -208,7 +206,7 @@ func (s *CachedSegmentsInfo) refreshQuota() int {
 
 // ReadQuotaSnapshot is for the single in-process QuotaCenter consumer. A
 // separate diagnostic reader requests full=true and never acknowledges changes.
-func (s *CachedSegmentsInfo) ReadQuotaSnapshot(full bool) *metricsinfo.QuotaSnapshot {
+func (s *SegmentsInfo) ReadQuotaSnapshot(full bool) *metricsinfo.QuotaSnapshot {
 	s.quota.mu.Lock()
 	defer s.quota.mu.Unlock()
 	scanned := s.refreshQuota()
@@ -225,7 +223,7 @@ func (s *CachedSegmentsInfo) ReadQuotaSnapshot(full bool) *metricsinfo.QuotaSnap
 
 // AcknowledgeQuotaSnapshot clears only values actually incorporated by the
 // consumer. It cannot clear a newer publication or metadata awaiting refresh.
-func (s *CachedSegmentsInfo) AcknowledgeQuotaSnapshot(snapshot *metricsinfo.QuotaSnapshot) {
+func (s *SegmentsInfo) AcknowledgeQuotaSnapshot(snapshot *metricsinfo.QuotaSnapshot) {
 	s.quota.mu.Lock()
 	defer s.quota.mu.Unlock()
 	if snapshot.BaselineGeneration != s.quota.baseline {
@@ -250,7 +248,7 @@ func (s *CachedSegmentsInfo) AcknowledgeQuotaSnapshot(snapshot *metricsinfo.Quot
 
 // resetQuotaCache is called only on the disabled reference path. It prevents
 // inactive incremental tracking from retaining an unconsumed history of drops.
-func (s *CachedSegmentsInfo) resetQuotaCache() {
+func (s *SegmentsInfo) resetQuotaCache() {
 	s.quota.mu.Lock()
 	defer s.quota.mu.Unlock()
 	s.quota.dirtyMu.Lock()
@@ -269,7 +267,7 @@ func (s *CachedSegmentsInfo) resetQuotaCache() {
 	metrics.DataCoordQuotaCachePending.WithLabelValues("consumer").Set(0)
 }
 
-func (s *CachedSegmentsInfo) discardQuotaPendingWithoutConsumer() {
+func (s *SegmentsInfo) discardQuotaPendingWithoutConsumer() {
 	s.quota.mu.Lock()
 	defer s.quota.mu.Unlock()
 	if !Params.QuotaConfig.LocalQuotaCalculationEnabled.GetAsBool() {

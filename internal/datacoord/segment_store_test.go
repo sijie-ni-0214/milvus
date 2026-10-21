@@ -362,7 +362,10 @@ func TestMetaDropSegments(t *testing.T) {
 		m, persist := newCASTestMeta(t)
 		require.NoError(t, m.AddSegment(ctx, newDroppedTestSegment(1)))
 		planned := m.segments.GetSegment(1)
-		m.segments.SetIsCompacting(1, true)
+		require.NoError(t, m.UpdateSegment(1, func(segment *SegmentInfo) bool {
+			segment.NumOfRows++
+			return true
+		}))
 
 		removed, err := m.DropSegments(ctx, []*SegmentInfo{planned})
 		require.NoError(t, err)

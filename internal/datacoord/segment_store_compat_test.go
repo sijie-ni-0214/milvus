@@ -56,7 +56,7 @@ func countKeys(t *testing.T, cli *clientv3.Client, prefix string) int64 {
 	return resp.Count
 }
 
-func recoverIntoCache(t *testing.T, store *casSegmentStore, cache *CachedSegmentsInfo) map[int64]*datapb.SegmentInfo {
+func recoverIntoCache(t *testing.T, store *casSegmentStore, cache *SegmentsInfo) map[int64]*datapb.SegmentInfo {
 	records, versions, err := store.ListSegments(context.Background(), nil)
 	require.NoError(t, err)
 	byID := make(map[int64]*datapb.SegmentInfo, len(records))
@@ -69,7 +69,7 @@ func recoverIntoCache(t *testing.T, store *casSegmentStore, cache *CachedSegment
 
 // cachedVersions returns the cached version of each of segmentIDs: the base of
 // a write built from the cached values.
-func cachedVersions(cache *CachedSegmentsInfo, segmentIDs ...int64) map[int64]int64 {
+func cachedVersions(cache *SegmentsInfo, segmentIDs ...int64) map[int64]int64 {
 	versions := make(map[int64]int64, len(segmentIDs))
 	for _, id := range segmentIDs {
 		versions[id], _ = cache.Version(id)
@@ -339,7 +339,7 @@ func TestIsPermanentStoreError(t *testing.T) {
 	require.False(t, isPermanentStoreError(rpctypes.ErrGRPCNoSpace))
 }
 
-func TestCachedSegmentsInfoPublishKeepsLastExpireTime(t *testing.T) {
+func TestSegmentsInfoPublishKeepsLastExpireTime(t *testing.T) {
 	cache := NewSegmentsInfo()
 	cache.SetSegment(1, NewSegmentInfo(&datapb.SegmentInfo{ID: 1, LastExpireTime: 10}), 1)
 	writerCopy := cache.GetSegment(1).Clone()

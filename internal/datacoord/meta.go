@@ -283,7 +283,7 @@ func newMetaWithPersist(ctx context.Context, catalog metastore.DataCoordCatalog,
 		ctx:                      ctx,
 		catalog:                  catalog,
 		metaStore:                metaStore,
-		segments:                 NewSegmentsInfo(),
+		segments:                 NewSegmentsInfo(metaStore),
 		segmentManifestLocks:     lock.NewKeyLock[int64](),
 		channelSync:              newChannelSync(),
 		chunkManager:             chunkManager,
@@ -381,10 +381,6 @@ func newMetaWithPersist(ctx context.Context, catalog metastore.DataCoordCatalog,
 	}
 	mlog.Info(ctx, "datacoord parallel metadata recovery done",
 		mlog.Duration("duration", time.Since(parallelRecoveryStart)))
-
-	// Serve the shared store's segment reads, QueryCoord's included, from the
-	// segment cache, so every segment exists once in memory.
-	mt.segments.AttachStore(metaStore)
 
 	// Assign sub-metas after all goroutines complete
 	mt.indexMeta = im
@@ -509,8 +505,11 @@ func (m *meta) reloadFromKV(ctx context.Context, collectionIDs []int64) error {
 		mlog.Duration("duration", time.Since(scanStart)))
 
 	segmentCacheBuildStart := time.Now()
-	// LoadSegment does not count the segments; the counts of all of them are
-	// published at once, replacing any left by an earlier recovery attempt.
+	// Recovery retries reuse the injected store: start from empty, so this
+	// attempt holds exactly what the catalog holds now. LoadSegment does not
+	// count the segments; the counts of all of them are published at once,
+	// replacing any left by an earlier recovery attempt.
+	m.segments.store.ClearSegments()
 	aggregates := newSegmentRecoveryMetricAggregates()
 	normalize := m.segmentLoadNormalizer()
 	for i, segment := range segments {
@@ -1083,8 +1082,10 @@ func (m *meta) DropSegments(ctx context.Context, candidates []*SegmentInfo) (int
 			continue
 		}
 		seen.Insert(candidate.GetID())
+		// A candidate is still the stored value when its proto is: protos are
+		// immutable and every change of the stored value replaces it.
 		current, version := m.segments.GetSegmentWithVersion(candidate.GetID())
-		if current != candidate || candidate.GetState() != commonpb.SegmentState_Dropped {
+		if current == nil || current.SegmentInfo != candidate.SegmentInfo || candidate.GetState() != commonpb.SegmentState_Dropped {
 			continue
 		}
 		segments = append(segments, candidate)
@@ -1109,11 +1110,11 @@ func (m *meta) DropSegments(ctx context.Context, candidates []*SegmentInfo) (int
 	var dropErr error
 	for _, segment := range segments {
 		current, version := m.segments.GetSegmentWithVersion(segment.GetID())
-		switch current {
-		case nil:
+		switch {
+		case current == nil:
 			// Removed from the cache since.
 			removed++
-		case segment:
+		case current.SegmentInfo == segment.SegmentInfo:
 			if err := m.store().DropSegment(ctx, map[int64]int64{segment.GetID(): version}, segment.SegmentInfo); err != nil {
 				dropErr = merr.Combine(dropErr, err)
 				continue

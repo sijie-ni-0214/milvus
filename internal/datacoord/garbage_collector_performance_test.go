@@ -650,7 +650,7 @@ func TestDataCoordDropIndexGCLargeScalePerformance(t *testing.T) {
 	}
 	m := &meta{
 		ctx:       ctx,
-		segments:  NewCachedSegmentsInfo(),
+		segments:  NewSegmentsInfo(),
 		indexMeta: indexMeta,
 	}
 	// A single live segment is sufficient to force the DropIndex eligibility
