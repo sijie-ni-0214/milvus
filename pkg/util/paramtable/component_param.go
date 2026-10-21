@@ -3823,6 +3823,7 @@ type queryCoordConfig struct {
 	UpdateTargetNeedSegmentDataReady ParamItem `refreshable:"true"`
 
 	AutoWarmupForNonPKIsolationCollection ParamItem `refreshable:"false"`
+	EnableLoadCollectionWarmupHint        ParamItem `refreshable:"false"`
 	EnableSQNServeSegments                ParamItem `refreshable:"false"`
 }
 
@@ -4647,6 +4648,15 @@ Set to 0 to disable the penalty period.`,
 		Export:       false,
 	}
 	p.AutoWarmupForNonPKIsolationCollection.Init(base.mgr)
+
+	p.EnableLoadCollectionWarmupHint = ParamItem{
+		Key:          "queryCoord.enableLoadCollectionWarmupHint",
+		Version:      "3.0.0",
+		DefaultValue: "false",
+		Doc:          "Enable the LoadCollection warmup hint only after all coordinators, proxies and nodes support it.",
+		Export:       true,
+	}
+	p.EnableLoadCollectionWarmupHint.Init(base.mgr)
 
 	p.EnableSQNServeSegments = ParamItem{
 		Key:          "queryCoord.enableSQNServeSegments",
