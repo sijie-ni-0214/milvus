@@ -1089,25 +1089,37 @@ func (gc *garbageCollector) recycleDroppedSegments(ctx context.Context, signal <
 	}()
 
 	metadataScanStart := time.Now()
-	all := gc.meta.SelectSegments(ctx)
+	// The scan keeps only the dropped segments and the outputs they were
+	// compacted into: it does not assemble every segment of the meta.
+	totalSegments := 0
 	drops := make(map[int64]*SegmentInfo, 0)
-	compactTo := make(map[int64]*SegmentInfo)
+	compactToProtos := make(map[int64]*datapb.SegmentInfo)
+	children := make(map[int64][]int64)
 	channels := typeutil.NewSet[string]()
-	for _, segment := range all {
+	gc.meta.segments.RangeReused(func(segment *SegmentInfo) bool {
+		totalSegments++
 		if segment.GetState() == commonpb.SegmentState_Dropped {
-			drops[segment.GetID()] = segment
+			drops[segment.GetID()] = segment.ShadowClone()
 			channels.Insert(funcutil.ToPhysicalChannel(segment.GetInsertChannel()))
 			// continue
 			// A(indexed), B(indexed) -> C(no indexed), D(no indexed) -> E(no indexed), A, B can not be GC
 		}
 		for _, from := range segment.GetCompactionFrom() {
-			compactTo[from] = segment
+			compactToProtos[from] = segment.SegmentInfo
+			children[from] = append(children[from], segment.GetID())
+		}
+		return true
+	})
+	compactTo := make(map[int64]*SegmentInfo, len(drops))
+	for id := range drops {
+		if to, ok := compactToProtos[id]; ok {
+			compactTo[id] = gc.meta.segments.assemble(to.GetID(), to)
 		}
 	}
 	log.Info(ctx, "recycleDroppedSegments metadata scan done",
-		mlog.Int("totalSegments", len(all)),
+		mlog.Int("totalSegments", totalSegments),
 		mlog.Int("droppedSegments", len(drops)),
-		mlog.Int("compactionSources", len(compactTo)),
+		mlog.Int("compactionSources", len(compactToProtos)),
 		mlog.Int("channels", channels.Len()),
 		mlog.Duration("timeCost", time.Since(metadataScanStart)))
 
@@ -1115,7 +1127,7 @@ func (gc *garbageCollector) recycleDroppedSegments(ctx context.Context, signal <
 	// A Dropped parent can still be the published QueryView frontier. Keep
 	// its descendants too: intermediate lineage is needed to flatten a later
 	// sort/merge before replacing that frontier. Snapshot once per sweep.
-	protected := gc.dataViewCompactionProtection(all)
+	protected := gc.dataViewCompactionProtection(children)
 
 	droppedCompactTo := make(map[int64]*SegmentInfo)
 	for id := range drops {
@@ -1326,18 +1338,13 @@ func (gc *garbageCollector) recycleDroppedSegment(ctx context.Context, io *packe
 // dataViewCompactionProtection retains both the published bases and the
 // intermediate metadata needed to relate current leaves to those bases. Once
 // the latest and all retained Views move past a base, its old ancestry is no
-// longer protected. This is O(segments + lineage edges), once per GC sweep.
-func (gc *garbageCollector) dataViewCompactionProtection(segments []*SegmentInfo) map[int64]struct{} {
+// longer protected. children maps a compaction parent to its outputs. This is
+// O(lineage edges), once per GC sweep.
+func (gc *garbageCollector) dataViewCompactionProtection(children map[int64][]int64) map[int64]struct{} {
 	if gc.meta.dataViewManager == nil {
 		return nil
 	}
 	protected := gc.meta.dataViewManager.ReferencedSegments()
-	children := make(map[int64][]int64)
-	for _, segment := range segments {
-		for _, parent := range segment.GetCompactionFrom() {
-			children[parent] = append(children[parent], segment.GetID())
-		}
-	}
 	queue := make([]int64, 0, len(protected))
 	for id := range protected {
 		queue = append(queue, id)

@@ -835,7 +835,6 @@ func (m *meta) getQuotaInfoByScan() *metricsinfo.DataCoordQuotaMetrics {
 	// collection id => l0 delta entry count
 	collectionL0RowCounts := make(map[UniqueID]int64)
 
-	segments := m.segments.GetSegments()
 	var total int64
 	// In aggregate mode these are keyed directly by database / all, rather
 	// than building and discarding collection-level display metrics first.
@@ -846,7 +845,7 @@ func (m *meta) getQuotaInfoByScan() *metricsinfo.DataCoordQuotaMetrics {
 	storedRowsByDB := make(map[string]map[commonpb.SegmentState]int64)
 	l0DeleteEntriesByDB := make(map[string]int64)
 
-	for _, segment := range segments {
+	m.segments.RangeReused(func(segment *SegmentInfo) bool {
 		segmentSize := segment.getSegmentSize()
 		if isSegmentHealthy(segment) && !segment.GetIsImporting() {
 			total += segmentSize
@@ -901,7 +900,8 @@ func (m *meta) getQuotaInfoByScan() *metricsinfo.DataCoordQuotaMetrics {
 				collectionL0RowCounts[segment.GetCollectionID()] += segment.getDeltaCount()
 			}
 		}
-	}
+		return true
+	})
 
 	// Reset to remove dropped collection
 	metrics.DataCoordStoredBinlogSize.Reset()
@@ -973,12 +973,12 @@ func (m *meta) getQuotaInfoByScan() *metricsinfo.DataCoordQuotaMetrics {
 
 func (m *meta) getAllCollectionNumRowsByScan() map[int64]int64 {
 	ret := make(map[int64]int64)
-	segments := m.segments.GetSegments()
-	for _, segment := range segments {
+	m.segments.RangeReused(func(segment *SegmentInfo) bool {
 		if isSegmentHealthy(segment) {
 			ret[segment.GetCollectionID()] += segment.GetNumOfRows()
 		}
-	}
+		return true
+	})
 	return ret
 }
 
@@ -4458,27 +4458,29 @@ func (m *meta) completeBumpSchemaVersionReplacementMutation(
 }
 
 func (m *meta) getSegmentsMetrics(collectionID int64) []*metricsinfo.Segment {
-
-	segments := make([]*metricsinfo.Segment, 0, m.segments.Len())
-	for _, s := range m.segments.GetSegments() {
-		if collectionID <= 0 || s.GetCollectionID() == collectionID {
-			segments = append(segments, &metricsinfo.Segment{
-				SegmentID:    s.ID,
-				CollectionID: s.CollectionID,
-				PartitionID:  s.PartitionID,
-				Channel:      s.InsertChannel,
-				NumOfRows:    s.NumOfRows,
-				State:        s.State.String(),
-				MemSize:      s.getSegmentSize(),
-				Level:        s.Level.String(),
-				IsImporting:  s.IsImporting,
-				Compacted:    s.Compacted,
-				IsSorted:     s.IsSorted,
-				NodeID:       paramtable.GetNodeID(),
-			})
-		}
+	var filters []SegmentFilter
+	if collectionID > 0 {
+		filters = append(filters, WithCollection(collectionID))
 	}
-
+	// Non-nil: an empty result marshals as [].
+	segments := make([]*metricsinfo.Segment, 0)
+	m.segments.RangeReused(func(s *SegmentInfo) bool {
+		segments = append(segments, &metricsinfo.Segment{
+			SegmentID:    s.ID,
+			CollectionID: s.CollectionID,
+			PartitionID:  s.PartitionID,
+			Channel:      s.InsertChannel,
+			NumOfRows:    s.NumOfRows,
+			State:        s.State.String(),
+			MemSize:      s.getSegmentSize(),
+			Level:        s.Level.String(),
+			IsImporting:  s.IsImporting,
+			Compacted:    s.Compacted,
+			IsSorted:     s.IsSorted,
+			NodeID:       paramtable.GetNodeID(),
+		})
+		return true
+	}, filters...)
 	return segments
 }
 

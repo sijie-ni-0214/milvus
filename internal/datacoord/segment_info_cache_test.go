@@ -281,4 +281,44 @@ func BenchmarkSegmentsInfoSelect(b *testing.B) {
 			s.GetSegments()
 		}
 	})
+	b.Run("range_reused", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			dropped := 0
+			s.RangeReused(func(segment *SegmentInfo) bool {
+				if segment.GetState() == commonpb.SegmentState_Dropped {
+					dropped++
+				}
+				return true
+			})
+		}
+	})
+}
+
+func TestSegmentsInfo_RangeReusedVisitsTheSelectedSegments(t *testing.T) {
+	s := NewSegmentsInfo()
+	for id := int64(1); id <= 4; id++ {
+		segment := newGrowingTestSegment(id)
+		segment.CollectionID = 1 + id%2
+		s.SetSegment(id, segment, 1)
+	}
+	s.SetIsCompacting(3, true)
+
+	var kept []*SegmentInfo
+	s.RangeReused(func(segment *SegmentInfo) bool {
+		kept = append(kept, segment.ShadowClone())
+		return true
+	}, WithCollection(2))
+	require.Len(t, kept, 2)
+	assert.ElementsMatch(t, []int64{1, 3}, []int64{kept[0].GetID(), kept[1].GetID()})
+	for _, segment := range kept {
+		assert.Equal(t, segment.GetID() == 3, segment.isCompacting, "a kept segment carries its own state")
+	}
+
+	visited := 0
+	s.RangeReused(func(*SegmentInfo) bool {
+		visited++
+		return false
+	})
+	assert.Equal(t, 1, visited, "returning false stops the range")
 }

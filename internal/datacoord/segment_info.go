@@ -174,24 +174,31 @@ func (s *SegmentsInfo) Range(fn func(segmentID UniqueID, segment *SegmentInfo) b
 }
 
 func (s *SegmentsInfo) GetSegmentsBySelector(filters ...SegmentFilter) []*SegmentInfo {
+	result := make([]*SegmentInfo, 0)
+	s.RangeReused(func(segment *SegmentInfo) bool {
+		result = append(result, segment.ShadowClone())
+		return true
+	}, filters...)
+	return result
+}
+
+// RangeReused visits the live segments the filters select with one reused
+// value, valid only during fn; fn returns false to stop. A visitor that keeps
+// a segment keeps segment.ShadowClone(). Unlike the reads returning segments,
+// it allocates nothing per segment, which matters to scans of every segment.
+func (s *SegmentsInfo) RangeReused(fn func(segment *SegmentInfo) bool, filters ...SegmentFilter) {
 	criterion := &segmentCriterion{}
 	for _, filter := range filters {
 		filter.AddFilter(criterion)
 	}
-
-	result := make([]*SegmentInfo, 0)
-	// The filters run on a reused value; only the matching segments are
-	// assembled for the result.
-	candidate := &SegmentInfo{}
+	segment := &SegmentInfo{}
 	s.rangeCandidates(criterion, func(segmentID int64, segProto *datapb.SegmentInfo) bool {
-		s.fill(candidate, segmentID, segProto)
-		if criterion.Match(candidate) {
-			matched := *candidate
-			result = append(result, &matched)
+		s.fill(segment, segmentID, segProto)
+		if !criterion.Match(segment) {
+			return true
 		}
-		return true
+		return fn(segment)
 	})
-	return result
 }
 
 // rangeCandidates visits the live segments of the criterion's collection and
