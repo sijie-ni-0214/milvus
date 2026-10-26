@@ -51,6 +51,7 @@ import (
 	"github.com/milvus-io/milvus/pkg/v3/proto/indexpb"
 	"github.com/milvus-io/milvus/pkg/v3/proto/internalpb"
 	"github.com/milvus-io/milvus/pkg/v3/proto/viewpb"
+	"github.com/milvus-io/milvus/pkg/v3/util/conc"
 	"github.com/milvus-io/milvus/pkg/v3/util/lock"
 	"github.com/milvus-io/milvus/pkg/v3/util/merr"
 	"github.com/milvus-io/milvus/pkg/v3/util/metricsinfo"
@@ -134,6 +135,10 @@ type Meta struct {
 	segmentChangeGroups      map[int64]*model.SegmentChangeGroup
 	stagedSegmentToGroup     map[int64]int64
 	supersededSegmentToGroup map[int64]int64
+
+	// manifestReadPrefetch, when set, holds manifest reads started ahead of
+	// recovery; reloadSegmentIndexesFromManifests takes it.
+	manifestReadPrefetch *conc.Future[*ManifestReadPrefetch]
 }
 
 // collectionInfo is DataCoord's name for the collection metadata held in the
@@ -165,6 +170,29 @@ func (m *Meta) CloseManifestCommitExecutor() {
 
 // NewMeta creates meta from provided `kv.TxnKV`
 func NewMeta(ctx context.Context, catalog metastore.DataCoordCatalog, chunkManager storage.ChunkManager, metaStore metacache.MetaStore, broker broker.Broker, loadDomainMetas DomainMetaLoader) (*Meta, error) {
+	mt, err := NewMetaWithoutManifestIndexes(ctx, catalog, chunkManager, metaStore, broker, loadDomainMetas, nil)
+	if err != nil {
+		return nil, err
+	}
+	// Manifest-backed indexes must be restored even if new manifest writes are disabled.
+	if err := mt.ReloadSegmentIndexesFromManifests(ctx); err != nil {
+		mt.CloseManifestCommitExecutor()
+		return nil, retry.Unrecoverable(err)
+	}
+	return mt, nil
+}
+
+// RecoveryPrefetch supplies read-only startup work. The owner joins all reads
+// before discarding a failed attempt; subsequent attempts read fresh data.
+type RecoveryPrefetch struct {
+	Catalog   *metacache.RecoveryRead
+	Manifests *conc.Future[*ManifestReadPrefetch]
+}
+
+// NewMetaWithoutManifestIndexes recovers the catalog and DataCoord state. The
+// caller must restore manifest indexes before any index-dependent recovery or
+// serving, and close the executor on failure.
+func NewMetaWithoutManifestIndexes(ctx context.Context, catalog metastore.DataCoordCatalog, chunkManager storage.ChunkManager, metaStore metacache.MetaStore, broker broker.Broker, loadDomainMetas DomainMetaLoader, prefetched *RecoveryPrefetch) (*Meta, error) {
 	metaRecoveryStart := time.Now()
 	mlog.Info(ctx, "datacoord meta recovery started")
 
@@ -196,6 +224,9 @@ func NewMeta(ctx context.Context, catalog metastore.DataCoordCatalog, chunkManag
 		supersededSegmentToGroup: make(map[int64]int64),
 	}
 
+	if prefetched != nil {
+		mt.manifestReadPrefetch = prefetched.Manifests
+	}
 	initialized := false
 	defer func() {
 		if !initialized {
@@ -220,6 +251,9 @@ func NewMeta(ctx context.Context, catalog metastore.DataCoordCatalog, chunkManag
 
 	// MetaStore.LoadFromCatalog loads segments + channel checkpoints in parallel with domain meta loading.
 	g.Go(func() error {
+		if prefetched != nil {
+			return metaStore.LoadFromRecovery(ctx, collectionIDs, mt.segmentLoadNormalizer(), prefetched.Catalog)
+		}
 		return metaStore.LoadFromCatalog(ctx, collectionIDs, mt.segmentLoadNormalizer())
 	})
 
@@ -240,16 +274,6 @@ func NewMeta(ctx context.Context, catalog metastore.DataCoordCatalog, chunkManag
 	mt.IndexCatalog = indexCatalog
 	if protection != nil {
 		mt.CompactionProtection = protection
-	}
-
-	// Recovery follows the durable storage location, not the current write
-	// mode. A segment marked manifest_has_index may contain records published
-	// while the switch was previously on, so it must still be loaded after the
-	// switch is turned off. Unmarked clusters perform no manifest reads.
-	if err := mt.ReloadSegmentIndexesFromManifests(ctx); err != nil {
-		// Object-store reads have already retried per segment. Re-entering
-		// initMeta's metastore retry would reread every successful manifest.
-		return nil, retry.Unrecoverable(err)
 	}
 
 	// Segment change groups load AFTER segments are in memory: the recovery

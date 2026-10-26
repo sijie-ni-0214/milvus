@@ -162,14 +162,14 @@ func (s *indexTaskSuite) TestCreateTaskOnWorker() {
 	it := NewIndexBuildTask(t, 1, s.mt, s.im, handler, cm, NewIndexEngineVersionManager())
 
 	s.Run("task not exist in meta", func() {
-		s.im.SegmentBuildInfo.buildID2SegmentIndex.Remove(s.taskID)
+		s.im.SegmentBuildInfo.byBuildID(s.taskID).Remove(s.taskID)
 		cluster := session.NewMockCluster(s.T())
 		it.CreateTaskOnWorker(1, cluster)
 		s.Equal(indexpb.JobState_JobStateNone, indexpb.JobState(it.IndexState))
 	})
 
 	s.Run("segment not healthy", func() {
-		s.im.SegmentBuildInfo.buildID2SegmentIndex.Insert(s.taskID, &model.SegmentIndex{
+		s.im.SegmentBuildInfo.byBuildID(s.taskID).Insert(s.taskID, &model.SegmentIndex{
 			CollectionID: s.collID,
 			PartitionID:  s.partID,
 			SegmentID:    s.segID,
@@ -972,7 +972,7 @@ func (s *indexTaskSuite) newInProgressTaskWithMeta(catalog *catalogmocks.DataCoo
 	im := createIndexMetaWithSegment(catalog, s.collID, s.partID, s.segID, s.indexID, s.fieldID, s.taskID)
 	mt.IndexCatalog = im
 	// Mutate the stored record in place: GetIndexJob returns a clone.
-	job, ok := im.SegmentBuildInfo.buildID2SegmentIndex.Get(s.taskID)
+	job, ok := im.SegmentBuildInfo.byBuildID(s.taskID).Get(s.taskID)
 	s.Require().True(ok)
 	job.IndexState = commonpb.IndexState_InProgress
 	job.NodeID = 1
@@ -1155,7 +1155,7 @@ func (s *indexTaskSuite) TestCreateTaskOnWorkerNullableVectorEffectiveRows() {
 			IndexState:   commonpb.IndexState_Unissued,
 			NumRows:      numRows,
 		}
-		s.im.SegmentBuildInfo.buildID2SegmentIndex.Insert(s.taskID, t)
+		s.im.SegmentBuildInfo.byBuildID(s.taskID).Insert(s.taskID, t)
 		cm := mocks.NewChunkManager(s.T())
 		cm.EXPECT().RootPath().Return("root").Maybe()
 		return NewIndexBuildTask(t, 1, s.mt, s.im, newHandler(), cm, NewIndexEngineVersionManager())

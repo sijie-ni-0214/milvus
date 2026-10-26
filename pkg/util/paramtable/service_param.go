@@ -637,10 +637,11 @@ func formatLocalStoragePath(value string) string {
 }
 
 type MetaStoreConfig struct {
-	MetaStoreType   ParamItem `refreshable:"false"`
-	PaginationSize  ParamItem `refreshable:"true"`
-	ReadConcurrency ParamItem `refreshable:"true"`
-	MaxEtcdTxnNum   ParamItem `refreshable:"true"`
+	MetaStoreType      ParamItem `refreshable:"false"`
+	PaginationSize     ParamItem `refreshable:"true"`
+	ReadConcurrency    ParamItem `refreshable:"true"`
+	MaxEtcdTxnNum      ParamItem `refreshable:"true"`
+	ParallelScanRanges ParamItem `refreshable:"true"`
 }
 
 func (p *MetaStoreConfig) Init(base *BaseTable) {
@@ -684,6 +685,19 @@ func (p *MetaStoreConfig) Init(base *BaseTable) {
 		},
 	}
 	p.MaxEtcdTxnNum.Init(base.mgr)
+
+	p.ParallelScanRanges = ParamItem{
+		Key:          "metastore.parallelScanRanges",
+		Version:      "3.1.0",
+		DefaultValue: "8",
+		Doc: `number of key ranges a metadata recovery scan of a large metastore prefix is split into, at the
+collections it holds; the ranges are read in parallel at one etcd revision. 1 reads every prefix in one walk,
+at most 64 are used.`,
+		Formatter: func(value string) string {
+			return strconv.Itoa(min(max(getAsInt(value), 1), 64))
+		},
+	}
+	p.ParallelScanRanges.Init(base.mgr)
 
 	// TODO: The initialization operation of metadata storage is called in the initialization phase of every node.
 	// There should be a single initialization operation for meta store, then move the metrics registration to there.

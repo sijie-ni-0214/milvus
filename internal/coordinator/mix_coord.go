@@ -235,6 +235,10 @@ func (s *mixCoordImpl) initInternal() error {
 		mlog.Duration("duration", time.Since(streamingCoordStart)))
 
 	s.rootcoordServer.SetFileResourceObserver(s.fileResourceObserver)
+	// DataCoord's metadata reads use RootCoord's collection IDs to restrict
+	// recovery and split key ranges: start them once RootCoord has read its
+	// collections, so they overlap the rest of RootCoord's recovery.
+	s.rootcoordServer.SetRecoveredCollectionIDsReporter(s.datacoordServer.StartMetaPrefetch)
 	rootCoordInitStart := time.Now()
 	if err := s.rootcoordServer.Init(); err != nil {
 		mlog.Error(s.ctx, "rootCoord init failed",
@@ -1710,6 +1714,9 @@ func (s *mixCoordImpl) GetQueryViewSegmentLoadInfo(ctx context.Context, req *que
 func (s *mixCoordImpl) initDataAndQueryCoord() error {
 	// Recover DataViews before QueryViews acquire their exact-version references.
 	// Neither coordinator starts background GC/balancing until both have recovered.
+	// QueryCoord's metadata reads need nothing DataCoord recovers: start them
+	// now so their cold etcd reads overlap DataCoord recovery.
+	s.queryCoordServer.StartMetaPrefetch()
 	dataCoordRecoveryStart := time.Now()
 	mlog.Info(s.ctx, "dataCoord recovery started")
 	s.datacoordServer.SetFileResourceObserver(s.fileResourceObserver)

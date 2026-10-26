@@ -76,6 +76,7 @@ import (
 	"github.com/milvus-io/milvus/pkg/v3/proto/querypb"
 	"github.com/milvus-io/milvus/pkg/v3/proto/viewpb"
 	"github.com/milvus-io/milvus/pkg/v3/util"
+	"github.com/milvus-io/milvus/pkg/v3/util/conc"
 	"github.com/milvus-io/milvus/pkg/v3/util/lock"
 	"github.com/milvus-io/milvus/pkg/v3/util/logutil"
 	"github.com/milvus-io/milvus/pkg/v3/util/merr"
@@ -208,6 +209,11 @@ type Server struct {
 
 	// file resource
 	fileResourceObserver FileResourceObserver
+
+	// metaPrefetch holds the catalog reads StartMetaPrefetch started, until
+	// initMeta takes them.
+	metaPrefetch     atomic.Pointer[metaPrefetch]
+	metaPrefetchOnce sync.Once
 }
 
 type FileResourceObserver interface {
@@ -764,11 +770,11 @@ func (s *Server) initKV() error {
 	mlog.Info(s.ctx, "data coordinator connecting to metadata store", mlog.String("metaType", metaType))
 	switch metaType {
 	case util.MetaStoreTypeTiKV:
-		s.metaRootPath = Params.TiKVCfg.MetaRootPath.GetValue()
+		s.metaRootPath = metaStoreRootPath()
 		s.kv = tikv.NewTiKV(s.tikvCli, s.metaRootPath,
 			tikv.WithRequestTimeout(paramtable.Get().TiKVCfg.RequestTimeout.GetAsDuration(time.Millisecond)))
 	case util.MetaStoreTypeEtcd:
-		s.metaRootPath = Params.EtcdCfg.MetaRootPath.GetValue()
+		s.metaRootPath = metaStoreRootPath()
 		s.kv = etcdkv.NewEtcdKV(s.etcdCli, s.metaRootPath,
 			etcdkv.WithRequestTimeout(paramtable.Get().EtcdCfg.RequestTimeout.GetAsDuration(time.Millisecond)))
 	default:
@@ -776,6 +782,14 @@ func (s *Server) initKV() error {
 	}
 	mlog.Info(s.ctx, "data coordinator successfully connected to metadata store", mlog.String("metaType", metaType))
 	return nil
+}
+
+// metaStoreRootPath is the namespace used by the configured metadata backend.
+func metaStoreRootPath() string {
+	if Params.MetaStoreCfg.MetaStoreType.GetValue() == util.MetaStoreTypeTiKV {
+		return Params.TiKVCfg.MetaRootPath.GetValue()
+	}
+	return Params.EtcdCfg.MetaRootPath.GetValue()
 }
 
 // domainMetas holds the per-domain metas that Server owns.
@@ -791,13 +805,17 @@ type domainMetas struct {
 }
 
 // loadDomainMetas returns a DomainMetaLoader that builds every domain meta in parallel into out and returns the index catalog and the compaction protection.
-func loadDomainMetas(catalog metastore.DataCoordCatalog, chunkManager storage.ChunkManager, out *domainMetas) meta.DomainMetaLoader {
+func loadDomainMetas(catalog metastore.DataCoordCatalog, chunkManager storage.ChunkManager, out *domainMetas, prefetched ...*conc.Future[*index.IndexMeta]) meta.DomainMetaLoader {
 	return func(ctx context.Context, collectionIDs []int64) (meta.SegmentIndexCatalog, meta.CompactionProtection, error) {
 		g, _ := errgroup.WithContext(ctx)
 
 		g.Go(func() error {
 			var err error
-			out.indexMeta, err = index.NewIndexMeta(ctx, catalog, collectionIDs)
+			if len(prefetched) > 0 && prefetched[0] != nil {
+				out.indexMeta, err = prefetched[0].Await()
+			} else {
+				out.indexMeta, err = index.NewIndexMeta(ctx, catalog, collectionIDs)
+			}
 			return err
 		})
 
@@ -880,18 +898,50 @@ func (s *Server) initMeta(chunkManager storage.ChunkManager) error {
 	if !ok {
 		return merr.WrapErrServiceInternalMsg("datacoord catalog does not support DataView persistence")
 	}
+	// List the persisted DataViews while the phases below recover SegmentMeta,
+	// Collections and Imports. No DataView key can change before RecoverManager:
+	// every writer goes through the DataViewManager it builds, the DDL callbacks
+	// that reach the manager are registered only after recovery, and external
+	// RPCs wait for the recovery barrier. A failed RecoverManager attempt may
+	// have dropped or written keys, so only the first attempt uses this listing.
+	listCtx, cancelList := context.WithCancel(s.ctx)
 	var (
-		recoveredMeta        *meta.Meta
-		recoveredDomainMetas domainMetas
+		listed      = make(chan struct{})
+		listedErr   error
+		listedViews []*viewpb.DataViewOfCollection
 	)
+	go func() {
+		defer close(listed)
+		listedViews, listedErr = catalog.ListAllDataViews(listCtx)
+	}()
+	defer func() {
+		cancelList()
+		<-listed
+	}()
+	// Only the first attempt uses the reads StartMetaPrefetch started; later
+	// attempts read the catalog themselves.
+	prefetched := s.metaPrefetch.Swap(nil)
+	var recoveredMeta *meta.Meta
+	var recoveredDomainMetas domainMetas
+	if prefetched != nil {
+		defer prefetched.close()
+	}
 	reloadEtcdFn := func() error {
 		metaInitializationStart := time.Now()
-		mlog.Info(s.ctx, "datacoord metadata initialization attempt started")
-		var (
-			err error
-			dm  domainMetas
-		)
-		recoveredMeta, err = meta.NewMeta(s.ctx, s.catalog, chunkManager, s.metaStore, s.broker, loadDomainMetas(s.catalog, chunkManager, &dm))
+		mlog.Info(s.ctx, "datacoord metadata initialization attempt started", mlog.Bool("prefetched", prefetched != nil))
+		var err error
+		var dm domainMetas
+		var recovery *meta.RecoveryPrefetch
+		var indexRead *conc.Future[*index.IndexMeta]
+		if prefetched != nil {
+			recovery = prefetched.recovery
+			indexRead = prefetched.indexMeta
+		}
+		recoveredMeta, err = meta.NewMetaWithoutManifestIndexes(s.ctx, s.catalog, chunkManager, s.metaStore, s.broker, loadDomainMetas(s.catalog, chunkManager, &dm, indexRead), recovery)
+		if err != nil && prefetched != nil {
+			prefetched.close()
+		}
+		prefetched = nil
 		recoveredDomainMetas = dm
 		if err != nil {
 			mlog.Warn(s.ctx, "datacoord metadata initialization attempt failed",
@@ -913,6 +963,11 @@ func (s *Server) initMeta(chunkManager storage.ChunkManager) error {
 			recoveredMeta.CloseManifestCommitExecutor()
 		}
 	}()
+	// Manifest recovery overlaps independent import recovery and the DataView
+	// catalog listing. DataView projection reads index readiness, so wait before
+	// RecoverManager. Join before closing the manifest commit executor.
+	manifestIndexes := meta.StartManifestIndexRecovery(s.ctx, recoveredMeta)
+	defer manifestIndexes.Abort()
 	// Retry each recovery phase independently: a later metadata error must
 	// not repeat newMeta's successful object-storage manifest scan.
 	var recoveredImports bulkimport.ImportMeta
@@ -924,6 +979,11 @@ func (s *Server) initMeta(chunkManager storage.ChunkManager) error {
 		return err
 	}
 
+	if err := manifestIndexes.Wait(); err != nil {
+		// Object-store reads have already retried per segment. Retrying
+		// initMeta would reread every successful manifest.
+		return retry.Unrecoverable(err)
+	}
 	// Collections come from RootCoord's MetaTable through the shared
 	// CollectionSource. Recover DataViews for live collections only, as the
 	// ShowCollections walk this replaced did.
@@ -936,7 +996,26 @@ func (s *Server) initMeta(chunkManager storage.ChunkManager) error {
 	dataViewRecoveryStart := time.Now()
 	mlog.Info(s.ctx, "datacoord DataView recovery started",
 		mlog.Int("totalCollections", len(collectionIDs)))
+	firstAttempt := true
 	if err := retry.Do(s.ctx, func() error {
+		options := []dataview.Option{
+			dataview.WithFrontierProjector(func(ctx context.Context, collectionID int64) (map[string]uint64, error) {
+				return transformFrontierBounds(ctx, recoveredMeta, recoveredImports, collectionID)
+			}),
+			dataview.WithPendingTransformProjector(func(ctx context.Context, view *viewpb.DataViewOfCollection) (map[string]uint64, error) {
+				return pendingTransformBounds(ctx, recoveredMeta, recoveredImports, view)
+			}),
+			dataview.WithRecoveryConcurrency(paramtable.Get().MetaStoreCfg.ReadConcurrency.GetAsInt()),
+		}
+		if firstAttempt {
+			firstAttempt = false
+			<-listed
+			if listedErr != nil {
+				return listedErr
+			}
+			options = append(options, dataview.WithListedDataViews(listedViews))
+			listedViews = nil
+		}
 		var err error
 		manager, err = dataview.RecoverManager(
 			s.ctx,
@@ -945,12 +1024,7 @@ func (s *Server) initMeta(chunkManager storage.ChunkManager) error {
 			recoveredMeta.LoadableProjection,
 			collectionIDs,
 			collectionVChannels,
-			dataview.WithFrontierProjector(func(ctx context.Context, collectionID int64) (map[string]uint64, error) {
-				return transformFrontierBounds(ctx, recoveredMeta, recoveredImports, collectionID)
-			}),
-			dataview.WithPendingTransformProjector(func(ctx context.Context, view *viewpb.DataViewOfCollection) (map[string]uint64, error) {
-				return pendingTransformBounds(ctx, recoveredMeta, recoveredImports, view)
-			}),
+			options...,
 		)
 		return err
 	}, retry.Attempts(connMetaMaxRetryTime)); err != nil {

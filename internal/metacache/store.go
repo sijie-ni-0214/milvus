@@ -37,6 +37,7 @@ import (
 	"github.com/milvus-io/milvus-proto/go-api/v3/schemapb"
 	"github.com/milvus-io/milvus/internal/metastore"
 	"github.com/milvus-io/milvus/internal/storage"
+	"github.com/milvus-io/milvus/internal/util/recovery"
 	"github.com/milvus-io/milvus/pkg/v3/metrics"
 	"github.com/milvus-io/milvus/pkg/v3/mlog"
 	"github.com/milvus-io/milvus/pkg/v3/proto/datapb"
@@ -193,6 +194,7 @@ type MetaStore interface {
 
 	// Loading
 	LoadFromCatalog(ctx context.Context, collectionIDs []int64, normalize SegmentNormalizer) error
+	LoadFromRecovery(ctx context.Context, collectionIDs []int64, normalize SegmentNormalizer, reads *RecoveryRead) error
 }
 
 type metaStore struct {
@@ -658,12 +660,20 @@ type allSegmentRecoveryCatalog interface {
 	ListAllSegments(context.Context) ([]*datapb.SegmentInfo, error)
 }
 
-func (s *metaStore) listRecoverySegments(ctx context.Context, collectionIDs []int64) ([][]*datapb.SegmentInfo, error) {
+func listRecoverySegments(ctx context.Context, catalog metastore.DataCoordCatalog, collectionIDs []int64) ([][]*datapb.SegmentInfo, error) {
 	if len(collectionIDs) == 0 {
 		return nil, nil
 	}
-	if catalog, ok := s.catalog.(allSegmentRecoveryCatalog); ok {
-		segments, err := catalog.ListAllSegments(ctx)
+	if catalog, ok := catalog.(allSegmentRecoveryCatalog); ok {
+		var segments []*datapb.SegmentInfo
+		var err error
+		if ranged, ok := catalog.(interface {
+			ListAllSegmentsForRecovery(context.Context, []int64) ([]*datapb.SegmentInfo, error)
+		}); ok {
+			segments, err = ranged.ListAllSegmentsForRecovery(ctx, collectionIDs)
+		} else {
+			segments, err = catalog.ListAllSegments(ctx)
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -684,7 +694,7 @@ func (s *metaStore) listRecoverySegments(ctx context.Context, collectionIDs []in
 		i := i
 		collID := collID
 		futures = append(futures, pool.Submit(func() (any, error) {
-			segments, err := s.catalog.ListSegments(ctx, collID)
+			segments, err := catalog.ListSegments(ctx, collID)
 			if err != nil {
 				return nil, err
 			}
@@ -692,7 +702,7 @@ func (s *metaStore) listRecoverySegments(ctx context.Context, collectionIDs []in
 			return nil, nil
 		}))
 	}
-	if err := conc.AwaitAll(futures...); err != nil {
+	if err := conc.BlockOnAll(futures...); err != nil {
 		return nil, err
 	}
 	return collectionSegments, nil
@@ -701,65 +711,92 @@ func (s *metaStore) listRecoverySegments(ctx context.Context, collectionIDs []in
 // LoadFromCatalog loads segments and channel checkpoints. A non-nil normalize
 // runs on every segment first; if it fails, no segment is installed.
 func (s *metaStore) LoadFromCatalog(ctx context.Context, collectionIDs []int64, normalize SegmentNormalizer) error {
-	record := timerecord.NewTimeRecorder("metaStore")
+	return s.LoadFromRecovery(ctx, collectionIDs, normalize, nil)
+}
 
-	// Recovery retries (newMeta is wrapped in retry.Do) reuse this store,
-	// because it is injected rather than rebuilt per attempt. Loading is
-	// otherwise purely additive, so a failed attempt would leave its segments
-	// behind -- and if the catalog's collection set shrank in between, those
-	// orphans stay resolvable to QueryCoord forever. Start from empty so each
-	// attempt reflects exactly what the catalog holds now.
+// LoadFromRecovery consumes an optional read-ahead snapshot. Neither normalized
+// records nor checkpoints become visible until every read and validation has
+// succeeded. A retry starts with an empty table and reads afresh.
+func (s *metaStore) LoadFromRecovery(ctx context.Context, collectionIDs []int64, normalize SegmentNormalizer, reads *RecoveryRead) error {
+	record := timerecord.NewTimeRecorder("metaStore")
 	s.segments.Store(newSegmentTable())
 	s.mu.Lock()
 	s.checkpoints = make(map[string]*msgpb.MsgPosition)
 	s.mu.Unlock()
-
-	collectionSegments, err := s.listRecoverySegments(ctx, collectionIDs)
+	if reads == nil {
+		reads = StartRecoveryRead(ctx, s.catalog, collectionIDs)
+	}
+	defer reads.Close()
+	groups, err := reads.Segments.Await()
 	if err != nil {
 		return err
 	}
-	aggregates := newSegmentRecoveryMetricAggregates()
-	for _, segments := range collectionSegments {
-		for i, segment := range segments {
-			if normalize != nil {
-				segments[i], err = normalize(segment)
-				if err != nil {
-					return err
-				}
+	// The collection view at installation is authoritative even for a prefetched scan.
+	allowed := typeutil.NewSet(collectionIDs...)
+	count := 0
+	for _, group := range groups {
+		count += len(group)
+	}
+	records := make([]*datapb.SegmentInfo, 0, count)
+	for _, group := range groups {
+		for _, segment := range group {
+			if allowed.Contain(segment.GetCollectionID()) {
+				records = append(records, segment)
 			}
-			aggregates.Add(segments[i])
 		}
 	}
-
-	channelCPs, err := s.catalog.ListChannelCheckpoint(ctx)
+	workers := recovery.Workers()
+	aggregates := make([]*segmentRecoveryMetricAggregates, workers)
+	for worker := range aggregates {
+		aggregates[worker] = newSegmentRecoveryMetricAggregates()
+	}
+	rebuilt := recovery.NewProgress(workers, 100000)
+	rebuildStart := time.Now()
+	err = recovery.ForEachInShards(len(records), workers, func(i int) int64 { return records[i].GetID() }, func(worker, i int) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if normalize != nil {
+			normalized, err := normalize(records[i])
+			if err != nil {
+				return err
+			}
+			records[i] = normalized
+		}
+		aggregates[worker].Add(records[i])
+		if completed, report := rebuilt.Add(worker); report && completed < len(records) {
+			mlog.Info(ctx, "segment recovery normalization progress", mlog.Int("completedSegments", completed), mlog.Int("totalSegments", len(records)), mlog.Duration("duration", time.Since(rebuildStart)))
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	checkpoints, err := reads.Checkpoints.Await()
 	if err != nil {
 		return err
 	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-
-	for _, segments := range collectionSegments {
-		s.LoadSegments(segments)
+	table := newRecoveredSegmentTable(records)
+	if err := ctx.Err(); err != nil {
+		return err
 	}
-	aggregates.PublishSegmentCounts()
-	aggregates.ReplayFileHistogramsAsync()
-
 	s.mu.Lock()
-	for vChannel, pos := range channelCPs {
-		pos.ChannelName = vChannel
-		s.checkpoints[vChannel] = pos
+	for channel, position := range checkpoints {
+		position.ChannelName = channel
+		s.checkpoints[channel] = position
 	}
+	s.segments.Store(table)
 	s.mu.Unlock()
-
+	for _, other := range aggregates[1:] {
+		aggregates[0].merge(other)
+	}
+	aggregates[0].PublishSegmentCounts()
+	aggregates[0].ReplayFileHistogramsAsync()
 	s.emitCheckpointMetrics()
-
-	numSegments := s.segments.Load().len()
-
-	mlog.Info(ctx, "metaStore LoadFromCatalog done",
-		mlog.Int("numSegments", numSegments),
-		mlog.Int("numCheckpoints", len(channelCPs)),
-		mlog.Duration("duration", record.ElapseSpan()))
+	mlog.Info(ctx, "metaStore LoadFromCatalog done", mlog.Int("numSegments", table.len()), mlog.Int("numCheckpoints", len(checkpoints)), mlog.Duration("duration", record.ElapseSpan()))
 	return nil
 }
 

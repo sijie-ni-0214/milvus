@@ -99,6 +99,13 @@ func TestInitMetaDoesNotReplayManifestScan(t *testing.T) {
 				metaStore: meta.NewMetaStoreWithCollections(svrCatalog, 100),
 			}
 			server.SetDataViewCollectionRecoveryValidator(func(context.Context, int64) (bool, error) {
+				// DataView validation/reconciliation must wait for the completed
+				// manifest installs, including their persisted empty-index markers.
+				for _, id := range []int64{5001, 5002} {
+					segment, found := server.metaStore.GetSegment(id)
+					require.True(t, found)
+					require.False(t, segment.GetManifestHasIndex())
+				}
 				return true, nil
 			})
 			err := server.initMeta(cm)
@@ -121,10 +128,14 @@ func TestInitMetaDoesNotReplayManifestScan(t *testing.T) {
 				require.Nil(t, server.meta)
 				require.Nil(t, server.dataViewManager)
 				require.False(t, retry.IsRecoverable(err))
-				if mode == "invalid" || mode == "dataview-failure" {
+				switch mode {
+				case "invalid":
 					require.ErrorIs(t, err, merr.ErrDataIntegrity)
 					require.Equal(t, 1, reads[bad])
-				} else {
+				case "dataview-failure":
+					require.ErrorIs(t, err, merr.ErrDataIntegrity)
+					require.LessOrEqual(t, reads[bad], 1)
+				default:
 					require.Equal(t, 3, reads[bad])
 				}
 			}

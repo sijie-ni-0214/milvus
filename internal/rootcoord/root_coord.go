@@ -178,6 +178,10 @@ type Core struct {
 
 	fileResourceObserver FileResourceObserver
 
+	// reportRecoveredCollectionIDs, when set, receives the IDs of the
+	// collections meta recovery read; see SetRecoveredCollectionIDsReporter.
+	reportRecoveredCollectionIDs func(collectionIDs []int64)
+
 	// telemetry manager for client telemetry collection and command management
 	telemetryMgr *telemetry.TelemetryManager
 }
@@ -238,6 +242,13 @@ func (c *Core) IsCollectionDropped(ctx context.Context, collectionID int64) (boo
 	default:
 		return false, merr.WrapErrDataIntegrityMsg("collection %d has unknown state %d", collectionID, collection.State)
 	}
+}
+
+// SetRecoveredCollectionIDsReporter makes meta recovery hand report the IDs of
+// the collections it read before it finishes recovering them (see
+// kvmetastore.WithRecoveredCollectionIDs). Call it before Init.
+func (c *Core) SetRecoveredCollectionIDsReporter(report func(collectionIDs []int64)) {
+	c.reportRecoveredCollectionIDs = report
 }
 
 func (c *Core) ValidateDataViewCollectionForRecovery(ctx context.Context, collectionID int64) (bool, error) {
@@ -486,7 +497,11 @@ func (c *Core) initMetaTable(initCtx context.Context) error {
 		default:
 			return retry.Unrecoverable(merr.WrapErrServiceInternalMsg("not supported meta store: %s", Params.MetaStoreCfg.MetaStoreType.GetValue()))
 		}
-		catalog = kvmetastore.NewCatalog(metaKV)
+		var options []kvmetastore.CatalogOption
+		if c.reportRecoveredCollectionIDs != nil {
+			options = append(options, kvmetastore.WithRecoveredCollectionIDs(c.reportRecoveredCollectionIDs))
+		}
+		catalog = kvmetastore.NewCatalog(metaKV, options...)
 
 		meta, err := NewMetaTable(c.ctx, catalog, c.tsoAllocator)
 		if err != nil {

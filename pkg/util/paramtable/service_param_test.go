@@ -624,6 +624,17 @@ func TestServiceParam(t *testing.T) {
 		assert.NoError(t, bt.Save(Params.MaxEtcdTxnNum.Key, "2"))
 		assert.Equal(t, 2, Params.MaxEtcdTxnNum.GetAsInt())
 		assert.NoError(t, bt.Reset(Params.MaxEtcdTxnNum.Key))
+
+		assert.Equal(t, 8, Params.ParallelScanRanges.GetAsInt())
+		for _, value := range []string{"0", "-1", "invalid"} {
+			assert.NoError(t, bt.Save(Params.ParallelScanRanges.Key, value))
+			assert.Equal(t, 1, Params.ParallelScanRanges.GetAsInt(), "an unusable value reads every prefix in one walk")
+		}
+		assert.NoError(t, bt.Save(Params.ParallelScanRanges.Key, "3"))
+		assert.Equal(t, 3, Params.ParallelScanRanges.GetAsInt())
+		assert.NoError(t, bt.Save(Params.ParallelScanRanges.Key, "1000"))
+		assert.Equal(t, 64, Params.ParallelScanRanges.GetAsInt())
+		assert.NoError(t, bt.Reset(Params.ParallelScanRanges.Key))
 	})
 
 	t.Run("test profile config", func(t *testing.T) {

@@ -27,6 +27,7 @@ import (
 // SegmentIndexCatalog is what the manifest commit path and the segment
 // readiness predicate need from the index meta. indexMeta implements it.
 type SegmentIndexCatalog interface {
+	NewManifestIndexRecovery() SegmentIndexRecovery
 	GetSegmentIndexState(collID, segmentID, indexID int64) *indexpb.SegmentIndexState
 	// GetIndexParams returns the index params of the index.
 	GetIndexParams(collID, indexID UniqueID) []*commonpb.KeyValuePair
@@ -104,3 +105,12 @@ type CompactionProtection interface {
 // with segment loading and installs the returned catalog and protection
 // before reloading segment indexes from manifests.
 type DomainMetaLoader func(ctx context.Context, collectionIDs []int64) (SegmentIndexCatalog, CompactionProtection, error)
+
+// SegmentIndexRecovery batches startup-only installs. A worker owns each
+// instance; merge only instances from the same catalog after their workers join.
+type SegmentIndexRecovery interface {
+	Install(*model.SegmentIndex)
+	Merge(SegmentIndexRecovery)
+	Finish()
+	Installed() int
+}

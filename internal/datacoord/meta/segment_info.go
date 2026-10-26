@@ -28,6 +28,7 @@ import (
 	"github.com/milvus-io/milvus-proto/go-api/v3/msgpb"
 	"github.com/milvus-io/milvus/internal/metacache"
 	"github.com/milvus-io/milvus/internal/storage"
+	"github.com/milvus-io/milvus/internal/util/recovery"
 	"github.com/milvus-io/milvus/internal/util/segmentutil"
 	"github.com/milvus-io/milvus/pkg/v3/mlog"
 	"github.com/milvus-io/milvus/pkg/v3/proto/datapb"
@@ -173,14 +174,41 @@ func NewSegmentsInfo(store metacache.MetaStore) *SegmentsInfo {
 // the compaction relations and the per-segment transient state would stay
 // empty until each segment happens to be written again.
 func (s *SegmentsInfo) RebuildFromStore() {
-	var compacted []*datapb.SegmentInfo
-	for id, segProto := range s.store.GetAllSegments() {
-		if len(segProto.GetCompactionFrom()) > 0 {
-			compacted = append(compacted, segProto)
-		}
-		s.dcState.Insert(id, newDCSegmentState(segProto))
+	snapshot := s.store.GetAllSegments()
+	records := make([]*datapb.SegmentInfo, 0, len(snapshot))
+	for _, record := range snapshot {
+		records = append(records, record)
 	}
-	s.updateCompactionTo(nil, compacted)
+	workers := recovery.Workers()
+	type relation struct{ from, child int64 }
+	// Each producer owns its row. Relations of one source end in the same
+	// merge shard, so rebuilding a large compaction needs no global map lock.
+	relations := make([][][]relation, workers)
+	for worker := range relations {
+		relations[worker] = make([][]relation, workers)
+	}
+	_ = recovery.ForEachInShards(len(records), workers, func(i int) int64 { return records[i].GetID() }, func(worker, i int) error {
+		record := records[i]
+		s.dcState.Insert(record.GetID(), newDCSegmentState(record))
+		for _, from := range record.GetCompactionFrom() {
+			shard := recovery.ShardOf(from, workers)
+			relations[worker][shard] = append(relations[worker][shard], relation{from: from, child: record.GetID()})
+		}
+		return nil
+	})
+	_ = recovery.ForEachInShards(workers, workers, func(i int) int64 { return int64(i) }, func(_, shard int) error {
+		merged := make(map[int64][]int64)
+		for _, producer := range relations {
+			for _, edge := range producer[shard] {
+				merged[edge.from] = append(merged[edge.from], edge.child)
+			}
+		}
+		for from, children := range merged {
+			slices.Sort(children)
+			s.compactionTo.Insert(from, children)
+		}
+		return nil
+	})
 }
 
 // newDCSegmentState seeds the transient state of a segment read back from the

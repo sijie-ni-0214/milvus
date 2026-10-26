@@ -54,3 +54,15 @@ func TestNameDb_GetConcurrentWithWrites(t *testing.T) {
 	}
 	<-done
 }
+
+func TestNameDbReserveKeepsEntries(t *testing.T) {
+	names := newNameDb()
+	names.insert("db", "kept", 100)
+	names.reserve("db", 1000)
+	names.reserve("missing-db", 1000)
+	names.reserve("db", 0)
+	assert.Equal(t, map[string]UniqueID{"kept": 100}, names.listCollections("db"))
+	assert.False(t, names.exist("missing-db"), "reserve never creates a database")
+	names.insert("db", "added", 200)
+	assert.Equal(t, map[string]UniqueID{"kept": 100, "added": 200}, names.listCollections("db"))
+}

@@ -446,3 +446,7 @@ func buildDataViewVersionPrefix(collectionID int64) string {
 func buildDataViewVersionKey(collectionID, streamingVersion, compactVersion int64) string {
 	return fmt.Sprintf("%s/%d/versions/%d/%d", DataViewPrefix, collectionID, streamingVersion, compactVersion)
 }
+
+func buildSegmentIndexPartitionPrefix(collectionID, partitionID typeutil.UniqueID) string {
+	return fmt.Sprintf("%s/%d/%d/", util.SegmentIndexPrefix, collectionID, partitionID)
+}

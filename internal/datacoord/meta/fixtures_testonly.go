@@ -195,14 +195,19 @@ func (s *fakeManifestStore) FailReadsFrom() {
 // submits directly to the native executor; only this test stub uses a goroutine.
 func MockManifestIndexSubmissions(t *testing.T) {
 	t.Helper()
-	mock := mockey.Mock(packed.SubmitManifestIndexInfos).To(func(ctx context.Context, io *packed.ManifestIOContext, manifest string, config *indexpb.StorageConfig, complete func([]packed.ManifestIndexInfo, error)) error {
+	submit := func(ctx context.Context, io *packed.ManifestIOContext, manifest string, config *indexpb.StorageConfig, complete func([]packed.ManifestIndexInfo, error)) error {
 		go func() {
 			entries, err := packed.GetManifestIndexInfosAsync(ctx, io, manifest, config)
 			complete(entries, err)
 		}()
 		return nil
-	}).Build()
+	}
+	mock := mockey.Mock(packed.SubmitManifestIndexInfos).To(submit).Build()
 	t.Cleanup(func() { mock.UnPatch() })
+	properties := mockey.Mock(packed.SubmitManifestIndexInfosWithProperties).To(func(ctx context.Context, io *packed.ManifestIOContext, manifest string, _ *packed.ManifestReadProperties, complete func([]packed.ManifestIndexInfo, error)) error {
+		return submit(ctx, io, manifest, CreateStorageConfig(), complete)
+	}).Build()
+	t.Cleanup(func() { properties.UnPatch() })
 }
 
 func MockManifestUpdateResult(manifestPath string, updates *packed.ManifestUpdates) packed.ManifestUpdateResult {
