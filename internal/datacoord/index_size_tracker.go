@@ -166,6 +166,22 @@ func (t *storedIndexSizeTracker) update(ctx context.Context, collectionID, index
 	setStoredIndexSizeMetric(collectionID, state.total)
 }
 
+// add applies, index by index, the additions update(ctx, collectionID, indexID,
+// 0, size) would apply, and publishes the resulting total once. The caller
+// verifies that every index is active while holding the collection-level index
+// DDL read lock.
+func (t *storedIndexSizeTracker) add(collectionID UniqueID, sizes map[UniqueID]uint64) {
+	state := t.getOrCreateCollection(collectionID)
+	state.mu.Lock()
+	defer state.mu.Unlock()
+
+	for indexID, size := range sizes {
+		state.indexSizes[indexID] += size
+		state.total += size
+	}
+	setStoredIndexSizeMetric(collectionID, state.total)
+}
+
 // deactivate removes active indexes from the aggregate in O(number of index
 // IDs). The caller holds the collection-level index DDL write lock so a late
 // FinishTask cannot recreate the metric.

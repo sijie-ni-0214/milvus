@@ -196,7 +196,7 @@ func TestReloadLocalManifestPathsReadOnlyAndLazyPersistence(t *testing.T) {
 	// Stats is deliberately nil: NewSegmentInfo fills it, so the compatibility
 	// layer must clone before constructing the in-memory segment as well.
 	for i := 0; i < 2; i++ {
-		require.NoError(t, mt.reloadFromKV(ctx, []int64{1}))
+		require.NoError(t, mt.reloadFromKV(ctx, []int64{1}, nil))
 		loaded := mt.segments.GetSegment(3)
 		require.NotNil(t, loaded)
 		assert.Equal(t, expected, loaded.GetManifestPath())
@@ -234,7 +234,7 @@ func TestReloadLocalManifestPathsReadOnlyAndLazyPersistence(t *testing.T) {
 	require.NoError(t, mt.UpdateSegmentsInfo(ctx, UpdateStatusOperator(3, commonpb.SegmentState_Dropped)))
 	assert.True(t, proto.Equal(original, raw))
 	assert.Equal(t, expected, stored.GetManifestPath())
-	require.NoError(t, mt.reloadFromKV(ctx, []int64{1}))
+	require.NoError(t, mt.reloadFromKV(ctx, []int64{1}, nil))
 	assert.Equal(t, expected, mt.segments.GetSegment(3).GetManifestPath())
 	catalog.AssertNumberOfCalls(t, "AlterSegments", 2)
 	legacyContents, err := os.ReadFile(legacyFile)
@@ -265,7 +265,7 @@ func TestReloadLocalManifestPathsRejectInvalid(t *testing.T) {
 			catalog.EXPECT().ListSegments(mock.Anything, int64(1)).Return([]*datapb.SegmentInfo{raw}, nil).Once()
 			catalog.EXPECT().ListChannelCheckpoint(mock.Anything).Return(nil, nil).Maybe()
 			mt := newLocalManifestTestMeta(t, catalog, storage.NewLocalChunkManager(objectstorage.RootPath(t.TempDir())))
-			require.ErrorIs(t, mt.reloadFromKV(context.Background(), []int64{1}), merr.ErrDataIntegrity)
+			require.ErrorIs(t, mt.reloadFromKV(context.Background(), []int64{1}, nil), merr.ErrDataIntegrity)
 			assert.Nil(t, mt.segments.GetSegment(3), "invalid metadata must never enter the segment cache")
 			assert.True(t, proto.Equal(original, raw))
 			assertLocalManifestCatalogReadOnly(t, catalog)
@@ -301,7 +301,7 @@ func TestReloadLocalManifestPathsBypass(t *testing.T) {
 				cm = mocks.NewChunkManager(t)
 			}
 			mt := newLocalManifestTestMeta(t, catalog, cm)
-			require.NoError(t, mt.reloadFromKV(context.Background(), []int64{1}))
+			require.NoError(t, mt.reloadFromKV(context.Background(), []int64{1}, nil))
 			loaded := mt.segments.GetSegment(3)
 			require.NotNil(t, loaded)
 			assert.Equal(t, tc.manifest, loaded.GetManifestPath())

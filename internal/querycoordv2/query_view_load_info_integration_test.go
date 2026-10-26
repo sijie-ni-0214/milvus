@@ -53,7 +53,7 @@ func TestQueryViewLoadInfoInitializationAndRecovery(t *testing.T) {
 		require.NoError(t, s.initMeta())
 		require.Empty(t, s.meta.GetAll(ctx))
 		// QueryView runtime owns load recovery; initMeta only restores resource groups.
-		deps := newDefaultQViewsRuntimeDependencies(storage, client, nil, s.mixCoord)
+		deps := newDefaultQViewsRuntimeDependencies(storage, queryview.NewQueryViewCatalog(storage, "coord"), client, nil, s.mixCoord)
 		t.Cleanup(func() {
 			deps.queryNodeManager.Close()
 			deps.streamingNodeHandler.Close()

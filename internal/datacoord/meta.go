@@ -26,6 +26,7 @@ import (
 	"sort"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/cockroachdb/errors"
@@ -53,6 +54,7 @@ import (
 	"github.com/milvus-io/milvus/pkg/v3/proto/internalpb"
 	"github.com/milvus-io/milvus/pkg/v3/proto/rootcoordpb"
 	"github.com/milvus-io/milvus/pkg/v3/proto/viewpb"
+	"github.com/milvus-io/milvus/pkg/v3/util/conc"
 	"github.com/milvus-io/milvus/pkg/v3/util/funcutil"
 	"github.com/milvus-io/milvus/pkg/v3/util/lock"
 	"github.com/milvus-io/milvus/pkg/v3/util/merr"
@@ -154,6 +156,10 @@ type meta struct {
 	segmentChangeGroups      map[int64]*model.SegmentChangeGroup
 	stagedSegmentToGroup     map[int64]int64
 	supersededSegmentToGroup map[int64]int64
+
+	// manifestReadPrefetch, when set, holds manifest reads started ahead of
+	// recovery; reloadSegmentIndexesFromManifests takes it.
+	manifestReadPrefetch *conc.Future[*manifestReadPrefetch]
 }
 
 func (m *meta) GetIndexMeta() *indexMeta {
@@ -234,6 +240,12 @@ func (m *meta) closeManifestCommitExecutor() {
 const (
 	collectionRecoveryProgressLogInterval   = 10000
 	segmentCacheRecoveryProgressLogInterval = 100000
+	// collectionCacheRecoveryConcurrency bounds the collections looked up at
+	// once while the collection cache is rebuilt. The lookups are in-process
+	// RootCoord tasks that RootCoord partly serializes (each one takes a
+	// collection-level KeyLock), so the speedup levels off after a few workers;
+	// the bound leaves headroom above that point.
+	collectionCacheRecoveryConcurrency = 16
 )
 
 // NewMeta creates meta from provided `kv.TxnKV`
@@ -247,6 +259,32 @@ func newMeta(ctx context.Context, catalog metastore.DataCoordCatalog, chunkManag
 // QueryCoord reads segments.
 func newMetaWithPersist(ctx context.Context, catalog metastore.DataCoordCatalog, chunkManager storage.ChunkManager, metaStore metacache.MetaStore, broker broker.Broker,
 	segmentPersist OptimisticTxnPersist[string, *datapb.SegmentInfo], metaRootPath string,
+) (*meta, error) {
+	mt, err := newMetaWithoutManifestIndexes(ctx, catalog, chunkManager, metaStore, broker, segmentPersist, metaRootPath, nil)
+	if err != nil {
+		return nil, err
+	}
+	// Recovery follows the durable storage location, not the current write
+	// mode. A segment marked manifest_has_index may contain records published
+	// while the switch was previously on, so it must still be loaded after the
+	// switch is turned off. Unmarked clusters perform no manifest reads.
+	if err := mt.reloadSegmentIndexesFromManifests(ctx); err != nil {
+		mt.closeManifestCommitExecutor()
+		// Object-store reads have already retried per segment. Re-entering
+		// initMeta's metastore retry would reread every successful manifest.
+		return nil, retry.Unrecoverable(err)
+	}
+	return mt, nil
+}
+
+// newMetaWithoutManifestIndexes is newMetaWithPersist without recovering the
+// segment indexes recorded in segment manifests, which needs only the
+// segments and the index meta it recovers. The caller must run
+// reloadSegmentIndexesFromManifests before the meta is used. A non-nil
+// prefetched supplies the index meta, segment records and channel checkpoints
+// instead of reading them; it requires segmentPersist.
+func newMetaWithoutManifestIndexes(ctx context.Context, catalog metastore.DataCoordCatalog, chunkManager storage.ChunkManager, metaStore metacache.MetaStore, broker broker.Broker,
+	segmentPersist OptimisticTxnPersist[string, *datapb.SegmentInfo], metaRootPath string, prefetched *metaPrefetch,
 ) (*meta, error) {
 	metaRecoveryStart := time.Now()
 	mlog.Info(ctx, "datacoord meta recovery started")
@@ -295,6 +333,10 @@ func newMetaWithPersist(ctx context.Context, catalog metastore.DataCoordCatalog,
 	if segmentPersist != nil {
 		mt.segmentStore = newCASSegmentStore(segmentPersist, catalog, metaRootPath)
 	}
+	if prefetched != nil {
+		mt.segmentStore = prefetched.store
+		mt.manifestReadPrefetch = prefetched.manifests
+	}
 
 	initialized := false
 	defer func() {
@@ -308,7 +350,11 @@ func newMetaWithPersist(ctx context.Context, catalog metastore.DataCoordCatalog,
 
 	g.Go(func() error {
 		var err error
-		im, err = newIndexMeta(ctx, catalog)
+		if prefetched != nil {
+			im, err = prefetched.indexMeta.Await()
+		} else {
+			im, err = recoverIndexMeta(ctx, catalog, collectionIDs)
+		}
 		return err
 	})
 
@@ -370,7 +416,7 @@ func newMetaWithPersist(ctx context.Context, catalog metastore.DataCoordCatalog,
 
 	// reloadFromKV loads segments + channel checkpoints in parallel with sub-meta loading.
 	g.Go(func() error {
-		return mt.reloadFromKV(ctx, collectionIDs)
+		return mt.reloadFromKV(ctx, collectionIDs, prefetched)
 	})
 
 	if err := g.Wait(); err != nil {
@@ -391,16 +437,6 @@ func newMetaWithPersist(ctx context.Context, catalog metastore.DataCoordCatalog,
 	mt.statsTaskMeta = stm
 	mt.externalCollectionRefreshMeta = ecrm
 	mt.snapshotMeta = spm
-
-	// Recovery follows the durable storage location, not the current write
-	// mode. A segment marked manifest_has_index may contain records published
-	// while the switch was previously on, so it must still be loaded after the
-	// switch is turned off. Unmarked clusters perform no manifest reads.
-	if err := mt.reloadSegmentIndexesFromManifests(ctx); err != nil {
-		// Object-store reads have already retried per segment. Re-entering
-		// initMeta's metastore retry would reread every successful manifest.
-		return nil, retry.Unrecoverable(err)
-	}
 
 	// Segment change groups load AFTER segments are in memory: the recovery
 	// index build exempts L0 superseded parents, which requires segment levels
@@ -455,6 +491,23 @@ func (a *segmentRecoveryMetricAggregates) Add(info *SegmentInfo) {
 	a.deleteFileCountFrequency[stats.GetDeltaBinlogCount()]++
 }
 
+// merge adds the aggregates of other.
+func (a *segmentRecoveryMetricAggregates) merge(other *segmentRecoveryMetricAggregates) {
+	for labels, count := range other.segmentCounts {
+		a.segmentCounts[labels] += count
+	}
+	for fileCount, frequency := range other.insertFileCountFrequency {
+		a.insertFileCountFrequency[fileCount] += frequency
+	}
+	for fileCount, frequency := range other.statFileCountFrequency {
+		a.statFileCountFrequency[fileCount] += frequency
+	}
+	for fileCount, frequency := range other.deleteFileCountFrequency {
+		a.deleteFileCountFrequency[fileCount] += frequency
+	}
+	a.numStoredRows += other.numStoredRows
+}
+
 func (a *segmentRecoveryMetricAggregates) PublishSegmentCounts() {
 	metrics.DataCoordNumSegments.Reset()
 	for labels, count := range a.segmentCounts {
@@ -489,15 +542,75 @@ func (a *segmentRecoveryMetricAggregates) ReplayFileHistogramsAsync() {
 // cache, normalized by segmentLoadNormalizer, and the channel checkpoints into
 // the shared store. newMeta then attaches the cache to the shared store as its
 // segment storage.
-func (m *meta) reloadFromKV(ctx context.Context, collectionIDs []int64) error {
+func (m *meta) reloadFromKV(ctx context.Context, collectionIDs []int64, prefetched *metaPrefetch) error {
 	record := timerecord.NewTimeRecorder("datacoord")
 
+	// The channel checkpoints do not depend on the segments: scan them
+	// meanwhile. A segment error still takes precedence.
+	checkpointCtx, cancelCheckpointScan := context.WithCancel(m.ctx)
+	defer cancelCheckpointScan()
+	var channelCPs map[string]*msgpb.MsgPosition
+	var checkpointErr error
+	checkpointScanDone := make(chan struct{})
+	go func() {
+		defer close(checkpointScanDone)
+		checkpointScanStart := time.Now()
+		mlog.Info(ctx, "datacoord channel checkpoint catalog scan started")
+		if prefetched != nil {
+			channelCPs, checkpointErr = prefetched.checkpoints.Await()
+		} else {
+			channelCPs, checkpointErr = m.catalog.ListChannelCheckpoint(checkpointCtx)
+		}
+		if checkpointErr == nil {
+			mlog.Info(ctx, "datacoord channel checkpoint catalog scan done",
+				mlog.Int("numChannelCheckpoints", len(channelCPs)),
+				mlog.Duration("duration", time.Since(checkpointScanStart)))
+		}
+	}()
+
+	aggregates, numSegments, err := m.reloadSegments(ctx, collectionIDs, prefetched)
+	if err != nil {
+		cancelCheckpointScan()
+		<-checkpointScanDone
+		return err
+	}
+	<-checkpointScanDone
+	if checkpointErr != nil {
+		return checkpointErr
+	}
+	checkpointCacheBuildStart := time.Now()
+	m.metaStore.ReplaceChannelCheckpoints(channelCPs)
+	mlog.Info(ctx, "datacoord channel checkpoint cache rebuild done",
+		mlog.Int("numChannelCheckpoints", len(channelCPs)),
+		mlog.Duration("duration", time.Since(checkpointCacheBuildStart)))
+	aggregates.ReplayFileHistogramsAsync()
+
+	mlog.Info(ctx, "DataCoord meta reloadFromKV done",
+		mlog.Int("numSegments", numSegments),
+		mlog.Duration("duration", record.ElapseSpan()))
+	return nil
+}
+
+// reloadSegments loads the segments with their store versions into the
+// segment cache and publishes their counts.
+func (m *meta) reloadSegments(ctx context.Context, collectionIDs []int64, prefetched *metaPrefetch) (*segmentRecoveryMetricAggregates, int, error) {
 	scanStart := time.Now()
 	mlog.Info(ctx, "datacoord segment catalog scan started",
-		mlog.Int("numCollections", len(collectionIDs)))
-	segments, versions, err := m.store().ListSegments(m.ctx, collectionIDs)
+		mlog.Int("numCollections", len(collectionIDs)), mlog.Bool("prefetched", prefetched != nil))
+	var (
+		segments []*datapb.SegmentInfo
+		versions []int64
+		err      error
+	)
+	if prefetched != nil {
+		var scan prefetchedSegments
+		scan, err = prefetched.segments.Await()
+		segments, versions = scan.records, scan.versions
+	} else {
+		segments, versions, err = m.store().ListSegments(m.ctx, collectionIDs)
+	}
 	if err != nil {
-		return err
+		return nil, 0, err
 	}
 	numSegments := len(segments)
 	mlog.Info(ctx, "datacoord segment catalog scan done",
@@ -510,50 +623,61 @@ func (m *meta) reloadFromKV(ctx context.Context, collectionIDs []int64) error {
 	// count the segments; the counts of all of them are published at once,
 	// replacing any left by an earlier recovery attempt.
 	m.segments.store.ClearSegments()
-	aggregates := newSegmentRecoveryMetricAggregates()
-	normalize := m.segmentLoadNormalizer()
-	for i, segment := range segments {
-		normalized, err := normalize(segment)
-		if err != nil {
-			return err
-		}
-		info := NewSegmentInfo(normalized)
-		m.segments.LoadSegment(normalized.GetID(), info, versions[i])
-		aggregates.Add(info)
-		recoveredSegments := i + 1
-		if recoveredSegments%segmentCacheRecoveryProgressLogInterval == 0 && recoveredSegments < numSegments {
-			mlog.Info(ctx, "datacoord segment cache rebuild progress",
-				mlog.Int("completedSegments", recoveredSegments),
-				mlog.Int("totalSegments", numSegments),
-				mlog.Duration("duration", time.Since(segmentCacheBuildStart)))
-		}
+	aggregates, err := m.installRecoveredSegments(ctx, segments, versions)
+	if err != nil {
+		return nil, 0, err
 	}
 	aggregates.PublishSegmentCounts()
 	mlog.Info(ctx, "datacoord segment cache rebuild done",
 		mlog.Int("numSegments", numSegments),
 		mlog.Int64("numStoredRows", aggregates.numStoredRows),
 		mlog.Duration("duration", time.Since(segmentCacheBuildStart)))
+	return aggregates, numSegments, nil
+}
 
-	checkpointScanStart := time.Now()
-	mlog.Info(ctx, "datacoord channel checkpoint catalog scan started")
-	channelCPs, err := m.catalog.ListChannelCheckpoint(m.ctx)
-	if err != nil {
-		return err
+// installRecoveredSegments normalizes the recovered segments and installs them
+// at their versions into the segment cache, on recovery workers sharded by
+// segment ID: the records of one segment ID are installed in scan order, as
+// one pass over them in order would. The compaction relations, keyed by the
+// segments compacted from, are replayed afterwards sharded by those, in scan
+// order too. A normalization error is the one such a pass would stop at.
+func (m *meta) installRecoveredSegments(ctx context.Context, segments []*datapb.SegmentInfo, versions []int64) (*segmentRecoveryMetricAggregates, error) {
+	start := time.Now()
+	workers := recoveryWorkers()
+	normalize := m.segmentLoadNormalizer()
+	aggregates := make([]*segmentRecoveryMetricAggregates, workers)
+	compactToChanges := make([][][]compactToChange, workers)
+	for worker := range workers {
+		aggregates[worker] = newSegmentRecoveryMetricAggregates()
+		compactToChanges[worker] = make([][]compactToChange, workers)
 	}
-	mlog.Info(ctx, "datacoord channel checkpoint catalog scan done",
-		mlog.Int("numChannelCheckpoints", len(channelCPs)),
-		mlog.Duration("duration", time.Since(checkpointScanStart)))
-	checkpointCacheBuildStart := time.Now()
-	m.metaStore.ReplaceChannelCheckpoints(channelCPs)
-	mlog.Info(ctx, "datacoord channel checkpoint cache rebuild done",
-		mlog.Int("numChannelCheckpoints", len(channelCPs)),
-		mlog.Duration("duration", time.Since(checkpointCacheBuildStart)))
-	aggregates.ReplayFileHistogramsAsync()
-
-	mlog.Info(ctx, "DataCoord meta reloadFromKV done",
-		mlog.Int("numSegments", numSegments),
-		mlog.Duration("duration", record.ElapseSpan()))
-	return nil
+	installed := newRecoveryProgress(workers, segmentCacheRecoveryProgressLogInterval)
+	err := forEachInShards(len(segments), workers, func(i int) int64 { return segments[i].GetID() }, func(worker, i int) error {
+		normalized, err := normalize(segments[i])
+		if err != nil {
+			return err
+		}
+		info := NewSegmentInfo(normalized)
+		if old, applied := m.segments.loadRecovered(normalized.GetID(), info, versions[i]); applied {
+			appendCompactToChanges(compactToChanges[worker], i, old, normalized)
+		}
+		aggregates[worker].Add(info)
+		if done, report := installed.add(worker); report && done < len(segments) {
+			mlog.Info(ctx, "datacoord segment cache rebuild progress",
+				mlog.Int("completedSegments", done),
+				mlog.Int("totalSegments", len(segments)),
+				mlog.Duration("duration", time.Since(start)))
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	m.segments.replayCompactTo(compactToChanges)
+	for _, other := range aggregates[1:] {
+		aggregates[0].merge(other)
+	}
+	return aggregates[0], nil
 }
 
 // segmentLoadNormalizer prepares each segment read back from the catalog
@@ -647,75 +771,84 @@ func (m *meta) reloadCollectionsFromRootcoord(ctx context.Context, broker broker
 		mlog.Duration("showCollectionsRPCDuration", showCollectionsDuration),
 		mlog.Duration("duration", time.Since(recoveryStart)))
 
+	// The collections are looked up concurrently, so the RPC durations, which
+	// sum the call latencies, can exceed the wall-clock "duration"; their sum
+	// divided by it is the average number of lookups in flight.
 	collectionCacheBuildStart := time.Now()
-	describeCollectionRPCDuration := time.Duration(0)
-	showPartitionsRPCDuration := time.Duration(0)
-	slowestCollectionID := int64(0)
-	slowestCollectionDuration := time.Duration(0)
+	var (
+		failed atomic.Bool
+
+		mu                            sync.Mutex // guards the fields below
+		describeCollectionRPCDuration time.Duration
+		showPartitionsRPCDuration     time.Duration
+		completedCollections          int
+		slowestCollectionID           int64
+		slowestCollectionDuration     time.Duration // of the collection's two lookups
+		failedIndex                   = -1          // the lowest index of a failed lookup
+		failure                       collectionLookup
+	)
+	infos := make([]*collectionInfo, len(collectionIDs))
+	var g errgroup.Group
+	g.SetLimit(collectionCacheRecoveryConcurrency)
 	for index, collectionID := range collectionIDs {
-		collectionStart := time.Now()
-
-		describeStart := time.Now()
-		descResp, err := broker.DescribeCollectionInternal(ctx, collectionID)
-		describeDuration := time.Since(describeStart)
-		describeCollectionRPCDuration += describeDuration
-		if err != nil {
-			mlog.Warn(ctx, "datacoord collection cache recovery failed",
-				mlog.String("stage", "DescribeCollectionInternal"),
-				mlog.FieldCollectionID(collectionID),
-				mlog.Int("completedCollections", index),
-				mlog.Int("totalCollections", len(collectionIDs)),
-				mlog.Duration("callDuration", describeDuration),
-				mlog.Err(err))
-			return err
+		// Start no lookups after a failure; the running ones finish.
+		if failed.Load() {
+			break
 		}
-
-		showPartitionsStart := time.Now()
-		partitionIDs, err := broker.ShowPartitionsInternal(ctx, collectionID)
-		showPartitionsDuration := time.Since(showPartitionsStart)
-		showPartitionsRPCDuration += showPartitionsDuration
-		if err != nil {
-			mlog.Warn(ctx, "datacoord collection cache recovery failed",
-				mlog.String("stage", "ShowPartitionsInternal"),
-				mlog.FieldCollectionID(collectionID),
-				mlog.Int("completedCollections", index),
-				mlog.Int("totalCollections", len(collectionIDs)),
-				mlog.Duration("callDuration", showPartitionsDuration),
-				mlog.Err(err))
-			return err
-		}
-
-		m.addCollectionToCache(&collectionInfo{
-			ID:             collectionID,
-			Schema:         descResp.GetSchema(),
-			Partitions:     partitionIDs,
-			StartPositions: descResp.GetStartPositions(),
-			Properties:     funcutil.KeyValuePair2Map(descResp.GetProperties()),
-			CreatedAt:      descResp.GetCreatedTimestamp(),
-			DatabaseName:   descResp.GetDbName(),
-			DatabaseID:     descResp.GetDbId(),
-			VChannelNames:  descResp.GetVirtualChannelNames(),
+		g.Go(func() error {
+			lookup := lookupCollectionForCache(ctx, broker, collectionID)
+			mu.Lock()
+			defer mu.Unlock()
+			describeCollectionRPCDuration += lookup.describeDuration
+			showPartitionsRPCDuration += lookup.showPartitionsDuration
+			if lookup.err != nil {
+				if failedIndex < 0 || index < failedIndex {
+					failedIndex, failure = index, lookup
+				}
+				failed.Store(true)
+				return lookup.err
+			}
+			infos[index] = lookup.info
+			if collectionDuration := lookup.describeDuration + lookup.showPartitionsDuration; collectionDuration > slowestCollectionDuration {
+				slowestCollectionID = collectionID
+				slowestCollectionDuration = collectionDuration
+			}
+			completedCollections++
+			if completedCollections%collectionRecoveryProgressLogInterval == 0 && completedCollections < len(collectionIDs) {
+				mlog.Info(ctx, "datacoord collection cache recovery progress",
+					mlog.Int("completedCollections", completedCollections),
+					mlog.Int("totalCollections", len(collectionIDs)),
+					mlog.Duration("averageCollectionDuration", time.Since(collectionCacheBuildStart)/time.Duration(completedCollections)),
+					mlog.Duration("describeCollectionRPCDuration", describeCollectionRPCDuration),
+					mlog.Duration("showPartitionsRPCDuration", showPartitionsRPCDuration),
+					mlog.Int64("slowestCollectionID", slowestCollectionID),
+					mlog.Duration("slowestCollectionDuration", slowestCollectionDuration),
+					mlog.Duration("duration", time.Since(collectionCacheBuildStart)))
+			}
+			return nil
 		})
-
-		if collectionDuration := time.Since(collectionStart); collectionDuration > slowestCollectionDuration {
-			slowestCollectionID = collectionID
-			slowestCollectionDuration = collectionDuration
-		}
-		completedCollections := index + 1
-		if completedCollections%collectionRecoveryProgressLogInterval == 0 && completedCollections < len(collectionIDs) {
-			mlog.Info(ctx, "datacoord collection cache recovery progress",
-				mlog.Int("completedCollections", completedCollections),
-				mlog.Int("totalCollections", len(collectionIDs)),
-				mlog.Duration("averageCollectionDuration", time.Since(collectionCacheBuildStart)/time.Duration(completedCollections)),
-				mlog.Duration("describeCollectionRPCDuration", describeCollectionRPCDuration),
-				mlog.Duration("showPartitionsRPCDuration", showPartitionsRPCDuration),
-				mlog.Int64("slowestCollectionID", slowestCollectionID),
-				mlog.Duration("slowestCollectionDuration", slowestCollectionDuration),
-				mlog.Duration("duration", time.Since(collectionCacheBuildStart)))
-		}
+	}
+	if g.Wait() != nil {
+		// Return the first failure in list order, not the earliest in time:
+		// every collection listed before it was dispatched before it and has
+		// finished, so the outcome does not depend on scheduling.
+		mlog.Warn(ctx, "datacoord collection cache recovery failed",
+			mlog.String("stage", failure.stage),
+			mlog.FieldCollectionID(collectionIDs[failedIndex]),
+			mlog.Int("completedCollections", completedCollections),
+			mlog.Int("totalCollections", len(collectionIDs)),
+			mlog.Duration("callDuration", failure.callDuration),
+			mlog.Err(failure.err))
+		return failure.err
+	}
+	// Install in list order once every lookup succeeded; a failed attempt
+	// installs nothing.
+	for _, info := range infos {
+		m.addCollectionToCache(info)
 	}
 	mlog.Info(ctx, "datacoord collection cache recovery done",
 		mlog.Int("numCollections", len(collectionIDs)),
+		mlog.Int("concurrency", collectionCacheRecoveryConcurrency),
 		mlog.Duration("describeCollectionRPCDuration", describeCollectionRPCDuration),
 		mlog.Duration("showPartitionsRPCDuration", showPartitionsRPCDuration),
 		mlog.Int64("slowestCollectionID", slowestCollectionID),
@@ -723,6 +856,53 @@ func (m *meta) reloadCollectionsFromRootcoord(ctx context.Context, broker broker
 		mlog.Duration("duration", time.Since(collectionCacheBuildStart)),
 		mlog.Duration("totalDuration", time.Since(recoveryStart)))
 	return nil
+}
+
+// collectionLookup is the outcome of looking up one collection for the
+// collection cache.
+type collectionLookup struct {
+	info                   *collectionInfo
+	describeDuration       time.Duration
+	showPartitionsDuration time.Duration
+	// On failure: the failed call, its duration and its error.
+	stage        string
+	callDuration time.Duration
+	err          error
+}
+
+// lookupCollectionForCache describes a collection and lists its partitions
+// through RootCoord, building its collection cache entry. A failed describe
+// skips the partition listing.
+func lookupCollectionForCache(ctx context.Context, broker broker.Broker, collectionID int64) collectionLookup {
+	var lookup collectionLookup
+	describeStart := time.Now()
+	descResp, err := broker.DescribeCollectionInternal(ctx, collectionID)
+	lookup.describeDuration = time.Since(describeStart)
+	if err != nil {
+		lookup.stage, lookup.callDuration, lookup.err = "DescribeCollectionInternal", lookup.describeDuration, err
+		return lookup
+	}
+
+	showPartitionsStart := time.Now()
+	partitionIDs, err := broker.ShowPartitionsInternal(ctx, collectionID)
+	lookup.showPartitionsDuration = time.Since(showPartitionsStart)
+	if err != nil {
+		lookup.stage, lookup.callDuration, lookup.err = "ShowPartitionsInternal", lookup.showPartitionsDuration, err
+		return lookup
+	}
+
+	lookup.info = &collectionInfo{
+		ID:             collectionID,
+		Schema:         descResp.GetSchema(),
+		Partitions:     partitionIDs,
+		StartPositions: descResp.GetStartPositions(),
+		Properties:     funcutil.KeyValuePair2Map(descResp.GetProperties()),
+		CreatedAt:      descResp.GetCreatedTimestamp(),
+		DatabaseName:   descResp.GetDbName(),
+		DatabaseID:     descResp.GetDbId(),
+		VChannelNames:  descResp.GetVirtualChannelNames(),
+	}
+	return lookup
 }
 
 // addCollectionToCache puts a collection into MetaStore and invalidates its
@@ -3545,7 +3725,6 @@ func (m *meta) dropLandedOutputs(r *segmentReader, input *SegmentInfo, result *d
 }
 
 func (m *meta) ValidateSegmentStateBeforeCompleteCompactionMutation(t *datapb.CompactionTask) error {
-
 	// Snapshot compaction protection exists to keep the sealed-segment list stable during
 	// backfill — if an L1/L2 segment gets merged away mid-backfill, the backfill breaks.
 	// L0 segments are transient delete-log carriers, not part of that stable list, and
@@ -3773,7 +3952,6 @@ func isSegmentHealthy(segment *SegmentInfo) bool {
 }
 
 func (m *meta) HasSegments(segIDs []UniqueID) (bool, error) {
-
 	for _, segID := range segIDs {
 		if m.segments.GetSegment(segID) == nil {
 			return false, merr.WrapErrServiceInternalMsg("segment is not exist with ID = %d", segID)
@@ -3784,7 +3962,6 @@ func (m *meta) HasSegments(segIDs []UniqueID) (bool, error) {
 
 // GetCompactionTo returns the segment info of the segment to be compacted to.
 func (m *meta) GetCompactionTo(segmentID int64) ([]*SegmentInfo, bool) {
-
 	return m.segments.GetCompactionTo(segmentID)
 }
 

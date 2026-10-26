@@ -466,24 +466,58 @@ func (kc *Catalog) CreateIndex(ctx context.Context, index *model.Index) error {
 }
 
 func (kc *Catalog) ListIndexes(ctx context.Context) ([]*model.Index, error) {
-	indexes := make([]*model.Index, 0)
-	applyFn := func(key []byte, value []byte) error {
-		meta := &indexpb.FieldIndex{}
-		err := proto.Unmarshal(value, meta)
+	return kc.ListIndexesForRecovery(ctx, nil)
+}
+
+// ListIndexesForRecovery lists every field index like ListIndexes, reading the
+// prefix as metastore.parallelScanRanges key ranges split at collectionIDs,
+// in parallel at one revision, each decoded in the goroutine of its range.
+// The indexes come back in key order, as from one walk.
+func (kc *Catalog) ListIndexesForRecovery(ctx context.Context, collectionIDs []int64) ([]*model.Index, error) {
+	return listInRanges(ctx, kc.MetaKv, util.FieldIndexPrefix+"/", collectionIDs, kc.paginationSize,
+		func(_ []byte, value []byte) (*model.Index, error) {
+			meta := &indexpb.FieldIndex{}
+			if err := proto.Unmarshal(value, meta); err != nil {
+				mlog.Warn(ctx, "unmarshal index info failed", mlog.Err(err))
+				return nil, err
+			}
+			return model.UnmarshalIndexModel(meta), nil
+		})
+}
+
+// listInRanges decodes every key under prefix into a T, walking the prefix as
+// metastore.parallelScanRanges key ranges split at collectionIDs (see
+// kv.WalkWithPrefixInRanges), and returns the T in key order.
+func listInRanges[T any](
+	ctx context.Context,
+	metaKv kv.MetaKv,
+	prefix string,
+	collectionIDs []int64,
+	paginationSize int,
+	decode func(key, value []byte) (T, error),
+) ([]T, error) {
+	bounds := kv.RangeBounds(prefix, collectionIDs, paramtable.Get().MetaStoreCfg.ParallelScanRanges.GetAsInt())
+	ranges := make([][]T, len(bounds)+1)
+	err := kv.WalkWithPrefixInRanges(ctx, metaKv, prefix, bounds, paginationSize, func(rangeIndex int, key, value []byte) error {
+		item, err := decode(key, value)
 		if err != nil {
-			mlog.Warn(ctx, "unmarshal index info failed", mlog.Err(err))
 			return err
 		}
-
-		indexes = append(indexes, model.UnmarshalIndexModel(meta))
+		ranges[rangeIndex] = append(ranges[rangeIndex], item)
 		return nil
-	}
-
-	err := kc.MetaKv.WalkWithPrefix(ctx, util.FieldIndexPrefix+"/", kc.paginationSize, applyFn)
+	})
 	if err != nil {
 		return nil, err
 	}
-	return indexes, nil
+	total := 0
+	for _, items := range ranges {
+		total += len(items)
+	}
+	all := make([]T, 0, total)
+	for _, items := range ranges {
+		all = append(all, items...)
+	}
+	return all, nil
 }
 
 func (kc *Catalog) AlterIndexes(ctx context.Context, indexes []*model.Index) error {
@@ -561,43 +595,45 @@ func (kc *Catalog) CreateSegmentIndex(ctx context.Context, segIdx *model.Segment
 	return nil
 }
 
-func (kc *Catalog) listSegmentIndexesWithPrefix(ctx context.Context, prefix string) ([]*model.SegmentIndex, error) {
-	segIndexes := make([]*model.SegmentIndex, 0)
-	applyFn := func(key []byte, value []byte) error {
-		segmentIndexInfo := &indexpb.SegmentIndex{}
-		err := proto.Unmarshal(value, segmentIndexInfo)
-		if err != nil {
-			mlog.Warn(ctx, "unmarshal segment index info failed", mlog.Err(err))
-			return err
-		}
-
-		segIndexes = append(segIndexes, model.UnmarshalSegmentIndexModel(segmentIndexInfo))
-		return nil
-	}
-
+// listSegmentIndexesWithPrefix lists the segment indexes under prefix, in key
+// order; collectionIDs split a prefix of several collections into parallel
+// ranges (see listInRanges).
+func (kc *Catalog) listSegmentIndexesWithPrefix(ctx context.Context, prefix string, collectionIDs []int64) ([]*model.SegmentIndex, error) {
 	paginationSize := kc.paginationSize
 	if paginationSize <= 0 || paginationSize > segmentIndexPaginationSize {
 		paginationSize = segmentIndexPaginationSize
 	}
-	err := kc.MetaKv.WalkWithPrefix(ctx, prefix, paginationSize, applyFn)
-	if err != nil {
-		return nil, err
-	}
-
-	return segIndexes, nil
+	return listInRanges(ctx, kc.MetaKv, prefix, collectionIDs, paginationSize,
+		func(_ []byte, value []byte) (*model.SegmentIndex, error) {
+			segmentIndexInfo := &indexpb.SegmentIndex{}
+			if err := proto.Unmarshal(value, segmentIndexInfo); err != nil {
+				mlog.Warn(ctx, "unmarshal segment index info failed", mlog.Err(err))
+				return nil, err
+			}
+			return model.UnmarshalSegmentIndexModel(segmentIndexInfo), nil
+		})
 }
 
 func (kc *Catalog) ListSegmentIndexes(ctx context.Context, collectionID int64) ([]*model.SegmentIndex, error) {
-	return kc.listSegmentIndexesWithPrefix(ctx, buildSegmentIndexCollectionPrefix(collectionID))
+	return kc.listSegmentIndexesWithPrefix(ctx, buildSegmentIndexCollectionPrefix(collectionID), nil)
 }
 
 // ListAllSegmentIndexes scans the global segment-index prefix for metadata recovery.
 func (kc *Catalog) ListAllSegmentIndexes(ctx context.Context) ([]*model.SegmentIndex, error) {
-	return kc.listSegmentIndexesWithPrefix(ctx, util.SegmentIndexPrefix+"/")
+	return kc.ListAllSegmentIndexesForRecovery(ctx, nil)
+}
+
+// ListAllSegmentIndexesForRecovery lists every segment index like
+// ListAllSegmentIndexes, reading the prefix as metastore.parallelScanRanges
+// key ranges split at collectionIDs, in parallel at one revision, each decoded
+// in the goroutine of its range. The indexes come back in key order, as from
+// one walk.
+func (kc *Catalog) ListAllSegmentIndexesForRecovery(ctx context.Context, collectionIDs []int64) ([]*model.SegmentIndex, error) {
+	return kc.listSegmentIndexesWithPrefix(ctx, util.SegmentIndexPrefix+"/", collectionIDs)
 }
 
 func (kc *Catalog) ListPartitionSegmentIndexes(ctx context.Context, collectionID, partitionID int64) ([]*model.SegmentIndex, error) {
-	return kc.listSegmentIndexesWithPrefix(ctx, buildSegmentIndexPartitionPrefix(collectionID, partitionID))
+	return kc.listSegmentIndexesWithPrefix(ctx, buildSegmentIndexPartitionPrefix(collectionID, partitionID), nil)
 }
 
 func (kc *Catalog) AlterSegmentIndexes(ctx context.Context, segIdxes []*model.SegmentIndex) error {

@@ -425,6 +425,11 @@ func TestReconcileOrphanImportSegments(t *testing.T) {
 	_, err = addImportSegment(ctx, meta, 103, 998, 998, 2, 3, "v0", datapb.SegmentLevel_L1, 1, 4)
 	require.NoError(t, err)
 	require.NoError(t, meta.UpdateSegmentsInfo(ctx, UpdateStatusOperator(103, commonpb.SegmentState_Dropped)))
+	// A segment that is not importing is never an orphan, referenced or not.
+	require.NoError(t, meta.AddSegment(ctx, NewSegmentInfo(&datapb.SegmentInfo{
+		ID: 104, CollectionID: 2, PartitionID: 3, InsertChannel: "v0",
+		State: commonpb.SegmentState_Flushed, Level: datapb.SegmentLevel_L1,
+	})))
 
 	v3task := newImportTaskV3(&datapb.ImportTaskV3{JobId: 1, TaskId: 10, CollectionId: 2, SegmentId: 100}, importMeta, meta, nil)
 	require.NoError(t, importMeta.AddTask(ctx, v3task))
@@ -440,6 +445,7 @@ func TestReconcileOrphanImportSegments(t *testing.T) {
 	require.Equal(t, commonpb.SegmentState_Importing, meta.GetSegment(ctx, 101).GetState())
 	require.Equal(t, commonpb.SegmentState_Dropped, meta.GetSegment(ctx, 102).GetState())
 	require.Equal(t, commonpb.SegmentState_Dropped, meta.GetSegment(ctx, 103).GetState())
+	require.Equal(t, commonpb.SegmentState_Flushed, meta.GetSegment(ctx, 104).GetState())
 }
 
 // TestImportTaskV3QueryRetryPreparesFreshRun pins the Retry branch of the query

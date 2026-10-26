@@ -17,6 +17,7 @@
 package datacoord
 
 import (
+	"cmp"
 	"context"
 	"fmt"
 	"slices"
@@ -290,6 +291,120 @@ func (s *SegmentsInfo) SetSegment(segmentID UniqueID, segment *SegmentInfo, vers
 // publishes the counts of all loaded segments at once.
 func (s *SegmentsInfo) LoadSegment(segmentID UniqueID, segment *SegmentInfo, version int64) {
 	s.install(segmentID, segment, version, s.store.LoadSegment)
+}
+
+// loadRecovered installs a segment read back by recovery like LoadSegment,
+// except for its compaction relations, which recovery replays once every
+// segment is installed (see replayCompactTo). It returns the value the
+// segment replaced and whether the write applied. Installs of different
+// segments may run concurrently.
+func (s *SegmentsInfo) loadRecovered(segmentID UniqueID, segment *SegmentInfo, version int64) (*datapb.SegmentInfo, bool) {
+	normalizeSegmentRowCount(segment.SegmentInfo)
+	old, applied := s.store.LoadSegment(segmentID, segment.SegmentInfo, version)
+	if !applied {
+		return nil, false
+	}
+	s.setDCState(segmentID, dcStateOf(segment))
+	s.invalidateQuota(old, segment.SegmentInfo)
+	return old, true
+}
+
+// compactToChange is a change of the compaction relations that an install
+// makes (see reindexCompactTo): the relation of segment from is removed, or
+// segment is added to it. pos orders the changes of the installs.
+type compactToChange struct {
+	from    int64
+	segment int64
+	pos     int32
+	remove  bool
+}
+
+// appendCompactToChanges appends to shards, by the shard of the segment
+// compacted from, the changes reindexCompactTo makes for the install at pos
+// of segment over old.
+func appendCompactToChanges(shards [][]compactToChange, pos int, old, segment *datapb.SegmentInfo) {
+	if old != nil && !slices.Equal(old.GetCompactionFrom(), segment.GetCompactionFrom()) {
+		for _, from := range old.GetCompactionFrom() {
+			shard := shardOf(from, len(shards))
+			shards[shard] = append(shards[shard], compactToChange{from: from, pos: int32(pos), remove: true})
+		}
+	}
+	for _, from := range segment.GetCompactionFrom() {
+		shard := shardOf(from, len(shards))
+		shards[shard] = append(shards[shard], compactToChange{from: from, segment: segment.GetID(), pos: int32(pos)})
+	}
+}
+
+// replayCompactTo applies the compaction relation changes of the installs of
+// recovery. changes[w][shard] holds, in install order, the changes worker w
+// made to the relations of shard. Every shard is replayed on its own
+// goroutine, the changes of a relation in install order, so each relation
+// ends as installing the segments one after another leaves it. Recovery is
+// the only writer of the relations while it runs.
+func (s *SegmentsInfo) replayCompactTo(changes [][][]compactToChange) {
+	if len(changes) == 0 {
+		return
+	}
+	var wg sync.WaitGroup
+	for shard := range changes[0] {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			var mine []compactToChange
+			for _, workerChanges := range changes {
+				mine = append(mine, workerChanges[shard]...)
+			}
+			slices.SortFunc(mine, func(a, b compactToChange) int {
+				if c := cmp.Compare(a.from, b.from); c != 0 {
+					return c
+				}
+				if c := cmp.Compare(a.pos, b.pos); c != 0 {
+					return c
+				}
+				// An install removes the relations of the old value first.
+				switch {
+				case a.remove == b.remove:
+					return 0
+				case a.remove:
+					return -1
+				default:
+					return 1
+				}
+			})
+			for start := 0; start < len(mine); {
+				from := mine[start].from
+				end := start
+				for end < len(mine) && mine[end].from == from {
+					end++
+				}
+				s.applyCompactToChanges(from, mine[start:end])
+				start = end
+			}
+		}()
+	}
+	wg.Wait()
+}
+
+// applyCompactToChanges applies the changes of the relation of from in order,
+// like deleteCompactTo and addCompactTo do.
+func (s *SegmentsInfo) applyCompactToChanges(from int64, changes []compactToChange) {
+	existing, existed := s.compactionTo.Get(from)
+	children := slices.Clone(existing)
+	present := existed
+	for _, change := range changes {
+		switch {
+		case change.remove:
+			children, present = nil, false
+		case !slices.Contains(children, change.segment):
+			children, present = append(children, change.segment), true
+		}
+	}
+	switch {
+	case present:
+		s.compactionTo.Insert(from, children)
+	case existed:
+		s.compactionTo.Remove(from)
+	}
 }
 
 // install writes segment through write and, when the write applied, sets the
@@ -650,6 +765,7 @@ func normalizeSegmentRowCount(segProto *datapb.SegmentInfo) {
 	}
 	segmentutil.ReCalcRowCount(segProto, segProto)
 }
+
 func (s *SegmentInfo) IsDeltaLogExists(logID int64) bool {
 	for _, deltaLogs := range s.GetDeltalogs() {
 		for _, l := range deltaLogs.GetBinlogs() {

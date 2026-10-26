@@ -21,6 +21,7 @@ import (
 	"context"
 	"errors"
 	"net"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -29,10 +30,12 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.etcd.io/etcd/api/v3/etcdserverpb"
 	"go.etcd.io/etcd/api/v3/mvccpb"
+	"go.etcd.io/etcd/api/v3/v3rpc/rpctypes"
 	clientv3 "go.etcd.io/etcd/client/v3"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/milvus-io/milvus/pkg/v3/util/merr"
 )
@@ -51,10 +54,38 @@ type rangeStreamTestServer struct {
 	streamCalls              atomic.Int32
 	rangeCalls               atomic.Int32
 	streamLimit              atomic.Int64
+
+	// pinnedRangeErr fails every Range read at a pinned revision.
+	pinnedRangeErr error
+
+	// blockStreamAt blocks the stream of the range starting at it until the
+	// client cancels it, then closes blockedStreamCanceled.
+	blockStreamAt         string
+	blockedStreamCanceled chan struct{}
+
+	mu             sync.Mutex
+	streamRequests []*etcdserverpb.RangeRequest
+	rangeRequests  []*etcdserverpb.RangeRequest
+}
+
+func (s *rangeStreamTestServer) record(requests *[]*etcdserverpb.RangeRequest, req *etcdserverpb.RangeRequest) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	*requests = append(*requests, proto.Clone(req).(*etcdserverpb.RangeRequest))
+}
+
+func (s *rangeStreamTestServer) recorded(requests *[]*etcdserverpb.RangeRequest) []*etcdserverpb.RangeRequest {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return slices.Clone(*requests)
 }
 
 func (s *rangeStreamTestServer) Range(_ context.Context, req *etcdserverpb.RangeRequest) (*etcdserverpb.RangeResponse, error) {
 	s.rangeCalls.Add(1)
+	s.record(&s.rangeRequests, req)
+	if s.pinnedRangeErr != nil && req.Revision > 0 {
+		return nil, s.pinnedRangeErr
+	}
 	kvs := s.filter(req)
 	pageSize := s.rangePageSize
 	if pageSize <= 0 || pageSize > len(kvs) {
@@ -74,8 +105,14 @@ func (s *rangeStreamTestServer) Range(_ context.Context, req *etcdserverpb.Range
 func (s *rangeStreamTestServer) RangeStream(req *etcdserverpb.RangeRequest, stream etcdserverpb.KV_RangeStreamServer) error {
 	s.streamCalls.Add(1)
 	s.streamLimit.Store(req.Limit)
+	s.record(&s.streamRequests, req)
 	if s.streamErr != nil && s.streamErrAfterChunks == 0 {
 		return s.streamErr
+	}
+	if s.blockStreamAt != "" && string(req.Key) == s.blockStreamAt {
+		<-stream.Context().Done()
+		close(s.blockedStreamCanceled)
+		return stream.Context().Err()
 	}
 
 	kvs := s.filter(req)
@@ -110,6 +147,9 @@ func (s *rangeStreamTestServer) RangeStream(req *etcdserverpb.RangeRequest, stre
 func (s *rangeStreamTestServer) filter(req *etcdserverpb.RangeRequest) []*mvccpb.KeyValue {
 	result := make([]*mvccpb.KeyValue, 0, len(s.kvs))
 	for _, keyValue := range s.kvs {
+		if len(req.RangeEnd) == 0 && !bytes.Equal(keyValue.Key, req.Key) {
+			continue
+		}
 		if bytes.Compare(keyValue.Key, req.Key) < 0 {
 			continue
 		}
@@ -233,4 +273,163 @@ func TestWalkPrefixCancelsStreamOnCallbackFailure(t *testing.T) {
 		require.FailNow(t, "RangeStream server did not observe callback cancellation")
 	}
 	require.Zero(t, server.rangeCalls.Load())
+}
+
+func rangeTestKeys(keyValues []*mvccpb.KeyValue) []string {
+	keys := make([]string, len(keyValues))
+	for i, keyValue := range keyValues {
+		keys[i] = string(keyValue.Key)
+	}
+	return keys
+}
+
+// collectRanges walks prefix in the ranges of bounds and returns the keys of
+// every range.
+func collectRanges(t *testing.T, client clientv3.KV, prefix string, bounds []string, paginationSize int) ([][]string, error) {
+	t.Helper()
+	ranges := make([][]string, len(bounds)+1)
+	err := WalkPrefixInRanges(context.Background(), client, prefix, bounds, paginationSize, time.Second,
+		func(rangeIndex int, keyValue *mvccpb.KeyValue) error {
+			ranges[rangeIndex] = append(ranges[rangeIndex], string(keyValue.Key))
+			return nil
+		})
+	return ranges, err
+}
+
+func TestWalkPrefixInRangesReadsEveryRangeAtOneRevision(t *testing.T) {
+	server := &rangeStreamTestServer{kvs: rangeStreamTestKVs(), streamChunkSize: 1}
+	client := newRangeStreamTestClient(t, server)
+
+	ranges, err := collectRanges(t, client, "prefix/", []string{"prefix/2", "prefix/3"}, 1)
+	require.NoError(t, err)
+	require.Equal(t, [][]string{{"prefix/1"}, {"prefix/2"}, {"prefix/3"}}, ranges)
+
+	// One point read takes the revision every range is read at.
+	rangeRequests := server.recorded(&server.rangeRequests)
+	require.Len(t, rangeRequests, 1)
+	require.Equal(t, "prefix/", string(rangeRequests[0].Key))
+	require.Empty(t, rangeRequests[0].RangeEnd)
+	streams := server.recorded(&server.streamRequests)
+	require.Len(t, streams, 3)
+	slices.SortFunc(streams, func(a, b *etcdserverpb.RangeRequest) int { return bytes.Compare(a.Key, b.Key) })
+	for i, want := range [][2]string{{"prefix/", "prefix/2"}, {"prefix/2", "prefix/3"}, {"prefix/3", "prefix0"}} {
+		require.Equal(t, want[0], string(streams[i].Key))
+		require.Equal(t, want[1], string(streams[i].RangeEnd))
+		require.EqualValues(t, 100, streams[i].Revision, "every range is pinned to the revision of the point read")
+		require.Zero(t, streams[i].Limit)
+	}
+}
+
+func TestWalkPrefixInRangesWithoutBoundsIsOneWalk(t *testing.T) {
+	server := &rangeStreamTestServer{kvs: rangeStreamTestKVs(), streamChunkSize: 2}
+	client := newRangeStreamTestClient(t, server)
+
+	ranges, err := collectRanges(t, client, "prefix/", nil, 1)
+	require.NoError(t, err)
+	require.Equal(t, [][]string{{"prefix/1", "prefix/2", "prefix/3"}}, ranges)
+	require.Zero(t, server.rangeCalls.Load(), "one walk needs no revision read")
+	streams := server.recorded(&server.streamRequests)
+	require.Len(t, streams, 1)
+	require.Zero(t, streams[0].Revision)
+}
+
+func TestWalkPrefixInRangesFallsBackToPaginationAtTheRevision(t *testing.T) {
+	server := &rangeStreamTestServer{
+		kvs:           rangeStreamTestKVs(),
+		rangePageSize: 1,
+		streamErr:     status.Error(codes.Unimplemented, "RangeStream is unsupported"),
+	}
+	client := newRangeStreamTestClient(t, server)
+
+	ranges, err := collectRanges(t, client, "prefix/", []string{"prefix/2"}, 3)
+	require.NoError(t, err)
+	require.Equal(t, [][]string{{"prefix/1"}, {"prefix/2", "prefix/3"}}, ranges)
+
+	pages := server.recorded(&server.rangeRequests)[1:]
+	require.NotEmpty(t, pages)
+	for _, page := range pages {
+		require.EqualValues(t, 100, page.Revision, "every page is pinned to the revision of the point read")
+		require.True(t, string(page.Key) < string(page.RangeEnd))
+		require.Contains(t, []string{"prefix/2", "prefix0"}, string(page.RangeEnd), "a page stays inside its range")
+		require.EqualValues(t, 2, page.Limit, "the ranges share the page size of one walk")
+	}
+}
+
+func TestWalkPrefixInRangesReturnsTheFirstErrorInKeyOrder(t *testing.T) {
+	canceled := make(chan struct{})
+	server := &rangeStreamTestServer{
+		kvs:                   rangeStreamTestKVs(),
+		blockStreamAt:         "prefix/3",
+		blockedStreamCanceled: canceled,
+	}
+	client := newRangeStreamTestClient(t, server)
+	firstErr := errors.New("first range failed")
+	laterErr := errors.New("second range failed")
+	laterFailed := make(chan struct{})
+
+	err := WalkPrefixInRanges(context.Background(), client, "prefix/", []string{"prefix/2", "prefix/3"}, 1, time.Second,
+		func(rangeIndex int, keyValue *mvccpb.KeyValue) error {
+			switch rangeIndex {
+			case 0:
+				// Fail only after a later range did: the first range's error
+				// still wins.
+				<-laterFailed
+				return firstErr
+			case 1:
+				close(laterFailed)
+				return laterErr
+			}
+			return nil
+		})
+	require.ErrorIs(t, err, firstErr)
+	select {
+	case <-canceled:
+	case <-time.After(5 * time.Second):
+		require.FailNow(t, "a failed range did not cancel the ranges after it")
+	}
+}
+
+func TestWalkPrefixInRangesRejectsUnorderedBounds(t *testing.T) {
+	server := &rangeStreamTestServer{kvs: rangeStreamTestKVs()}
+	client := newRangeStreamTestClient(t, server)
+
+	for _, bounds := range [][]string{
+		{"prefix/3", "prefix/2"},
+		{"prefix/2", "prefix/2"},
+		{"prefix/"},
+		{"other/1"},
+	} {
+		_, err := collectRanges(t, client, "prefix/", bounds, 1)
+		require.ErrorIs(t, err, merr.ErrServiceInternal, bounds)
+	}
+	require.Zero(t, server.streamCalls.Load())
+	require.Zero(t, server.rangeCalls.Load())
+}
+
+func TestWalkPrefixInRangesFailsLikeOneWalkOnReadErrors(t *testing.T) {
+	server := &rangeStreamTestServer{
+		kvs:                  rangeStreamTestKVs(),
+		streamChunkSize:      1,
+		streamErr:            status.Error(codes.Unavailable, "stream interrupted"),
+		streamErrAfterChunks: 1,
+	}
+	client := newRangeStreamTestClient(t, server)
+
+	_, err := collectRanges(t, client, "prefix/", []string{"prefix/2"}, 1)
+	require.ErrorIs(t, err, merr.ErrIoFailed)
+	require.Equal(t, merr.SystemError, merr.GetErrorType(err), "the recovery retry must stay armed")
+}
+
+func TestWalkPrefixInRangesFailsOnACompactedRevisionWhilePaginating(t *testing.T) {
+	server := &rangeStreamTestServer{
+		kvs:            rangeStreamTestKVs(),
+		streamErr:      status.Error(codes.Unimplemented, "RangeStream is unsupported"),
+		pinnedRangeErr: rpctypes.ErrGRPCCompacted,
+	}
+	client := newRangeStreamTestClient(t, server)
+
+	_, err := collectRanges(t, client, "prefix/", []string{"prefix/2"}, 1)
+	require.ErrorIs(t, err, merr.ErrIoFailed)
+	require.Contains(t, err.Error(), "compacted")
+	require.Equal(t, merr.SystemError, merr.GetErrorType(err), "the recovery retry must stay armed")
 }

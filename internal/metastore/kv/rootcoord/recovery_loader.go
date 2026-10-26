@@ -20,6 +20,7 @@ import (
 	"bytes"
 	"context"
 	"strconv"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/sync/errgroup"
@@ -45,7 +46,8 @@ const recoveryScanProgressInterval = 100000
 // The legacy collection prefix, the database collection prefix and the
 // partition, field, struct array field and function prefixes are each scanned
 // once, and child metadata is joined to its collection by collection ID. This
-// replaces one read per database plus four reads per collection.
+// replaces one read per database plus four reads per collection. The child
+// prefixes are read as metastore.parallelScanRanges key ranges.
 func (kc *Catalog) ListCollectionsForRecovery(
 	ctx context.Context,
 	dbIDs []int64,
@@ -109,6 +111,15 @@ func (kc *Catalog) ListCollectionsForRecovery(
 	if err != nil {
 		return nil, err
 	}
+	if kc.reportRecoveredCollectionIDs != nil {
+		collectionIDs := make([]int64, 0, numCollections)
+		for _, collections := range collectionsByDB {
+			for _, collection := range collections {
+				collectionIDs = append(collectionIDs, collection.CollectionID)
+			}
+		}
+		kc.reportRecoveredCollectionIDs(collectionIDs)
+	}
 	if len(targets) > 0 {
 		if err := attachRecoveryChildMetadata(ctx, walker, targets, duplicates); err != nil {
 			return nil, err
@@ -133,28 +144,38 @@ func attachRecoveryChildMetadata(
 	targets map[int64]*model.Collection,
 	duplicates map[int64][]*model.Collection,
 ) error {
+	collectionIDs := make([]int64, 0, len(targets))
+	for collectionID := range targets {
+		collectionIDs = append(collectionIDs, collectionID)
+	}
 	g, gCtx := errgroup.WithContext(ctx)
 	g.Go(func() error {
-		return scanRecoveryChildren(gCtx, walker, PartitionMetaPrefix+"/", targets, duplicates,
+		return scanRecoveryChildren(gCtx, walker, PartitionMetaPrefix+"/", collectionIDs, targets, duplicates,
 			unmarshalPartition, (*model.Partition).Clone,
 			func(c *model.Collection) *[]*model.Partition { return &c.Partitions })
 	})
 	g.Go(func() error {
-		return scanRecoveryChildren(gCtx, walker, FieldMetaPrefix+"/", targets, duplicates,
+		return scanRecoveryChildren(gCtx, walker, FieldMetaPrefix+"/", collectionIDs, targets, duplicates,
 			unmarshalField, (*model.Field).Clone,
 			func(c *model.Collection) *[]*model.Field { return &c.Fields })
 	})
 	g.Go(func() error {
-		return scanRecoveryChildren(gCtx, walker, StructArrayFieldMetaPrefix+"/", targets, duplicates,
+		return scanRecoveryChildren(gCtx, walker, StructArrayFieldMetaPrefix+"/", collectionIDs, targets, duplicates,
 			unmarshalStructArrayField, (*model.StructArrayField).Clone,
 			func(c *model.Collection) *[]*model.StructArrayField { return &c.StructArrayFields })
 	})
 	g.Go(func() error {
-		return scanRecoveryChildren(gCtx, walker, FunctionMetaPrefix+"/", targets, duplicates,
+		return scanRecoveryChildren(gCtx, walker, FunctionMetaPrefix+"/", collectionIDs, targets, duplicates,
 			unmarshalFunction, (*model.Function).Clone,
 			func(c *model.Collection) *[]*model.Function { return &c.Functions })
 	})
 	return g.Wait()
+}
+
+// recoveryChildRun is a run of consecutive child keys of one collection.
+type recoveryChildRun[T any] struct {
+	collectionID int64
+	children     []T
 }
 
 // scanRecoveryChildren scans prefix, whose keys have the form
@@ -162,31 +183,55 @@ func attachRecoveryChildMetadata(
 // targets to the slot of that collection. A collection in duplicates gets a
 // clone, so collections never share child models. Entries of other collections
 // are skipped without being decoded.
+//
+// The prefix is read as metastore.parallelScanRanges key ranges split at
+// collectionIDs, each decoded in the goroutine of its range. The children are
+// then appended range after range in key order, so every collection gets its
+// children in the order one walk of the prefix would append them.
 func scanRecoveryChildren[T any](
 	ctx context.Context,
 	walker kv.MetaKv,
 	prefix string,
+	collectionIDs []int64,
 	targets map[int64]*model.Collection,
 	duplicates map[int64][]*model.Collection,
 	decode func(value []byte) (T, error),
 	clone func(T) T,
 	slot func(*model.Collection) *[]T,
 ) error {
-	return walkRecoveryPrefixByID(ctx, walker, prefix, func(collectionID int64, value []byte) error {
-		target, ok := targets[collectionID]
-		if !ok {
+	bounds := kv.RangeBounds(prefix, collectionIDs, paramtable.Get().MetaStoreCfg.ParallelScanRanges.GetAsInt())
+	runs := make([][]recoveryChildRun[T], len(bounds)+1)
+	err := walkRecoveryPrefixByIDInRanges(ctx, walker, prefix, bounds, func(rangeIndex int, collectionID int64, value []byte) error {
+		if _, ok := targets[collectionID]; !ok {
 			return nil
 		}
 		child, err := decode(value)
 		if err != nil {
 			return err
 		}
-		*slot(target) = append(*slot(target), child)
-		for _, duplicate := range duplicates[collectionID] {
-			*slot(duplicate) = append(*slot(duplicate), clone(child))
+		rangeRuns := runs[rangeIndex]
+		if last := len(rangeRuns) - 1; last >= 0 && rangeRuns[last].collectionID == collectionID {
+			rangeRuns[last].children = append(rangeRuns[last].children, child)
+			return nil
 		}
+		runs[rangeIndex] = append(rangeRuns, recoveryChildRun[T]{collectionID: collectionID, children: []T{child}})
 		return nil
 	})
+	if err != nil {
+		return err
+	}
+	for _, rangeRuns := range runs {
+		for _, run := range rangeRuns {
+			target := targets[run.collectionID]
+			*slot(target) = append(*slot(target), run.children...)
+			for _, duplicate := range duplicates[run.collectionID] {
+				for _, child := range run.children {
+					*slot(duplicate) = append(*slot(duplicate), clone(child))
+				}
+			}
+		}
+	}
+	return nil
 }
 
 // walkRecoveryPrefixByID scans prefix, whose keys have the form
@@ -198,16 +243,30 @@ func walkRecoveryPrefixByID(
 	prefix string,
 	fn func(id int64, value []byte) error,
 ) error {
+	return walkRecoveryPrefixByIDInRanges(ctx, walker, prefix, nil, func(_ int, id int64, value []byte) error {
+		return fn(id, value)
+	})
+}
+
+// walkRecoveryPrefixByIDInRanges is walkRecoveryPrefixByID over the key ranges
+// bounds split prefix into; see walkRecoveryPrefixInRanges.
+func walkRecoveryPrefixByIDInRanges(
+	ctx context.Context,
+	walker kv.MetaKv,
+	prefix string,
+	bounds []string,
+	fn func(rangeIndex int, id int64, value []byte) error,
+) error {
 	// WalkWithPrefix passes full keys, in the form GetPath returns.
 	fullPrefix := []byte(walker.GetPath(prefix))
-	return walkRecoveryPrefix(ctx, walker, prefix, func(key, value []byte) error {
+	return walkRecoveryPrefixInRanges(ctx, walker, prefix, bounds, func(rangeIndex int, key, value []byte) error {
 		id, ok := parseRecoveryKeyID(fullPrefix, key)
 		if !ok {
 			mlog.RatedWarn(ctx, 1.0, "skip metadata key without an identifier during rootcoord recovery",
 				mlog.String("key", string(key)))
 			return nil
 		}
-		return fn(id, value)
+		return fn(rangeIndex, id, value)
 	})
 }
 
@@ -219,32 +278,47 @@ func walkRecoveryPrefix(
 	prefix string,
 	fn func(key, value []byte) error,
 ) error {
+	return walkRecoveryPrefixInRanges(ctx, walker, prefix, nil, func(_ int, key, value []byte) error {
+		return fn(key, value)
+	})
+}
+
+// walkRecoveryPrefixInRanges is walkRecoveryPrefix over the key ranges bounds
+// split prefix into, read in parallel when the kv supports it (see
+// kv.WalkWithPrefixInRanges). fn is called concurrently for different ranges.
+func walkRecoveryPrefixInRanges(
+	ctx context.Context,
+	walker kv.MetaKv,
+	prefix string,
+	bounds []string,
+	fn func(rangeIndex int, key, value []byte) error,
+) error {
 	pageSize := paramtable.Get().MetaStoreCfg.PaginationSize.GetAsInt()
 	start := time.Now()
-	scanned := 0
-	err := walker.WalkWithPrefix(ctx, prefix, pageSize, func(key, value []byte) error {
+	var scanned atomic.Int64
+	err := kv.WalkWithPrefixInRanges(ctx, walker, prefix, bounds, pageSize, func(rangeIndex int, key, value []byte) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		scanned++
-		if scanned%recoveryScanProgressInterval == 0 {
+		if numScanned := scanned.Add(1); numScanned%recoveryScanProgressInterval == 0 {
 			mlog.Info(ctx, "rootcoord recovery prefix scan progress",
 				mlog.String("prefix", prefix),
-				mlog.Int("numScanned", scanned),
+				mlog.Int64("numScanned", numScanned),
 				mlog.Duration("duration", time.Since(start)))
 		}
 		if bytes.Equal(value, SuffixSnapshotTombstone) {
 			return nil
 		}
-		return fn(key, value)
+		return fn(rangeIndex, key, value)
 	})
 	if err != nil {
 		return merr.Wrapf(err, "scan rootcoord metadata prefix %s", prefix)
 	}
 	mlog.Info(ctx, "rootcoord recovery prefix scan done",
 		mlog.String("prefix", prefix),
-		mlog.Int("numScanned", scanned),
+		mlog.Int64("numScanned", scanned.Load()),
 		mlog.Int("pageSize", pageSize),
+		mlog.Int("numRanges", len(bounds)+1),
 		mlog.Duration("duration", time.Since(start)))
 	return nil
 }

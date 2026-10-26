@@ -20,6 +20,7 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
+	"sync/atomic"
 	"time"
 
 	"github.com/samber/lo"
@@ -43,7 +44,10 @@ const (
 )
 
 // implementation assertion
-var _ kv.WatchKV = (*etcdKV)(nil)
+var (
+	_ kv.WatchKV     = (*etcdKV)(nil)
+	_ kv.RangeWalker = (*etcdKV)(nil)
+)
 
 // etcdKV implements TxnKV interface, it supports to process multiple kvs in a transaction.
 type etcdKV struct {
@@ -99,7 +103,13 @@ func (kv *etcdKV) walkPrefix(ctx context.Context, prefix string, paginationSize 
 			return fn(keyValue)
 		},
 	)
+	observeWalk(start, int64(totalSize), err)
+	return err
+}
 
+// observeWalk records the meta metrics of a prefix walk that read totalSize
+// bytes.
+func observeWalk(start time.Time, totalSize int64, err error) {
 	metrics.MetaOpCounter.WithLabelValues(metrics.MetaGetLabel, metrics.TotalLabel).Inc()
 	if err == nil {
 		metrics.MetaKvSize.WithLabelValues(metrics.MetaGetLabel).Observe(float64(totalSize))
@@ -108,7 +118,45 @@ func (kv *etcdKV) walkPrefix(ctx context.Context, prefix string, paginationSize 
 	} else {
 		metrics.MetaOpCounter.WithLabelValues(metrics.MetaGetLabel, metrics.FailLabel).Inc()
 	}
-	return err
+}
+
+// WalkWithPrefixInRanges implements kv.RangeWalker: it walks prefix like
+// WalkWithPrefix, as the key ranges bounds split it into, read in parallel at
+// one revision (see WalkPrefixInRanges).
+func (kv *etcdKV) WalkWithPrefixInRanges(ctx context.Context, prefix string, bounds []string, paginationSize int, fn func(rangeIndex int, key, value []byte) error) error {
+	start := time.Now()
+	prefix = kv.GetPath(prefix)
+	var totalSize atomic.Int64
+	err := WalkPrefixInRanges(
+		getContextWithoutAuth(ctx),
+		kv.client,
+		prefix,
+		rootedBounds(kv.GetPath, bounds),
+		paginationSize,
+		kv.requestTimeout,
+		func(rangeIndex int, keyValue *mvccpb.KeyValue) error {
+			totalSize.Add(int64(len(keyValue.Key) + len(keyValue.Value)))
+			return fn(rangeIndex, keyValue.Key, keyValue.Value)
+		},
+	)
+	observeWalk(start, totalSize.Load(), err)
+	if err != nil {
+		return err
+	}
+
+	CheckElapseAndWarn(ctx, start, "Slow etcd operation(WalkWithPrefixInRanges)",
+		mlog.String("prefix", prefix), mlog.Int("numRanges", len(bounds)+1))
+	return nil
+}
+
+// rootedBounds returns bounds under the root path the way getPath roots a
+// prefix.
+func rootedBounds(getPath func(string) string, bounds []string) []string {
+	rooted := make([]string, len(bounds))
+	for i, bound := range bounds {
+		rooted[i] = getPath(bound)
+	}
+	return rooted
 }
 
 func (kv *etcdKV) WalkWithPrefix(ctx context.Context, prefix string, paginationSize int, fn func([]byte, []byte) error) error {

@@ -267,10 +267,13 @@ func (mt *MetaTable) reload() error {
 		mlog.Bool("created", defaultDatabaseCreated),
 		mlog.Duration("duration", time.Since(defaultDatabaseStart)))
 
-	collectionsByDB, err := mt.loadCollectionsForRecovery()
+	collectionsByDB, recoveredCollections, err := mt.loadCollectionsForRecovery()
 	if err != nil {
 		return err
 	}
+	// Every recovered collection is indexed below; size the indexes once.
+	mt.collID2Meta = make(map[UniqueID]*model.Collection, recoveredCollections)
+	mt.partitionName2ID = make(map[int64]map[string]int64, recoveredCollections)
 
 	// in order to support backward compatibility with meta of the old version, it also
 	// needs to reload collections that have no database
@@ -297,6 +300,7 @@ func (mt *MetaTable) reload() error {
 			mlog.Int("numCollections", len(collections)))
 
 		cacheBuildStart := time.Now()
+		mt.names.reserve(dbName, len(collections))
 		for index, collection := range collections {
 			if collection.DBName != "" && collection.DBName != dbName {
 				mlog.Warn(mt.ctx,
@@ -311,7 +315,7 @@ func (mt *MetaTable) reload() error {
 			ensureCollectionMaxFieldIDProperty(collection)
 			mt.collID2Meta[collection.CollectionID] = collection
 			// Build partition name index
-			mt.partitionName2ID[collection.CollectionID] = make(map[string]int64)
+			mt.partitionName2ID[collection.CollectionID] = make(map[string]int64, len(collection.Partitions))
 			for _, partition := range collection.Partitions {
 				if partition.Available() {
 					mt.partitionName2ID[collection.CollectionID][partition.PartitionName] = partition.PartitionID
@@ -446,8 +450,9 @@ func (mt *MetaTable) reload() error {
 
 // insert into default database if the collections doesn't inside some database
 // loadCollectionsForRecovery lists the collections of every database, and those
-// stored without one under util.NonDBID, in one recovery pass.
-func (mt *MetaTable) loadCollectionsForRecovery() (map[int64][]*model.Collection, error) {
+// stored without one under util.NonDBID, in one recovery pass. It also returns
+// their total count.
+func (mt *MetaTable) loadCollectionsForRecovery() (map[int64][]*model.Collection, int, error) {
 	dbIDs := make([]int64, 0, len(mt.dbName2Meta)+1)
 	dbIDs = append(dbIDs, util.NonDBID)
 	for _, db := range mt.dbName2Meta {
@@ -459,7 +464,7 @@ func (mt *MetaTable) loadCollectionsForRecovery() (map[int64][]*model.Collection
 		mlog.Int("numDatabases", len(mt.dbName2Meta)))
 	collectionsByDB, err := mt.catalog.ListCollectionsForRecovery(mt.ctx, dbIDs, typeutil.MaxTimestamp)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	totalCollections := 0
 	for _, collections := range collectionsByDB {
@@ -469,7 +474,7 @@ func (mt *MetaTable) loadCollectionsForRecovery() (map[int64][]*model.Collection
 		mlog.Int("numCollections", totalCollections),
 		mlog.Int("numDatabases", len(mt.dbName2Meta)),
 		mlog.Duration("duration", time.Since(start)))
-	return collectionsByDB, nil
+	return collectionsByDB, totalCollections, nil
 }
 
 func (mt *MetaTable) reloadWithNonDatabase(oldCollections []*model.Collection) error {
@@ -479,6 +484,7 @@ func (mt *MetaTable) reloadWithNonDatabase(oldCollections []*model.Collection) e
 	partitionNum := int64(0)
 
 	cacheBuildStart := time.Now()
+	mt.names.reserve(util.DefaultDBName, len(oldCollections))
 	for index, collection := range oldCollections {
 		ensureCollectionMaxFieldIDProperty(collection)
 		mt.collID2Meta[collection.CollectionID] = collection

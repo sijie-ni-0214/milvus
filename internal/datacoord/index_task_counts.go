@@ -66,18 +66,27 @@ func indexTaskStateSlot(state commonpb.IndexState) int {
 	}
 }
 
-func (c *indexTaskCounts) adjustTask(task *model.SegmentIndex, delta int64) {
+// taskCountSlot returns where a task is counted: its index and the slot of its
+// state; ok is false for a task that is not counted.
+func taskCountSlot(task *model.SegmentIndex) (key [2]int64, slot int, ok bool) {
 	if task == nil || task.IsDeleted {
-		return
+		return key, 0, false
 	}
-	slot := indexTaskStateSlot(task.IndexState)
+	slot = indexTaskStateSlot(task.IndexState)
 	if slot < 0 {
+		return key, 0, false
+	}
+	return [2]int64{task.CollectionID, task.IndexID}, slot, true
+}
+
+func (c *indexTaskCounts) adjustTask(task *model.SegmentIndex, delta int64) {
+	key, slot, ok := taskCountSlot(task)
+	if !ok {
 		return
 	}
 	if c.byIndex == nil {
 		c.byIndex = make(map[[2]int64]indexTaskStateCounts)
 	}
-	key := [2]int64{task.CollectionID, task.IndexID}
 	counts := c.byIndex[key]
 	counts[slot] += delta
 	if counts == (indexTaskStateCounts{}) {
@@ -99,6 +108,32 @@ func (c *indexTaskCounts) replaceTask(old, current *model.SegmentIndex) {
 	}
 	c.adjustTask(old, -1)
 	c.adjustTask(current, 1)
+}
+
+// addTasks adds tasks counted by index and state slot (see taskCountSlot), as
+// adjustTask adds them one at a time.
+func (c *indexTaskCounts) addTasks(tasks map[[2]int64]indexTaskStateCounts) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.byIndex == nil {
+		c.byIndex = make(map[[2]int64]indexTaskStateCounts)
+	}
+	for key, delta := range tasks {
+		counts := c.byIndex[key]
+		for slot := range counts {
+			counts[slot] += delta[slot]
+		}
+		if counts == (indexTaskStateCounts{}) {
+			delete(c.byIndex, key)
+		} else {
+			c.byIndex[key] = counts
+		}
+		if c.active[key] {
+			for slot := range c.total {
+				c.total[slot] += delta[slot]
+			}
+		}
+	}
 }
 
 func (c *indexTaskCounts) replaceIndex(old, current *model.Index) {

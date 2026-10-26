@@ -182,6 +182,11 @@ type Server struct {
 
 	// file resource
 	fileResourceObserver FileResourceObserver
+
+	// metaPrefetch holds the catalog reads StartMetaPrefetch started, until
+	// initMeta takes them.
+	metaPrefetch     atomic.Pointer[metaPrefetch]
+	metaPrefetchOnce sync.Once
 }
 
 type FileResourceObserver interface {
@@ -688,17 +693,41 @@ func (s *Server) initKV() error {
 	mlog.Info(s.ctx, "data coordinator connecting to metadata store", mlog.String("metaType", metaType))
 	switch metaType {
 	case util.MetaStoreTypeTiKV:
-		s.metaRootPath = Params.TiKVCfg.MetaRootPath.GetValue()
+		s.metaRootPath = metaStoreRootPath()
 		s.kv = tikv.NewTiKV(s.tikvCli, s.metaRootPath,
 			tikv.WithRequestTimeout(paramtable.Get().TiKVCfg.RequestTimeout.GetAsDuration(time.Millisecond)))
 	case util.MetaStoreTypeEtcd:
-		s.metaRootPath = Params.EtcdCfg.MetaRootPath.GetValue()
+		s.metaRootPath = metaStoreRootPath()
 		s.kv = etcdkv.NewEtcdKV(s.etcdCli, s.metaRootPath,
 			etcdkv.WithRequestTimeout(paramtable.Get().EtcdCfg.RequestTimeout.GetAsDuration(time.Millisecond)))
 	default:
 		return retry.Unrecoverable(merr.WrapErrServiceInternalMsg("unsupported meta store: %s", metaType))
 	}
 	mlog.Info(s.ctx, "data coordinator successfully connected to metadata store", mlog.String("metaType", metaType))
+	return nil
+}
+
+// metaStoreRootPath is the root of the metadata keys in the configured meta
+// store.
+func metaStoreRootPath() string {
+	if Params.MetaStoreCfg.MetaStoreType.GetValue() == util.MetaStoreTypeTiKV {
+		return Params.TiKVCfg.MetaRootPath.GetValue()
+	}
+	return Params.EtcdCfg.MetaRootPath.GetValue()
+}
+
+// newSegmentPersist returns the optimistic store segments are kept in as full
+// records next to the catalog keys, every segment write a compare-and-swap.
+// Without a meta store client (a server assembled by unit tests) it returns
+// nil, and segments stay in the catalog.
+func (s *Server) newSegmentPersist() OptimisticTxnPersist[string, *datapb.SegmentInfo] {
+	marshaler := &SegmentInfoMarshaler{}
+	switch {
+	case Params.MetaStoreCfg.MetaStoreType.GetValue() == util.MetaStoreTypeTiKV && s.tikvCli != nil:
+		return NewOptimisticTxnTiKVPersist[string, *datapb.SegmentInfo](s.tikvCli, marshaler)
+	case Params.MetaStoreCfg.MetaStoreType.GetValue() != util.MetaStoreTypeTiKV && s.etcdCli != nil:
+		return NewOptimisticTxnEtcdPersist[string, *datapb.SegmentInfo](s.etcdCli, marshaler)
+	}
 	return nil
 }
 
@@ -720,24 +749,37 @@ func (s *Server) initMeta(chunkManager storage.ChunkManager) error {
 	if !ok {
 		return merr.WrapErrServiceInternalMsg("datacoord catalog does not support DataView persistence")
 	}
-	// Segments are kept as full records in an optimistic store next to the
-	// catalog keys; every segment write is a compare-and-swap. Without a
-	// meta store client (a server assembled by unit tests) segments stay in
-	// the catalog.
-	marshaler := &SegmentInfoMarshaler{}
-	var segmentPersist OptimisticTxnPersist[string, *datapb.SegmentInfo]
-	switch {
-	case Params.MetaStoreCfg.MetaStoreType.GetValue() == util.MetaStoreTypeTiKV && s.tikvCli != nil:
-		segmentPersist = NewOptimisticTxnTiKVPersist[string, *datapb.SegmentInfo](s.tikvCli, marshaler)
-	case Params.MetaStoreCfg.MetaStoreType.GetValue() != util.MetaStoreTypeTiKV && s.etcdCli != nil:
-		segmentPersist = NewOptimisticTxnEtcdPersist[string, *datapb.SegmentInfo](s.etcdCli, marshaler)
-	}
+	// List the persisted DataViews while the phases below recover SegmentMeta,
+	// Collections and Imports. No DataView key can change before RecoverManager:
+	// every writer goes through the DataViewManager it builds, the DDL callbacks
+	// that reach the manager are registered only after recovery, and external
+	// RPCs wait for the recovery barrier. A failed RecoverManager attempt may
+	// have dropped or written keys, so only the first attempt uses this listing.
+	listCtx, cancelList := context.WithCancel(s.ctx)
+	var (
+		listed      = make(chan struct{})
+		listedErr   error
+		listedViews []*viewpb.DataViewOfCollection
+	)
+	go func() {
+		defer close(listed)
+		listedViews, listedErr = catalog.ListAllDataViews(listCtx)
+	}()
+	defer func() {
+		cancelList()
+		<-listed
+	}()
+	segmentPersist := s.newSegmentPersist()
+	// Only the first attempt uses the reads StartMetaPrefetch started; later
+	// attempts read the catalog themselves.
+	prefetched := s.metaPrefetch.Swap(nil)
 	var recoveredMeta *meta
 	reloadEtcdFn := func() error {
 		metaInitializationStart := time.Now()
-		mlog.Info(s.ctx, "datacoord metadata initialization attempt started")
+		mlog.Info(s.ctx, "datacoord metadata initialization attempt started", mlog.Bool("prefetched", prefetched != nil))
 		var err error
-		recoveredMeta, err = newMetaWithPersist(s.ctx, s.catalog, chunkManager, s.metaStore, s.broker, segmentPersist, s.metaRootPath)
+		recoveredMeta, err = newMetaWithoutManifestIndexes(s.ctx, s.catalog, chunkManager, s.metaStore, s.broker, segmentPersist, s.metaRootPath, prefetched)
+		prefetched = nil
 		if err != nil {
 			mlog.Warn(s.ctx, "datacoord metadata initialization attempt failed",
 				mlog.Duration("duration", time.Since(metaInitializationStart)),
@@ -757,8 +799,15 @@ func (s *Server) initMeta(chunkManager storage.ChunkManager) error {
 			recoveredMeta.closeManifestCommitExecutor()
 		}
 	}()
+	// Recover the segment indexes recorded in segment manifests while the
+	// collection, import and DataView phases below run: it needs only the
+	// recovered segments and index meta, and none of those phases reads the
+	// index meta or the manifest markers it clears. Publication waits for it.
+	// Declared after the executor cleanup so that it is joined first.
+	manifestIndexes := startManifestIndexRecovery(s.ctx, recoveredMeta)
+	defer manifestIndexes.abort()
 	// Retry each recovery phase independently: a later metadata error must
-	// not repeat newMeta's successful object-storage manifest scan.
+	// not repeat the successful object-storage manifest scan.
 	if err := retry.Do(s.ctx, func() error {
 		return recoveredMeta.reloadCollectionsFromRootcoord(s.ctx, s.broker)
 	}, retry.Attempts(connMetaMaxRetryTime)); err != nil {
@@ -783,7 +832,26 @@ func (s *Server) initMeta(chunkManager storage.ChunkManager) error {
 	dataViewRecoveryStart := time.Now()
 	mlog.Info(s.ctx, "datacoord DataView recovery started",
 		mlog.Int("totalCollections", len(collectionIDs)))
+	firstAttempt := true
 	if err := retry.Do(s.ctx, func() error {
+		options := []dataview.Option{
+			dataview.WithFrontierProjector(func(ctx context.Context, collectionID int64) (map[string]uint64, error) {
+				return transformFrontierBounds(ctx, recoveredMeta, recoveredImports, collectionID)
+			}),
+			dataview.WithPendingTransformProjector(func(ctx context.Context, view *viewpb.DataViewOfCollection) (map[string]uint64, error) {
+				return pendingTransformBounds(ctx, recoveredMeta, recoveredImports, view)
+			}),
+			dataview.WithRecoveryConcurrency(paramtable.Get().MetaStoreCfg.ReadConcurrency.GetAsInt()),
+		}
+		if firstAttempt {
+			firstAttempt = false
+			<-listed
+			if listedErr != nil {
+				return listedErr
+			}
+			options = append(options, dataview.WithListedDataViews(listedViews))
+			listedViews = nil
+		}
 		var err error
 		manager, err = dataview.RecoverManager(
 			s.ctx,
@@ -792,12 +860,7 @@ func (s *Server) initMeta(chunkManager storage.ChunkManager) error {
 			recoveredMeta.loadableProjection,
 			collectionIDs,
 			collectionVChannels,
-			dataview.WithFrontierProjector(func(ctx context.Context, collectionID int64) (map[string]uint64, error) {
-				return transformFrontierBounds(ctx, recoveredMeta, recoveredImports, collectionID)
-			}),
-			dataview.WithPendingTransformProjector(func(ctx context.Context, view *viewpb.DataViewOfCollection) (map[string]uint64, error) {
-				return pendingTransformBounds(ctx, recoveredMeta, recoveredImports, view)
-			}),
+			options...,
 		)
 		return err
 	}, retry.Attempts(connMetaMaxRetryTime)); err != nil {
@@ -809,6 +872,11 @@ func (s *Server) initMeta(chunkManager storage.ChunkManager) error {
 	mlog.Info(s.ctx, "datacoord DataView recovery done",
 		mlog.Int("totalCollections", len(collectionIDs)),
 		mlog.Duration("duration", time.Since(dataViewRecoveryStart)))
+	if err := manifestIndexes.wait(); err != nil {
+		// Object-store reads have already retried per segment. Retrying
+		// initMeta would reread every successful manifest.
+		return retry.Unrecoverable(err)
+	}
 	// Publish only fully recovered metadata. A failed later phase must not
 	// make a subsequent initMeta call return early with partial state.
 	recoveredMeta.dataViewManager = manager

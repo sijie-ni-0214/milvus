@@ -11,6 +11,7 @@ import (
 	"github.com/milvus-io/milvus/internal/metastore"
 	datacoordkv "github.com/milvus-io/milvus/internal/metastore/kv/datacoord"
 	"github.com/milvus-io/milvus/internal/metastore/kv/txn"
+	"github.com/milvus-io/milvus/pkg/v3/kv"
 	"github.com/milvus-io/milvus/pkg/v3/mlog"
 	"github.com/milvus-io/milvus/pkg/v3/proto/datapb"
 	"github.com/milvus-io/milvus/pkg/v3/util"
@@ -217,17 +218,19 @@ func (s *casSegmentStore) join(key string) string {
 	return util.GetPath(s.rootPath, key)
 }
 
-// ListSegments scans every segment record and binlog KV in one walk per
-// prefix; the store is keyed by segment, so collectionIDs is not needed to
-// bound the scans.
-func (s *casSegmentStore) ListSegments(ctx context.Context, _ []int64) ([]*datapb.SegmentInfo, []int64, error) {
+// ListSegments scans every segment record and binlog KV, the binlog families
+// in one walk per prefix. The store is keyed by segment, so collectionIDs is
+// not needed to bound the scans; it splits the walk of the records into
+// parallel ranges (see scanRecords).
+func (s *casSegmentStore) ListSegments(ctx context.Context, collectionIDs []int64) ([]*datapb.SegmentInfo, []int64, error) {
 	var records []*datapb.SegmentInfo
 	var versions []int64
+	var inline int
 	var binlogs []map[int64][]*datapb.FieldBinlog
 	g, gctx := errgroup.WithContext(ctx)
 	g.Go(func() error {
 		var err error
-		_, records, versions, err = s.persist.Scan(gctx, s.join(datacoordkv.SegmentPrefix+"/"))
+		records, versions, inline, err = s.scanRecords(gctx, collectionIDs)
 		return err
 	})
 	g.Go(func() error {
@@ -239,21 +242,79 @@ func (s *casSegmentStore) ListSegments(ctx context.Context, _ []int64) ([]*datap
 		return nil, nil, err
 	}
 
-	inline := 0
-	for _, record := range records {
-		if datacoordkv.HasInlineBinlogs(record) {
-			s.inline.Insert(record.GetID())
-			inline++
-		}
-		s.codec.DecodeRecord(record)
-	}
-	if err := datacoordkv.FillSegmentBinlogs(records, binlogs); err != nil {
+	// Records sharing a segment ID share its binlogs: shard by segment ID.
+	err := forEachInShards(len(records), recoveryWorkers(), func(i int) int64 { return records[i].GetID() }, func(_, i int) error {
+		return datacoordkv.FillSegmentBinlog(records[i], binlogs)
+	})
+	if err != nil {
 		return nil, nil, err
 	}
 	if inline > 0 {
 		mlog.Info(ctx, "segment records still carry their binlogs; their next write moves them out", mlog.Int("numSegments", inline))
 	}
 	return records, versions, nil
+}
+
+// segmentRecordRange holds the records one key range of a scan decoded, in key
+// order.
+type segmentRecordRange struct {
+	records  []*datapb.SegmentInfo
+	versions []int64
+	inline   int
+}
+
+// add decodes a stored record into the range.
+func (r *segmentRecordRange) add(s *casSegmentStore, record *datapb.SegmentInfo, version int64) {
+	if datacoordkv.HasInlineBinlogs(record) {
+		s.inline.Insert(record.GetID())
+		r.inline++
+	}
+	s.codec.DecodeRecord(record)
+	r.records = append(r.records, record)
+	r.versions = append(r.versions, version)
+}
+
+// scanRecords reads every segment record with its version, decoded as the
+// catalog decodes it, in key order, and counts the records that still carry
+// their binlogs. A persist that reads key ranges reads the records as
+// metastore.parallelScanRanges ranges split at collectionIDs, each decoded in
+// the goroutine of its range; any other persist reads them in one scan.
+func (s *casSegmentStore) scanRecords(ctx context.Context, collectionIDs []int64) ([]*datapb.SegmentInfo, []int64, int, error) {
+	prefix := s.join(datacoordkv.SegmentPrefix + "/")
+	bounds := kv.RangeBounds(prefix, collectionIDs, paramtable.Get().MetaStoreCfg.ParallelScanRanges.GetAsInt())
+	var ranges []segmentRecordRange
+	if scanner, ok := s.persist.(rangeScanner[*datapb.SegmentInfo]); ok && len(bounds) > 0 {
+		ranges = make([]segmentRecordRange, len(bounds)+1)
+		err := scanner.ScanInRanges(ctx, prefix, bounds, func(rangeIndex int, _ string, record *datapb.SegmentInfo, version int64) error {
+			ranges[rangeIndex].add(s, record, version)
+			return nil
+		})
+		if err != nil {
+			return nil, nil, 0, err
+		}
+	} else {
+		_, records, versions, err := s.persist.Scan(ctx, prefix)
+		if err != nil {
+			return nil, nil, 0, err
+		}
+		ranges = make([]segmentRecordRange, 1)
+		for i, record := range records {
+			ranges[0].add(s, record, versions[i])
+		}
+	}
+
+	total, inline := 0, 0
+	for _, r := range ranges {
+		total += len(r.records)
+		inline += r.inline
+	}
+	records := make([]*datapb.SegmentInfo, 0, total)
+	versions := make([]int64, 0, total)
+	for _, r := range ranges {
+		records = append(records, r.records...)
+		versions = append(versions, r.versions...)
+	}
+	return records, versions, inline, nil
 }
 
 // loadBinlogs reads the binlog KVs under prefixes (one prefix per family, in

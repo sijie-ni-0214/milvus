@@ -63,6 +63,17 @@ type OptimisticTxnPersist[K comparable, V any] interface {
 	WalkRaw(ctx context.Context, prefix string, fn func(key string, value []byte) error) error
 }
 
+// rangeScanner is a persist that reads a prefix as the contiguous key ranges
+// bounds split it into, in parallel at one store revision (see
+// etcdkv.WalkPrefixInRanges).
+type rangeScanner[V any] interface {
+	// ScanInRanges calls fn with every value under prefix and its version,
+	// like Scan, and the index of its range: for the keys of one range in key
+	// order from one goroutine, for different ranges concurrently. The error
+	// returned is the first one in key order.
+	ScanInRanges(ctx context.Context, prefix string, bounds []string, fn func(rangeIndex int, key string, value V, version int64) error) error
+}
+
 // Txn collects operations and commits them atomically.
 type Txn[K comparable, V any] interface {
 	// Insert adds a write for a key that must not exist.
@@ -356,6 +367,8 @@ type etcdPersist[K string, V any] struct {
 	marshaler Marshaler[V]
 }
 
+var _ rangeScanner[*datapb.SegmentInfo] = (*etcdPersist[string, *datapb.SegmentInfo])(nil)
+
 func NewOptimisticTxnEtcdPersist[K string, V any](cli *clientv3.Client, marshaler Marshaler[V]) OptimisticTxnPersist[K, V] {
 	return &etcdPersist[K, V]{cli: cli, marshaler: marshaler}
 }
@@ -395,6 +408,27 @@ func (p *etcdPersist[K, V]) Scan(ctx context.Context, prefix K) ([]K, []V, []int
 		return nil, nil, nil, err
 	}
 	return ks, vals, vers, nil
+}
+
+// ScanInRanges implements rangeScanner: it reads the ranges in parallel at one
+// revision, decoding every value in the goroutine of its range.
+func (p *etcdPersist[K, V]) ScanInRanges(ctx context.Context, prefix string, bounds []string, fn func(rangeIndex int, key string, value V, version int64) error) error {
+	// Linearizable, like Scan.
+	return etcdkv.WalkPrefixInRanges(
+		ctx,
+		p.cli,
+		prefix,
+		bounds,
+		paramtable.Get().MetaStoreCfg.PaginationSize.GetAsInt(),
+		0,
+		func(rangeIndex int, keyValue *mvccpb.KeyValue) error {
+			value, err := decodeStoredValue(p.marshaler, string(keyValue.Key), keyValue.Value)
+			if err != nil {
+				return err
+			}
+			return fn(rangeIndex, string(keyValue.Key), value, keyValue.ModRevision)
+		},
+	)
 }
 
 func (p *etcdPersist[K, V]) Get(ctx context.Context, keys []K) (map[K]TxnResult[V], error) {

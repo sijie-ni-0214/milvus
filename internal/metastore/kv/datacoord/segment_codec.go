@@ -354,14 +354,23 @@ func parseBinlogKey(key string) (int64, error) {
 // order of SegmentBinlogPrefixes, keyed by segment ID.
 func FillSegmentBinlogs(segments []*datapb.SegmentInfo, binlogs []map[typeutil.UniqueID][]*datapb.FieldBinlog) error {
 	for _, segment := range segments {
-		for i, family := range segmentBinlogFamilies {
-			field := family.field(segment)
-			if len(*field) == 0 {
-				*field = binlogs[i][segment.GetID()]
-			}
-			if err := binlog.CompressFieldBinlogs(*field); err != nil {
-				return err
-			}
+		if err := FillSegmentBinlog(segment, binlogs); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// FillSegmentBinlog is FillSegmentBinlogs of one record. Records of one
+// segment ID get the same binlogs, so they must be filled one after another.
+func FillSegmentBinlog(segment *datapb.SegmentInfo, binlogs []map[typeutil.UniqueID][]*datapb.FieldBinlog) error {
+	for i, family := range segmentBinlogFamilies {
+		field := family.field(segment)
+		if len(*field) == 0 {
+			*field = binlogs[i][segment.GetID()]
+		}
+		if err := binlog.CompressFieldBinlogs(*field); err != nil {
+			return err
 		}
 	}
 	return nil

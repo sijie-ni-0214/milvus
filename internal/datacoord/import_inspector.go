@@ -155,20 +155,23 @@ func (s *importInspector) reconcileOrphanImportSegments() {
 		}
 	}
 	var orphanIDs []int64
-	for _, segment := range s.meta.GetAllSegmentsUnsafe() {
+	// The pass keeps only IDs, so it visits every segment with the reused
+	// value instead of assembling each one.
+	s.meta.segments.RangeReused(func(segment *SegmentInfo) bool {
 		if !segment.GetIsImporting() {
-			continue
+			return true
 		}
 		// Dropped segments are already owned by the generic GC; re-dropping them
 		// here would reset DroppedAt and keep them out of GC indefinitely.
 		if segment.GetState() == commonpb.SegmentState_Dropped {
-			continue
+			return true
 		}
 		if _, ok := referenced[segment.GetID()]; ok {
-			continue
+			return true
 		}
 		orphanIDs = append(orphanIDs, segment.GetID())
-	}
+		return true
+	})
 	if len(orphanIDs) == 0 {
 		return
 	}

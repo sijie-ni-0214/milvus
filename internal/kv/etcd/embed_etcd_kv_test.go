@@ -785,6 +785,20 @@ func TestEmbedEtcd(te *testing.T) {
 			testFn(5)
 			testFn(100)
 		})
+
+		t.Run("in ranges", func(t *testing.T) {
+			_, ok := metaKv.(kv.RangeWalker)
+			require.True(t, ok)
+			for _, pagination := range []int{1, 5} {
+				ranges := make([][]string, 3)
+				err = kv.WalkWithPrefixInRanges(context.TODO(), metaKv, "A", []string{"AA", "AB/2"}, pagination, func(rangeIndex int, key []byte, value []byte) error {
+					ranges[rangeIndex] = append(ranges[rangeIndex], string(key)[len(rootPath)+1:])
+					return nil
+				})
+				require.NoError(t, err)
+				assert.Equal(t, [][]string{{"A/100"}, {"AA/100", "AB/100"}, {"AB/2/100"}}, ranges, fmt.Errorf("pagination: %d", pagination))
+			}
+		})
 	})
 
 	te.Run("test has", func(t *testing.T) {
