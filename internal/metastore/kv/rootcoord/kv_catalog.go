@@ -42,11 +42,30 @@ type Catalog struct {
 	Txn kv.TxnKV
 
 	pool *conc.Pool[any]
+
+	// reportRecoveredCollectionIDs, when set, receives the IDs of the
+	// collections recovery read; see WithRecoveredCollectionIDs.
+	reportRecoveredCollectionIDs func(collectionIDs []int64)
 }
 
-func NewCatalog(metaKV kv.TxnKV) metastore.RootCoordCatalog {
+// CatalogOption configures a Catalog.
+type CatalogOption func(*Catalog)
+
+// WithRecoveredCollectionIDs makes ListCollectionsForRecovery hand report the
+// IDs of the collections it read as soon as it has them, before it reads their
+// partitions, fields and functions. report runs on the recovering goroutine,
+// once per call, and must not block.
+func WithRecoveredCollectionIDs(report func(collectionIDs []int64)) CatalogOption {
+	return func(c *Catalog) { c.reportRecoveredCollectionIDs = report }
+}
+
+func NewCatalog(metaKV kv.TxnKV, opts ...CatalogOption) metastore.RootCoordCatalog {
 	ioPool := conc.NewPool[any](paramtable.Get().MetaStoreCfg.ReadConcurrency.GetAsInt())
-	return &Catalog{Txn: metaKV, pool: ioPool}
+	catalog := &Catalog{Txn: metaKV, pool: ioPool}
+	for _, opt := range opts {
+		opt(catalog)
+	}
+	return catalog
 }
 
 func BuildCollectionKey(dbID typeutil.UniqueID, collectionID typeutil.UniqueID) string {

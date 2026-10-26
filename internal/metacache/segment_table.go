@@ -23,6 +23,7 @@ import (
 	"github.com/samber/lo"
 
 	"github.com/milvus-io/milvus-proto/go-api/v3/commonpb"
+	"github.com/milvus-io/milvus/internal/util/recovery"
 	"github.com/milvus-io/milvus/pkg/v3/metrics"
 	"github.com/milvus-io/milvus/pkg/v3/proto/datapb"
 	"github.com/milvus-io/milvus/pkg/v3/util/typeutil"
@@ -347,4 +348,51 @@ func (t *segmentTable) rangeAll(fn func(segment *datapb.SegmentInfo)) {
 		fn(segment)
 		return true
 	})
+}
+
+// newRecoveredSegmentTable constructs unpublished tables without per-record
+// writer locks. The retirement ordering matches LoadSegments: a Dropped row
+// wins over a live row of the same ID. Normal runtime writes still use apply.
+func newRecoveredSegmentTable(records []*datapb.SegmentInfo) *segmentTable {
+	t := newSegmentTable()
+	workers := recovery.Workers()
+	_ = recovery.ForEachInShards(len(records), workers, func(i int) int64 { return records[i].GetID() }, func(_, i int) error {
+		record := records[i]
+		previous, exists := t.segments.Get(record.GetID())
+		if !exists || previous.GetState() != commonpb.SegmentState_Dropped || record.GetState() == commonpb.SegmentState_Dropped {
+			t.segments.Insert(record.GetID(), record)
+		}
+		return nil
+	})
+	final := make([]*datapb.SegmentInfo, 0, t.segments.Len())
+	t.segments.Range(func(_ int64, record *datapb.SegmentInfo) bool { final = append(final, record); return true })
+	_ = recovery.ForEachInShards(len(final), workers, func(i int) int64 { return final[i].GetCollectionID() }, func(_, i int) error {
+		record := final[i]
+		shard, exists := t.shards.Get(record.GetCollectionID())
+		if !exists {
+			shard = &segmentShard{ids: make(map[int64]struct{}), byChannel: make(map[string]map[int64]struct{})}
+			t.shards.Insert(record.GetCollectionID(), shard)
+		}
+		shard.ids[record.GetID()] = struct{}{}
+		ids, exists := shard.byChannel[record.GetInsertChannel()]
+		if !exists {
+			ids = make(map[int64]struct{})
+			shard.byChannel[record.GetInsertChannel()] = ids
+		}
+		ids[record.GetID()] = struct{}{}
+		return nil
+	})
+	// One entry per collection/channel, rather than a global lock per segment.
+	t.shards.Range(func(collectionID int64, shard *segmentShard) bool {
+		for channel := range shard.byChannel {
+			collections, exists := t.channels[channel]
+			if !exists {
+				collections = make(map[int64]struct{})
+				t.channels[channel] = collections
+			}
+			collections[collectionID] = struct{}{}
+		}
+		return true
+	})
+	return t
 }

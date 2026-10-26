@@ -209,3 +209,43 @@ func (c *indexTaskCounts) snapshot() indexTaskStateCounts {
 	defer c.mu.RUnlock()
 	return c.total
 }
+
+// accumulateRecoveryTask follows adjustTask: sizes include deleted tasks and
+// unknown states, while counts contain only live tasks with a known state.
+func accumulateRecoveryTask(stats map[[2]int64]indexTaskStats, task *model.SegmentIndex) {
+	key := [2]int64{task.CollectionID, task.IndexID}
+	value := stats[key]
+	value.size += int64(task.IndexSerializedSize)
+	if slot := indexTaskStateSlot(task.IndexState); slot >= 0 && !task.IsDeleted {
+		value.counts[slot]++
+	}
+	if value != (indexTaskStats{}) {
+		stats[key] = value
+	}
+}
+
+func (c *indexTaskCounts) addTasks(batch map[[2]int64]indexTaskStats) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.byIndex == nil {
+		c.byIndex = make(map[[2]int64]indexTaskStats)
+	}
+	for key, delta := range batch {
+		stats := c.byIndex[key]
+		for slot, count := range delta.counts {
+			stats.counts[slot] += count
+			if c.active[key] {
+				c.total[slot] += count
+			}
+		}
+		stats.size += delta.size
+		if stats == (indexTaskStats{}) {
+			delete(c.byIndex, key)
+		} else {
+			c.byIndex[key] = stats
+		}
+		if c.active[key] && delta.size != 0 {
+			c.addActiveSize(key[0], delta.size)
+		}
+	}
+}

@@ -85,3 +85,20 @@ func (a *segmentRecoveryMetricAggregates) ReplayFileHistogramsAsync() {
 		}
 	}()
 }
+
+// merge adds the aggregates of other.
+func (a *segmentRecoveryMetricAggregates) merge(other *segmentRecoveryMetricAggregates) {
+	for labels, count := range other.segmentCounts {
+		a.segmentCounts[labels] += count
+	}
+	for fileCount, frequency := range other.insertFileCountFrequency {
+		a.insertFileCountFrequency[fileCount] += frequency
+	}
+	for fileCount, frequency := range other.statFileCountFrequency {
+		a.statFileCountFrequency[fileCount] += frequency
+	}
+	for fileCount, frequency := range other.deleteFileCountFrequency {
+		a.deleteFileCountFrequency[fileCount] += frequency
+	}
+	a.numStoredRows += other.numStoredRows
+}

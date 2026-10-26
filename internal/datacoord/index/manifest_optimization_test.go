@@ -14,7 +14,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package meta
+package index
 
 import (
 	"context"
@@ -28,6 +28,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/milvus-io/milvus-proto/go-api/v3/commonpb"
+	"github.com/milvus-io/milvus/internal/datacoord/meta"
 	"github.com/milvus-io/milvus/internal/storage"
 	"github.com/milvus-io/milvus/internal/storagev2/packed"
 	"github.com/milvus-io/milvus/pkg/v3/objectstorage"
@@ -41,7 +42,7 @@ import (
 func TestManifestReadBudgetSharedAndCancellable(t *testing.T) {
 	old := Params.DataCoordCfg.SegmentIndexManifestLoadConcurrency.SwapTempValue("2")
 	defer Params.DataCoordCfg.SegmentIndexManifestLoadConcurrency.SwapTempValue(old)
-	m := &Meta{}
+	m := &meta.Meta{}
 	io := packed.NewManifestIOContext(8)
 	defer io.Close()
 	entered := make(chan struct{}, 8)
@@ -84,13 +85,13 @@ func TestManifestReadBudgetSharedAndCancellable(t *testing.T) {
 
 // A delayed first read must not impose a barrier on subsequent segments.
 func TestManifestRecoveryContinuouslySchedulesReads(t *testing.T) {
-	MockManifestIndexSubmissions(t)
+	meta.MockManifestIndexSubmissions(t)
 	old := Params.DataCoordCfg.SegmentIndexManifestLoadConcurrency.SwapTempValue("2")
 	defer Params.DataCoordCfg.SegmentIndexManifestLoadConcurrency.SwapTempValue(old)
-	m, err := NewMemoryMeta(t)
+	m, _, err := NewMemoryMetaWithIndex(t)
 	require.NoError(t, err)
 	for i := int64(1); i <= 5; i++ {
-		require.NoError(t, m.AddSegment(context.Background(), NewSegmentInfo(&datapb.SegmentInfo{
+		require.NoError(t, m.AddSegment(context.Background(), meta.NewSegmentInfo(&datapb.SegmentInfo{
 			ID: i, CollectionID: 300, PartitionID: 30, State: commonpb.SegmentState_Flushed,
 			StorageVersion: storage.StorageV3, ManifestHasIndex: true,
 			ManifestPath: packed.MarshalManifestPath("/tmp/recovery", i),
@@ -130,12 +131,12 @@ func TestManifestRecoverySingleExecutor(t *testing.T) {
 	defer Params.DataCoordCfg.SegmentIndexManifestLoadConcurrency.SwapTempValue(oldRead)
 	oldCommit := Params.DataCoordCfg.ManifestCommitConcurrency.SwapTempValue("16")
 	defer Params.DataCoordCfg.ManifestCommitConcurrency.SwapTempValue(oldCommit)
-	m, err := NewMemoryMeta(t)
+	m, _, err := NewMemoryMetaWithIndex(t)
 	require.NoError(t, err)
 	root := t.TempDir()
 	cfg := &indexpb.StorageConfig{StorageType: "local", RootPath: root}
 	m.ChunkManager = storage.NewLocalChunkManager(objectstorage.RootPath(root))
-	config := mockey.Mock(CreateStorageConfig).Return(cfg).Build()
+	config := mockey.Mock(meta.CreateStorageConfig).Return(cfg).Build()
 	defer config.UnPatch()
 	for i := int64(1); i <= 5; i++ {
 		base := path.Join(root, "insert_log", metautil.JoinIDPath(300, 30, i))
@@ -143,7 +144,7 @@ func TestManifestRecoverySingleExecutor(t *testing.T) {
 			DeltaLogs: []packed.DeltaLogEntry{{Path: "delta", NumEntries: 1}},
 		})
 		require.NoError(t, err)
-		require.NoError(t, m.AddSegment(context.Background(), NewSegmentInfo(&datapb.SegmentInfo{
+		require.NoError(t, m.AddSegment(context.Background(), meta.NewSegmentInfo(&datapb.SegmentInfo{
 			ID: i, CollectionID: 300, PartitionID: 30, State: commonpb.SegmentState_Flushed,
 			StorageVersion: storage.StorageV3, ManifestHasIndex: true, ManifestPath: manifest,
 		})))
@@ -159,10 +160,10 @@ func TestManifestRecoverySingleExecutor(t *testing.T) {
 func TestManifestRecoveryFailureDrainsAcceptedReads(t *testing.T) {
 	old := Params.DataCoordCfg.SegmentIndexManifestLoadConcurrency.SwapTempValue("2")
 	defer Params.DataCoordCfg.SegmentIndexManifestLoadConcurrency.SwapTempValue(old)
-	m, err := NewMemoryMeta(t)
+	m, _, err := NewMemoryMetaWithIndex(t)
 	require.NoError(t, err)
 	for i := int64(1); i <= 5; i++ {
-		require.NoError(t, m.AddSegment(context.Background(), NewSegmentInfo(&datapb.SegmentInfo{
+		require.NoError(t, m.AddSegment(context.Background(), meta.NewSegmentInfo(&datapb.SegmentInfo{
 			ID: i, CollectionID: 300, PartitionID: 30, State: commonpb.SegmentState_Flushed,
 			StorageVersion: storage.StorageV3, ManifestHasIndex: true,
 			ManifestPath: packed.MarshalManifestPath("/tmp/recovery", i),
@@ -173,7 +174,7 @@ func TestManifestRecoveryFailureDrainsAcceptedReads(t *testing.T) {
 		complete func([]packed.ManifestIndexInfo, error)
 	}
 	pending := make(chan pendingRead, 5)
-	reader := mockey.Mock(packed.SubmitManifestIndexInfos).To(func(ctx context.Context, _ *packed.ManifestIOContext, _ string, _ *indexpb.StorageConfig, complete func([]packed.ManifestIndexInfo, error)) error {
+	reader := mockey.Mock(packed.SubmitManifestIndexInfosWithProperties).To(func(ctx context.Context, _ *packed.ManifestIOContext, _ string, _ *packed.ManifestReadProperties, complete func([]packed.ManifestIndexInfo, error)) error {
 		pending <- pendingRead{ctx, complete}
 		return nil
 	}).Build()

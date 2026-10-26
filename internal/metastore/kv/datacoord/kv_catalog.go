@@ -34,6 +34,7 @@ import (
 	"github.com/milvus-io/milvus/internal/metastore/kv/txn"
 	"github.com/milvus-io/milvus/internal/metastore/model"
 	"github.com/milvus-io/milvus/internal/storage"
+	"github.com/milvus-io/milvus/internal/util/recovery"
 	"github.com/milvus-io/milvus/internal/util/segmentutil"
 	"github.com/milvus-io/milvus/pkg/v3/common"
 	"github.com/milvus-io/milvus/pkg/v3/kv"
@@ -48,6 +49,8 @@ import (
 	"github.com/milvus-io/milvus/pkg/v3/util/paramtable"
 	"github.com/milvus-io/milvus/pkg/v3/util/typeutil"
 )
+
+const segmentIndexPaginationSize = 10000
 
 type Catalog struct {
 	MetaKv kv.MetaKv
@@ -69,16 +72,22 @@ func NewCatalog(MetaKv kv.MetaKv, chunkManagerRootPath string, metaRootpath stri
 }
 
 func (kc *Catalog) ListSegments(ctx context.Context, collectionID int64) ([]*datapb.SegmentInfo, error) {
-	return kc.listSegmentsAndBinlogs(ctx, fmt.Sprintf("%d/", collectionID))
+	return kc.listSegmentsAndBinlogs(ctx, fmt.Sprintf("%d/", collectionID), nil)
 }
 
 // ListAllSegments scans each segment and binlog namespace once during recovery.
 // Callers must restrict the result to RootCoord's collection snapshot.
 func (kc *Catalog) ListAllSegments(ctx context.Context) ([]*datapb.SegmentInfo, error) {
-	return kc.listSegmentsAndBinlogs(ctx, "")
+	return kc.ListAllSegmentsForRecovery(ctx, nil)
 }
 
-func (kc *Catalog) listSegmentsAndBinlogs(ctx context.Context, collectionPrefix string) ([]*datapb.SegmentInfo, error) {
+// ListAllSegmentsForRecovery splits the segment-record prefix at collection IDs.
+// IDs choose range boundaries only; MetaStore filters the recovered collection scope.
+func (kc *Catalog) ListAllSegmentsForRecovery(ctx context.Context, collectionIDs []int64) ([]*datapb.SegmentInfo, error) {
+	return kc.listSegmentsAndBinlogs(ctx, "", collectionIDs)
+}
+
+func (kc *Catalog) listSegmentsAndBinlogs(ctx context.Context, collectionPrefix string, collectionIDs []int64) ([]*datapb.SegmentInfo, error) {
 	group, _ := errgroup.WithContext(ctx)
 	segments := make([]*datapb.SegmentInfo, 0)
 	insertLogs := make(map[typeutil.UniqueID][]*datapb.FieldBinlog, 1)
@@ -104,7 +113,7 @@ func (kc *Catalog) listSegmentsAndBinlogs(ctx context.Context, collectionPrefix 
 	executeFn(storage.StatsBinlog, statsLogs)
 	executeFn(storage.BM25Binlog, bm25Logs)
 	group.Go(func() error {
-		ret, err := kc.listSegmentsWithPrefix(ctx, SegmentPrefix+"/"+collectionPrefix)
+		ret, err := kc.listSegmentRecordsInRanges(ctx, SegmentPrefix+"/"+collectionPrefix, collectionIDs)
 		if err != nil {
 			return err
 		}
@@ -129,24 +138,26 @@ func (kc *Catalog) listSegments(ctx context.Context, collectionID int64) ([]*dat
 }
 
 func (kc *Catalog) listSegmentsWithPrefix(ctx context.Context, prefix string) ([]*datapb.SegmentInfo, error) {
-	segments := make([]*datapb.SegmentInfo, 0)
+	return kc.listSegmentRecordsInRanges(ctx, prefix, nil)
+}
 
-	applyFn := func(key []byte, value []byte) error {
+func (kc *Catalog) listSegmentRecordsInRanges(ctx context.Context, prefix string, collectionIDs []int64) ([]*datapb.SegmentInfo, error) {
+	decode := func(key []byte, value []byte) (*datapb.SegmentInfo, error) {
 		// due to SegmentStatslogPathPrefix has the same prefix with SegmentPrefix, so skip it.
 		if strings.Contains(string(key), SegmentStatslogPathPrefix) {
-			return nil
+			return nil, nil
 		}
 
 		// due to StatsTaskPrefix has the same prefix with SegmentPrefix, so skip it.
 		// when the WalkWithPrefix is refactored, this patch can be removed.
 		if strings.Contains(string(key), StatsTaskPrefix) {
-			return nil
+			return nil, nil
 		}
 
 		segmentInfo := &datapb.SegmentInfo{}
 		err := proto.Unmarshal(value, segmentInfo)
 		if err != nil {
-			return err
+			return nil, merr.WrapErrDataIntegrity(err, "unmarshal segment metadata key %s", string(key))
 		}
 
 		// Restore full paths for text index logs (compatible with old version).
@@ -161,16 +172,21 @@ func (kc *Catalog) listSegmentsWithPrefix(ctx context.Context, prefix string) ([
 		)
 		metautil.ExtractJSONKeyStatsRelativePaths(segmentInfo.GetJsonKeyStats())
 
-		segments = append(segments, segmentInfo)
-		return nil
+		return segmentInfo, nil
 	}
 
-	err := kc.MetaKv.WalkWithPrefix(ctx, prefix, kc.paginationSize, applyFn)
+	segments, err := listInRanges(ctx, kc.MetaKv, prefix, collectionIDs, kc.paginationSize, decode)
 	if err != nil {
 		return nil, err
 	}
-
-	return segments, nil
+	filtered := segments[:0]
+	for _, segment := range segments {
+		if segment != nil {
+			filtered = append(filtered, segment)
+		}
+	}
+	clear(segments[len(filtered):])
+	return filtered, nil
 }
 
 func (kc *Catalog) parseBinlogKey(key string) (int64, error) {
@@ -245,37 +261,37 @@ func (kc *Catalog) listBinlogs(ctx context.Context, binlogType storage.BinlogTyp
 func (kc *Catalog) applyBinlogInfo(segments []*datapb.SegmentInfo, insertLogs, deltaLogs,
 	statsLogs, bm25Logs map[typeutil.UniqueID][]*datapb.FieldBinlog,
 ) error {
-	var err error
-	for _, segmentInfo := range segments {
+	return recovery.ForEachInShards(len(segments), recovery.Workers(), func(i int) int64 { return segments[i].GetID() }, func(_, i int) error {
+		segmentInfo := segments[i]
 		if len(segmentInfo.Binlogs) == 0 {
 			segmentInfo.Binlogs = insertLogs[segmentInfo.ID]
 		}
-		if err = binlog.CompressFieldBinlogs(segmentInfo.Binlogs); err != nil {
+		if err := binlog.CompressFieldBinlogs(segmentInfo.Binlogs); err != nil {
 			return err
 		}
 
 		if len(segmentInfo.Deltalogs) == 0 {
 			segmentInfo.Deltalogs = deltaLogs[segmentInfo.ID]
 		}
-		if err = binlog.CompressFieldBinlogs(segmentInfo.Deltalogs); err != nil {
+		if err := binlog.CompressFieldBinlogs(segmentInfo.Deltalogs); err != nil {
 			return err
 		}
 
 		if len(segmentInfo.Statslogs) == 0 {
 			segmentInfo.Statslogs = statsLogs[segmentInfo.ID]
 		}
-		if err = binlog.CompressFieldBinlogs(segmentInfo.Statslogs); err != nil {
+		if err := binlog.CompressFieldBinlogs(segmentInfo.Statslogs); err != nil {
 			return err
 		}
 
 		if len(segmentInfo.Bm25Statslogs) == 0 {
 			segmentInfo.Bm25Statslogs = bm25Logs[segmentInfo.ID]
 		}
-		if err = binlog.CompressFieldBinlogs(segmentInfo.Bm25Statslogs); err != nil {
+		if err := binlog.CompressFieldBinlogs(segmentInfo.Bm25Statslogs); err != nil {
 			return err
 		}
-	}
-	return nil
+		return nil
+	})
 }
 
 func (kc *Catalog) AddSegment(ctx context.Context, segment *datapb.SegmentInfo) error {
@@ -808,24 +824,58 @@ func (kc *Catalog) CreateIndex(ctx context.Context, index *model.Index) error {
 }
 
 func (kc *Catalog) ListIndexes(ctx context.Context) ([]*model.Index, error) {
-	indexes := make([]*model.Index, 0)
-	applyFn := func(key []byte, value []byte) error {
-		meta := &indexpb.FieldIndex{}
-		err := proto.Unmarshal(value, meta)
+	return kc.ListIndexesForRecovery(ctx, nil)
+}
+
+// ListIndexesForRecovery lists every field index like ListIndexes, reading the
+// prefix as metastore.parallelScanRanges key ranges split at collectionIDs,
+// in parallel at one revision, each decoded in the goroutine of its range.
+// The indexes come back in key order, as from one walk.
+func (kc *Catalog) ListIndexesForRecovery(ctx context.Context, collectionIDs []int64) ([]*model.Index, error) {
+	return listInRanges(ctx, kc.MetaKv, util.FieldIndexPrefix+"/", collectionIDs, kc.paginationSize,
+		func(_ []byte, value []byte) (*model.Index, error) {
+			meta := &indexpb.FieldIndex{}
+			if err := proto.Unmarshal(value, meta); err != nil {
+				mlog.Warn(ctx, "unmarshal index info failed", mlog.Err(err))
+				return nil, err
+			}
+			return model.UnmarshalIndexModel(meta), nil
+		})
+}
+
+// listInRanges decodes every key under prefix into a T, walking the prefix as
+// metastore.parallelScanRanges key ranges split at collectionIDs (see
+// kv.WalkWithPrefixInRanges), and returns the T in key order.
+func listInRanges[T any](
+	ctx context.Context,
+	metaKv kv.MetaKv,
+	prefix string,
+	collectionIDs []int64,
+	paginationSize int,
+	decode func(key, value []byte) (T, error),
+) ([]T, error) {
+	bounds := kv.RangeBounds(prefix, collectionIDs, paramtable.Get().MetaStoreCfg.ParallelScanRanges.GetAsInt())
+	ranges := make([][]T, len(bounds)+1)
+	err := kv.WalkWithPrefixInRanges(ctx, metaKv, prefix, bounds, paginationSize, func(rangeIndex int, key, value []byte) error {
+		item, err := decode(key, value)
 		if err != nil {
-			mlog.Warn(ctx, "unmarshal index info failed", mlog.Err(err))
 			return err
 		}
-
-		indexes = append(indexes, model.UnmarshalIndexModel(meta))
+		ranges[rangeIndex] = append(ranges[rangeIndex], item)
 		return nil
-	}
-
-	err := kc.MetaKv.WalkWithPrefix(ctx, util.FieldIndexPrefix+"/", kc.paginationSize, applyFn)
+	})
 	if err != nil {
 		return nil, err
 	}
-	return indexes, nil
+	total := 0
+	for _, items := range ranges {
+		total += len(items)
+	}
+	all := make([]T, 0, total)
+	for _, items := range ranges {
+		all = append(all, items...)
+	}
+	return all, nil
 }
 
 func (kc *Catalog) AlterIndexes(ctx context.Context, indexes []*model.Index) error {
@@ -903,35 +953,45 @@ func (kc *Catalog) CreateSegmentIndex(ctx context.Context, segIdx *model.Segment
 	return nil
 }
 
+// listSegmentIndexesWithPrefix lists the segment indexes under prefix, in key
+// order; collectionIDs split a prefix of several collections into parallel
+// ranges (see listInRanges).
+func (kc *Catalog) listSegmentIndexesWithPrefix(ctx context.Context, prefix string, collectionIDs []int64) ([]*model.SegmentIndex, error) {
+	paginationSize := kc.paginationSize
+	if paginationSize <= 0 || paginationSize > segmentIndexPaginationSize {
+		paginationSize = segmentIndexPaginationSize
+	}
+	return listInRanges(ctx, kc.MetaKv, prefix, collectionIDs, paginationSize,
+		func(_ []byte, value []byte) (*model.SegmentIndex, error) {
+			segmentIndexInfo := &indexpb.SegmentIndex{}
+			if err := proto.Unmarshal(value, segmentIndexInfo); err != nil {
+				mlog.Warn(ctx, "unmarshal segment index info failed", mlog.Err(err))
+				return nil, err
+			}
+			return model.UnmarshalSegmentIndexModel(segmentIndexInfo), nil
+		})
+}
+
 func (kc *Catalog) ListSegmentIndexes(ctx context.Context, collectionID int64) ([]*model.SegmentIndex, error) {
-	return kc.listSegmentIndexesWithPrefix(ctx, buildSegmentIndexCollectionPrefix(collectionID))
+	return kc.listSegmentIndexesWithPrefix(ctx, buildSegmentIndexCollectionPrefix(collectionID), nil)
 }
 
-// ListAllSegmentIndexes scans the global segment-index prefix for recovery.
+// ListAllSegmentIndexes scans the global segment-index prefix for metadata recovery.
 func (kc *Catalog) ListAllSegmentIndexes(ctx context.Context) ([]*model.SegmentIndex, error) {
-	return kc.listSegmentIndexesWithPrefix(ctx, util.SegmentIndexPrefix+"/")
+	return kc.ListAllSegmentIndexesForRecovery(ctx, nil)
 }
 
-func (kc *Catalog) listSegmentIndexesWithPrefix(ctx context.Context, prefix string) ([]*model.SegmentIndex, error) {
-	segIndexes := make([]*model.SegmentIndex, 0)
-	applyFn := func(key []byte, value []byte) error {
-		segmentIndexInfo := &indexpb.SegmentIndex{}
-		err := proto.Unmarshal(value, segmentIndexInfo)
-		if err != nil {
-			mlog.Warn(ctx, "unmarshal segment index info failed", mlog.Err(err))
-			return err
-		}
+// ListAllSegmentIndexesForRecovery lists every segment index like
+// ListAllSegmentIndexes, reading the prefix as metastore.parallelScanRanges
+// key ranges split at collectionIDs, in parallel at one revision, each decoded
+// in the goroutine of its range. The indexes come back in key order, as from
+// one walk.
+func (kc *Catalog) ListAllSegmentIndexesForRecovery(ctx context.Context, collectionIDs []int64) ([]*model.SegmentIndex, error) {
+	return kc.listSegmentIndexesWithPrefix(ctx, util.SegmentIndexPrefix+"/", collectionIDs)
+}
 
-		segIndexes = append(segIndexes, model.UnmarshalSegmentIndexModel(segmentIndexInfo))
-		return nil
-	}
-
-	err := kc.MetaKv.WalkWithPrefix(ctx, prefix, kc.paginationSize, applyFn)
-	if err != nil {
-		return nil, err
-	}
-
-	return segIndexes, nil
+func (kc *Catalog) ListPartitionSegmentIndexes(ctx context.Context, collectionID, partitionID int64) ([]*model.SegmentIndex, error) {
+	return kc.listSegmentIndexesWithPrefix(ctx, buildSegmentIndexPartitionPrefix(collectionID, partitionID), nil)
 }
 
 func (kc *Catalog) AlterSegmentIndexes(ctx context.Context, segIdxes []*model.SegmentIndex) error {

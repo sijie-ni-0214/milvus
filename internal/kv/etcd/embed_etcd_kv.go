@@ -38,7 +38,10 @@ import (
 )
 
 // implementation assertion
-var _ kv.MetaKv = (*EmbedEtcdKV)(nil)
+var (
+	_ kv.MetaKv      = (*EmbedEtcdKV)(nil)
+	_ kv.RangeWalker = (*EmbedEtcdKV)(nil)
+)
 
 const (
 	defaultRetryCount    = 3
@@ -145,6 +148,23 @@ func (kv *EmbedEtcdKV) WalkWithPrefix(ctx context.Context, prefix string, pagina
 	return kv.walkPrefix(ctx, prefix, paginationSize, func(keyValue *mvccpb.KeyValue) error {
 		return fn(keyValue.Key, keyValue.Value)
 	})
+}
+
+// WalkWithPrefixInRanges implements kv.RangeWalker: it walks prefix like
+// WalkWithPrefix, as the key ranges bounds split it into, read in parallel at
+// one revision (see WalkPrefixInRanges).
+func (kv *EmbedEtcdKV) WalkWithPrefixInRanges(ctx context.Context, prefix string, bounds []string, paginationSize int, fn func(rangeIndex int, key, value []byte) error) error {
+	return WalkPrefixInRanges(
+		getContextWithoutAuth(ctx),
+		kv.client,
+		kv.GetPath(prefix),
+		rootedBounds(kv.GetPath, bounds),
+		paginationSize,
+		kv.requestTimeout,
+		func(rangeIndex int, keyValue *mvccpb.KeyValue) error {
+			return fn(rangeIndex, keyValue.Key, keyValue.Value)
+		},
+	)
 }
 
 // LoadWithPrefix returns all the keys and values with the given key prefix

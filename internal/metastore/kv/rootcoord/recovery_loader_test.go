@@ -150,6 +150,40 @@ func TestCatalogListCollectionsForRecoverySkipsChildScansForEmbeddedMetadata(t *
 	assert.Zero(t, recorder.calls[FunctionMetaPrefix+"/"])
 }
 
+func TestCatalogListCollectionsForRecoveryReportsCollectionIDsBeforeChildScans(t *testing.T) {
+	records := map[string][]byte{
+		CollectionMetaPrefix + "/50": marshalRecoveryProto(t, &pb.CollectionInfo{
+			ID: 50, DbId: util.DefaultDBID, Schema: &schemapb.CollectionSchema{Name: "legacy"}, State: pb.CollectionState_CollectionCreated,
+		}),
+		CollectionInfoMetaPrefix + "/1/100": marshalRecoveryProto(t, &pb.CollectionInfo{
+			ID: 100, DbId: 1, Schema: &schemapb.CollectionSchema{Name: "c100"}, State: pb.CollectionState_CollectionCreated,
+		}),
+		CollectionInfoMetaPrefix + "/1/200": marshalRecoveryProto(t, &pb.CollectionInfo{
+			ID: 200, DbId: 1, Schema: &schemapb.CollectionSchema{Name: "c200"}, State: pb.CollectionState_CollectionCreated,
+		}),
+		CollectionInfoMetaPrefix + "/1/999": []byte(tombstone()),
+		FieldMetaPrefix + "/100/11":         marshalRecoveryProto(t, &schemapb.FieldSchema{FieldID: 11, Name: "f100"}),
+	}
+	recorder := &recoveryWalkRecorder{calls: make(map[string]int)}
+	metaKV := newRecoveryMetaKV(t, records, recorder)
+	var reported [][]int64
+	childScansAtReport := -1
+	catalog := NewCatalog(metaKV, WithRecoveredCollectionIDs(func(collectionIDs []int64) {
+		reported = append(reported, collectionIDs)
+		recorder.mu.Lock()
+		childScansAtReport = recorder.calls[FieldMetaPrefix+"/"] + recorder.calls[PartitionMetaPrefix+"/"]
+		recorder.mu.Unlock()
+	})).(*Catalog)
+
+	collectionsByDB, err := catalog.ListCollectionsForRecovery(context.Background(), []int64{util.NonDBID, 1}, 0)
+	require.NoError(t, err)
+	require.Len(t, collectionsByDB[1], 2)
+	require.Len(t, reported, 1)
+	assert.ElementsMatch(t, []int64{50, 100, 200}, reported[0])
+	assert.Zero(t, childScansAtReport)
+	assert.Positive(t, recorder.calls[FieldMetaPrefix+"/"])
+}
+
 func TestCatalogListCollectionsForRecoveryRequiresPrefixWalker(t *testing.T) {
 	catalog := NewCatalog(mocks.NewTxnKV(t)).(*Catalog)
 
