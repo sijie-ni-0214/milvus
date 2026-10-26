@@ -111,22 +111,8 @@ func (i *TalonPrewarmInspector) inspect(ctx context.Context) {
 		mlog.RatedWarn(ctx, 1, "Talon prewarm enumeration failed", mlog.Err(err))
 		return
 	}
-	active := make(map[string]struct{}, len(descriptors))
+	active := make(map[string]uint64, len(descriptors))
 	failures := 0
-	batch := make([]TalonPrewarmRequest, 0, i.batchSize)
-	loaded := 0
-	flush := func() {
-		if ctx.Err() != nil {
-			return
-		}
-		if err := i.client.BatchLoad(ctx, batch); err != nil {
-			failures++
-			mlog.RatedWarn(ctx, 1, "Talon prewarm batch load failed", mlog.Int("count", len(batch)), mlog.Err(err))
-		} else {
-			loaded += len(batch)
-		}
-		batch = batch[:0]
-	}
 	for _, descriptor := range descriptors {
 		if ctx.Err() != nil {
 			return
@@ -141,19 +127,56 @@ func (i *TalonPrewarmInspector) inspect(ctx context.Context) {
 		if uri == "" {
 			continue
 		}
-		if _, ok := active[uri]; ok {
+		active[uri] = size
+	}
+	for uri := range i.metadata {
+		if size, ok := active[uri]; !ok || size > 0 {
+			delete(i.metadata, uri)
+		}
+	}
+	batch := make([]TalonPrewarmRequest, 0, i.batchSize)
+	loaded := 0
+	flush := func() {
+		if len(batch) == 0 || ctx.Err() != nil {
+			return
+		}
+		if err := i.client.BatchLoad(ctx, batch); err != nil {
+			failures++
+			mlog.RatedWarn(ctx, 1, "Talon prewarm batch load failed", mlog.Int("count", len(batch)), mlog.Err(err))
+		} else {
+			loaded += len(batch)
+		}
+		batch = batch[:0]
+	}
+	add := func(request TalonPrewarmRequest) {
+		batch = append(batch, request)
+		if len(batch) == i.batchSize {
+			flush()
+		}
+	}
+	// Load the identity milvus-storage readers use (Manifest::ReadFrom,
+	// TalonFileSystem::OpenTalon): a recorded manifest size skips the HEAD and
+	// opens Talon's unchecked version; any other manifest opens with the ETag
+	// that stat reports. Manifests that record their size load first, since any
+	// other may wait for a serial stat.
+	for uri, size := range active {
+		if ctx.Err() != nil {
+			return
+		}
+		if size > 0 {
+			add(TalonPrewarmRequest{URI: uri, Size: size})
+		}
+	}
+	flush()
+	for uri, size := range active {
+		if ctx.Err() != nil {
+			return
+		}
+		if size > 0 {
 			continue
 		}
-		active[uri] = struct{}{}
-		// Load the identity milvus-storage readers use (Manifest::ReadFrom,
-		// TalonFileSystem::OpenTalon): a recorded manifest size skips the HEAD and
-		// opens Talon's unchecked version; any other manifest opens with the ETag
-		// that stat reports.
 		request, ok := i.metadata[uri]
-		if size > 0 {
-			request = TalonPrewarmRequest{URI: uri, Size: size}
-			delete(i.metadata, uri)
-		} else if !ok {
+		if !ok {
 			size, version, err := i.client.Stat(ctx, uri)
 			if err != nil {
 				failures++
@@ -163,18 +186,8 @@ func (i *TalonPrewarmInspector) inspect(ctx context.Context) {
 			request = TalonPrewarmRequest{URI: uri, Size: size, Version: version}
 			i.metadata[uri] = request
 		}
-		batch = append(batch, request)
-		if len(batch) == i.batchSize {
-			flush()
-		}
+		add(request)
 	}
-	if len(batch) > 0 {
-		flush()
-	}
-	for uri := range i.metadata {
-		if _, ok := active[uri]; !ok {
-			delete(i.metadata, uri)
-		}
-	}
+	flush()
 	mlog.Info(ctx, "Talon prewarm round finished", mlog.Int("active", len(active)), mlog.Int("loaded", loaded), mlog.Int("failures", failures))
 }
