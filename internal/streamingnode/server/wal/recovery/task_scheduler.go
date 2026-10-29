@@ -183,6 +183,10 @@ func (t *trackedTask) SchedulerTaskType() string {
 	return nodescheduler.TaskTypeName(t.task)
 }
 
+func (t *trackedTask) SchedulerLane() nodescheduler.Lane {
+	return nodescheduler.LaneOf(t.task)
+}
+
 func (t *trackedTask) Execute(ctx context.Context) error {
 	err := t.task.Execute(ctx)
 	if !errors.Is(err, nodescheduler.ErrDelay) {

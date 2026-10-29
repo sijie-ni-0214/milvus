@@ -213,6 +213,12 @@ type broadcastAckTask struct {
 	completed        bool
 }
 
+// SchedulerLane keeps acknowledgements, which DDL callers wait on, from
+// queueing behind segment flushes.
+func (t *broadcastAckTask) SchedulerLane() nodescheduler.Lane {
+	return nodescheduler.LaneControl
+}
+
 func (t *broadcastAckTask) Execute(ctx context.Context) error {
 	t.observeDropCollectionStage(dropCollectionStageAckReadyWait, time.Since(t.createdAt))
 	defer func() {
