@@ -3233,29 +3233,26 @@ func (m *Meta) IsCollectionCompactionBlocked(collectionID int64) bool {
 
 // GetCompactableSegmentGroupByCollection returns eligible L0 segments grouped by collection.
 // Collections with eligible L1/L2 segments retain an empty entry for the L0
-// policy's active/idle bookkeeping, without allocating wrappers for those segments.
+// policy's active/idle bookkeeping, without copying their segment metadata.
 // Snapshot protection applies to referenced L1/L2 segments and must not block
 // L0 delete-log compaction, which would cause delta log accumulation and write stalls.
 func (m *Meta) GetCompactableSegmentGroupByCollection() map[int64][]*SegmentInfo {
 	ret := make(map[int64][]*SegmentInfo)
-	segment := &SegmentInfo{}
-	for id, segProto := range m.Segments.store.GetAllSegments() {
-		dc := m.Segments.dcStateOf(id)
-		segment.SegmentInfo = segProto
-		segment.IsCompacting = dc != nil && dc.isCompacting
-		if !IsSegmentHealthy(segment) || !IsFlushed(segment) ||
-			segment.IsCompacting || segment.GetIsImporting() {
-			continue
-		}
-
+	m.Segments.RangeReused(func(segment *SegmentInfo) bool {
 		collectionID := segment.GetCollectionID()
 		if _, ok := ret[collectionID]; !ok {
 			ret[collectionID] = nil
 		}
 		if segment.GetLevel() == datapb.SegmentLevel_L0 {
-			ret[collectionID] = append(ret[collectionID], m.Segments.assemble(segProto, dc))
+			ret[collectionID] = append(ret[collectionID], segment.ShadowClone())
 		}
-	}
+		return true
+	}, SegmentFilterFunc(func(segment *SegmentInfo) bool {
+		return IsSegmentHealthy(segment) &&
+			IsFlushed(segment) && // sealed segment
+			!segment.IsCompacting && // not compacting now
+			!segment.GetIsImporting() // not importing now
+	}))
 	return ret
 }
 
