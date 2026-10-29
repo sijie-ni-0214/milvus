@@ -281,6 +281,7 @@ func (s *nodeScheduler) reportStats() {
 				mlog.Info(
 					context.TODO(), "[SN recovery] node scheduler stats",
 					mlog.String("phase", "node_scheduler"),
+					mlog.Stringer("lane", s.lane),
 					mlog.String("taskType", task.taskType),
 					mlog.Int("capacity", snapshot.capacity),
 					mlog.Int64("totalQueued", snapshot.totalQueued),

@@ -46,6 +46,45 @@ type Task interface {
 	Execute(context.Context) error
 }
 
+// Lane separates tasks that must not wait for each other's workers. Each lane
+// has its own queue and its own workers, sized by the same concurrency.
+type Lane int
+
+const (
+	// LaneDefault runs bulk data work, such as segment loads and flushes.
+	LaneDefault Lane = iota
+	// LaneControl runs coordination work that callers wait on, such as
+	// QueryView preparation and broadcast acknowledgements, so that it never
+	// waits for workers held by bulk work. Work it depends on may still do.
+	LaneControl
+	laneCount
+)
+
+var laneNames = [laneCount]string{"default", "control"}
+
+func (l Lane) String() string {
+	if l < LaneDefault || l >= laneCount {
+		return laneNames[LaneDefault]
+	}
+	return laneNames[l]
+}
+
+// LaneProvider lets a task, or a wrapper of one, choose its lane. Tasks without
+// it run in LaneDefault.
+type LaneProvider interface {
+	SchedulerLane() Lane
+}
+
+// LaneOf returns the lane a task runs in; an unknown lane runs in LaneDefault.
+func LaneOf(task Task) Lane {
+	if provider, ok := task.(LaneProvider); ok {
+		if lane := provider.SchedulerLane(); lane > LaneDefault && lane < laneCount {
+			return lane
+		}
+	}
+	return LaneDefault
+}
+
 type TaskHandle interface {
 	Cancel()
 	Wait(context.Context) error
@@ -110,6 +149,7 @@ func MarkDelay(err error) error {
 type nodeScheduler struct {
 	ctx     context.Context
 	cancel  context.CancelFunc
+	lane    Lane
 	stats   *schedulerStats
 	metrics schedulerMetrics
 
@@ -176,6 +216,10 @@ func (h *taskHandle) Wait(ctx context.Context) error {
 }
 
 func New(concurrency int) *nodeScheduler {
+	return newLaneScheduler(LaneDefault, concurrency)
+}
+
+func newLaneScheduler(lane Lane, concurrency int) *nodeScheduler {
 	if concurrency <= 0 {
 		panic("node scheduler concurrency must be greater than zero")
 	}
@@ -184,6 +228,7 @@ func New(concurrency int) *nodeScheduler {
 	scheduler := &nodeScheduler{
 		ctx:     ctx,
 		cancel:  cancel,
+		lane:    lane,
 		stats:   newSchedulerStats(concurrency),
 		metrics: newSchedulerMetrics(paramtable.GetStringNodeID()),
 		queue:   list.New(),
@@ -206,9 +251,9 @@ func (s *nodeScheduler) resize(concurrency int) {
 		return
 	}
 
+	s.metrics.adjustConcurrency(concurrency - s.concurrency)
 	s.concurrency = concurrency
 	s.stats.setCapacity(concurrency)
-	s.metrics.setConcurrency(concurrency)
 	if concurrency > s.workerCount {
 		additional := concurrency - s.workerCount
 		s.workerCount += additional
@@ -261,11 +306,11 @@ func (s *nodeScheduler) Close() {
 		s.mu.Unlock()
 		s.workers.Wait()
 		s.reporter.Wait()
-		s.metrics.setConcurrency(0)
 		return
 	}
 
 	s.closed = true
+	s.metrics.adjustConcurrency(-s.concurrency)
 	for element := s.queue.Front(); element != nil; element = element.Next() {
 		entry := element.Value.(*taskEntry)
 		entry.queued = nil
@@ -291,7 +336,6 @@ func (s *nodeScheduler) Close() {
 
 	s.workers.Wait()
 	s.reporter.Wait()
-	s.metrics.setConcurrency(0)
 }
 
 // cancelTask removes queued/delayed work immediately. A running task owns its
@@ -487,7 +531,33 @@ func (s *nodeScheduler) promoteDelayed() {
 	}
 }
 
-var getGlobalScheduler = sync.OnceValue(func() *nodeScheduler {
+type laneSchedulers [laneCount]*nodeScheduler
+
+func newLaneSchedulers(concurrency int) *laneSchedulers {
+	var schedulers laneSchedulers
+	for lane := range schedulers {
+		schedulers[lane] = newLaneScheduler(Lane(lane), concurrency)
+	}
+	return &schedulers
+}
+
+func (s *laneSchedulers) Submit(task Task, opts ...Option) TaskHandle {
+	return s[LaneOf(task)].Submit(task, opts...)
+}
+
+func (s *laneSchedulers) resize(concurrency int) {
+	for _, scheduler := range s {
+		scheduler.resize(concurrency)
+	}
+}
+
+func (s *laneSchedulers) Close() {
+	for _, scheduler := range s {
+		scheduler.Close()
+	}
+}
+
+var getGlobalScheduler = sync.OnceValue(func() *laneSchedulers {
 	params := paramtable.Get()
 	ratioParam := &params.CommonCfg.NodeSchedulerMaxConcurrencyRatio
 	cpu := hardware.GetCPUNum()
@@ -499,7 +569,7 @@ var getGlobalScheduler = sync.OnceValue(func() *nodeScheduler {
 			mlog.Int("concurrency", concurrency))
 	}
 
-	scheduler := New(concurrency)
+	scheduler := newLaneSchedulers(concurrency)
 	params.Watch(ratioParam.Key, config.NewHandler("node-scheduler-concurrency", func(event *config.Event) {
 		if !event.HasUpdated {
 			return

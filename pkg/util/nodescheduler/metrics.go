@@ -54,8 +54,9 @@ func newSchedulerMetrics(nodeID string) schedulerMetrics {
 	return schedulerMetrics{nodeID: nodeID}
 }
 
-func (m schedulerMetrics) setConcurrency(concurrency int) {
-	metrics.NodeSchedulerConcurrency.WithLabelValues(m.nodeID).Set(float64(concurrency))
+// Each lane contributes its capacity to the existing per-node gauge.
+func (m schedulerMetrics) adjustConcurrency(delta int) {
+	metrics.NodeSchedulerConcurrency.WithLabelValues(m.nodeID).Add(float64(delta))
 }
 
 func (m schedulerMetrics) observeEnqueued(taskType string) {
