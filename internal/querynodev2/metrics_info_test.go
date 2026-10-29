@@ -20,6 +20,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bytedance/mockey"
 	"github.com/cockroachdb/errors"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
@@ -32,6 +33,7 @@ import (
 	"github.com/milvus-io/milvus/internal/mocks/distributed/mock_streaming"
 	"github.com/milvus-io/milvus/internal/querynodev2/delegator"
 	"github.com/milvus-io/milvus/internal/querynodev2/pipeline"
+	"github.com/milvus-io/milvus/internal/querynodev2/qnview"
 	"github.com/milvus-io/milvus/internal/querynodev2/segments"
 	"github.com/milvus-io/milvus/pkg/v3/metrics"
 	"github.com/milvus-io/milvus/pkg/v3/mq/msgdispatcher"
@@ -262,9 +264,14 @@ func TestGetQuotaMetricsAggregatesCollectionGauges(t *testing.T) {
 	wal.EXPECT().Local().Return(local).Once()
 	streaming.SetWALForTest(wal)
 	t.Cleanup(streaming.RecoverWALForTest)
+	// QueryView collections live outside the segment manager.
+	queryViewCollections := mockey.Mock((*qnview.SegmentResourceManager).CollectionIDs).Return([]int64{3, 5}).Build()
+	t.Cleanup(func() { queryViewCollections.UnPatch() })
+	node.queryViewSegments.Store(&qnview.SegmentResourceManager{})
 
 	quotaMetrics, err := getQuotaMetrics(node)
 	require.NoError(t, err)
+	assert.ElementsMatch(t, []int64{1, 2, 3, 5}, quotaMetrics.Effect.CollectionIDs)
 	assert.Equal(t, int64(300), quotaMetrics.GrowingSegmentsSize)
 	assert.Equal(t, float64(300), testutil.ToFloat64(metrics.QueryNodeEntitiesSize.WithLabelValues(
 		"7", metrics.AllLabel, segments.SegmentTypeGrowing.String())))
