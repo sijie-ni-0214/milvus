@@ -303,9 +303,14 @@ func TestGetQuotaMetricsAggregatesCollectionGauges(t *testing.T) {
 	wal.EXPECT().Local().Return(local).Once()
 	streaming.SetWALForTest(wal)
 	t.Cleanup(streaming.RecoverWALForTest)
+	// QueryView collections live outside the segment manager.
+	queryViewCollections := mockey.Mock((*qnview.SegmentResourceManager).CollectionIDs).Return([]int64{3, 5}).Build()
+	t.Cleanup(func() { queryViewCollections.UnPatch() })
+	node.queryViewSegments.Store(&qnview.SegmentResourceManager{})
 
 	quotaMetrics, err := getQuotaMetrics(node)
 	require.NoError(t, err)
+	assert.ElementsMatch(t, []int64{1, 2, 3, 5}, quotaMetrics.Effect.CollectionIDs)
 	assert.Equal(t, int64(300), quotaMetrics.GrowingSegmentsSize)
 	assert.Equal(t, float64(300), testutil.ToFloat64(metrics.QueryNodeEntitiesSize.WithLabelValues(
 		"7", metrics.AllLabel, segments.SegmentTypeGrowing.String())))
