@@ -34,7 +34,6 @@ import (
 	"github.com/milvus-io/milvus-proto/go-api/v3/milvuspb"
 	"github.com/milvus-io/milvus-proto/go-api/v3/schemapb"
 	"github.com/milvus-io/milvus/internal/storage"
-	"github.com/milvus-io/milvus/internal/storagev2/packed"
 	"github.com/milvus-io/milvus/pkg/v3/common"
 	"github.com/milvus-io/milvus/pkg/v3/proto/datapb"
 	"github.com/milvus-io/milvus/pkg/v3/proto/indexpb"
@@ -54,23 +53,23 @@ const (
 	vectorIndexName       = "cmek_hnsw"
 	vectorIndexType       = "HNSW"
 	vectorIndexVersion    = int32(8)
-	vectorIndexPathFormat = indexpb.IndexStorePathVersion_INDEX_STORE_PATH_VERSION_SEGMENT_ROOTED
+	vectorIndexPathFormat = indexpb.IndexStorePathVersion_INDEX_STORE_PATH_VERSION_BUILD_ROOTED
 )
 
-type VectorIndexV3Suite struct {
+type VectorIndexV2Suite struct {
 	integration.MiniClusterSuite
 	dbName string
 	ezID   int64
 }
 
-func (s *VectorIndexV3Suite) SetupSuite() {
+func (s *VectorIndexV2Suite) SetupSuite() {
 	s.WithOptions(integration.WithoutResetDeploymentWhenTestTearDown())
-	s.WithMilvusConfig("common.storage.useLoonFFI", "true")
+	s.WithMilvusConfig("common.storage.useLoonFFI", "false")
 	s.WithMilvusConfig("dataNode.storage.format", "parquet")
 	s.WithMilvusConfig("common.storage.enableGrowingSourceFlush", "false")
 	s.WithMilvusConfig("dataCoord.targetVecIndexVersion", strconv.Itoa(int(vectorIndexVersion)))
 	s.WithMilvusConfig("dataCoord.forceRebuildSegmentIndex", "true")
-	s.WithMilvusConfig("dataCoord.index.storePathVersion", "2")
+	s.WithMilvusConfig("dataCoord.index.storePathVersion", "0")
 	s.WithMilvusConfig("indexCoord.segment.minSegmentNumRowsToEnableIndex", "64")
 	s.WithMilvusConfig("queryNode.segcore.interimIndex.enableIndex", "false")
 	s.WithMilvusConfig("queryNode.segcore.tieredStorage.warmup.vectorIndex", common.WarmupSync)
@@ -97,7 +96,7 @@ func (s *VectorIndexV3Suite) SetupSuite() {
 	s.Require().Positive(s.ezID)
 }
 
-func (s *VectorIndexV3Suite) TearDownSuite() {
+func (s *VectorIndexV2Suite) TearDownSuite() {
 	if s.Cluster != nil && s.dbName != "" {
 		status, err := s.Cluster.MilvusClient.DropDatabase(context.Background(), &milvuspb.DropDatabaseRequest{DbName: s.dbName})
 		s.NoError(merr.CheckRPCCall(status, err))
@@ -105,11 +104,11 @@ func (s *VectorIndexV3Suite) TearDownSuite() {
 	s.MiniClusterSuite.TearDownSuite()
 }
 
-func TestVectorIndexV3Suite(t *testing.T) {
-	suite.Run(t, new(VectorIndexV3Suite))
+func TestVectorIndexV2Suite(t *testing.T) {
+	suite.Run(t, new(VectorIndexV2Suite))
 }
 
-func (s *VectorIndexV3Suite) TestVectorIndexData() {
+func (s *VectorIndexV2Suite) TestVectorIndexData() {
 	ctx := s.Cluster.GetContext()
 	collection := "cmek_vector_index_" + funcutil.GenRandomStr()
 	schema := &schemapb.CollectionSchema{
@@ -196,7 +195,7 @@ func (s *VectorIndexV3Suite) TestVectorIndexData() {
 	s.assertVectorIndexSearch(ctx, collection, firstFloatVector([]*schemapb.FieldData{vectors}, fixtureVectorName, vectorIndexDim))
 }
 
-func (s *VectorIndexV3Suite) assertVectorIndexDescription(ctx context.Context, collection string) int64 {
+func (s *VectorIndexV2Suite) assertVectorIndexDescription(ctx context.Context, collection string) int64 {
 	response, err := s.Cluster.MilvusClient.DescribeIndex(ctx, &milvuspb.DescribeIndexRequest{
 		DbName: s.dbName, CollectionName: collection, FieldName: fixtureVectorName, IndexName: vectorIndexName,
 	})
@@ -216,7 +215,7 @@ func (s *VectorIndexV3Suite) assertVectorIndexDescription(ctx context.Context, c
 	return description.GetIndexID()
 }
 
-func (s *VectorIndexV3Suite) locateVectorIndex(ctx context.Context, segments []*datapb.SegmentInfo, indexID int64) []inspector.VectorIndexSet {
+func (s *VectorIndexV2Suite) locateVectorIndex(ctx context.Context, segments []*datapb.SegmentInfo, indexID int64) []inspector.VectorIndexSet {
 	var sets []inspector.VectorIndexSet
 	var locateErr error
 	s.Require().Eventually(func() bool {
@@ -229,7 +228,7 @@ func (s *VectorIndexV3Suite) locateVectorIndex(ctx context.Context, segments []*
 	return sets
 }
 
-func (s *VectorIndexV3Suite) inspectVectorIndexObjects(ctx context.Context, sets []inspector.VectorIndexSet) {
+func (s *VectorIndexV2Suite) inspectVectorIndexObjects(ctx context.Context, sets []inspector.VectorIndexSet) {
 	reader := inspector.ObjectReader{ChunkManager: s.Cluster.ChunkManager}
 	for _, set := range sets {
 		s.Require().Positive(set.IndexVersion)
@@ -245,19 +244,15 @@ func (s *VectorIndexV3Suite) inspectVectorIndexObjects(ctx context.Context, sets
 	}
 }
 
-func (s *VectorIndexV3Suite) assertVectorOnlyColumnGroup(segments []*datapb.SegmentInfo) {
+func (s *VectorIndexV2Suite) assertVectorOnlyColumnGroup(segments []*datapb.SegmentInfo) {
 	for _, segment := range segments {
-		s.Require().Equal(storage.StorageV3, segment.GetStorageVersion(), "segment %d", segment.GetID())
-		groups, err := packed.ReadManifestColumnGroups(segment.GetManifestPath(), packed.CreateStorageConfig())
-		s.Require().NoError(err)
+		s.Require().Equal(storage.StorageV2, segment.GetStorageVersion(), "segment %d", segment.GetID())
 		matches := 0
-		field := strconv.FormatInt(vectorIndexFieldID, 10)
-		for _, group := range groups {
-			for _, column := range group.Columns {
-				if column == field {
+		for _, fieldBinlog := range segment.GetBinlogs() {
+			for _, child := range fieldBinlog.GetChildFields() {
+				if child == vectorIndexFieldID {
 					matches++
-					s.Require().Equal([]string{field}, group.Columns, "vector field must be the column group's only child")
-					s.Require().NotEmpty(group.Files)
+					s.Require().Equal([]int64{vectorIndexFieldID}, fieldBinlog.GetChildFields(), "vector field must be the column group's only child")
 				}
 			}
 		}
@@ -265,7 +260,7 @@ func (s *VectorIndexV3Suite) assertVectorOnlyColumnGroup(segments []*datapb.Segm
 	}
 }
 
-func (s *VectorIndexV3Suite) assertLoadedVectorIndexes(ctx context.Context, sets []inspector.VectorIndexSet) {
+func (s *VectorIndexV2Suite) assertLoadedVectorIndexes(ctx context.Context, sets []inspector.VectorIndexSet) {
 	s.Require().Eventually(func() bool {
 		var loadedSegments []*metricsinfo.Segment
 		for _, process := range s.Cluster.GetAllQueryNodes() {
@@ -370,7 +365,7 @@ func TestLoadedVectorIndexesRejectsUnexpectedSegment(t *testing.T) {
 	require.False(t, loadedVectorIndexesMatch(segments, sets))
 }
 
-func (s *VectorIndexV3Suite) assertVectorLoadedFields(ctx context.Context, collectionID int64) {
+func (s *VectorIndexV2Suite) assertVectorLoadedFields(ctx context.Context, collectionID int64) {
 	response, err := s.Cluster.MixCoordClient.ShowLoadCollections(ctx, &querypb.ShowCollectionsRequest{CollectionIDs: []int64{collectionID}})
 	s.Require().NoError(merr.CheckRPCCall(response, err))
 	s.Require().Len(response.GetLoadFields(), 1)
@@ -379,7 +374,7 @@ func (s *VectorIndexV3Suite) assertVectorLoadedFields(ctx context.Context, colle
 	s.Require().Equal([]int64{100, vectorIndexFieldID}, actual)
 }
 
-func (s *VectorIndexV3Suite) assertVectorIndexSearch(ctx context.Context, collection string, vector []float32) {
+func (s *VectorIndexV2Suite) assertVectorIndexSearch(ctx context.Context, collection string, vector []float32) {
 	request := integration.ConstructSearchRequest(s.dbName, collection, "", fixtureVectorName, schemapb.DataType_FloatVector,
 		[]string{fixturePrimaryKey}, metric.L2, map[string]any{"ef": vectorIndexRows}, 1, vectorIndexDim, 1, -1)
 	value := make([]byte, len(vector)*4)
@@ -398,7 +393,7 @@ func (s *VectorIndexV3Suite) assertVectorIndexSearch(ctx context.Context, collec
 	s.Require().InDelta(0, response.GetResults().GetScores()[0], 1e-6)
 }
 
-func (s *VectorIndexV3Suite) vectorSealedSegments(collection string) []*datapb.SegmentInfo {
+func (s *VectorIndexV2Suite) vectorSealedSegments(collection string) []*datapb.SegmentInfo {
 	var segments []*datapb.SegmentInfo
 	s.Require().Eventually(func() bool {
 		current, err := s.Cluster.ShowSegmentsWithDB(s.dbName, collection)
@@ -417,7 +412,7 @@ func (s *VectorIndexV3Suite) vectorSealedSegments(collection string) []*datapb.S
 	return segments
 }
 
-func (s *VectorIndexV3Suite) assertVectorFlushProducedSegment(flushed []int64, segments []*datapb.SegmentInfo) {
+func (s *VectorIndexV2Suite) assertVectorFlushProducedSegment(flushed []int64, segments []*datapb.SegmentInfo) {
 	flushedIDs := make(map[int64]struct{}, len(flushed))
 	for _, id := range flushed {
 		flushedIDs[id] = struct{}{}
@@ -435,7 +430,7 @@ func (s *VectorIndexV3Suite) assertVectorFlushProducedSegment(flushed []int64, s
 	s.FailNow("no current sealed segment came from this flush", "flush=%v", flushed)
 }
 
-func (s *VectorIndexV3Suite) cleanupVectorCollection(collection string) {
+func (s *VectorIndexV2Suite) cleanupVectorCollection(collection string) {
 	ctx := context.Background()
 	_, _ = s.Cluster.MilvusClient.ReleaseCollection(ctx, &milvuspb.ReleaseCollectionRequest{DbName: s.dbName, CollectionName: collection})
 	status, err := s.Cluster.MilvusClient.DropCollection(ctx, &milvuspb.DropCollectionRequest{DbName: s.dbName, CollectionName: collection})
