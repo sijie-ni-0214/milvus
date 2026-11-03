@@ -115,6 +115,9 @@ func (info *VChannelView) AssignmentMeta() *streamingpb.VChannelMeta {
 	return proto.Clone(info.meta).(*streamingpb.VChannelMeta)
 }
 
+// WritePathRecoveryState captures write-path state with a shared, read-only
+// Schema. Callers may retain it across history updates and cleanup, but must
+// not modify the schema or its nested values.
 func (info *VChannelView) WritePathRecoveryState() (moduleapi.VChannelWritePathRecoveryState, bool) {
 	info.mu.Lock()
 	defer info.mu.Unlock()
@@ -133,7 +136,7 @@ func (info *VChannelView) WritePathRecoveryState() (moduleapi.VChannelWritePathR
 		}
 	}
 	if schemas := collection.GetSchemas(); len(schemas) > 0 && schemas[len(schemas)-1].GetSchema() != nil {
-		state.Schema = proto.Clone(schemas[len(schemas)-1].GetSchema()).(*schemapb.CollectionSchema)
+		state.Schema = schemas[len(schemas)-1].GetSchema()
 		state.SchemaTimeTick = schemas[len(schemas)-1].GetCheckpointTimeTick()
 	}
 	return state, true
