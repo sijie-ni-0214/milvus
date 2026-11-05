@@ -167,11 +167,16 @@ TEST_F(ScalarIndexTranslatorTest,
             config["nested"] = true;
             std::unique_ptr<SealedIndexTranslator> translator;
             {
+                auto construction_info = info;
                 folly::CancellationSource cancel;
                 OpContext creation(cancel.getToken());
                 creation.runtime_load_priority = 1;
                 translator = std::make_unique<SealedIndexTranslator>(
-                    &info, tracer::TraceContext{}, context_, config, &creation);
+                    &construction_info,
+                    tracer::TraceContext{},
+                    context_,
+                    config,
+                    &creation);
                 cancel.requestCancellation();
             }
             EXPECT_EQ(translator->Family(), index::families::kSort);
@@ -193,6 +198,13 @@ TEST_F(ScalarIndexTranslatorTest,
             EXPECT_TRUE(hits[1]);
             EXPECT_TRUE(hits[2]);
             EXPECT_FALSE(hits[3]);
+
+            // Neither the first load nor a reload needs the constructor's
+            // borrowed parameter map, whose owner has already been destroyed.
+            cells.clear();
+            auto reloaded = translator->get_cells(&load, {0});
+            ASSERT_EQ(reloaded.size(), 1);
+            EXPECT_EQ(reloaded.front().second->Count(), 4);
         }
     }
 }
