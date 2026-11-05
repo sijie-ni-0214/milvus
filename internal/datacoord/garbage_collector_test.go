@@ -5551,6 +5551,72 @@ func TestGarbageCollector_recycleUnusedJSONStatsFiles_GlobalFormatPrefixOnce(t *
 	}, walkCalls)
 }
 
+// TestGarbageCollector_recycleUnusedJSONFiles_FailureLogFields tests that a failure while
+// clearing an old version logs exactly the segment and field it happened on.
+func TestGarbageCollector_recycleUnusedJSONFiles_FailureLogFields(t *testing.T) {
+	ctx := context.Background()
+	meta := &meta{
+		catalog: &datacoord.Catalog{},
+		segments: newSegmentsInfoWithSegments(map[int64]*SegmentInfo{
+			1002: {
+				SegmentInfo: &datapb.SegmentInfo{
+					ID:           1002,
+					CollectionID: 100,
+					PartitionID:  10,
+					State:        commonpb.SegmentState_Flushed,
+					JsonKeyStats: map[int64]*datapb.JsonKeyStats{
+						102: {FieldID: 102, Version: 2, BuildID: 402},
+					},
+				},
+			},
+		}),
+		metaStore: metacache.NewMetaStore(nil),
+	}
+	cli := storage.NewLocalChunkManager(objectstorage.RootPath("gc"))
+	gc := newGarbageCollector(meta, &ServerHandler{}, GcOption{cli: cli})
+	defer gc.close()
+
+	mockRemove := mockey.Mock((*storage.LocalChunkManager).Remove).Return(assert.AnError).Build()
+	defer mockRemove.UnPatch()
+	mockWalk := mockey.Mock((*storage.LocalChunkManager).WalkWithPrefix).To(
+		func(cm *storage.LocalChunkManager, ctx context.Context, prefix string,
+			recursive bool, fn storage.ChunkObjectWalkFunc,
+		) error {
+			fn(&storage.ChunkObjectInfo{FilePath: prefix + "/old_file"})
+			return assert.AnError
+		}).Build()
+	defer mockWalk.UnPatch()
+
+	testCases := []struct {
+		name           string
+		recycle        func()
+		walkFailureLog string
+	}{
+		{
+			name:           "stats",
+			recycle:        func() { gc.recycleUnusedJSONStatsFiles(ctx, nil) },
+			walkFailureLog: "json stats files recycle failed when walk with prefix",
+		},
+		{
+			name:           "index",
+			recycle:        func() { gc.recycleUnusedJSONIndexFiles(ctx, nil) },
+			walkFailureLog: "json index files recycle failed when walk with prefix",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			sink := mlog.CaptureGlobalLogs(t, &mlog.Config{Level: "info"})
+
+			tc.recycle()
+
+			logs := sink.String()
+			assert.Contains(t, logs, `["some task failure in remove object pool"] [segmentID=1002] [fieldID=102] [error=`)
+			assert.Contains(t, logs, `["`+tc.walkFailureLog+`"] [segmentID=1002] [fieldID=102] [error=`)
+		})
+	}
+}
+
 func Test_parseV3SegmentID(t *testing.T) {
 	rootPath := "files"
 
