@@ -19,6 +19,7 @@ package rootcoord
 import (
 	"context"
 	"maps"
+	"slices"
 	"strconv"
 	"testing"
 
@@ -94,7 +95,8 @@ func TestQuotaLocalCalculationMatchesReference(t *testing.T) {
 	reference := NewQuotaCenter(manager, nil, newMockTsoAllocator(), meta)
 	t.Cleanup(local.cancel)
 	t.Cleanup(reference.cancel)
-	round := func() {
+	// round returns the collections the local calculation recalculated.
+	round := func() []int64 {
 		t.Helper()
 		local.prepareLocalQuota()
 		require.NotNil(t, local.localQuota)
@@ -112,6 +114,7 @@ func TestQuotaLocalCalculationMatchesReference(t *testing.T) {
 		require.NoError(t, reference.calculateRates())
 		require.NoError(t, local.calculateRates())
 		require.Equal(t, quotaTreeSnapshot(reference.rateLimiter.GetRootLimiters()), quotaTreeSnapshot(local.rateLimiter.GetRootLimiters()))
+		recalculated := slices.Sorted(maps.Keys(local.localQuota.dirty))
 		require.NoError(t, local.publishQuotaRules())
 		expected, err := quotasync.Flatten(reference.toRatesRequest().RootLimiter)
 		require.NoError(t, err)
@@ -119,6 +122,7 @@ func TestQuotaLocalCalculationMatchesReference(t *testing.T) {
 		for key, p := range expected {
 			require.True(t, proto.Equal(quotasync.Canonical(p), local.publishedRules.Policies[key]), "scope %v", key)
 		}
+		return recalculated
 	}
 	round()
 	version := local.publishedRules.Version
@@ -133,13 +137,26 @@ func TestQuotaLocalCalculationMatchesReference(t *testing.T) {
 	require.Len(t, local.publishedRules.Delta.Upserts, 1)
 	source.put(100, 100)
 	round()
-	// Memory pressure and release without segment changes.
-	local.queryNodeMetrics[1] = &metricsinfo.QueryNodeQuotaMetrics{Effect: metricsinfo.NodeEffect{CollectionIDs: []int64{100}}, Hms: metricsinfo.HardwareMetrics{Memory: 100, MemoryUsage: 99}}
-	round()
+	// A QueryNode's collections are recalculated only while it limits them:
+	// memory pressure and release without segment changes.
+	node := &metricsinfo.QueryNodeQuotaMetrics{Effect: metricsinfo.NodeEffect{CollectionIDs: []int64{100, 101}}, Hms: metricsinfo.HardwareMetrics{Memory: 100, MemoryUsage: 10}}
+	local.queryNodeMetrics[1] = node
+	require.Empty(t, round())
+	node.Hms.MemoryUsage = 99
+	require.Equal(t, []int64{100, 101}, round())
+	node.Hms.MemoryUsage = 10
+	require.Equal(t, []int64{100, 101}, round())
+	require.Empty(t, round())
+	// A neutral time tick factor is not a limit either.
+	require.NoError(t, Params.Save(Params.QuotaConfig.TtProtectionEnabled.Key, "true"))
+	node.Fgm = metricsinfo.FlowGraphMetric{MinFlowGraphChannel: "dml_0", NumFlowGraph: 1}
+	round() // A configuration change recalculates every collection.
+	require.Empty(t, round())
+	require.NoError(t, Params.Save(Params.QuotaConfig.TtProtectionEnabled.Key, "false"))
 	delete(local.queryNodeMetrics, 1)
 	round()
-	// Membership discovered outside NodeEffect still enters publication and
-	// is reset after it disappears, even with no configuration/data change.
+	// Limits found outside node reports still enter publication and are reset
+	// after they disappear, even with no configuration/data change.
 	require.NoError(t, Params.Save(Params.QuotaConfig.ForceDenyReading.Key, "true"))
 	t.Cleanup(func() { _ = Params.Reset(Params.QuotaConfig.ForceDenyReading.Key) })
 	round()
@@ -273,8 +290,11 @@ func BenchmarkQuotaLocalIdle(b *testing.B) {
 			manager.GetProxyClients().Insert(1, nil)
 			allocator := newMockTsoAllocator()
 			allocator.GenerateTSOF = func(uint32) (uint64, error) { return 100, nil }
-			q := NewQuotaCenter(manager, &localQuotaTestSource{}, allocator, quotaMetaForTest(count))
+			meta := quotaMetaForTest(count)
+			q := NewQuotaCenter(manager, &localQuotaTestSource{}, allocator, meta)
 			b.Cleanup(q.cancel)
+			// A QueryNode below its memory water levels reports every collection.
+			q.queryNodeMetrics[1] = &metricsinfo.QueryNodeQuotaMetrics{Effect: metricsinfo.NodeEffect{CollectionIDs: slices.Collect(maps.Keys(meta.collID2Meta))}, Hms: metricsinfo.HardwareMetrics{Memory: 100, MemoryUsage: 10}}
 			q.prepareLocalQuota()
 			require.NoError(b, q.calculateRates())
 			require.NoError(b, q.publishQuotaRules())
