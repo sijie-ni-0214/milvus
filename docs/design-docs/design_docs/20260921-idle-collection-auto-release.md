@@ -27,8 +27,9 @@ Proxy receives DQL
 
 QueryCoord periodically scans load configs
   -> No activity record: initialize it to the current time; skip release this round
-  -> Existing activity has expired: add the collection to the release batch
-  -> Run the existing release path with bounded concurrency; wait for the batch
+  -> Existing activity has expired: queue the collection unless it is already queued or releasing
+  -> Return without waiting; queued releases start whenever fewer than releaseConcurrency run
+  -> Check the collection is still idle, then run the existing release path
 ```
 
 ### Activity timestamps
@@ -42,13 +43,13 @@ QueryCoord periodically scans load configs
 
 The TTL starts when a scan first sees a load config. Later scans do not refresh existing timestamps. The scanner reads only load configs and activity timestamps; it does not call `DescribeCollection` or check collection readiness. Loading time can therefore count toward the TTL, and a slow load can be released before it first becomes ready.
 
-After collecting candidates, the scanner limits parallel releases with `releaseConcurrency`. Each release uses the existing collection DDL lock and load-config existence check. A failed release is logged without canceling other releases in the batch. If its load config remains, a later scan can select it again. The scanner waits for all calls in the current batch before processing another scan, so batches do not overlap.
+The scanner queues expired collections and returns without waiting for their releases. A collection stays queued, and later scans skip it, until its release returns. Queued releases start in order whenever fewer than `releaseConcurrency` run, so a slow release holds only its own slot and never delays the next scan. Right before releasing, the collection's activity and TTL are read again. Each release uses the existing collection DDL lock and load-config existence check. A failed release is logged without affecting other releases. If its load config remains, a later scan can queue it again.
 
 A successful release log means the `DropLoadConfig` broadcast call returned successfully. Physical resource cleanup on every node may still be in progress.
 
 ## Concurrency semantics
 
-If a query refreshes activity before the scanner reads the timestamp, the scanner uses the new timestamp. Once a collection has been selected, a later query does not cancel its release. Activity, readiness, and load-config versions are not rechecked before release.
+If a query refreshes activity before the scanner reads the timestamp, the scanner uses the new timestamp. A query, a manual release, disabling automatic release or a TTL change while the collection waits in the queue keeps it loaded, because activity and the TTL are read again right before its release; a later scan evaluates it again. Once the release has started, a later query does not cancel it. Readiness and load-config versions are not rechecked before release.
 
 Existing resource references protect segment resources already acquired by a query. If a later query stage encounters `CollectionNotLoaded`, `ViewNotFound`, or `ViewInvalidated`, the existing complete DQL retry handles recovery. The TTL does not provide a query or iterator view lease.
 
@@ -59,7 +60,7 @@ The activity mutex protects only in-memory records. Reading load configs, submit
 - **QueryCoord restart or leader change:** activity is not persisted. After load configs are recovered, the first scan starts a fresh TTL for each collection. Proxies do not need to report previous activity.
 - **Manual release, drop, or automatic release:** a synchronous load-config removal observer deletes the activity record. After a reload, a later scan initializes a new timestamp.
 - **Proxy exit:** there are no per-request registrations to clean up. Collections continue to expire according to their latest query attempt.
-- **Either feature disabled:** clear activity, stop refreshing timestamps, and stop the scan timer. Already-selected releases may still finish. When both features are enabled again, scanning initializes fresh TTLs.
+- **Either feature disabled:** clear activity, stop refreshing timestamps, and stop the scan timer. Queued releases that have not started are skipped; started ones may still finish. When both features are enabled again, scanning initializes fresh TTLs.
 
 ## Configuration
 
@@ -71,7 +72,7 @@ queryCoord:
     enabled: false
     idleTTLSeconds: 600
     checkIntervalSeconds: 30
-    releaseConcurrency: 16
+    releaseConcurrency: 64
 ```
 
 All four autoRelease parameters are marked as version `3.0.0` and support runtime updates:
@@ -80,8 +81,8 @@ All four autoRelease parameters are marked as version `3.0.0` and support runtim
 |---|---|
 | `enabled` | Requires autoLoad as well; disabling clears activity, and re-enabling starts fresh TTLs through scanning |
 | `idleTTLSeconds` | Scans use the latest TTL without resetting existing timestamps |
-| `checkIntervalSeconds` | The event loop resets the timer to the new interval after any running release batch finishes |
-| `releaseConcurrency` | The next batch uses the new limit; the current batch keeps its original limit |
+| `checkIntervalSeconds` | The event loop resets the timer to the new interval |
+| `releaseConcurrency` | Releases that start afterwards use the new limit; running releases are not interrupted |
 
 The TTL, scan interval, and concurrency must be positive. The TTL and scan interval must also fit in `time.Duration`. If autoRelease is enabled while autoLoad is disabled, QueryCoord logs a warning and leaves automatic release disabled.
 
