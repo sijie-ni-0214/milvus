@@ -278,33 +278,10 @@ func (q *QuotaCenter) quotaDatabaseIDs() []int64 {
 
 func (q *QuotaCenter) resetLocalQuotaRates() error {
 	local := q.localQuota
-	effects := make(map[int64]bool)
-	for _, node := range q.queryNodeMetrics {
-		for _, id := range node.Effect.CollectionIDs {
-			effects[id] = true
-		}
-		for id := range node.DeleteBufferInfo.CollectionDeleteBufferNum {
-			effects[id] = true
-		}
-		for id := range node.DeleteBufferInfo.CollectionDeleteBufferSize {
-			effects[id] = true
-		}
-	}
-	for _, node := range q.dataNodeMetrics {
-		for _, id := range node.Effect.CollectionIDs {
-			effects[id] = true
-		}
-	}
-	for id := range q.dataCoordMetrics.CollectionL0RowCount {
-		effects[id] = true
-	}
-	for id := range effects {
-		local.dirty[id] = true
-	}
-	for id := range local.previousEffects {
-		local.dirty[id] = true
-	}
-	local.previousEffects = effects
+	// Only collections limited in the previous round need their baseline back;
+	// collections that nodes report but no protection limits are left alone.
+	maps.Copy(local.dirty, local.previousEffects)
+	local.previousEffects = make(map[int64]bool)
 	clusterRates := quotaRateValues(internalpb.RateScope_Cluster)
 	dbRates := quotaRateValues(internalpb.RateScope_Database)
 	collRates := quotaRateValues(internalpb.RateScope_Collection)
@@ -400,11 +377,10 @@ func (q *QuotaCenter) resetLocalQuotaRates() error {
 	return nil
 }
 
-// Record at the actual mutation boundary as well as the sampled membership.
-// Streaming TimeTick can discover affected collections through WAL channel
-// membership which is not present in NodeEffect. A newly affected node is
-// still at its baseline; recording it ensures publication now and reset in
-// the next round, including when that external effect disappears.
+// Every collection- or partition-level limiter change must be recorded where it
+// is made: the next round resets only recorded collections. A newly limited
+// collection is still at its baseline; recording it ensures publication now
+// and reset in the next round, including when the limit's cause disappears.
 func (q *QuotaCenter) recordLocalQuotaEffect(collection int64) {
 	if q.localQuota != nil {
 		q.localQuota.dirty[collection] = true
