@@ -38,7 +38,7 @@
 
 **Where it lives:** the load config stores the epoch of the latest `load(warmup_hint=true)`; each QueryView carries the epoch it was built with; QueryNode records, for each physical segment base, the latest epoch it finished warming up for (`warmedEpoch`).
 
-**The only rule:** when the largest epoch among the views whose bindings are prepared on a segment base is greater than the base's `warmedEpoch`, the base is warmed up in the background. Warmup never blocks view readiness.
+**The QueryNode rule:** when the largest epoch among the views whose bindings are prepared on a segment base is greater than the base's `warmedEpoch`, the base is warmed up in the background. Warmup never blocks view readiness. The StreamingNode needs no epoch bookkeeping; see 5.8.
 
 **Why an epoch:** QueryViews are rebuilt frequently because of flush, compaction, balance, node changes and so on. The epoch changes only when `load(warmup_hint=true)` is called, so ordinary view rebuilds do not warm up existing segments again, while every hinted load triggers one warmup. The same rule covers in-place warmup (a normally loaded segment records 0), repeated warmup (a new, larger epoch) and new segments.
 
@@ -86,6 +86,13 @@ Same as a normal load and independent of the epoch: a shard counts as complete w
 - `Prewarm` pins every cell of every resource of a loaded segment and waits for completion: field data (all chunks, including the materialization of lazy column groups), every index in the segment's index inventory (vector, scalar, ngram, JSON path and text indexes), JSON stats, and the segment-level PK index and timestamp index. Field data is pinned in runs of about one load batch, estimated from the storage v2 cell target, so a search waits for and fails with at most the run holding its chunk rather than the whole field. This does not cover the PK and timestamp indexes, whose builds load their whole columns, or storage v1, where a chunk is a whole binlog and a run may span the field.
 - `Prewarm` supports cancellation. The C interface uses `CGO_CATCH_AND_RETURN_CSTATUS` throughout and keeps the original error code.
 
+### 5.8 StreamingNode
+
+- The shard leader serves BM25 queries from the shard's IDF oracle. With `queryView.idfOracle.lazyLoadSealedStats=true` the oracle reads the sealed BM25 statistics on the first BM25 query, so a hinted load would still leave that read on the first query.
+- Once a view with a warmup epoch is Ready, the StreamingNode queues a background warm of the oracles of the view's BM25 fields. The warm starts the shared materialization that the first BM25 query would otherwise start, and readiness does not wait for it.
+- Materializing once is enough: the aggregate then stays in memory and is kept current by later preparations until the oracle closes, and a new oracle, for example for a BM25 field that a schema change adds, is warmed when its views become Ready. A materialized or eagerly built oracle needs no warm, so repeated hinted loads and view rebuilds cost nothing.
+- Warms run on one node-wide queue, in arrival order, on at most a CPU count of workers, because every hinted view requests one when the StreamingNode recovers its views. A failed attempt, or one that a newer target canceled, is queued again after a jittered exponential backoff from 1 second up to 1 minute, until the warm succeeds or the oracle closes on Release. A query arriving meanwhile shares the running materialization, and at most one warm per oracle is queued, running or waiting to retry.
+
 ## 6. Protocol fields
 
 | Location | Field | Notes |
@@ -121,6 +128,7 @@ Same as a normal load and independent of the epoch: a shard counts as complete w
 - Balancer: rebuilds views when the epoch changes; placement is not restricted by warmup capability.
 - QueryNode: ready as soon as a normal load completes; background warmup of segment bases by epoch on a dedicated warm queue, with backoff retry, canceled only when a base retires, or its resource is closing and no query uses the base.
 - segcore: `Prewarm` also covers JSON stats, the PK index and the timestamp index.
+- StreamingNode: a Ready hinted view materializes the lazy BM25 statistics of the shard's IDF oracle in the background, on a node-wide warm queue with backoff retry.
 
 **Phase 2**
 
@@ -137,6 +145,7 @@ Same as a normal load and independent of the epoch: a shard counts as complete w
 - **Balancer:** an epoch change triggers a rebuild that carries the epoch; placement does not depend on warmup capability.
 - **QueryNode:** warmup does not block readiness and does not use the node scheduler; in-place warmup; a repeated hinted load queues another warmup; view rebuilds with the same epoch do not warm up again; a failed warmup retries with backoff without affecting views, and the retry warms up for the newest epoch; a warmup is not canceled while a query still uses the segment and stops when the segment closes; a replaced base retires after its warmup stops, and the new base warms up.
 - **segcore:** after `Prewarm`, the fields of lazy column groups (every chunk, warmed in more than one run), the PK index and the timestamp index are loaded.
+- **StreamingNode:** a Ready view with a warmup epoch materializes the lazy oracles of its BM25 fields without a query, and a view without one does not; a materialized or eager oracle is not warmed again; a failed attempt, or one a newer target canceled, retries after backoff; closing the oracle stops its warm; warms run on at most the node's worker count.
 - **End to end:** a hinted load after a query-triggered auto-load, with search uninterrupted throughout and not waiting under auto-load; on an unloaded collection, a hinted load becomes searchable as fast as a normal load; two hinted loads in a row; a hinted load right after Release; continuous writes and compaction during warmup; warmup retries under injected faults such as storage throttling.
 
 ## 11. Known limitations
