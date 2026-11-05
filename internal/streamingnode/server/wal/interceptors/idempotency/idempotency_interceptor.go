@@ -24,6 +24,7 @@ var (
 
 type idempotencyInterceptor struct {
 	config WindowConfig
+	cache  *windowManager
 
 	windows                *typeutil.ConcurrentMap[string, *Window]
 	txnInsertResultBuffers *idempotencyutils.TxnInsertResultBuffers
@@ -72,7 +73,10 @@ func newIdempotencyInterceptorWithParam(config WindowConfig, param *interceptors
 		replicateManager := param.ReplicateManager
 		replicateRole = replicateManager.Role
 	}
+	cache := newWindowManager(config)
+	cache.start()
 	return &idempotencyInterceptor{
+		cache:                  cache,
 		windows:                typeutil.NewConcurrentMap[string, *Window](),
 		txnInsertResultBuffers: idempotencyutils.NewTxnInsertResultBuffers(currentTimeTick, txnActive),
 		txnActive:              txnActive,
@@ -83,9 +87,21 @@ func newIdempotencyInterceptorWithParam(config WindowConfig, param *interceptors
 
 func newIdempotencyInterceptorWithSnapshots(config WindowConfig, snapshots map[string]*idempotencyview.Snapshot, param *interceptors.InterceptorBuildParam) *idempotencyInterceptor {
 	interceptor := newIdempotencyInterceptorWithParam(config, param)
-	for vchannel, snapshot := range snapshots {
-		interceptor.windows.Insert(vchannel, NewWindowFromSnapshot(config, snapshot))
+	interceptor.cache.mu.Lock()
+	for vchannel, window := range interceptor.cache.restore(snapshots) {
+		interceptor.windows.Insert(vchannel, window)
 	}
+	interceptor.cache.mu.Unlock()
+	return interceptor
+}
+
+func newIdempotencyInterceptorWithRecovery(config WindowConfig, snapshot *idempotencyview.RecoverySnapshot, param *interceptors.InterceptorBuildParam) *idempotencyInterceptor {
+	interceptor := newIdempotencyInterceptorWithParam(config, param)
+	interceptor.cache.mu.Lock()
+	for vc, window := range interceptor.cache.restoreOrdered(snapshot) {
+		interceptor.windows.Insert(vc, window)
+	}
+	interceptor.cache.mu.Unlock()
 	return interceptor
 }
 
@@ -359,6 +375,7 @@ func (impl *idempotencyInterceptor) appendTxnBody(ctx context.Context, msg messa
 }
 
 func (impl *idempotencyInterceptor) Close() {
+	impl.cache.shutdown()
 	// Drop the per-vchannel window metric series so they do not linger in the
 	// registry after this interceptor (one per pchannel WAL) tears down.
 	impl.windows.Range(func(vchannel string, _ *Window) bool {
@@ -371,7 +388,7 @@ func (impl *idempotencyInterceptor) window(vchannel string) *Window {
 	if window, found := impl.windows.Get(vchannel); found {
 		return window
 	}
-	window, _ := impl.windows.GetOrInsert(vchannel, NewWindow(impl.config))
+	window, _ := impl.windows.GetOrInsert(vchannel, impl.cache.newWindow(vchannel))
 	return window
 }
 
