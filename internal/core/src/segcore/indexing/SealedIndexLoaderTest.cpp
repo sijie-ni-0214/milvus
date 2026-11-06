@@ -123,12 +123,12 @@ TEST_F(SealedIndexLoaderTest,
                 folly::CancellationSource cancel;
                 OpContext creation(cancel.getToken());
                 creation.runtime_load_priority = 1;
-                translator = std::make_unique<SealedIndexLoader>(
-                    &construction_info,
-                    tracer::TraceContext{},
-                    context_,
-                    config,
-                    &creation);
+                translator =
+                    std::make_unique<SealedIndexLoader>(&construction_info,
+                                                        tracer::TraceContext{},
+                                                        context_,
+                                                        config,
+                                                        &creation);
                 cancel.requestCancellation();
             }
             EXPECT_EQ(translator->Family(), index::families::kSort);

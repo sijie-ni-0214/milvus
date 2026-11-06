@@ -8161,8 +8161,8 @@ ChunkedSegmentSealedImpl::load_field_data_common(
             std::chrono::duration_cast<std::chrono::milliseconds>(
                 snapshot_duration)
                 .count(),
-            std::chrono::duration_cast<std::chrono::milliseconds>(
-                prepare_done - start)
+            std::chrono::duration_cast<std::chrono::milliseconds>(prepare_done -
+                                                                  start)
                 .count(),
             std::chrono::duration_cast<std::chrono::milliseconds>(
                 interim_index_done - prepare_done)
@@ -11665,11 +11665,13 @@ ChunkedSegmentSealedImpl::Prewarm(
         if (runtime == nullptr) {
             continue;
         }
-        // Pinning an inventory entry loads its cache cell; the pin is dropped
-        // right away and the warmed cell stays under the caching layer policy.
+        // Prepare query storage through the reader contract. Destroying the
+        // reader releases its pin; the cache retains the warmed cell.
         for (const auto& entry : runtime->indexes.Entries(field_id)) {
-            auto pin = runtime->indexes.PinIndex(op_ctx, entry.key);
-            (void)pin;
+            auto reader = runtime->indexes.CreateIndexReader(op_ctx, entry.key);
+            if (reader) {
+                reader->Prefetch();
+            }
         }
     }
 }

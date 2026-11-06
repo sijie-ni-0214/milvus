@@ -124,13 +124,13 @@ TEST_P(RetrieveOutputFieldsTest, DefaultLoadPriorityRemainsHigh) {
     for (auto* ctx : {static_cast<milvus::OpContext*>(nullptr), &parent_ctx}) {
         auto results = std::make_unique<proto::segcore::RetrieveResults>();
         segment->FillTargetEntry(nullptr,
-                                plan.get(),
-                                results,
-                                offsets.data(),
-                                offsets.size(),
-                                false,
-                                true,
-                                ctx);
+                                 plan.get(),
+                                 results,
+                                 offsets.data(),
+                                 offsets.size(),
+                                 false,
+                                 true,
+                                 ctx);
     }
     EXPECT_EQ(fetched.load(), 2 * plan->field_ids_.size());
 }

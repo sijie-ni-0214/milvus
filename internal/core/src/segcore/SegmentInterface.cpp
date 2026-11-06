@@ -742,15 +742,17 @@ SegmentInternalInterface::FillTargetEntry(
     // Each field reads through its own OpContext, which keeps storage_usage
     // scoped to this segment: sharing the caller's op_ctx across segments
     // would double-count bytes.
-    auto fetch_one = [this, plan, &snapshot, offsets, size](
-                         FieldId field_id, milvus::OpContext* field_ctx)
-        -> std::unique_ptr<DataArray> {
+    auto fetch_one =
+        [this, plan, &snapshot, offsets, size](
+            FieldId field_id,
+            milvus::OpContext* field_ctx) -> std::unique_ptr<DataArray> {
         if (SystemProperty::Instance().IsSystem(field_id)) {
             auto system_type =
                 SystemProperty::Instance().GetSystemFieldType(field_id);
 
             FixedVector<int64_t> output(size);
-            bulk_subscript(field_ctx, system_type, offsets, size, output.data());
+            bulk_subscript(
+                field_ctx, system_type, offsets, size, output.data());
 
             auto data_array = std::make_unique<DataArray>();
             data_array->set_field_id(field_id.get());
