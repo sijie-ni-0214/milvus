@@ -162,7 +162,11 @@ TEST_F(SealedIndexLoaderTest,
                 const index::IScalarPredicateReader<std::string_view>*>(
                 reloaded_reader.get());
             ASSERT_NE(reloaded_predicate, nullptr);
-            EXPECT_EQ(reloaded_predicate->In(1, &key), hits);
+            const auto reloaded_hits = reloaded_predicate->In(1, &key);
+            ASSERT_EQ(reloaded_hits.size(), hits.size());
+            for (size_t i = 0; i < hits.size(); ++i) {
+                EXPECT_EQ(reloaded_hits[i], hits[i]) << i;
+            }
         }
     }
 }

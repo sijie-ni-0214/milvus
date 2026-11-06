@@ -81,8 +81,10 @@ type RemoteChunkManager struct {
 	readRetryAttempts uint
 }
 
-var _ ChunkManager = (*RemoteChunkManager)(nil)
-var _ BatchRemoveChunkManager = (*RemoteChunkManager)(nil)
+var (
+	_ ChunkManager            = (*RemoteChunkManager)(nil)
+	_ BatchRemoveChunkManager = (*RemoteChunkManager)(nil)
+)
 
 const (
 	persistentObjectTypeTransformLog  = "transform_log"

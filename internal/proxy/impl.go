@@ -5949,10 +5949,8 @@ func (node *Proxy) RefreshPolicyInfoCache(ctx context.Context, req *proxypb.Refr
 
 // SetRates limits the rates of requests.
 func (node *Proxy) SetRates(ctx context.Context, request *proxypb.SetRatesRequest) (*commonpb.Status, error) {
-	resp := merr.Success()
 	if err := merr.CheckHealthy(node.GetStateCode()); err != nil {
-		resp = merr.Status(err)
-		return resp, nil
+		return merr.Status(err), nil
 	}
 
 	return node.simpleLimiter.ApplyQuotaRequest(request), nil

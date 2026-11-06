@@ -187,7 +187,7 @@ func TestSNHandler_RecoveryWaitCancellationIsPerRequest(t *testing.T) {
 	waitForRecoveryWaiter(t, h)
 	cancelOne()
 	require.ErrorIs(t, receiveRecoveryQuery(t, first).err, context.Canceled)
-	// Cancelling one request must not wake or fail the others.
+	// Canceling one request must not wake or fail the others.
 	time.Sleep(50 * time.Millisecond)
 	for _, result := range remaining {
 		select {

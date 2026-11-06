@@ -25,12 +25,14 @@ import (
 	"github.com/milvus-io/milvus/pkg/v3/util/conc"
 )
 
-var ManifestIndexParamsForTest = manifestIndexParams
-var SegmentIndexFromManifestForTest = segmentIndexFromManifest
-var ManifestIndexUsableForTest = manifestIndexUsable
-var ManifestIndexUsableForSegmentForTest = manifestIndexUsableForSegment
-var ManifestIndexFilePathInfoForTest = manifestIndexFilePathInfo
-var ProjectManifestIndexesForTest = projectManifestIndexes
+var (
+	ManifestIndexParamsForTest           = manifestIndexParams
+	SegmentIndexFromManifestForTest      = segmentIndexFromManifest
+	ManifestIndexUsableForTest           = manifestIndexUsable
+	ManifestIndexUsableForSegmentForTest = manifestIndexUsableForSegment
+	ManifestIndexFilePathInfoForTest     = manifestIndexFilePathInfo
+	ProjectManifestIndexesForTest        = projectManifestIndexes
+)
 
 type ManifestReadResultForTest struct {
 	Segment *SegmentInfo
