@@ -18,9 +18,10 @@ package meta
 
 import (
 	"context"
+	"time"
+
 	"github.com/milvus-io/milvus/pkg/v3/mlog"
 	"github.com/milvus-io/milvus/pkg/v3/proto/datapb"
-	"time"
 )
 
 // ManifestReadPrefetch reads ahead the segment manifests that index recovery

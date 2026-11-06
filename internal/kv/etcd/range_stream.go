@@ -124,7 +124,9 @@ func walkRangesAt(
 	rangeCtxs := make([]context.Context, len(starts))
 	cancels := make([]context.CancelFunc, len(starts))
 	for i := range starts {
-		rangeCtxs[i], cancels[i] = context.WithCancel(ctx)
+		rangeCtx, cancel := context.WithCancel(ctx)
+		defer cancel()
+		rangeCtxs[i], cancels[i] = rangeCtx, cancel
 	}
 	errs := make([]error, len(starts))
 	var wg sync.WaitGroup

@@ -28,7 +28,6 @@ import (
 
 	"github.com/milvus-io/milvus-proto/go-api/v3/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v3/msgpb"
-
 	"github.com/milvus-io/milvus/internal/datacoord/index"
 	"github.com/milvus-io/milvus/internal/datacoord/meta"
 	"github.com/milvus-io/milvus/internal/metacache"
@@ -137,16 +136,19 @@ type gcPerfSegmentDeleteKV struct {
 func (p *gcPerfSegmentDeleteKV) MaxTxnOps() int {
 	return max(1, Params.MetaStoreCfg.MaxEtcdTxnNum.GetAsInt())
 }
+
 func (p *gcPerfSegmentDeleteKV) wait() {
 	p.txnRequests.Add(1)
 	if p.applyLatency {
 		time.Sleep(p.deleteLatency)
 	}
 }
+
 func (p *gcPerfSegmentDeleteKV) MultiSaveAndRemoveWithPrefix(_ context.Context, _ map[string]string, _ []string, _ ...predicates.Predicate) error {
 	p.wait()
 	return nil
 }
+
 func (p *gcPerfSegmentDeleteKV) MultiRemove(_ context.Context, keys []string) error {
 	p.wait()
 	p.deleteCalls.Add(int64(len(keys)))

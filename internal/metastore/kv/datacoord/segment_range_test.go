@@ -137,9 +137,11 @@ func TestCatalogSegmentRangesFailOnTheFirstCorruptRecord(t *testing.T) {
 }
 
 func rangeTestSegment(id int64) *datapb.SegmentInfo {
-	return &datapb.SegmentInfo{ID: id, CollectionID: 1, PartitionID: 2, InsertChannel: "ch-1", State: commonpb.SegmentState_Flushed, NumOfRows: 10,
+	return &datapb.SegmentInfo{
+		ID: id, CollectionID: 1, PartitionID: 2, InsertChannel: "ch-1", State: commonpb.SegmentState_Flushed, NumOfRows: 10,
 		Binlogs:       []*datapb.FieldBinlog{{FieldID: 101, Binlogs: []*datapb.Binlog{{LogID: id*10 + 1, EntriesNum: 10, LogSize: 8}}}},
 		Deltalogs:     []*datapb.FieldBinlog{{FieldID: 0, Binlogs: []*datapb.Binlog{{LogID: id*10 + 2, EntriesNum: 1}}}},
 		Statslogs:     []*datapb.FieldBinlog{{FieldID: 100, Binlogs: []*datapb.Binlog{{LogID: id*10 + 3}}}},
-		Bm25Statslogs: []*datapb.FieldBinlog{{FieldID: 102, Binlogs: []*datapb.Binlog{{LogID: id*10 + 4}}}}}
+		Bm25Statslogs: []*datapb.FieldBinlog{{FieldID: 102, Binlogs: []*datapb.Binlog{{LogID: id*10 + 4}}}},
+	}
 }

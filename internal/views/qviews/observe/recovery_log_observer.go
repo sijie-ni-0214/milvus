@@ -168,10 +168,10 @@ func (o *recoveryLogObserver) recordLocked(event Event, now time.Time) (string, 
 		view.state = e.To
 		progress.setExpectedSegments(view, e.ExpectedSegmentCount)
 		progress.setReadySegments(view, e.ReadySegmentCount)
-		if e.To == qviews.QueryViewStateUp {
+		switch e.To {
+		case qviews.QueryViewStateUp:
 			progress.finishView(e.View)
-		} else if e.To == qviews.QueryViewStateUnrecoverable ||
-			e.To == qviews.QueryViewStateDropping || e.To == qviews.QueryViewStateDropped {
+		case qviews.QueryViewStateUnrecoverable, qviews.QueryViewStateDropping, qviews.QueryViewStateDropped:
 			progress.removeView(e.View)
 		}
 	case CoordViewPreemptedEvent:

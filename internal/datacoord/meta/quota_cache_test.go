@@ -18,13 +18,13 @@ package meta
 
 import (
 	"context"
-	"errors"
 	"math/rand"
 	"strconv"
 	"sync"
 	"testing"
 
 	"github.com/bytedance/mockey"
+	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
 
 	"github.com/milvus-io/milvus-proto/go-api/v3/commonpb"

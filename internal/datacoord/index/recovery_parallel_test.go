@@ -91,7 +91,7 @@ func recoveredSegmentIndexesForTest() []*model.SegmentIndex {
 	var records []*model.SegmentIndex
 	buildID := int64(1)
 	for segment := range int64(1500) {
-		for indexID := range int64(1 + segment%3) {
+		for indexID := range 1 + segment%3 {
 			record := &model.SegmentIndex{
 				CollectionID:        1 + segment%7,
 				PartitionID:         10,

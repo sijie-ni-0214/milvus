@@ -29,8 +29,10 @@ import (
 	"github.com/milvus-io/milvus/pkg/v3/util/paramtable"
 )
 
-var _ ObjectStorage = (*MinioObjectStorage)(nil)
-var _ BulkObjectStorage = (*MinioObjectStorage)(nil)
+var (
+	_ ObjectStorage     = (*MinioObjectStorage)(nil)
+	_ BulkObjectStorage = (*MinioObjectStorage)(nil)
+)
 
 // minio-go caps a single CopyObject request at 5 GiB, regardless of the configured threshold.
 const minioSingleCopyObjectMaxSize = 5 * 1024 * 1024 * 1024
@@ -184,7 +186,7 @@ func (minioObjectStorage *MinioObjectStorage) RemoveObjects(ctx context.Context,
 
 	resolved := make([]bool, len(objectNames))
 	var batchErr error
-	resultCh := minioObjectStorage.Client.RemoveObjectsWithResult(ctx, bucketName, objects, minio.RemoveObjectsOptions{})
+	resultCh := minioObjectStorage.RemoveObjectsWithResult(ctx, bucketName, objects, minio.RemoveObjectsOptions{})
 	for result := range resultCh {
 		if result.ObjectName == "" {
 			if result.Err != nil {

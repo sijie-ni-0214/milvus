@@ -18,13 +18,14 @@ package datacoord
 
 import (
 	"context"
+	"slices"
+
 	"github.com/milvus-io/milvus/internal/datacoord/index"
 	"github.com/milvus-io/milvus/internal/datacoord/meta"
 	"github.com/milvus-io/milvus/internal/metacache"
 	"github.com/milvus-io/milvus/internal/metastore"
 	"github.com/milvus-io/milvus/pkg/v3/mlog"
 	"github.com/milvus-io/milvus/pkg/v3/util/conc"
-	"slices"
 )
 
 // metaPrefetch starts only catalog/object-store reads before DataCoord Init.

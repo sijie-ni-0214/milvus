@@ -1508,6 +1508,7 @@ func TestGarbageCollector_recycleDroppedSegments_V3(t *testing.T) {
 	assert.Nil(t, m.GetSegment(ctx, 2002))
 }
 
+//nolint:revive // A mockey method replacement takes the receiver before the context.
 func successfulGCFileRemovals(_ *gc.GarbageCollector, _ context.Context, paths []string) []storage.RemoveResult {
 	results := make([]storage.RemoveResult, len(paths))
 	for i, filePath := range paths {
