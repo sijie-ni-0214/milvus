@@ -119,11 +119,16 @@ TEST_F(SealedIndexLoaderTest,
             config["nested"] = true;
             std::unique_ptr<SealedIndexLoader> translator;
             {
+                auto construction_info = info;
                 folly::CancellationSource cancel;
                 OpContext creation(cancel.getToken());
                 creation.runtime_load_priority = 1;
                 translator = std::make_unique<SealedIndexLoader>(
-                    &info, tracer::TraceContext{}, context_, config, &creation);
+                    &construction_info,
+                    tracer::TraceContext{},
+                    context_,
+                    config,
+                    &creation);
                 cancel.requestCancellation();
             }
             EXPECT_EQ(translator->Family(), index::families::kSort);
@@ -145,6 +150,19 @@ TEST_F(SealedIndexLoaderTest,
             EXPECT_TRUE(hits[1]);
             EXPECT_TRUE(hits[2]);
             EXPECT_FALSE(hits[3]);
+
+            // Neither the first load nor a reload needs the constructor's
+            // borrowed parameter map, whose owner has already been destroyed.
+            request_reader.reset();
+            owner.reset();
+            auto reloaded = translator->CreateIndex(&load);
+            auto reloaded_reader = reloaded->CreateReader(&load);
+            EXPECT_EQ(reloaded_reader->Count(), 4);
+            const auto* reloaded_predicate = dynamic_cast<
+                const index::IScalarPredicateReader<std::string_view>*>(
+                reloaded_reader.get());
+            ASSERT_NE(reloaded_predicate, nullptr);
+            EXPECT_EQ(reloaded_predicate->In(1, &key), hits);
         }
     }
 }
