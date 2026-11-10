@@ -16,8 +16,8 @@ plus the implicit `+Inf` bucket. `_count` also counts completed stage attempts.
 blocked work. Prefetch/storage-batch queue stages are observed after dequeue;
 the Load worker queue stages are observed at worker completion. They do not
 track queue depth with this gauge. Use the existing executor/pool queue metrics
-for queue depth. There are 28 stage values: at most 56 histograms and 28 gauges,
-1316 exported time series per process. Labels contain no collection, segment,
+for queue depth. The 30 stage values expose up to 60 histograms and 30 gauges,
+for a maximum of 1410 time series per process. Labels contain no collection, segment,
 field, column-group, path or trace identifiers and are unchanged by collection
 metric aggregation mode. Handles and finite buckets are initialized together on
 first use, with no label-map construction on the observation hot path.
@@ -26,7 +26,9 @@ first use, with no label-map construction on the observation hot path.
 |---|---|
 | `search_prepare` | Per native search: lazy schema check, read-lease acquisition, schema compatibility and external-field validation, before invoking `segment->Search`. |
 | `search_execute` | Per executed native segment search, including operators, their initialization and prefetch waits. Inaccessible-field empty results skip this stage. |
-| `vector_prefetch_queue`, `mvcc_prefetch_queue` | Per submitted prefetch task: submission to worker entry. A dequeued task records queue time even if it is then cancelled. |
+| `json_stats_prefetch_metadata` | Resolve the stats layout needed by one JSON predicate on a sealed segment. |
+| `json_stats_prefetch_columns` | Warm the projected cells required by that predicate and, for a shared-data fallback, its BSON posting index. Concurrent predicates can share in-flight reads. |
+| `vector_prefetch_queue`, `mvcc_prefetch_queue` | Per prefetch body that starts: submission to worker entry. A driver that retracts queued work before the body starts produces no queue or run sample. |
 | `vector_prefetch_run`, `mvcc_prefetch_run` | Per worker invocation of vector/timestamp prefetch. Includes any cold reader initialization and cache loading performed by the call. |
 | `vector_prefetch_wait`, `mvcc_prefetch_wait` | Per valid prefetch future: blocking `get()` on the consumer, including cleanup waiting. The future is consumed once, so repeated `WaitPrefetch` calls do not duplicate observations. This overlaps background prefetch execution. |
 | `field_prefetch_prepare` | Per whole-field prefetch with a column: `num_chunks()` and chunk-ID construction. Includes lazy proxy/column-group synchronization and first materialization. |
@@ -56,6 +58,16 @@ fields: `{component="queryNode",operation="search_task",stage="l0_rerank"}` and
 `{component="queryNode",operation="reduce",stage="source_mapping"}`.
 
 ## Interpreting cold reads
+
+For compound filters, `internal_core_search_latency_scalar` includes waits for
+predicates reached during evaluation. Earlier versions waited for the entire
+filter tree before starting this timer. Vector prefetch can run concurrently
+with filtering. `internal_core_search_latency_vector` starts after the wait at
+the ANN call. On close the driver signals all of its speculative tasks before
+joining any operator. Queued work releases its query references immediately. Workers stop
+between reads and finish any storage call already in progress, including fills
+shared with other queries. For a fully filtered segment, `vector_prefetch_wait`
+can include this remaining cleanup wait.
 
 A normal V3 data file carries `file_size` and `footer_size` in the manifest, so
 reader initialization does not need a HEAD request to discover its size. A cold

@@ -46,6 +46,8 @@ enum class QueryStage {
     LoadColumnGroupsWait,
     LoadColumnGroupQueue,
     LoadColumnGroupRun,
+    JsonStatsPrefetchMetadata,
+    JsonStatsPrefetchColumns,
     Count,
 };
 

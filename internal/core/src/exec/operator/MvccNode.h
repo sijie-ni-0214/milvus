@@ -74,8 +74,7 @@ class PhyMvccNode : public Operator {
     }
 
     void
-    PrefetchAsync(const std::shared_ptr<folly::CPUThreadPoolExecutor>
-                      prefetch_pool) override {
+    PrefetchAsync(const milvus::PrefetchExecutor& prefetch_pool) override {
         auto self = std::static_pointer_cast<PhyMvccNode>(shared_from_this());
         auto* query_context =
             self->operator_context_->get_exec_context()->get_query_context();
@@ -88,7 +87,7 @@ class PhyMvccNode : public Operator {
         }
         const auto submit_time = std::chrono::steady_clock::now();
         prefetch_future_.emplace(
-            folly::via(prefetch_pool.get(), [self, trace_id, submit_time]() {
+            prefetch_pool.Submit([self, trace_id, submit_time]() {
                 const auto started = milvus::monitor::QueryStageClock::now();
                 milvus::tracer::ScopedRequestTraceID trace_scope(trace_id);
                 auto* query_context =

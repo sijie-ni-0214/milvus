@@ -59,6 +59,7 @@
 #include "cachinglayer/CacheSlot.h"
 #include "cachinglayer/Manager.h"
 #include "cachinglayer/Translator.h"
+#include "common/PrefetchExecutor.h"
 #include "common/Array.h"
 #include "common/StructElementOffsets.h"
 #include "common/ColumnarArrayChunkBuilder.h"
@@ -3893,13 +3894,18 @@ ChunkedSegmentSealedImpl::prefetch_chunks(
     AssertInfo(get_bit(snapshot->field_data_ready_bitset, field_id),
                "Can't get bitset element at " + std::to_string(field_id.get()));
     if (auto column = get_column(snapshot->runtime, field_id)) {
-        column->PrefetchChunks(op_ctx, chunk_ids);
+        if (!PrefetchExecutor::IsStopped()) {
+            column->PrefetchChunks(op_ctx, chunk_ids);
+        }
     }
 }
 
 void
 ChunkedSegmentSealedImpl::prefetch_chunks_locked(milvus::OpContext* op_ctx,
                                                  FieldId field_id) const {
+    if (PrefetchExecutor::IsStopped()) {
+        return;
+    }
     auto snapshot = CapturePublishedState();
     if (auto column = get_column(snapshot->runtime, field_id)) {
         // num_chunks may synchronously open a cold manifest reader.
@@ -3908,6 +3914,9 @@ ChunkedSegmentSealedImpl::prefetch_chunks_locked(milvus::OpContext* op_ctx,
         auto num_chunks = column->num_chunks();
         std::vector<int64_t> ids(num_chunks);
         std::iota(ids.begin(), ids.end(), 0);
+        if (PrefetchExecutor::IsStopped()) {
+            return;
+        }
         prepare_timer.End();
         // Includes cache admission, storage I/O, conversion and publication.
         milvus::monitor::QueryStageTimer load_timer(
@@ -11755,8 +11764,14 @@ void
 ChunkedSegmentSealedImpl::prefetch_vector(milvus::OpContext* op_ctx,
                                           FieldId field_id) const {
     std::shared_lock vector_state_lck(mutex_);
+    if (PrefetchExecutor::IsStopped()) {
+        return;
+    }
     auto runtime = CaptureRuntimeResourceState();
     auto index_reader = CreateIndexReader(op_ctx, runtime, field_id);
+    if (PrefetchExecutor::IsStopped()) {
+        return;
+    }
     if (index_reader) {
         const auto* vector =
             dynamic_cast<const index::IVectorReader*>(index_reader.get());
