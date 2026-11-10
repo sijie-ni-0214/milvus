@@ -3761,7 +3761,10 @@ TEST(ExprResCacheManagerV2Test, MemoryModePutGet) {
     v.valid_result = std::make_shared<milvus::TargetBitmap>(MakeBits(512));
     v.active_count = 512;
     v.eval_duration_us = 0;
+    EXPECT_FALSE(mgr.HasCachedResult(k, v.active_count));
     mgr.Put(k, v);
+    EXPECT_TRUE(mgr.HasCachedResult(k, v.active_count));
+    EXPECT_FALSE(mgr.HasCachedResult(k, v.active_count + 1));
 
     // Get it back
     ExprResCacheManager::Value got;
@@ -3864,7 +3867,10 @@ TEST(ExprResCacheManagerV2Test, DiskModePutGet) {
 
     // Keep a reference to the original result for verification
     auto original_result = v.result;
+    EXPECT_FALSE(mgr.HasCachedResult(k, v.active_count));
     mgr.Put(k, v);
+    EXPECT_TRUE(mgr.HasCachedResult(k, v.active_count));
+    EXPECT_FALSE(mgr.HasCachedResult(k, v.active_count + 1));
 
     // Verify disk file was created
     auto seg_path = tmpdir / "seg_200.cache";

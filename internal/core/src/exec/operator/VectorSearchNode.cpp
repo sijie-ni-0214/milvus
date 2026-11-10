@@ -87,8 +87,6 @@ PhyVectorSearchNode::AddInput(RowVectorPtr& input) {
 
 RowVectorPtr
 PhyVectorSearchNode::GetOutput() {
-    WaitPrefetch();
-
     milvus::exec::checkCancellation(query_context_);
 
     if (is_finished_ || !no_more_input_) {
@@ -103,12 +101,8 @@ PhyVectorSearchNode::GetOutput() {
         return nullptr;
     }
 
-    WaitPrefetch();
     span.SetAttribute("search_type", search_info_.metric_type_);
     span.SetAttribute("topk", search_info_.topk_);
-
-    std::chrono::high_resolution_clock::time_point vector_start =
-        std::chrono::high_resolution_clock::now();
 
     auto& ph = placeholder_group_->at(0);
     auto src_data = ph.get_blob();
@@ -198,6 +192,8 @@ PhyVectorSearchNode::GetOutput() {
         search_result.vector_search_filter_owner_ = GetColumnVector(input_);
     }
     auto op_context = query_context_->get_op_context();
+    WaitPrefetch();
+    auto vector_start = std::chrono::high_resolution_clock::now();
     segment_->vector_search(search_info_,
                             src_data,
                             src_offsets,

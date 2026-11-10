@@ -83,8 +83,7 @@ class PhyVectorSearchNode : public Operator {
     }
 
     void
-    PrefetchAsync(const std::shared_ptr<folly::CPUThreadPoolExecutor>
-                      prefetch_pool) override {
+    PrefetchAsync(const milvus::PrefetchExecutor& prefetch_pool) override {
         auto self =
             std::static_pointer_cast<PhyVectorSearchNode>(shared_from_this());
         const auto submit_time = std::chrono::steady_clock::now();
@@ -95,7 +94,7 @@ class PhyVectorSearchNode : public Operator {
             trace_id = milvus::tracer::GetRequestTraceID(op_ctx);
         }
         prefetch_future_.emplace(
-            folly::via(prefetch_pool.get(), [self, submit_time, trace_id]() {
+            prefetch_pool.Submit([self, submit_time, trace_id]() {
                 const auto started = milvus::monitor::QueryStageClock::now();
                 auto* op_ctx = self->query_context_->get_op_context();
                 milvus::tracer::ScopedRequestTraceID trace_scope(trace_id);

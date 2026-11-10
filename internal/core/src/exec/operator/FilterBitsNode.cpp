@@ -193,8 +193,6 @@ PhyFilterBitsNode::GetOutput() {
         "PhyFilterBitsNode::Execute", tracer::GetRootSpan(), true);
     tracer::AddEvent(fmt::format("input_rows: {}", need_process_rows_));
 
-    exprs_->WaitPrefetch();
-
     std::chrono::high_resolution_clock::time_point scalar_start =
         std::chrono::high_resolution_clock::now();
 
@@ -205,9 +203,8 @@ PhyFilterBitsNode::GetOutput() {
 
     // optimization: if all expressions can be executed at once,
     // execute in a single pass and flip in-place to avoid bitmap copies.
-    if (exprs_->CanExecuteAllAtOnce()) {
+    if (exprs_->expr(0)->TrySetExecuteAllAtOnce()) {
         tracer::AddEvent("expr_execute_all_at_once");
-        exprs_->SetExecuteAllAtOnce();
 
         exprs_->Eval(0, 1, true, eval_ctx, results_);
         AssertInfo(results_.size() == 1 && results_[0] != nullptr,
