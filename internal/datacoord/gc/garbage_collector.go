@@ -1337,11 +1337,10 @@ func (gc *GarbageCollector) recycleDroppedSegmentsInBatches(
 
 // RecycleDroppedSegment recycles one dropped segment through the batch pipeline.
 func (gc *GarbageCollector) RecycleDroppedSegment(ctx context.Context, io *packed.ManifestIOContext, segmentID int64) {
-	segment := gc.Meta.GetSegment(ctx, segmentID)
-	if segment == nil || ctx.Err() != nil {
+	if ctx.Err() != nil {
 		return
 	}
-	candidate, err := gc.prepareDroppedSegmentGCBatchCandidate(ctx, io, segmentID, segment)
+	candidate, err := gc.prepareDroppedSegmentGCBatchCandidate(ctx, io, segmentID, nil)
 	if err != nil {
 		mlog.Warn(ctx, "GC segment failed to plan file deletion", mlog.FieldSegmentID(segmentID), mlog.Err(err))
 		return
@@ -1392,14 +1391,15 @@ type droppedSegmentGCBatchCandidate struct {
 
 // prepareDroppedSegmentGCBatchCandidate plans the deletion of a dropped
 // segment. It returns nil when the segment must be kept for now.
-func (gc *GarbageCollector) prepareDroppedSegmentGCBatchCandidate(ctx context.Context, io *packed.ManifestIOContext, segmentID int64, segment *meta.SegmentInfo) (*droppedSegmentGCBatchCandidate, error) {
+func (gc *GarbageCollector) prepareDroppedSegmentGCBatchCandidate(ctx context.Context, io *packed.ManifestIOContext, segmentID int64, observed *meta.SegmentInfo) (*droppedSegmentGCBatchCandidate, error) {
 	// Observe the segment and index placements together. Rollback publishes both
 	// under this lock, and batch execution rechecks this revision before deletion.
 	locks := gc.Meta.GetSegmentManifestLocks()
 	locks.Lock(segmentID)
 	defer locks.Unlock(segmentID)
-	current := gc.Meta.GetSegment(ctx, segmentID)
-	if current == nil || current.SegmentInfo != segment.SegmentInfo || current.GetState() != commonpb.SegmentState_Dropped {
+	segment := gc.Meta.GetSegment(ctx, segmentID)
+	if segment == nil || segment.GetState() != commonpb.SegmentState_Dropped ||
+		(observed != nil && segment.SegmentInfo != observed.SegmentInfo) {
 		return nil, nil
 	}
 	segIndexes, indexFiles, blockReason := gc.GetDroppedSegmentIndexFiles(ctx, io, segmentID)

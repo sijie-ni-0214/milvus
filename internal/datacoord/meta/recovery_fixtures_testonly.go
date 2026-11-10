@@ -26,7 +26,6 @@ import (
 )
 
 var (
-	ManifestIndexParamsForTest           = manifestIndexParams
 	SegmentIndexFromManifestForTest      = segmentIndexFromManifest
 	ManifestIndexUsableForTest           = manifestIndexUsable
 	ManifestIndexUsableForSegmentForTest = manifestIndexUsableForSegment

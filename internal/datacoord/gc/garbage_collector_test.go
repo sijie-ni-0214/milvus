@@ -5511,6 +5511,47 @@ func setupDroppedSegmentBatchFixture(t *testing.T, count int) (*dcmeta.Meta, *sn
 	return m, dm
 }
 
+func TestDroppedSegmentBatchRechecksManifestBeforeDeletion(t *testing.T) {
+	ctx := t.Context()
+	m, dm := setupDroppedSegmentBatchFixture(t, 2)
+	cm := &batchRemoveChunkManager{rootPath: "root"}
+	gc := NewGarbageCollector(m, dcmeta.NewMockHandler(), GcTestDomainOption(dm, GcOption{Cli: cm}))
+	t.Cleanup(gc.Close)
+	io := NewGCManifestReadIO(t)
+	var batch []*droppedSegmentGCBatchCandidate
+	for _, id := range []int64{1, 2} {
+		candidate, err := gc.prepareDroppedSegmentGCBatchCandidate(ctx, io, id, m.GetSegment(ctx, id))
+		require.NoError(t, err)
+		require.NotNil(t, candidate)
+		batch = append(batch, candidate)
+	}
+
+	// A rollback published a new revision after the GC scan planned both deletions.
+	locks := m.GetSegmentManifestLocks()
+	locks.Lock(1)
+	unlockWriter := m.LockSegments(1)
+	updated := m.GetSegment(ctx, 1).Clone()
+	updated.ManifestPath = "root/insert_log/1/1/1/_metadata/manifest_2"
+	m.Segments.SetSegment(1, updated)
+	unlockWriter()
+	locks.Unlock(1)
+
+	cm.remove = func(_ context.Context, paths []string) []storage.RemoveResult {
+		require.Len(t, paths, 1)
+		require.True(t, strings.HasSuffix(paths[0], "index-file-2"))
+		if locks.TryLock(2) {
+			locks.Unlock(2)
+			t.Error("manifest publication could run during deletion")
+		}
+		return []storage.RemoveResult{{Path: paths[0]}}
+	}
+	gc.recycleDroppedSegmentBatch(ctx, batch)
+	require.Len(t, cm.calls, 1)
+	require.Equal(t, updated.GetManifestPath(), m.GetSegment(ctx, 1).GetManifestPath())
+	require.Len(t, dm.IndexMeta.GetAllSegmentIndexes(1), 1)
+	require.Nil(t, m.GetSegment(ctx, 2))
+}
+
 func TestGarbageCollector_recycleDroppedSegmentsInBatches(t *testing.T) {
 	checkpointCatalog := MockCheckpointCatalog(t, 1000)
 	t.Run("batches files and both metadata levels", func(t *testing.T) {
