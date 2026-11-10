@@ -11,7 +11,7 @@ In streaming mode, QueryCoord releases collections that have received no DQL att
 
 ## Component responsibilities and flow
 
-**Proxy** sends one `EnsureCollectionReady` RPC per complete DQL attempt of Search, HybridSearch, and Query, and retries the whole request on a recoverable release or view error. QueryCoord shares load submission and the readiness wait among all callers of a collection.
+**Proxy** sends one `EnsureCollectionReady` RPC per complete DQL attempt of Search, HybridSearch, and Query, and per read attempt of a Delete by expression, partial Upsert or AutoID Upsert, and retries the whole request or read on a recoverable release or view error. QueryCoord shares load submission and the readiness wait among all callers of a collection.
 
 **QueryCoord** keeps an in-memory `collectionID -> lastActiveAt` map. Existing readiness RPCs refresh activity, and a periodic scan of load configs selects expired collections. Requests from different Proxies update the same collection timestamp using QueryCoord's local clock.
 
@@ -37,7 +37,7 @@ QueryCoord periodically scans load configs
 - `EnsureCollectionReady` refreshes an existing record on entry.
 - A caller that joined a shared load or wait refreshes the record again after readiness is confirmed, immediately before returning success. It does not refresh activity while waiting or when returning an error.
 - Readiness RPCs only refresh records already initialized by the scanner. Request completion and internal requery stages do not refresh activity separately. A complete DQL retry refreshes it through the next initial check.
-- DML, load-progress requests, monitoring, and background operations do not refresh activity.
+- DML other than those reads, load-progress requests, monitoring, and background operations do not refresh activity.
 
 ### Scanning and release
 
