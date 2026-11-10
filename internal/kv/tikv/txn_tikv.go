@@ -17,7 +17,6 @@
 package tikv
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"math"
@@ -42,6 +41,7 @@ import (
 	"github.com/milvus-io/milvus/pkg/v3/util/paramtable"
 	_ "github.com/milvus-io/milvus/pkg/v3/util/resource" // Register the shared protobuf codec before Params starts etcd RPCs.
 	"github.com/milvus-io/milvus/pkg/v3/util/retry"
+	tikvutil "github.com/milvus-io/milvus/pkg/v3/util/tikv"
 	"github.com/milvus-io/milvus/pkg/v3/util/timerecord"
 	"github.com/milvus-io/milvus/pkg/v3/util/typeutil"
 )
@@ -60,7 +60,7 @@ const (
 	// This empty value is what we are reserving within TiKv to represent an empty string value.
 	// TiKV does not allow storing empty values for keys which is something we do in Milvus, so
 	// to get over this we are using the reserved keyword as placeholder.
-	EmptyValueString = "__milvus_reserved_empty_tikv_value_DO_NOT_USE"
+	EmptyValueString = tikvutil.EmptyValueString
 	// maxTiKVTxnOps bounds how many key ops we treat as one atomic TiKV txn.
 	// TiKV's own client-side limits are far higher (txn-entry-count-limit
 	// defaults to 300k, txn-total-size-limit to 100MB); 64Ki metadata-sized
@@ -598,7 +598,7 @@ func (kv *txnTiKV) checkPredicates(ctx context.Context, txn *transaction.KVTxn, 
 			if !exists {
 				return markPredicateNotMet(merr.WrapErrIoFailedReason(fmt.Sprintf("failed to read predicate target (%s:%v) for MultiSaveAndRemove", pred.Key(), pred.TargetValue()), tikverr.ErrNotExist.Error()))
 			}
-			if !pred.IsTrue(decodeValue(val)) {
+			if !pred.IsTrue(tikvutil.DecodeValue(val)) {
 				return markPredicateNotMet(merr.WrapErrIoFailedReason("failed to meet predicate", fmt.Sprintf("key=%s, value=%v", pred.Key(), pred.TargetValue())))
 			}
 		case predicates.PredTargetKeyExistence:
@@ -812,7 +812,7 @@ func (kv *txnTiKV) WalkWithPrefix(ctx context.Context, prefix string, pagination
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return ctxErr
 		}
-		err = fn(iter.Key(), decodeValue(iter.Value()))
+		err = fn(iter.Key(), tikvutil.DecodeValue(iter.Value()))
 		if err != nil {
 			return err
 		}
@@ -1024,22 +1024,10 @@ func CheckElapseAndWarn(start time.Time, message string, fields ...mlog.Field) b
 }
 
 func convertEmptyByteToString(value []byte) string {
-	return string(decodeValue(value))
+	return string(tikvutil.DecodeValue(value))
 }
 
 func convertEmptyStringToByte(value string) ([]byte, error) {
-	if value == "" {
-		return EmptyValueByte, nil
-	}
-	if value == EmptyValueString {
-		return nil, merr.WrapErrParameterInvalidMsg("value for key is reserved by EmptyValue: %s", EmptyValueString)
-	}
-	return []byte(value), nil
+	return tikvutil.EncodeValue([]byte(value))
 }
 
-func decodeValue(value []byte) []byte {
-	if len(value) == 0 || bytes.Equal(value, EmptyValueByte) {
-		return []byte{}
-	}
-	return value
-}

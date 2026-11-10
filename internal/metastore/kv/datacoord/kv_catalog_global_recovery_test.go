@@ -23,7 +23,10 @@ import (
 	"github.com/stretchr/testify/require"
 	"google.golang.org/protobuf/proto"
 
+	tikvkv "github.com/milvus-io/milvus/internal/kv/tikv"
+	"github.com/milvus-io/milvus/pkg/v3/kv/predicates"
 	"github.com/milvus-io/milvus/pkg/v3/proto/datapb"
+	tikvutil "github.com/milvus-io/milvus/pkg/v3/util/tikv"
 )
 
 func TestCatalogListAllSegmentsPreservesBinlogsAndPrefixBoundaries(t *testing.T) {
@@ -53,4 +56,30 @@ func TestCatalogListAllSegmentsPreservesBinlogsAndPrefixBoundaries(t *testing.T)
 	require.NoError(t, err)
 	require.Len(t, scoped, 1, "collection 1 must not scan collection 10")
 	require.EqualValues(t, 10, scoped[0].GetID())
+}
+
+// Exercise the bytes produced by etcd2tikv through the catalog used on startup.
+func TestCatalogMigratedEmptySegmentOnTiKV(t *testing.T) {
+	ctx := t.Context()
+	client := tikvutil.SetupLocalTxn()
+	defer client.Close()
+	store := tikvkv.NewTiKV(client, "catalog-test/meta")
+	key := buildSegmentPath(1, 2, 3)
+	seed, err := client.Begin()
+	require.NoError(t, err)
+	require.NoError(t, seed.Set([]byte(store.GetPath(key)), []byte(tikvutil.EmptyValueString)))
+	require.NoError(t, seed.Commit(ctx))
+	catalog := NewCatalog(store, "", "catalog-test/meta")
+	segments, err := catalog.ListAllSegments(ctx)
+	require.NoError(t, err)
+	require.Len(t, segments, 1)
+	require.True(t, proto.Equal(&datapb.SegmentInfo{}, segments[0]))
+	value, err := store.Load(ctx, key)
+	require.NoError(t, err)
+	require.Empty(t, value)
+	require.NoError(t, store.MultiSaveAndRemove(ctx, map[string]string{"raw/empty": ""}, nil, predicates.ValueEqual(key, "")))
+	keys, values, err := store.LoadWithPrefix(ctx, "raw/")
+	require.NoError(t, err)
+	require.Equal(t, []string{store.GetPath("raw/empty")}, keys)
+	require.Equal(t, []string{""}, values)
 }
