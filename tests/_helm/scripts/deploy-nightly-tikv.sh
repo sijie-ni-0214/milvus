@@ -17,10 +17,12 @@ MILVUS_IMAGE_REPOSITORY="${MILVUS_IMAGE_REPOSITORY:-harbor.milvus.io/milvusdb/mi
 MILVUS_IMAGE_TAG="${MILVUS_IMAGE_TAG:-}"
 WOODPECKER_IMAGE_REPOSITORY="${WOODPECKER_IMAGE_REPOSITORY:-harbor.milvus.io/woodpecker/woodpecker}"
 WOODPECKER_IMAGE_TAG="${WOODPECKER_IMAGE_TAG:-}"
-PD_IMAGE="${PD_IMAGE:-pingcap/pd:v8.5.3}"
-TIKV_IMAGE="${TIKV_IMAGE:-pingcap/tikv:v8.5.3}"
+PD_IMAGE="${PD_IMAGE:-pingcap/pd:v8.5.8}"
+TIKV_IMAGE="${TIKV_IMAGE:-pingcap/tikv:v8.5.8}"
 TIKV_STORAGE_CLASS="${TIKV_STORAGE_CLASS:-}"
 TIKV_STORAGE_SIZE="${TIKV_STORAGE_SIZE:-10Gi}"
+PD_STORAGE_SIZE="${PD_STORAGE_SIZE:-$TIKV_STORAGE_SIZE}"
+TIKV_REPLICAS="${TIKV_REPLICAS:-1}"
 TIKV_WAIT_TIMEOUT="${TIKV_WAIT_TIMEOUT:-300s}"
 HELM_TIMEOUT="${HELM_TIMEOUT:-1200s}"
 
@@ -40,8 +42,10 @@ Optional environment variables:
   NAMESPACE                  default: jenkins-milvus-ci
   VALUES_FILE                default: tests/_helm/values/nightly/distributed-woodpecker
   CHART_VERSION              default: 5.0.16
-  PD_IMAGE                   default: pingcap/pd:v8.5.3
-  TIKV_IMAGE                 default: pingcap/tikv:v8.5.3
+  PD_IMAGE                   default: pingcap/pd:v8.5.8
+  TIKV_IMAGE                 default: pingcap/tikv:v8.5.8
+  TIKV_REPLICAS              PD members and TiKV stores (1 or 3, default: 1)
+  PD_STORAGE_SIZE            default: TIKV_STORAGE_SIZE
   TIKV_STORAGE_CLASS         default: cluster default storage class
   TIKV_STORAGE_SIZE          default: 10Gi
   TIKV_WAIT_TIMEOUT          default: 300s
@@ -87,6 +91,24 @@ render_tikv_manifests() {
     storage_class_line="      storageClassName: ${TIKV_STORAGE_CLASS}"
   fi
 
+  local initial_cluster="" member host_spread="" pod_management="" i
+  for ((i=0; i<TIKV_REPLICAS; i++)); do
+    member="${RELEASE_NAME}-tikv-pd-${i}"
+    initial_cluster+="${initial_cluster:+,}${member}=http://${member}.${PD_HEADLESS}.${NAMESPACE}.svc:2380"
+  done
+  if [[ "$TIKV_REPLICAS" == 3 ]]; then
+    pod_management="  podManagementPolicy: Parallel"
+    host_spread="$(cat <<YAML
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - topologyKey: kubernetes.io/hostname
+            labelSelector:
+              matchLabels:
+                app.kubernetes.io/instance: ${RELEASE_NAME}
+                app.kubernetes.io/component: COMPONENT
+YAML
+)"
+  fi
   cat <<EOF
 apiVersion: v1
 kind: Service
@@ -162,7 +184,8 @@ metadata:
     app.kubernetes.io/component: pd
 spec:
   serviceName: ${PD_HEADLESS}
-  replicas: 1
+  replicas: ${TIKV_REPLICAS}
+${pod_management}
   selector:
     matchLabels:
       app.kubernetes.io/name: tikv
@@ -176,6 +199,7 @@ spec:
         app.kubernetes.io/component: pd
     spec:
       affinity:
+${host_spread/COMPONENT/pd}
         nodeAffinity:
           preferredDuringSchedulingIgnoredDuringExecution:
           - preference:
@@ -213,7 +237,7 @@ spec:
             --advertise-client-urls="http://\${POD_NAME}.${PD_HEADLESS}.${NAMESPACE}.svc:2379" \\
             --peer-urls=http://0.0.0.0:2380 \\
             --advertise-peer-urls="http://\${POD_NAME}.${PD_HEADLESS}.${NAMESPACE}.svc:2380" \\
-            --initial-cluster="\${POD_NAME}=http://\${POD_NAME}.${PD_HEADLESS}.${NAMESPACE}.svc:2380" \\
+            --initial-cluster="${initial_cluster}" \\
             --log-file=""
         env:
         - name: POD_NAME
@@ -259,7 +283,7 @@ spec:
 ${storage_class_line}
       resources:
         requests:
-          storage: ${TIKV_STORAGE_SIZE}
+          storage: ${PD_STORAGE_SIZE}
 ---
 apiVersion: apps/v1
 kind: StatefulSet
@@ -271,7 +295,8 @@ metadata:
     app.kubernetes.io/component: tikv
 spec:
   serviceName: ${TIKV_HEADLESS}
-  replicas: 1
+  replicas: ${TIKV_REPLICAS}
+${pod_management}
   selector:
     matchLabels:
       app.kubernetes.io/name: tikv
@@ -285,6 +310,7 @@ spec:
         app.kubernetes.io/component: tikv
     spec:
       affinity:
+${host_spread/COMPONENT/tikv}
         nodeAffinity:
           preferredDuringSchedulingIgnoredDuringExecution:
           - preference:
@@ -414,8 +440,8 @@ wait_for_tikv_store_up() {
     if last_output="$(timeout "${poll_timeout}s" kubectl --request-timeout="${poll_timeout}s" \
       exec -n "$NAMESPACE" "${RELEASE_NAME}-tikv-pd-0" -- \
       /pd-ctl -u http://127.0.0.1:2379 store 2>&1)"; then
-      if grep -Eq '"state_name"[[:space:]]*:[[:space:]]*"Up"' <<<"$last_output"; then
-        echo "PD reports a TiKV store in Up state."
+      if [[ "$(grep -Ec '"state_name"[[:space:]]*:[[:space:]]*"Up"' <<<"$last_output")" -ge "$TIKV_REPLICAS" ]]; then
+        echo "PD reports $TIKV_REPLICAS or more Up stores."
         return 0
       fi
     elif grep -Eqi '(/pd-ctl|pd-ctl).*(not found|no such file|executable file not found)|stat /pd-ctl' <<<"$last_output"; then
@@ -466,6 +492,11 @@ TIKV_HEADLESS="${RELEASE_NAME}-tikv-peer"
 if [[ "$ACTION" == "cleanup" ]]; then
   cleanup_tikv_resources
   exit 0
+fi
+
+if [[ "$TIKV_REPLICAS" != 1 && "$TIKV_REPLICAS" != 3 ]]; then
+  echo "TIKV_REPLICAS must be 1 or 3" >&2
+  exit 2
 fi
 
 if [[ "$DRY_RUN" == "1" ]]; then
