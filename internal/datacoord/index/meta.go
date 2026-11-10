@@ -615,7 +615,7 @@ func (m *IndexMeta) updateSegmentIndexManifestPublished(segIdx *model.SegmentInd
 			indexes.Insert(updated.IndexID, updated)
 		}
 	}
-	m.SegmentBuildInfo.buildID2SegmentIndex.Insert(updated.BuildID, updated)
+	m.SegmentBuildInfo.byBuildID(updated.BuildID).Insert(updated.BuildID, updated)
 	m.NotifyManifestIndexMigration(updated)
 }
 

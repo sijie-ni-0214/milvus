@@ -218,6 +218,29 @@ func TestRebuildSegmentIndexCacheLikeOnePassInOrder(t *testing.T) {
 	}
 }
 
+func TestRecoveryKeepsNewestIndexBuildAcrossPlacements(t *testing.T) {
+	m := newRecoveryTestIndexMeta()
+	current := &model.SegmentIndex{CollectionID: 1, SegmentID: 2, IndexID: 3, BuildID: 20}
+	older := model.CloneSegmentIndex(current)
+	older.BuildID = 10
+	m.rebuildSegmentIndexCache([]*model.SegmentIndex{current, older})
+	manifest := model.CloneSegmentIndex(older)
+	manifest.BuildID = 5
+	manifest.ManifestPublished = true
+	recovered := m.NewManifestIndexRecovery()
+	recovered.Install(manifest)
+	// A manifest may also contain a build already recovered from its catalog row.
+	duplicate := model.CloneSegmentIndex(current)
+	duplicate.ManifestPublished = true
+	recovered.Install(duplicate)
+	require.Equal(t, 1, recovered.Installed())
+	snapshot := snapshotIndexCache(m)
+	require.Equal(t, current.BuildID, snapshot.segmentIndexes[2][3].BuildID)
+	require.False(t, snapshot.builds[20].ManifestPublished)
+	require.False(t, snapshot.builds[10].ManifestPublished)
+	require.True(t, snapshot.builds[5].ManifestPublished)
+}
+
 // Recovering the index meta from a catalog that reads key ranges recovers what
 // one walk of each prefix recovers.
 func TestRecoverIndexMetaInRangesLikeOneWalk(t *testing.T) {

@@ -35,6 +35,7 @@ import (
 	"github.com/milvus-io/milvus/internal/metastore/model"
 	"github.com/milvus-io/milvus/internal/storage"
 	"github.com/milvus-io/milvus/internal/storagev2/packed"
+	"github.com/milvus-io/milvus/pkg/v3/common"
 	"github.com/milvus-io/milvus/pkg/v3/metrics"
 	"github.com/milvus-io/milvus/pkg/v3/objectstorage"
 	"github.com/milvus-io/milvus/pkg/v3/proto/datapb"
@@ -48,7 +49,7 @@ import (
 
 // The legacy* functions below are the recovery code as it was before
 // validation moved to the read executor and installation was batched. They are
-// kept verbatim as the reference the current recovery must reproduce.
+// the reference for per-record recovery, including its index-type-only parameters.
 
 func legacyManifestIndexFilePathInfo(segmentID int64, manifestIndex packed.ManifestIndexInfo) (*indexpb.IndexFilePathInfo, bool) {
 	if manifestIndex.Path == "" || manifestIndex.IndexName == "" || manifestIndex.IndexType == "" ||
@@ -73,7 +74,7 @@ func legacyManifestIndexFilePathInfo(segmentID int64, manifestIndex packed.Manif
 		BuildID:                   manifestIndex.BuildID,
 		IndexName:                 manifestIndex.IndexName,
 		IndexType:                 manifestIndex.IndexType,
-		IndexParams:               meta.ManifestIndexParamsForTest(manifestIndex),
+		IndexParams:               []*commonpb.KeyValuePair{{Key: common.IndexTypeKey, Value: manifestIndex.IndexType}},
 		IndexFilePaths:            filePaths,
 		SerializedSize:            uint64(manifestIndex.SerializedSize),
 		MemSize:                   uint64(manifestIndex.MemSize),
@@ -389,6 +390,10 @@ func snapshotRecoveredIndexState(t *testing.T, m *meta.Meta) recoveredIndexState
 	}
 	im.taskCounts.mu.RUnlock()
 	im.PublishStoredIndexSizes()
+	// A recovery worker can already have taken the dirty sizes for publication.
+	// Join that publisher before sampling the shared gauge.
+	im.taskCounts.publishMu.Lock()
+	defer im.taskCounts.publishMu.Unlock()
 	collected := make(chan prometheus.Metric)
 	go func() {
 		metrics.DataCoordStoredIndexFilesSize.Collect(collected)

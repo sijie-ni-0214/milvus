@@ -84,7 +84,7 @@ type segmentManifestIndexRollback struct {
 func (i *ManifestIndexRollbackInspector) scan(ctx context.Context) ([]segmentManifestIndexRollback, int) {
 	groups := make(map[int64]*segmentManifestIndexRollback)
 	pendingRecords := 0
-	i.indexMeta.SegmentBuildInfo.buildID2SegmentIndex.Range(func(_ int64, record *model.SegmentIndex) bool {
+	i.indexMeta.SegmentBuildInfo.Range(func(record *model.SegmentIndex) bool {
 		if ctx.Err() != nil {
 			return false
 		}
