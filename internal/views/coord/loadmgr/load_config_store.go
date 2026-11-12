@@ -131,13 +131,8 @@ func (s *LoadConfigStore) putLocked(ctx context.Context, cfg *LoadConfig) error 
 	s.mu.RLock()
 	previous := s.configs[cfg.CollectionID]
 	s.mu.RUnlock()
-	// Other DDL messages omit the warmup epoch, and epochs never decrease;
-	// only Remove clears it.
-	if previous != nil && previous.WarmupEpoch > cfg.WarmupEpoch {
-		cfg.WarmupEpoch = previous.WarmupEpoch
-	}
 	if sameLoadRequirements(previous, cfg) {
-		if previous.AutoLoad == cfg.AutoLoad && previous.WarmupEpoch == cfg.WarmupEpoch {
+		if previous.AutoLoad == cfg.AutoLoad {
 			return nil
 		}
 		// normalize owns cfg. Replace only scheduling metadata, preserving the
@@ -228,7 +223,6 @@ func sameLoadRequirements(a, b *LoadConfig) bool {
 	left, right := a.toCollectionLoadConfigProto(), b.toCollectionLoadConfigProto()
 	left.Version, right.Version = 0, 0
 	left.AutoLoad, right.AutoLoad = false, false
-	left.WarmupEpoch, right.WarmupEpoch = 0, 0
 	return proto.Equal(left, right)
 }
 

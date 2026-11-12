@@ -279,12 +279,6 @@ message LoadCollectionRequest {
     // Preload hints: empty follows the bound schema; nonempty is explicit.
     repeated int64 load_fields = 9;
     common.LoadPriority priority = 10;
-    // Original caller intent for warm-in-place detection only; load_fields
-    // retains the preload semantics above. The proxy expands omitted fields.
-    optional bool load_all_fields = 11;
-    bool skip_load_dynamic_field = 12;
-    // Asks QueryNodes to warm the loaded data in the background until release.
-    bool warmup_hint = 13;
 }
 
 message ReleaseCollectionRequest {
@@ -1327,6 +1321,7 @@ message GetQueryViewLoadInfoResponse {
     repeated view.LoadFieldConfig load_fields = 5; // Explicit preload set within required_fields; empty means none.
     repeated index.IndexInfo index_info_list = 6;
     repeated view.LoadFieldConfig required_fields = 7; // Explicit allowed query field scope; empty means none, never all fields.
+    repeated int64 replica_ids = 8; // Replica set belonging to this immutable load configuration.
 }
 
 message EnsureCollectionReadyRequest {

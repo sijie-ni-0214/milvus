@@ -57,6 +57,14 @@ func (s *sealedReadState) RetrieveByOffsets(ctx context.Context, plan *segcore.R
 	return s.parent.retrieveByOffsetsWithSegment(ctx, plan, s.native)
 }
 
+func (s *sealedReadState) Prewarm(ctx context.Context, fieldIDs []int64) error {
+	if err := s.parent.PinIfNotReleased(); err != nil {
+		return err
+	}
+	defer s.parent.Unpin()
+	return segcore.PrewarmSealedReadState(ctx, s.native, fieldIDs)
+}
+
 func (s *sealedReadState) HasRawData(fieldID int64) bool {
 	return s.native.HasRawData(fieldID)
 }

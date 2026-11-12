@@ -11,7 +11,6 @@ import (
 )
 
 type allocationResult struct {
-	warmupEpoch  int64
 	collectionID int64
 	shard        *ShardDataView
 	entries      []*SegmentDataView
@@ -113,7 +112,7 @@ func allocate(p *planningContext, shardID qviews.ShardID, baseRows map[int64]int
 			}
 		}
 	}
-	return &allocationResult{collectionID: desired.CollectionID, warmupEpoch: desired.WarmupEpoch, shard: shard, entries: entries, assignments: ctx.assignments, rowsByNode: ctx.rows, more: more}
+	return &allocationResult{collectionID: desired.CollectionID, shard: shard, entries: entries, assignments: ctx.assignments, rowsByNode: ctx.rows, more: more}
 }
 
 // materialize is called only for submitted candidates. The private sorted slice
@@ -140,7 +139,7 @@ func (r *allocationResult) materialize(p *planningContext, shardID qviews.ShardI
 		TransformStartAfterTimetick: r.shard.TransformStartAfterTimetick(),
 		SegmentManifestVersions:     manifests, PartitionStatsVersions: stats,
 	}).SetAssignments(assignments).SetLoadInfoVersion(p.ConfigVersion(r.collectionID)).
-		SetPreparationPriority(p.preparationPriority(shardID)).SetWarmupEpoch(r.warmupEpoch)
+		SetPreparationPriority(p.preparationPriority(shardID))
 }
 
 // currentSegmentNodes returns the selected intended placement, preferring a
