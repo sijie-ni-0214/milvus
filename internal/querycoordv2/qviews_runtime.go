@@ -45,13 +45,14 @@ import (
 	"github.com/milvus-io/milvus/pkg/v3/proto/viewpb"
 	"github.com/milvus-io/milvus/pkg/v3/util/conc"
 	"github.com/milvus-io/milvus/pkg/v3/util/merr"
+	"github.com/milvus-io/milvus/pkg/v3/util/syncutil"
 )
 
 type qviewsBalancer interface {
 	Start(ctx context.Context)
 	Stop()
 	Trigger(scopes ...balancer.TriggerScope)
-	Reconcile(ctx context.Context) error
+	TriggerWithCompletion(scopes ...balancer.TriggerScope) *syncutil.Future[error]
 }
 
 type qviewsRuntime struct {
