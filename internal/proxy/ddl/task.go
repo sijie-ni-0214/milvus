@@ -3182,8 +3182,8 @@ func (t *LoadCollectionTask) PreExecute(ctx context.Context) error {
 	return nil
 }
 
-// loadWarmupHint parses the optional load parameter that asks QueryNodes to
-// warm the loaded data in the background.
+// loadWarmupHint parses the optional load parameter requesting one background
+// prewarm pass independent of ordinary loading.
 func loadWarmupHint(params map[string]string) (bool, error) {
 	value, present := params[common.WarmupHintKey]
 	if !present {
@@ -3225,6 +3225,10 @@ func (t *LoadCollectionTask) Execute(ctx context.Context) (err error) {
 	if err := validateTextStorageV3Enabled(collSchema.CollectionSchema); err != nil {
 		return err
 	}
+	if t.warmupHint && typeutil.IsExternalCollection(collSchema.CollectionSchema) {
+		return merr.WrapErrParameterInvalidMsg("load warmup hint is not supported for external collections")
+	}
+
 	// prepare load field list
 	loadFields, err := collSchema.GetLoadFieldIDs(t.GetLoadFields(), t.GetSkipLoadDynamicField())
 	if err != nil {
@@ -3273,18 +3277,15 @@ func (t *LoadCollectionTask) Execute(ctx context.Context) (err error) {
 			t.Base,
 			commonpbutil.WithMsgType(commonpb.MsgType_LoadCollection),
 		),
-		DbID:                 0,
-		CollectionID:         collID,
-		Schema:               collSchema.CollectionSchema,
-		ReplicaNumber:        t.ReplicaNumber,
-		FieldIndexID:         fieldIndexIDs,
-		Refresh:              t.Refresh,
-		ResourceGroups:       t.ResourceGroups,
-		LoadFields:           loadFields,
-		LoadAllFields:        proto.Bool(len(t.GetLoadFields()) == 0),
-		SkipLoadDynamicField: t.GetSkipLoadDynamicField(),
-		Priority:             t.GetLoadPriority(),
-		WarmupHint:           t.warmupHint,
+		DbID:           0,
+		CollectionID:   collID,
+		Schema:         collSchema.CollectionSchema,
+		ReplicaNumber:  t.ReplicaNumber,
+		FieldIndexID:   fieldIndexIDs,
+		Refresh:        t.Refresh,
+		ResourceGroups: t.ResourceGroups,
+		LoadFields:     loadFields,
+		Priority:       t.GetLoadPriority(),
 	}
 	log.Info(ctx, "send LoadCollectionRequest to query coordinator",
 		mlog.FieldSchema(request.Schema),

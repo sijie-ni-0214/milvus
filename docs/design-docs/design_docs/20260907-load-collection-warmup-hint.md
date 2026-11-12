@@ -1,171 +1,64 @@
-# LoadCollection Warmup Hint Design (v3)
+# LoadCollection Warmup Hint Design (v7)
 
-- **Status:** In progress; the feature gate is off by default.
-- **History:** v3 replaced v2 (`20260907-load-collection-force-sync-warmup.md` in commit `6b6b24821a`) and v1 (commit `f492be6f2f`) on 2026-10-12. v3 changes the parameter from `warmup="sync"`, which meant waiting synchronously, to the hint `warmup_hint=true`: the server warms up in the background and does not guarantee completion.
-- **Scope:** the Streaming DDL load path under the QueryView architecture, QueryView resource preparation on QueryNode, and the segcore warmup interface.
+- **Scope:** Load admission, one-time prewarm requests, QN segment caches and SN lazy BM25 statistics.
+- **Architecture:** Ordinary load is unchanged; ephemeral prewarm uses the Proxy QueryView query route. There is no warmup epoch or View synchronization trigger.
 
-## 1. Requirements
+## 1. Contract
 
-1. Users can call `LoadCollection(load_params={"warmup_hint": "true"})` to hint the server to warm up ahead of time. They can also just query and let auto-load load the collection; auto-load does not warm up.
-2. When a collection is already loaded (including by query-triggered auto-load) without warmup, calling `load(warmup_hint=true)` warms up the loaded data.
-3. Every `load(warmup_hint=true)` call warms up again. When the cache still holds the data, the extra pass is cheap.
-4. Warmup is a background operation. It does not affect search, QueryView availability or load progress. Search runs as usual while warmup is unfinished, and data not yet warmed up is loaded on demand.
+`LoadCollection(load_params={"warmup_hint": "true"})` requests one background cache-warming pass on the local cluster. It creates no collection property or persistent policy.
 
-## 2. Non-goals
+- Proxy performs an ordinary load, then asynchronously submits a separate prewarm request after load admission succeeds. Each shard starts prewarming when its own serving View is Up; it does not wait for whole-collection loading progress. Queries and public loading progress do not wait for prewarming.
+- Hinted loads retain ordinary load validation and configuration semantics, including field/index checks. The separate prewarm operation never loads a collection or modifies its load configuration.
+- Each explicit hint creates a new request. Existing cache entries or an already materialized BM25 aggregate can make the pass cheap.
+- Balance, flush, compaction, new writes and restart neither inherit nor restore the request. Already borrowed resources continue warming across View replacement; the request never follows a new View or retries on another node.
+- Release, load-config replacement, timeout and Proxy shutdown discard pending work and cancel running requests. A canceled warm must not abort a cache load shared by a live query.
 
-- No external "warmup completed" signal. After `load(warmup_hint=true)`, `Await`, `GetLoadingProgress` and `GetLoadState` behave exactly as for a normal load; warmup progress is only observable in QueryNode logs and metrics.
-- No guarantee that data stays in the cache; eviction works as usual.
-- A warmup hint cannot be withdrawn; only Release ends it.
-- `LoadPartitions` and external collections do not support the warmup hint.
-- This design does not fix collection-level `warmup.*` properties taking only partial effect in QueryView mode.
+This is best-effort work without a public completion guarantee. SDK load waits, `GetLoadingProgress` and `GetLoadState` describe ordinary loading. Queries may share an in-progress cache read or BM25 materialization and wait for that read; prewarming also consumes CPU, memory and storage bandwidth.
 
-## 3. Semantics
+## 2. API and compatibility
 
-| Current state | Request | Result |
-| --- | --- | --- |
-| Not loaded | `load(warmup_hint=true)` | Searchable once a normal load completes; warmed up in the background afterwards |
-| Loaded (normally, by auto-load or with the hint) | `load(warmup_hint=true)` naming no replica number, resource groups or load fields | The load configuration, partitions included, is kept and search is unaffected; loaded segments are warmed up (again) in place in the background |
-| Loaded | `load(warmup_hint=true)` naming a replica number, resource groups or load fields | Restates the load configuration as a normal load does; warmed up in the background afterwards |
-| Loaded with the warmup hint | `load()` without the hint | The warmup hint is kept; no new warmup |
-| Any | Release (including auto-release) | Ends the warmup hint |
-| Not loaded | Query-triggered auto-load | Normal load without warmup |
-| Warmup hint present | New segments from flush, compaction or import | New segments are warmed up in the background after they load; segments already warmed up are not warmed up again |
-| Any | `load(warmup_hint=true, refresh=true)`, a non-boolean `warmup_hint`, or the hint on an external collection | Invalid parameter |
+The public parameter is `load_params={"warmup_hint": "true"}`; REST uses `warmupHint: true`. Existing proxy validation rejects malformed booleans, refresh combinations and unsupported external collections. `LoadPartitions` is unchanged.
 
-## 4. Core model: the warmup epoch
+An explicit `warmup_hint=true` requests prewarming directly; no additional configuration switch is required. A worker without `PrewarmOnView` rejects that attempt; there is no compatibility fallback to persisted hints.
 
-**Definition:** a warmup epoch is a number QueryCoord allocates for each `load(warmup_hint=true)` call. It is persisted, monotonically increasing and globally unique; 0 means no warmup hint.
+Existing collection and field cache warmup settings remain independent. Ordinary loads may perform work required by those settings, but cannot inherit an earlier hint.
 
-**Where it lives:** the load config stores the epoch of the latest `load(warmup_hint=true)`; each QueryView carries the epoch it was built with; QueryNode records, for each physical segment base, the latest epoch it finished warming up for (`warmedEpoch`).
+## 3. Admission and dispatch
 
-**The QueryNode rule:** when the largest epoch among the views whose bindings are prepared on a segment base is greater than the base's `warmedEpoch`, the base is warmed up in the background. Warmup never blocks view readiness. The StreamingNode needs no epoch bookkeeping; see 5.8.
+The public hint is consumed by Proxy. Proxy sends the existing `LoadCollectionRequest` without any warmup fields. Its load task retains ordinary validation and dispatch. After success, Proxy asynchronously invokes `queryclient.Prewarm(ctx, client, collectionID)` once; errors are logged and cannot change the successful load result. The coordinator load callback, WAL broadcast and load completion criteria are unchanged. QC exposes no prewarm RPC and owns no prewarm task.
 
-**Why an epoch:** QueryViews are rebuilt frequently because of flush, compaction, balance, node changes and so on. The epoch changes only when `load(warmup_hint=true)` is called, so ordinary view rebuilds do not warm up existing segments again, while every hinted load triggers one warmup. The same rule covers in-place warmup (a normally loaded segment records 0), repeated warmup (a new, larger epoch) and new segments.
+The query client reads the current load configuration through existing `GetQueryViewLoadInfo`. That metadata response includes the immutable configured replica IDs, including replicas that are still loading. It captures that set and the collection channels once. Every captured replica/shard gets its own pass; ordinary query load balancing, which chooses one replica per shard, is not used to reduce the prewarm scope. Later additions do not enter this request.
 
-## 5. End-to-end flow
+Each target independently waits in the existing replica-discovery subscription for its replica to advertise Up. It selects that advertised View version once and calls the SN `GetPrewarmPlan` method on the query-plan service. The method acquires exactly that View, verifies the captured load-config version, returns its worker topology and renews the existing serving lease. It does not wait for MVCC or execute a query. Missing, retired or mismatched Views end that target's attempt; they do not initiate replanning.
 
-### 5.1 Entry points
+The returned request-local plan captures the SN owner ID and channel term together with the View and QN placements. Proxy dispatches `PrewarmOnView` directly through the query transports. Both phases pin their target and disable configured transport retries; SN execution does not reread the current assignment. Planning and execution concurrency is bounded, while cold Up waits do not occupy dispatch slots. Errors on one target do not cancel other targets.
 
-- Go SDK `NewLoadCollectionOption(name).WithWarmupHint()`, `"warmupHint": true` in the REST v2 load request body, and clients that pass `load_params` directly all end up writing `load_params["warmup_hint"]`.
-- Proxy requires the value to be a boolean. When it is true, it cannot be combined with refresh or used on an external collection. Proxy then converts it to `warmup_hint` on the internal request.
+The request lifetime is owned by Proxy, independent of completion/cancellation of the original load RPC, and bounded by the existing load timeout. A request-owned, read-only load-info probe checks the original config version every second (each probe has a one-second timeout). Release, a new load-config version or a failed probe cancels outstanding waits and worker calls. Query client closure and Proxy shutdown also cancel them. This is cooperative cancellation, not an atomic release barrier. View replacement alone does not cancel borrowed resources. No state, epoch, allocator call, DDL mutation or recovery task is introduced.
 
-### 5.2 QueryCoord admission
+## 4. Persistence, recovery and CDC
 
-1. When the feature gate `queryCoord.enableLoadCollectionWarmupHint` is off, hinted loads are rejected. Node capabilities are not checked: warmup is only a hint, and an old QueryNode that does not support it ignores the epoch without affecting loading or queries.
-2. Each hinted load allocates a new epoch; a load without the hint keeps the epoch already in the load config.
-3. A hinted load on a loaded collection that names no replica number, resource groups or load fields (including `skip_load_dynamic_field`) keeps the current load configuration (partitions, fields, replicas and modes) and only advances the epoch; any other load restates the configuration as before.
-4. An `AlterLoadConfig` broadcast is generated, also when only the epoch changes.
+No epoch or hint is stored in `LoadConfig`, `CollectionLoadConfig`, `QueryViewMeta` or `AlterLoadConfig` messages. Ordinary automatic/manual placement, View synchronization and recovery contain no prewarm producer.
 
-### 5.3 Persistence and config version
+Prewarming is local ephemeral cache work. It is not written to the WAL or replicated by CDC. Ordinary load requirements retain their existing WAL and replication path. Restart or promotion cannot recreate this request; another explicit hint is required.
 
-- The epoch is written to the `AlterLoadConfig` message header and to the versioned collection load config in etcd, and survives recovery.
-- DDLs that carry no epoch (LoadPartitions, ReleasePartitions, TransferReplica, etc.) keep the existing epoch: merging takes the maximum. The epoch never decreases; Release deletes the load config, and the epoch with it.
-- The collection's config version is allocated when the load requirements change. They exclude the epoch, so an epoch-only change keeps the version and rewrites its record. The data the views serve has not changed, so with auto-load enabled the search readiness gate (the Up view's config version equals the current version) does not wait for views to be rebuilt. The store's global version still increments, so the balancer still observes the change.
+## 5. QueryNode resource ownership
 
-### 5.4 Balancer
+The handler acquires the requested ready View using the same lease as a query. The segment manager then borrows its sealed segment handles and immutable ReadStates. The lease and handles remain held until prewarming returns, so retiring the View cannot destroy those resources or redirect the pass to another generation.
 
-- When the Up view's epoch is smaller than the config's, the balancer rebuilds the shard's view so QueryNodes receive the new epoch. Placement is sticky: most segments stay on their node and are warmed up in place, and a segment that moves is warmed up after it loads on its new node.
-- Placement is not restricted by node warmup capability: warmup is background work that does not affect availability; an old QueryNode simply does not warm up.
-- A plan computed before the epoch changed may still be applied; at worst the view is rebuilt one extra time.
+Each borrowed ReadState is warmed once through the existing native load executor at low priority. The resource manager calls `ReadState.Prewarm` directly; the generic Segment and physical loader contracts are unchanged. The Go ReadState forwards its own native segment pointer to `segcore.PrewarmSealedReadState`, rather than the physical segment's subsequently adopted state. Segcore warms the pinned state's PK/timestamp resources, field chunks, JSON statistics and index readers. A failure ends this request without queuing retries.
 
-### 5.5 Load progress and search admission
+A running warm holds an operation reference. Explicit cancellation reaches native/storage work once no live query or other warm request shares the base. Query release rechecks canceled work so it can unwind before destruction. Node shutdown also cancels unshared work. Cancellation is cooperative; slow storage may delay cleanup. Completion releases the pins and does not guarantee permanent cache residency.
 
-Same as a normal load and independent of the epoch: a shard counts as complete when its Up view's config version equals the current version, and `Await` returns when all shards are complete. With auto-load enabled, the search readiness gate uses the same check.
+## 6. StreamingNode lazy BM25
 
-### 5.6 QueryNode
+The SN handler acquires the exact serving View lease and calls the optional resource-module prewarmer with the request context. Ordinary preparation and Ready notifications never initiate warming.
 
-- **Load:** takes the normal path with no forced synchronous warmup. A segment reports ready to its views once it is loaded and has caught up with the TransformLog, and the views go Up as usual.
-- **Background warmup:** each physical base of a segment resource (the sole owner of a segment's physical preparation and lifetime) records `warmedEpoch`. Reconciliation, the single decision point of the resource, starts a warm when the largest epoch of the bindings prepared on a base exceeds its `warmedEpoch`. The warm calls the physical loader's `Prewarm` on the base, which warms the read state the base currently adopts and the cells other read states share with it, and on success updates `warmedEpoch`. Warms run on the resource manager's own warm queue with at most as many workers as the warmup thread pool has threads, not on the node scheduler, so they do not slow down loads or reconciliation. A running warm is an operation of the resource, so closing the resource waits for it.
-- **Triggers:** a binding is prepared on a base, that is, its view becomes ready; a binding with a larger epoch is prepared on an already loaded base; the previous warm of the base completes.
-- **Serialization:** each base has at most one warm at a time. A warm that has not started adopts a larger epoch that arrives; a running warm started before it, so another warm follows when it completes.
-- **Failure:** retried with jittered exponential backoff (from 1 second up to 1 minute). Each retry warms up for the current largest epoch, until it succeeds or no binding needs it any more. A failure only writes a rate-limited log; it does not affect views and is not reported.
-- **Cancellation:** a warm is canceled only when its base retires, or when its segment resource is closing and no query uses the base. Both happen only after the last view and the last query using the base have released it, so canceling a warm never fails a query waiting on a cache load the warm started. A base retires only after its running warm stops, so its release does not wait for the warm on the node scheduler; a warm that has not started is dropped. Late results are discarded by task identity.
+BM25 prewarming joins or starts materialization for that View's exact data version. Queries and warm requests share flights and count their waiters. A warm-originated flight is canceled only after its last waiter leaves; canceling one warm therefore cannot abort a query or another warm using it.
 
-### 5.7 segcore
+If a new lazy target arrives during the flight, the old warm continues its borrowed reads while the new target can materialize independently. The old aggregate is not published as current, and the warm does not follow the replacement target. Node shutdown cancels and drains all flights, including detached old-target flights, before releasing oracle resources. Storage errors require another explicit request to start new prewarming.
 
-- `Prewarm` pins every cell of every resource of a loaded segment and waits for completion: field data (all chunks, including the materialization of lazy column groups), every index in the segment's index inventory (vector, scalar, ngram, JSON path and text indexes), JSON stats, and the segment-level PK index and timestamp index. Field data is pinned in runs of about one load batch, estimated from the storage v2 cell target, so a search waits for and fails with at most the run holding its chunk rather than the whole field. This does not cover the PK and timestamp indexes, whose builds load their whole columns, or storage v1, where a chunk is a whole binlog and a run may span the field.
-- `Prewarm` supports cancellation. The C interface uses `CGO_CATCH_AND_RETURN_CSTATUS` throughout and keeps the original error code.
+## 7. Verification scope
 
-### 5.8 StreamingNode
+Regression tests cover per-shard Up dispatch before whole-collection readiness, all-replica routing without load mutation, ordinary hinted-load field/index validation, release/reload/shutdown cancellation, one-attempt planning and worker RPC behavior, including fixed SN ownership across assignment changes, immutable QN ReadState borrowing across View replacement, shared-query cancellation protection, and old-target SN materialization without following new data.
 
-- The shard leader serves BM25 queries from the shard's IDF oracle. With `queryView.idfOracle.lazyLoadSealedStats=true` the oracle reads the sealed BM25 statistics on the first BM25 query, so a hinted load would still leave that read on the first query.
-- Once a view with a warmup epoch is Ready, the StreamingNode queues a background warm of the oracles of the view's BM25 fields. The warm starts the shared materialization that the first BM25 query would otherwise start, and readiness does not wait for it.
-- Materializing once is enough: the aggregate then stays in memory and is kept current by later preparations until the oracle closes, and a new oracle, for example for a BM25 field that a schema change adds, is warmed when its views become Ready. A materialized or eagerly built oracle needs no warm, so repeated hinted loads and view rebuilds cost nothing.
-- Warms run on one node-wide queue, in arrival order, on at most a CPU count of workers, because every hinted view requests one when the StreamingNode recovers its views. A failed attempt, or one that a newer target canceled, is queued again after a jittered exponential backoff from 1 second up to 1 minute, until the warm succeeds or the oracle closes on Release. A query arriving meanwhile shares the running materialization, and at most one warm per oracle is queued, running or waiting to retry.
-
-## 6. Protocol fields
-
-| Location | Field | Notes |
-| --- | --- | --- |
-| `milvuspb.LoadCollectionRequest` | `load_params["warmup_hint"]` | Public parameter; the public proto is unchanged |
-| `querypb.LoadCollectionRequest` | `bool warmup_hint` | Request flag from Proxy to QueryCoord |
-| `messagespb.AlterLoadConfigMessageHeader` | `int64 warmup_epoch` | 0 means no warmup hint |
-| `viewpb.CollectionLoadConfig` | `int64 warmup_epoch` | Persisted in etcd |
-| `viewpb.QueryViewMeta` | `int64 warmup_epoch` | The epoch the view was built with |
-
-- The load-time forced synchronous warmup of v1/v2 (`segcorepb.SegmentLoadInfo.force_sync_warmup` and its segcore conversion) has been removed. The `force_sync_warmup` left over from namespace Prewarm has no effect in QueryView mode and is removed in phase 3.
-
-## 7. Compatibility and gating
-
-- The gate is off by default. Before it is turned on, the whole cluster (Proxy, QueryCoord, QueryNode and its native libraries) must be upgraded.
-- During a rolling upgrade, old QueryNodes ignore the epoch and do not warm up, which does not affect loading or queries, so no separate node capability declaration is needed.
-- After the gate is turned off, collections that already have a warmup hint stay as they are, loads without the hint work as usual, and new hinted loads are rejected.
-
-## 8. Error handling
-
-| Scenario | Classification | Result |
-| --- | --- | --- |
-| Non-boolean `warmup_hint`, combined with refresh, or on an external collection | Invalid parameter (Input) | Rejected before acceptance |
-| Gate off | ServiceUnimplemented | Rejected without changing the config |
-| Background warmup fails (storage throttling, corrupted files, out of memory, etc.) | Original error class kept and logged | QueryNode retries with backoff; views, search and load progress are unaffected |
-| Release during warmup | Canceled | The warm and its pending retries are canceled once no view or query uses the segment; late results are discarded |
-
-## 9. Implementation plan
-
-**Phase 1** (this PR)
-
-- QueryCoord: each hinted load allocates a new epoch, which keeps the config version; load progress and search admission ignore the epoch.
-- Balancer: rebuilds views when the epoch changes; placement is not restricted by warmup capability.
-- QueryNode: ready as soon as a normal load completes; background warmup of segment bases by epoch on a dedicated warm queue, with backoff retry, canceled only when a base retires, or its resource is closing and no query uses the base.
-- segcore: `Prewarm` also covers JSON stats, the PK index and the timestamp index.
-- StreamingNode: a Ready hinted view materializes the lazy BM25 statistics of the shard's IDF oracle in the background, on a node-wide warm queue with backoff retry.
-
-**Phase 2**
-
-- QueryNode: reserve memory and disk for a full warmup before starting it; metrics for warmup progress and failures.
-- segcore: warm up the downstream resources of JSON stats and the lazily loaded resources inside indexes.
-
-**Phase 3**
-
-- Remove the `force_sync_warmup` path left over from namespace Prewarm.
-
-## 10. Testing and acceptance
-
-- **QueryCoord:** each hinted load increases the epoch; a load without the hint keeps it; other DDLs keep it; Release clears it; an epoch-only change keeps the config version; a hinted load naming no load options keeps the load configuration; hinted loads are rejected when the gate is off.
-- **Balancer:** an epoch change triggers a rebuild that carries the epoch; placement does not depend on warmup capability.
-- **QueryNode:** warmup does not block readiness and does not use the node scheduler; in-place warmup; a repeated hinted load queues another warmup; view rebuilds with the same epoch do not warm up again; a failed warmup retries with backoff without affecting views, and the retry warms up for the newest epoch; a warmup is not canceled while a query still uses the segment and stops when the segment closes; a replaced base retires after its warmup stops, and the new base warms up.
-- **segcore:** after `Prewarm`, the fields of lazy column groups (every chunk, warmed in more than one run), the PK index and the timestamp index are loaded.
-- **StreamingNode:** a Ready view with a warmup epoch materializes the lazy oracles of its BM25 fields without a query, and a view without one does not; a materialized or eager oracle is not warmed again; a failed attempt, or one a newer target canceled, retries after backoff; closing the oracle stops its warm; warms run on at most the node's worker count.
-- **End to end:** a hinted load after a query-triggered auto-load, with search uninterrupted throughout and not waiting under auto-load; on an unloaded collection, a hinted load becomes searchable as fast as a normal load; two hinted loads in a row; a hinted load right after Release; continuous writes and compaction during warmup; warmup retries under injected faults such as storage throttling.
-
-## 11. Known limitations
-
-1. Resources added to a segment base after its warmup (for example, an index built later) load under the normal policy and are not warmed up automatically.
-2. When bindings with different schemas or load scopes share a base, a warm covers the read state the base currently adopts; resources that only another read state uses are not warmed.
-3. There is no external warmup-completion signal; see Non-goals.
-4. For warmup coverage see 5.7; phase 2 fills the gaps.
-
-## 12. Differences from v2
-
-| Topic | v2 | v3 |
-| --- | --- | --- |
-| Parameter | `warmup="sync"` | `warmup_hint=true` (REST `"warmupHint": true`, Go SDK `WithWarmupHint()`) |
-| Warmup and readiness | A segment is ready only after its warmup; views wait for warmup | Ready once loaded; warmup runs in the background |
-| Load progress / Await | Waits for warmup | Same as a normal load |
-| Search under auto-load | Waits for warmup | Does not wait |
-| New loads | Forced synchronous warmup (`force_sync_warmup`) | Background warmup after a normal load |
-| Warmup failure | The waiting view becomes unrecoverable and the coordinator rebuilds it | Retried in the background with backoff; views unaffected |
-| Config version on an epoch-only change | Incremented | Unchanged |
-| Node warmup capability | Admission checks the target resource groups, and placement is restricted by capability | Not checked; only the feature gate remains |
-| Config version fence on balancer plans | Present | Removed (unrelated to warmup) |
-| Fix for reusing segments that linger after release | Included | Not needed: the QueryNode segment resource model keeps such a segment applying the TransformLog |
+Source tracing covers proxy admission, ordinary load/WAL replay, load-config recovery, automatic placement, manual placement, native ReadState pinning, and QN/SN request routing. No deployment performance claim is made by this change.

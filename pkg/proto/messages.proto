@@ -405,8 +405,6 @@ message AlterLoadConfigMessageHeader {
     bool use_local_replica_config = 7; // when true, use local cluster-level replica config instead of the replicas field above.
     repeated LoadFieldConfig required_fields = 8; // Explicit allowed query field scope; empty means none. Never inferred from load_fields.
     bool force_sync_warmup = 12; // whether load should synchronously warm mmap/cache data.
-    // Epoch of the latest LoadCollection warmup hint; 0 means none.
-    int64 warmup_epoch = 13;
 }
 
 // AlterLoadConfigMessageBody is the body of alter load config message.
