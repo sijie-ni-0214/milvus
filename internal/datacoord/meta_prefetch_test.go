@@ -29,6 +29,7 @@ import (
 	"github.com/milvus-io/milvus/internal/datacoord/broker"
 	"github.com/milvus-io/milvus/internal/datacoord/meta"
 	catalogmocks "github.com/milvus-io/milvus/internal/metastore/mocks"
+	"github.com/milvus-io/milvus/internal/metastore/model"
 	"github.com/milvus-io/milvus/pkg/v3/proto/datapb"
 )
 
@@ -36,7 +37,9 @@ func TestMetaPrefetchReplacesRecoveryScans(t *testing.T) {
 	ctx := context.Background()
 	catalog := catalogmocks.NewDataCoordCatalog(t)
 	catalog.EXPECT().ListIndexes(mock.Anything).Return(nil, nil).Once()
-	catalog.EXPECT().ListSegmentIndexes(mock.Anything, int64(1)).Return(nil, nil).Once()
+	catalog.EXPECT().ListSegmentIndexes(mock.Anything, int64(1)).Return([]*model.SegmentIndex{{
+		CollectionID: 1, PartitionID: 100, SegmentID: 10, IndexID: 1000, BuildID: 10000,
+	}}, nil).Once()
 	catalog.EXPECT().ListSegmentIndexes(mock.Anything, int64(2)).Return(nil, nil).Once()
 	catalog.EXPECT().ListSegments(mock.Anything, int64(1)).Return([]*datapb.SegmentInfo{{ID: 10, CollectionID: 1, PartitionID: 100, State: commonpb.SegmentState_Flushed}}, nil).Once()
 	catalog.EXPECT().ListSegments(mock.Anything, int64(2)).Return([]*datapb.SegmentInfo{{ID: 20, CollectionID: 2, PartitionID: 200, State: commonpb.SegmentState_Flushed}}, nil).Once()
@@ -50,6 +53,9 @@ func TestMetaPrefetchReplacesRecoveryScans(t *testing.T) {
 	catalog.EXPECT().ListSnapshots(mock.Anything).Return(nil, nil)
 	catalog.EXPECT().ListExternalCollectionRefreshJobs(mock.Anything).Return(nil, nil)
 	catalog.EXPECT().ListExternalCollectionRefreshTasks(mock.Anything).Return(nil, nil)
+	catalog.EXPECT().AlterSegmentIndexes(mock.Anything, mock.Anything).RunAndReturn(func(ctx context.Context, _ []*model.SegmentIndex) error {
+		return ctx.Err()
+	}).Once()
 	prefetched := startMetaPrefetch(ctx, catalog, []int64{2, 1})
 	defer prefetched.close()
 	indexMeta, err := prefetched.indexMeta.Await()
@@ -64,4 +70,7 @@ func TestMetaPrefetchReplacesRecoveryScans(t *testing.T) {
 	require.NotNil(t, recovered.GetSegment(ctx, 10))
 	require.NotNil(t, recovered.GetSegment(ctx, 20))
 	require.EqualValues(t, 1000, recovered.GetChannelCheckpoint("ch-1").GetTimestamp())
+	// initMeta adopts this object before its deferred prefetch cleanup runs.
+	prefetched.close()
+	require.NoError(t, dm.indexMeta.UpdateVersion(10000, 7), "adopted metadata must remain writable after cleanup")
 }

@@ -37,12 +37,14 @@ type metaPrefetch struct {
 }
 
 func startMetaPrefetch(ctx context.Context, catalog metastore.DataCoordCatalog, collectionIDs []int64) *metaPrefetch {
-	ctx, cancel := context.WithCancel(ctx)
-	reads := metacache.StartRecoveryRead(ctx, catalog, collectionIDs)
+	recoveryCtx, cancel := context.WithCancel(ctx)
+	reads := metacache.StartRecoveryRead(recoveryCtx, catalog, collectionIDs)
 	mlog.Info(ctx, "datacoord meta prefetch started", mlog.Int("numCollections", len(collectionIDs)))
 	return &metaPrefetch{
-		cancel:    cancel,
-		indexMeta: conc.Go(func() (*index.IndexMeta, error) { return index.NewIndexMeta(ctx, catalog, collectionIDs) }),
+		cancel: cancel,
+		indexMeta: conc.Go(func() (*index.IndexMeta, error) {
+			return index.NewIndexMetaWithRecoveryContext(ctx, recoveryCtx, catalog, collectionIDs)
+		}),
 		recovery: &meta.RecoveryPrefetch{
 			Catalog: reads,
 			Manifests: conc.Go(func() (*meta.ManifestReadPrefetch, error) {
@@ -50,7 +52,7 @@ func startMetaPrefetch(ctx context.Context, catalog metastore.DataCoordCatalog, 
 				if err != nil {
 					return nil, err
 				}
-				return meta.StartManifestReadPrefetch(ctx, slices.Concat(groups...)), nil
+				return meta.StartManifestReadPrefetch(recoveryCtx, slices.Concat(groups...)), nil
 			}),
 		},
 	}

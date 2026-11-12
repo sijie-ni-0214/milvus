@@ -247,8 +247,15 @@ func (m *segmentBuildInfo) GetTaskStats() []*metricsinfo.IndexTaskStats {
 	return m.taskStats.Values()
 }
 
-// NewMeta creates meta from provided `kv.TxnKV`
+// NewIndexMeta recovers index metadata using the context for its lifetime.
 func NewIndexMeta(ctx context.Context, catalog metastore.DataCoordCatalog, collectionIDs []int64) (*IndexMeta, error) {
+	return NewIndexMetaWithRecoveryContext(ctx, ctx, catalog, collectionIDs)
+}
+
+// NewIndexMetaWithRecoveryContext uses recoveryCtx for the initial catalog reads
+// and ctx for runtime writes. A prefetch owner can cancel recoveryCtx during
+// cleanup without canceling the recovered metadata's lifetime context.
+func NewIndexMetaWithRecoveryContext(ctx, recoveryCtx context.Context, catalog metastore.DataCoordCatalog, collectionIDs []int64) (*IndexMeta, error) {
 	mt := &IndexMeta{
 		ctx:                         ctx,
 		Catalog:                     catalog,
@@ -259,7 +266,7 @@ func NewIndexMeta(ctx context.Context, catalog metastore.DataCoordCatalog, colle
 		manifestIndexBackfillNotify: make(chan struct{}, 1),
 		manifestIndexRollbackNotify: make(chan struct{}, 1),
 	}
-	err := mt.reloadFromKV(collectionIDs)
+	err := mt.reloadFromKV(recoveryCtx, collectionIDs)
 	if err != nil {
 		return nil, err
 	}
@@ -277,14 +284,14 @@ type rangedIndexRecoveryCatalog interface {
 	ListAllSegmentIndexesForRecovery(context.Context, []int64) ([]*model.SegmentIndex, error)
 }
 
-func (m *IndexMeta) listIndexes(collectionIDs []int64) ([]*model.Index, error) {
+func (m *IndexMeta) listIndexes(ctx context.Context, collectionIDs []int64) ([]*model.Index, error) {
 	if catalog, ok := m.Catalog.(rangedIndexRecoveryCatalog); ok {
-		return catalog.ListIndexesForRecovery(m.ctx, collectionIDs)
+		return catalog.ListIndexesForRecovery(ctx, collectionIDs)
 	}
-	return m.Catalog.ListIndexes(m.ctx)
+	return m.Catalog.ListIndexes(ctx)
 }
 
-func (m *IndexMeta) listRecoverySegmentIndexes(collectionIDs []int64) ([][]*model.SegmentIndex, error) {
+func (m *IndexMeta) listRecoverySegmentIndexes(ctx context.Context, collectionIDs []int64) ([][]*model.SegmentIndex, error) {
 	if len(collectionIDs) == 0 {
 		return nil, nil
 	}
@@ -292,9 +299,9 @@ func (m *IndexMeta) listRecoverySegmentIndexes(collectionIDs []int64) ([][]*mode
 		var indexes []*model.SegmentIndex
 		var err error
 		if ranged, ok := m.Catalog.(rangedIndexRecoveryCatalog); ok {
-			indexes, err = ranged.ListAllSegmentIndexesForRecovery(m.ctx, collectionIDs)
+			indexes, err = ranged.ListAllSegmentIndexesForRecovery(ctx, collectionIDs)
 		} else {
-			indexes, err = catalog.ListAllSegmentIndexes(m.ctx)
+			indexes, err = catalog.ListAllSegmentIndexes(ctx)
 		}
 		if err != nil {
 			return nil, err
@@ -315,7 +322,7 @@ func (m *IndexMeta) listRecoverySegmentIndexes(collectionIDs []int64) ([][]*mode
 	for i, collID := range collectionIDs {
 		i, collID := i, collID
 		futures = append(futures, pool.Submit(func() (any, error) {
-			segIdxes, err := m.Catalog.ListSegmentIndexes(m.ctx, collID)
+			segIdxes, err := m.Catalog.ListSegmentIndexes(ctx, collID)
 			if err != nil {
 				return nil, err
 			}
@@ -330,7 +337,7 @@ func (m *IndexMeta) listRecoverySegmentIndexes(collectionIDs []int64) ([][]*mode
 }
 
 // reloadFromKV loads meta from KV storage
-func (m *IndexMeta) reloadFromKV(collectionIDs []int64) error {
+func (m *IndexMeta) reloadFromKV(ctx context.Context, collectionIDs []int64) error {
 	record := timerecord.NewTimeRecorder("IndexMeta-reloadFromKV")
 
 	// Parallel load and process: ListIndexes and ListSegmentIndexes have no dependency,
@@ -338,35 +345,35 @@ func (m *IndexMeta) reloadFromKV(collectionIDs []int64) error {
 	// collectionSegIdxes is hoisted to function scope for the metrics goroutine
 	// launched after g.Wait.
 	var collectionSegIdxes [][]*model.SegmentIndex
-	g, _ := errgroup.WithContext(m.ctx)
+	g, _ := errgroup.WithContext(ctx)
 	g.Go(func() error {
 		fieldIndexScanStart := time.Now()
-		mlog.Info(m.ctx, "IndexMeta field index catalog scan started")
-		fieldIndexes, err := m.listIndexes(collectionIDs)
+		mlog.Info(ctx, "IndexMeta field index catalog scan started")
+		fieldIndexes, err := m.listIndexes(ctx, collectionIDs)
 		if err != nil {
-			mlog.Error(m.ctx, "IndexMeta reloadFromKV load field indexes fail",
+			mlog.Error(ctx, "IndexMeta reloadFromKV load field indexes fail",
 				mlog.Duration("duration", time.Since(fieldIndexScanStart)),
 				mlog.Err(err))
 			return err
 		}
-		mlog.Info(m.ctx, "IndexMeta field index catalog scan done",
+		mlog.Info(ctx, "IndexMeta field index catalog scan done",
 			mlog.Int("numFieldIndexes", len(fieldIndexes)),
 			mlog.Duration("duration", time.Since(fieldIndexScanStart)))
 		fieldIndexCacheStart := time.Now()
 		for _, fieldIndex := range fieldIndexes {
 			m.updateCollectionIndex(fieldIndex)
 		}
-		mlog.Info(m.ctx, "IndexMeta field index cache rebuild done",
+		mlog.Info(ctx, "IndexMeta field index cache rebuild done",
 			mlog.Int("numFieldIndexes", len(fieldIndexes)),
 			mlog.Duration("duration", time.Since(fieldIndexCacheStart)))
 		return nil
 	})
 	g.Go(func() error {
 		scanStart := time.Now()
-		mlog.Info(m.ctx, "IndexMeta segment index catalog scan started",
+		mlog.Info(ctx, "IndexMeta segment index catalog scan started",
 			mlog.Int("numCollections", len(collectionIDs)))
 		var err error
-		collectionSegIdxes, err = m.listRecoverySegmentIndexes(collectionIDs)
+		collectionSegIdxes, err = m.listRecoverySegmentIndexes(ctx, collectionIDs)
 		if err != nil {
 			return err
 		}
@@ -374,14 +381,14 @@ func (m *IndexMeta) reloadFromKV(collectionIDs []int64) error {
 		for _, segIdxes := range collectionSegIdxes {
 			totalSegmentIndexCount += len(segIdxes)
 		}
-		mlog.Info(m.ctx, "IndexMeta segment index catalog scan done",
+		mlog.Info(ctx, "IndexMeta segment index catalog scan done",
 			mlog.Int("numCollections", len(collectionIDs)),
 			mlog.Int("numSegmentIndexes", totalSegmentIndexCount),
 			mlog.Duration("duration", time.Since(scanStart)))
 
 		cacheBuildStart := time.Now()
 		m.rebuildSegmentIndexCache(slices.Concat(collectionSegIdxes...))
-		mlog.Info(m.ctx, "IndexMeta segment index cache rebuild done",
+		mlog.Info(ctx, "IndexMeta segment index cache rebuild done",
 			mlog.Int("numSegmentIndexes", totalSegmentIndexCount),
 			mlog.Duration("duration", time.Since(cacheBuildStart)))
 		return nil
@@ -402,7 +409,7 @@ func (m *IndexMeta) reloadFromKV(collectionIDs []int64) error {
 		}
 	}()
 
-	mlog.Info(m.ctx, "IndexMeta reloadFromKV done", mlog.Duration("duration", record.ElapseSpan()))
+	mlog.Info(ctx, "IndexMeta reloadFromKV done", mlog.Duration("duration", record.ElapseSpan()))
 	return nil
 }
 
