@@ -180,7 +180,22 @@ find_package(unordered_dense REQUIRED)
 find_package(absl REQUIRED)
 find_package(bson-1.0 REQUIRED)
 find_package(simde REQUIRED)
-find_package(milvus-common REQUIRED)
+# milvus-common#151: background scheduling of resource waiters.
+include(FetchContent)
+FetchContent_Declare(
+    milvus-common
+    GIT_REPOSITORY https://github.com/sparknack/milvus-common.git
+    GIT_TAG enhance/dlist-background-scheduling
+    GIT_SHALLOW TRUE
+    SOURCE_DIR ${CMAKE_BINARY_DIR}/thirdparty/milvus-common/milvus-common-src
+    BINARY_DIR ${CMAKE_BINARY_DIR}/thirdparty/milvus-common/milvus-common-build
+    OVERRIDE_FIND_PACKAGE
+)
+FetchContent_MakeAvailable(milvus-common)
+add_library(milvus-common::milvus-common ALIAS milvus-common)
+target_include_directories(milvus-common PUBLIC ${milvus-common_SOURCE_DIR}/include)
+set_target_properties(milvus-common PROPERTIES LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
+set(milvus-common_INCLUDE_DIRS ${milvus-common_SOURCE_DIR}/include)
 if (LINUX)
     find_package(OpenBLAS CONFIG REQUIRED)
 endif()
