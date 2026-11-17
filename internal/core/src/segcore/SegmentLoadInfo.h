@@ -407,11 +407,50 @@ struct LoadDiff {
  * utility methods for common operations like field lookups, index queries,
  * and binlog path management.
  */
+// Diagnostic-only guards for protobuf string ownership.  They are compiled in
+// unconditionally but stay inert unless MILVUS_DIAG_SLI_ALIAS=1, so production
+// behaviour is unchanged.  A hit means two live SegmentLoadInfo instances own
+// the same protobuf string buffer (or one instance was destroyed twice).
+bool
+DiagLoadInfoAliasEnabled();
+
+void
+DiagLoadInfoRegister(const void* self,
+                     const proto::segcore::SegmentLoadInfo& info);
+
+void
+DiagLoadInfoUnregister(const void* self);
+
+// Moves the tracked ownership set from src to dst (used by move ctor/assign).
+void
+DiagLoadInfoTakeover(const void* src, const void* dst);
+
 class SegmentLoadInfo {
  public:
     using ProtoType = milvus::proto::segcore::SegmentLoadInfo;
 
     SegmentLoadInfo() = delete;
+
+    ~SegmentLoadInfo() {
+        if (DiagLoadInfoAliasEnabled()) {
+            DiagLoadInfoUnregister(this);
+        }
+    }
+
+    void
+    DiagRegister() const {
+        if (DiagLoadInfoAliasEnabled()) {
+            DiagLoadInfoRegister(this, info_);
+        }
+    }
+
+    void
+    DiagTakeoverFrom(const SegmentLoadInfo& src) const {
+        if (DiagLoadInfoAliasEnabled()) {
+            DiagLoadInfoTakeover(&src, this);
+            DiagLoadInfoRegister(this, info_);
+        }
+    }
 
     explicit SegmentLoadInfo(const ProtoType& info, SchemaPtr schema)
         : SegmentLoadInfo(info,
@@ -433,6 +472,7 @@ class SegmentLoadInfo {
             std::make_shared<const SealedFieldLayout>(schema, scope);
         SetFieldSelection(*fields);
         BuildCache(fields);
+        DiagRegister();
     }
 
     SegmentLoadInfo(const ProtoType& info, const SealedFieldLayoutPtr& fields)
@@ -440,6 +480,7 @@ class SegmentLoadInfo {
         restrict_load_fields_ = fields->HasExplicitLoadScope();
         SetFieldSelection(*fields);
         BuildCache(fields);
+        DiagRegister();
     }
 
     SegmentLoadInfo(ProtoType&& info, const SealedFieldLayoutPtr& fields)
@@ -447,6 +488,7 @@ class SegmentLoadInfo {
         restrict_load_fields_ = fields->HasExplicitLoadScope();
         SetFieldSelection(*fields);
         BuildCache(fields);
+        DiagRegister();
     }
 
     /**
@@ -467,6 +509,7 @@ class SegmentLoadInfo {
           column_groups_(other.column_groups_),
           created_text_indexes_(other.created_text_indexes_) {
         BuildFieldBinlogCache();
+        DiagRegister();
     }
 
     /**
@@ -487,6 +530,7 @@ class SegmentLoadInfo {
           field_binlog_cache_(std::move(other.field_binlog_cache_)),
           column_groups_(std::move(other.column_groups_)),
           created_text_indexes_(std::move(other.created_text_indexes_)) {
+        DiagTakeoverFrom(other);
     }
 
     /**
@@ -509,6 +553,7 @@ class SegmentLoadInfo {
             fields_filled_with_default_ = other.fields_filled_with_default_;
             created_text_indexes_ = other.created_text_indexes_;
             BuildFieldBinlogCache();
+            DiagRegister();
         }
         return *this;
     }
@@ -534,6 +579,7 @@ class SegmentLoadInfo {
             field_binlog_cache_ = std::move(other.field_binlog_cache_);
             column_groups_ = std::move(other.column_groups_);
             created_text_indexes_ = std::move(other.created_text_indexes_);
+            DiagTakeoverFrom(other);
         }
         return *this;
     }
@@ -1131,6 +1177,7 @@ class SegmentLoadInfo {
         compact.set_estimated_bytes_per_row(info_.estimated_bytes_per_row());
         compact.set_commit_timestamp(info_.commit_timestamp());
         info_.Swap(&compact);
+        DiagRegister();
         field_binlog_cache_.clear();
         decltype(converted_field_index_cache_)().swap(
             converted_field_index_cache_);

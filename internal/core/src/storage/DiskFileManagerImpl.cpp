@@ -15,6 +15,7 @@
 // limitations under the License.
 
 #include <cxxabi.h>
+#include <folly/ScopeGuard.h>
 #include "common/FastMem.h"
 #include <string.h>
 #include <algorithm>
@@ -436,6 +437,8 @@ DiskFileManagerImpl::AddBatchIndexFiles(
 
     std::vector<std::future<std::shared_ptr<uint8_t[]>>> futures;
     futures.reserve(remote_file_sizes.size());
+    auto futures_guard = folly::makeGuard(
+        [&futures]() { storage::DrainFutures(futures); });
     AssertInfo(local_file_offsets.size() == remote_files.size(),
                "inconsistent size of offset slices with file slices");
     AssertInfo(remote_files.size() == remote_file_sizes.size(),

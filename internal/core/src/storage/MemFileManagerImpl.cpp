@@ -14,6 +14,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <cstdlib>
+#include <cstring>
+
+#include <folly/ScopeGuard.h>
 #include "storage/MemFileManagerImpl.h"
 
 #include <atomic>
@@ -46,6 +50,95 @@
 #include "storage/ThreadPools.h"
 #include "storage/Types.h"
 #include "storage/Util.h"
+
+namespace {
+
+// DIAG: token lifecycle tracing, enabled by MILVUS_DIAG_TOKEN_TRACE=1.
+// Reads the packed reference-count word of folly::detail::CancellationState:
+// bit0 cancelled, bit1 locked, bit2 merging, bits3-33 token refs, bits34-63
+// source refs.  The class has a virtual destructor, so the word follows the
+// vtable pointer.
+uint64_t
+DiagTokenRefs(const void* state) {
+    if (state == nullptr) {
+        return 0;
+    }
+    const auto* word = reinterpret_cast<const std::atomic<uint64_t>*>(
+        static_cast<const char*>(state) + sizeof(void*));
+    const uint64_t raw = word->load(std::memory_order_relaxed);
+    return (raw & ((uint64_t{1} << 34) - 1)) >> 3;
+}
+
+const void*
+DiagTokenStatePtr(const folly::CancellationToken& token) {
+    if (sizeof(folly::CancellationToken) != sizeof(const void*)) {
+        return nullptr;
+    }
+    const void* state = nullptr;
+    std::memcpy(&state, &token, sizeof(state));
+    return state;
+}
+
+struct DiagTok {
+    folly::CancellationToken token;
+    uint64_t id{0};
+    const void* state_at_submit{nullptr};
+    std::string path;
+
+    DiagTok(folly::CancellationToken t, uint64_t i, std::string p)
+        : token(std::move(t)),
+          id(i),
+          state_at_submit(DiagTokenStatePtr(token)),
+          path(std::move(p)) {
+        LOG_INFO("[DIAGTOK] ev=create self={} id={} state={} refs={} path={}",
+                 static_cast<const void*>(this),
+                 id,
+                 state_at_submit,
+                 DiagTokenRefs(state_at_submit),
+                 path);
+        static const bool diag_sentinel = [] {
+            const char* value = std::getenv("MILVUS_DIAG_TOKEN_SENTINEL");
+            return value != nullptr && std::string(value) == "1";
+        }();
+        if (diag_sentinel) {
+            auto* kept = new folly::CancellationToken(token);
+            (void)kept;
+        }
+    }
+    DiagTok(const DiagTok& other)
+        : token(other.token),
+          id(other.id),
+          state_at_submit(other.state_at_submit),
+          path(other.path) {
+        LOG_INFO(
+            "[DIAGTOK] ev=copy self={} id={} state_submit={} state_now={} "
+            "refs={}",
+            static_cast<const void*>(this),
+            id,
+            state_at_submit,
+            DiagTokenStatePtr(token),
+            DiagTokenRefs(DiagTokenStatePtr(token)));
+    }
+    DiagTok(DiagTok&& other) noexcept
+        : token(std::move(other.token)),
+          id(other.id),
+          state_at_submit(other.state_at_submit),
+          path(std::move(other.path)) {
+        LOG_INFO("[DIAGTOK] ev=move self={} id={}", static_cast<const void*>(this), id);
+    }
+    ~DiagTok() {
+        LOG_INFO(
+            "[DIAGTOK] ev=destroy self={} id={} state_submit={} state_now={} "
+            "refs={}",
+            static_cast<const void*>(this),
+            id,
+            state_at_submit,
+            DiagTokenStatePtr(token),
+            DiagTokenRefs(DiagTokenStatePtr(token)));
+    }
+};
+
+}  // namespace
 
 namespace milvus::storage {
 
@@ -146,10 +239,40 @@ MemFileManagerImpl::LoadIndexToMemory(
             ThreadPools::GetThreadPool(milvus::PriorityForLoad(priority));
         std::vector<std::future<std::unique_ptr<DataCodec>>> index_datas;
         index_datas.reserve(batch_files.size());
+        auto futures_guard = folly::makeGuard(
+            [&index_datas]() { storage::DrainFutures(index_datas); });
+        // DIAG(A/B): MILVUS_DIAG_DETACH_CELL_TOKEN=1 detaches the request-scoped
+        // cancellation token from the async index reads. Used to attribute the
+        // CancellationToken use-after-free to the token outliving its source.
+        static const bool diag_detach_token = [] {
+            const char* value = std::getenv("MILVUS_DIAG_DETACH_CELL_TOKEN");
+            return value != nullptr && std::string(value) == "1";
+        }();
+        auto task_token = diag_detach_token ? folly::CancellationToken{} : token;
+        static const bool diag_token_trace = [] {
+            const char* value = std::getenv("MILVUS_DIAG_TOKEN_TRACE");
+            return value != nullptr && std::string(value) == "1";
+        }();
+        static std::atomic<uint64_t> diag_tok_seq{1};
         for (const auto& path : batch_files) {
+            if (!diag_token_trace) {
+                index_datas.push_back(
+                    pool.Submit([manager = rcm_, path, priority, task_token] {
+                        return ReadLegacyIndexFile(
+                            *manager, path, priority, task_token);
+                    }));
+                continue;
+            }
+            DiagTok dt(task_token, diag_tok_seq.fetch_add(1), path);
             index_datas.push_back(
-                pool.Submit([manager = rcm_, path, priority, token] {
-                    return ReadLegacyIndexFile(*manager, path, priority, token);
+                pool.Submit([manager = rcm_, priority, dt]() mutable {
+                    LOG_INFO("[DIAGTOK] ev=run_start id={} state={}",
+                             dt.id,
+                             DiagTokenStatePtr(dt.token));
+                    auto result = ReadLegacyIndexFile(
+                        *manager, dt.path, priority, dt.token);
+                    LOG_INFO("[DIAGTOK] ev=run_end id={}", dt.id);
+                    return result;
                 }));
         }
         size_t idx = 0;

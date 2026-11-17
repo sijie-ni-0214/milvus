@@ -1930,11 +1930,26 @@ SegmentGrowingImpl::load_field_data_internal(const LoadFieldDataInfo& infos) {
                                        channel,
                                        infos.load_priority,
                                        std::move(array_type));
+        // The producer can block pushing into the bounded channel,
+        // including its close marker, and this frame has no other
+        // join on it: consume pending entries and join before unwinding.
+        bool channel_exhausted = false;
+        auto drain_on_unwind = folly::makeGuard([&]() {
+            if (!channel_exhausted) {
+                FieldDataPtr discarded;
+                while (channel->pop(discarded)) {
+                }
+                channel_exhausted = true;
+            }
+            storage::DrainFuture(load_future);
+        });
 
         LOG_INFO("segment {} submits load field {} task to thread pool",
                  this->get_segment_id(),
                  field_id.get());
         auto field_data = storage::CollectFieldDataChannel(channel);
+        channel_exhausted = true;
+        drain_on_unwind.dismiss();
         load_field_data_common(field_id,
                                reserved_offset,
                                field_data,
@@ -4210,6 +4225,8 @@ SegmentGrowingImpl::LoadColumnsGroups(std::string manifest_path) {
     std::vector<
         std::future<std::unordered_map<FieldId, std::vector<FieldDataPtr>>>>
         load_group_futures;
+    auto futures_guard = folly::makeGuard(
+        [&load_group_futures]() { storage::DrainFutures(load_group_futures); });
     for (int64_t i = 0; i < column_groups->size(); ++i) {
         if (!group_has_live_field(i)) {
             LOG_INFO(
@@ -4365,6 +4382,8 @@ SegmentGrowingImpl::LoadColumnGroup(
 
     auto part_futures = std::vector<
         std::future<std::vector<std::shared_ptr<arrow::RecordBatch>>>>();
+    auto futures_guard = folly::makeGuard(
+        [&part_futures]() { storage::DrainFutures(part_futures); });
     for (const auto& part : split_result) {
         part_futures.emplace_back(
             thread_pool.Submit([chunk_reader = chunk_reader.get(), part]() {

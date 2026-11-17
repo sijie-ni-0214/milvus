@@ -1201,12 +1201,17 @@ GetObjectData(ChunkManager* remote_chunk_manager,
             return res;
         };
 
-    for (auto& file : remote_files) {
-        futures.emplace_back(pool.Submit(DownloadAndDeserialize,
-                                         remote_chunk_manager,
-                                         is_field_data,
-                                         array_type,
-                                         file));
+    try {
+        for (auto& file : remote_files) {
+            futures.emplace_back(pool.Submit(DownloadAndDeserialize,
+                                             remote_chunk_manager,
+                                             is_field_data,
+                                             array_type,
+                                             file));
+        }
+    } catch (...) {
+        DrainFutures(futures);
+        throw;
     }
     return futures;
 }
@@ -1221,6 +1226,8 @@ PutIndexData(ChunkManager* remote_chunk_manager,
              std::shared_ptr<CPluginContext> plugin_context) {
     auto& pool = ThreadPools::GetThreadPool(milvus::ThreadPoolPriority::MIDDLE);
     std::vector<std::future<std::pair<std::string, size_t>>> futures;
+    auto futures_guard = folly::makeGuard(
+        [&futures]() { DrainFutures(futures); });
     AssertInfo(data_slices.size() == slice_sizes.size(),
                "inconsistent data slices size {} with slice sizes {}",
                data_slices.size(),

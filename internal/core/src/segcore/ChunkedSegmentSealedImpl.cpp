@@ -2848,6 +2848,8 @@ ChunkedSegmentSealedImpl::LoadColumnGroups(
     auto& pool = ThreadPools::GetThreadPool(milvus::ThreadPoolPriority::MIDDLE);
     std::vector<std::future<void>> load_group_futures;
     load_group_futures.reserve(tasks.size());
+    auto futures_guard = folly::makeGuard(
+        [&load_group_futures]() { storage::DrainFutures(load_group_futures); });
     for (auto& task : tasks) {
         const auto submitted = milvus::monitor::QueryStageClock::now();
         auto future = pool.Submit(
@@ -9678,6 +9680,8 @@ ChunkedSegmentSealedImpl::LoadColumnGroups(
     auto& pool = ThreadPools::GetThreadPool(milvus::ThreadPoolPriority::MIDDLE);
     std::vector<std::future<void>> load_group_futures;
     load_group_futures.reserve(tasks.size());
+    auto futures_guard = folly::makeGuard(
+        [&load_group_futures]() { storage::DrainFutures(load_group_futures); });
     for (auto& task : tasks) {
         const auto submitted = milvus::monitor::QueryStageClock::now();
         auto future = pool.Submit(
@@ -10112,6 +10116,8 @@ ChunkedSegmentSealedImpl::ReloadColumns(const std::vector<FieldId>& field_ids,
                                         milvus::OpContext* op_ctx) {
     auto& pool = ThreadPools::GetThreadPool(milvus::ThreadPoolPriority::MIDDLE);
     std::vector<std::future<void>> reload_futures;
+    auto futures_guard = folly::makeGuard(
+        [&reload_futures]() { storage::DrainFutures(reload_futures); });
     for (auto& field_id : field_ids) {
         auto future = pool.Submit([this, field_id, op_ctx]() {
             auto column = get_column(field_id);
@@ -10142,6 +10148,8 @@ ChunkedSegmentSealedImpl::LoadBatchTextIndexes(
     auto& pool = ThreadPools::GetThreadPool(milvus::ThreadPoolPriority::MIDDLE);
     std::vector<std::future<void>> load_index_futures;
     load_index_futures.reserve(text_indexes_to_load.size());
+    auto futures_guard = folly::makeGuard(
+        [&load_index_futures]() { storage::DrainFutures(load_index_futures); });
 
     for (auto& [field_id, load_text_index_info] : text_indexes_to_load) {
         AssertInfo(field_exists_in_schema(schema_snapshot, field_id),
@@ -10194,6 +10202,8 @@ ChunkedSegmentSealedImpl::LoadBatchIndexes(
     auto& pool = ThreadPools::GetThreadPool(milvus::ThreadPoolPriority::MIDDLE);
     std::vector<std::future<void>> load_index_futures;
     load_index_futures.reserve(field_id_to_index_info.size());
+    auto futures_guard = folly::makeGuard(
+        [&load_index_futures]() { storage::DrainFutures(load_index_futures); });
 
     for (auto& pair : field_id_to_index_info) {
         auto field_id = pair.first;
@@ -10413,6 +10423,8 @@ ChunkedSegmentSealedImpl::LoadBatchFieldData(
     auto& pool = ThreadPools::GetThreadPool(milvus::ThreadPoolPriority::MIDDLE);
     std::vector<std::future<void>> load_field_futures;
     load_field_futures.reserve(field_data_to_load.size());
+    auto futures_guard = folly::makeGuard(
+        [&load_field_futures]() { storage::DrainFutures(load_field_futures); });
 
     for (const auto& [field_id, load_field_data_info] : field_data_to_load) {
         // Create local copies to capture in lambda (C++17 compatible)

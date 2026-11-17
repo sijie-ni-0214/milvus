@@ -11,8 +11,14 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdlib>
 #include <iterator>
 #include <memory>
+#include <mutex>
+#include <string>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
 
 #include "common/Common.h"
 #include "common/Consts.h"
@@ -26,6 +32,16 @@
 #include "pb/schema.pb.h"
 #include "segcore/SegcoreConfig.h"
 #include "segcore/SegmentLoadInfo.h"
+
+#include <unordered_set>
+
+#include <unordered_map>
+
+#include <string>
+
+#include <mutex>
+
+#include <cstdlib>
 #include "segcore/default_fs.h"
 #include "storage/LocalChunkManager.h"
 #include "storage/LocalChunkManagerSingleton.h"
@@ -36,6 +52,142 @@
 #include "storage/loon_ffi/util.h"
 
 namespace milvus::segcore {
+
+namespace {
+
+// ---------------------------------------------------------------------------
+// Diagnostic-only ownership registry for protobuf string buffers.
+// Enabled by MILVUS_DIAG_SLI_ALIAS=1; inert otherwise.
+// ---------------------------------------------------------------------------
+struct AliasGuardState {
+    std::mutex mu;
+    // instance -> registered string pointers
+    std::unordered_map<const void*, std::vector<const void*>> owned;
+    // string pointer -> owning instance
+    std::unordered_map<const void*, const void*> owner;
+};
+
+AliasGuardState&
+AliasState() {
+    static AliasGuardState state;
+    return state;
+}
+
+void
+DiagReportConflict(const void* ptr,
+                   const char* what,
+                   int64_t field_id,
+                   int64_t build_id,
+                   int64_t segment_id,
+                   const void* owner) {
+    LOG_ERROR(
+        "[DIAG_SLI] SHARED_BUFFER string={} kind={} seg={} field={} build={} "
+        "existing_owner={}",
+        ptr,
+        what,
+        segment_id,
+        field_id,
+        build_id,
+        owner);
+    LOG_ERROR("[DIAG_SLI] abort to capture both owners");
+    std::abort();
+}
+
+}  // namespace
+
+bool
+DiagLoadInfoAliasEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("MILVUS_DIAG_SLI_ALIAS");
+        return value != nullptr && std::string(value) == "1";
+    }();
+    return enabled;
+}
+
+void
+DiagLoadInfoRegister(const void* self,
+                     const proto::segcore::SegmentLoadInfo& info) {
+    if (!DiagLoadInfoAliasEnabled()) {
+        return;
+    }
+    auto& state = AliasState();
+    std::lock_guard<std::mutex> lock(state.mu);
+
+    // Re-registration of the same instance (e.g. after proto swap) replaces the
+    // previous set.
+    auto existing = state.owned.find(self);
+    if (existing != state.owned.end()) {
+        for (const auto* ptr : existing->second) {
+            state.owner.erase(ptr);
+        }
+        existing->second.clear();
+    } else {
+        state.owned.emplace(self, std::vector<const void*>{});
+    }
+    auto& tracked = state.owned[self];
+
+    const int64_t segment_id = info.segmentid();
+    auto track = [&](const std::string& value, const char* what, int64_t fid,
+                     int64_t build) {
+        if (value.empty()) {
+            return;
+        }
+        const void* ptr = value.data();
+        auto [it, inserted] = state.owner.emplace(ptr, self);
+        if (!inserted && it->second != self) {
+            DiagReportConflict(ptr, what, fid, build, segment_id, it->second);
+        }
+        tracked.push_back(ptr);
+    };
+
+    for (const auto& [field_id, stats] : info.jsonkeystatslogs()) {
+        track(stats.base_path(), "json_key_stats.base_path", field_id,
+              stats.buildid());
+        for (const auto& file : stats.files()) {
+            track(file, "json_key_stats.files", field_id, stats.buildid());
+        }
+    }
+}
+
+void
+DiagLoadInfoTakeover(const void* src, const void* dst) {
+    if (!DiagLoadInfoAliasEnabled() || src == dst) {
+        return;
+    }
+    auto& state = AliasState();
+    std::lock_guard<std::mutex> lock(state.mu);
+    auto it = state.owned.find(src);
+    if (it == state.owned.end()) {
+        return;
+    }
+    for (const auto* ptr : it->second) {
+        state.owner.erase(ptr);
+    }
+    it->second.clear();
+}
+
+void
+DiagLoadInfoUnregister(const void* self) {
+    if (!DiagLoadInfoAliasEnabled()) {
+        return;
+    }
+    auto& state = AliasState();
+    std::lock_guard<std::mutex> lock(state.mu);
+    auto it = state.owned.find(self);
+    if (it == state.owned.end()) {
+        LOG_ERROR(
+            "[DIAG_SLI] DOUBLE_DESTROY SegmentLoadInfo instance={} was never "
+            "registered or already destroyed",
+            self);
+        std::abort();
+    }
+    for (const auto* ptr : it->second) {
+        state.owner.erase(ptr);
+    }
+    state.owned.erase(it);
+}
+
+
 
 std::shared_ptr<milvus_storage::api::ColumnGroups>
 SegmentLoadInfo::GetColumnGroups() const {
