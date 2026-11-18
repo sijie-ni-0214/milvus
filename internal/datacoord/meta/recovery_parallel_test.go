@@ -126,7 +126,6 @@ func installInOrder(m *Meta, segments []*datapb.SegmentInfo) error {
 // dcStateShape is the DataCoord state of a segment without the times it was
 // taken at.
 type dcStateShape struct {
-	allocations     int
 	lastFlushTime   bool
 	isCompacting    bool
 	lastWrittenTime bool
@@ -159,7 +158,6 @@ func snapshotSegmentCache(s *SegmentsInfo) segmentCacheSnapshot {
 	}
 	s.dcState.Range(func(segmentID int64, state *dcSegmentState) bool {
 		snapshot.dcState[segmentID] = dcStateShape{
-			allocations:     len(state.allocations),
 			lastFlushTime:   !state.lastFlushTime.IsZero(),
 			isCompacting:    state.isCompacting,
 			lastWrittenTime: !state.lastWrittenTime.IsZero(),
