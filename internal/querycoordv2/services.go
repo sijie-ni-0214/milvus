@@ -33,7 +33,6 @@ import (
 	"github.com/milvus-io/milvus-proto/go-api/v3/schemapb"
 	"github.com/milvus-io/milvus/internal/coordinator/snmanager"
 	"github.com/milvus-io/milvus/internal/distributed/streaming"
-	"github.com/milvus-io/milvus/internal/querycoordv2/job"
 	"github.com/milvus-io/milvus/internal/querycoordv2/meta"
 	"github.com/milvus-io/milvus/internal/querycoordv2/utils"
 	"github.com/milvus-io/milvus/internal/util/componentutil"
@@ -461,8 +460,11 @@ func (s *Server) Prewarm(ctx context.Context, req *querypb.PrewarmRequest) (*que
 	}
 
 	s.initPrewarmTaskStore().create(taskID)
-	job := newPrewarmJob(ctx, s, req, taskID)
-	s.jobScheduler.Add(job)
+	work := newPrewarmJob(ctx, s, req, taskID)
+	if err := s.jobScheduler.Add(work); err != nil {
+		s.initPrewarmTaskStore().fail(taskID, err)
+		return &querypb.PrewarmResponse{Status: merr.Status(err)}, nil
+	}
 	logger.Info(ctx, "prewarm task submitted", mlog.String("taskID", taskID))
 	return &querypb.PrewarmResponse{
 		Status:    merr.Success(),
@@ -583,7 +585,7 @@ func (s *Server) waitPrewarmPartitionLoaded(ctx context.Context, collectionID in
 		}
 		partition := s.meta.GetPartition(ctx, partitionID)
 		if partition != nil && partition.LoadPercentage >= 100 {
-			return job.WaitUpdatePartition(ctx, s.targetObserver, collectionID, partitionID)
+			return s.waitPrewarmTarget(ctx, collectionID, partitionID)
 		}
 
 		select {
@@ -591,6 +593,32 @@ func (s *Server) waitPrewarmPartitionLoaded(ctx context.Context, collectionID in
 			return merr.Wrapf(ctx.Err(), "context error while waiting for prewarm partition loaded, collection=%d, partition=%d", collectionID, partitionID)
 		case <-ticker.C:
 		}
+	}
+}
+
+func (s *Server) waitPrewarmTarget(ctx context.Context, collection int64, partition int64) error {
+	// manual trigger update next target
+	ready, err := s.targetObserver.UpdatePartition(ctx, collection, partition)
+	if err != nil {
+		return merr.Wrapf(err, "failed to update next target, collection=%d", collection)
+	}
+	select {
+	case <-ready:
+		return nil
+	default:
+	}
+
+	// accelerate check
+	s.targetObserver.TriggerUpdateCurrentTarget(collection)
+
+	// wait current target ready
+	select {
+	case <-ready:
+		return nil
+	case <-ctx.Done():
+		return merr.Wrapf(ctx.Err(), "context error while waiting for current target updated, collection=%d", collection)
+	case <-time.After(30 * time.Second):
+		return merr.WrapErrServiceUnavailableMsg("wait current target updated timeout, collection=%d", collection)
 	}
 }
 

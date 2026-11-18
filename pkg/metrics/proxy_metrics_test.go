@@ -35,16 +35,16 @@ func TestCleanupProxyCollectionMetricsKeepsGlobalFunctionCall(t *testing.T) {
 		dbName      = "test_db"
 	)
 
-	ProxyFunctionCall.WithLabelValues(nodeIDLabel, "Search", SuccessLabel, CauseNA).Inc()
-	ProxyFunctionCall.WithLabelValues(nodeIDLabel, "Insert", FailLabel, CauseSystem).Inc()
+	ProxyFunctionCall.WithLabelValues(nodeIDLabel, "Search", SuccessLabel, CauseNA, "").Inc()
+	ProxyFunctionCall.WithLabelValues(nodeIDLabel, "Insert", FailLabel, CauseSystem, "").Inc()
 
 	CleanupProxyCollectionMetrics(nodeID, dbName, "target_collection")
 
 	expected := fmt.Sprintf(`
 # HELP milvus_proxy_req_count count of operation executed
 # TYPE milvus_proxy_req_count counter
-milvus_proxy_req_count{cause=%q,function_name="Search",node_id="1",status="success"} 1
-milvus_proxy_req_count{cause=%q,function_name="Insert",node_id="1",status="fail"} 1
+milvus_proxy_req_count{cause=%q,function_name="Search",node_id="1",rg="",status="success"} 1
+milvus_proxy_req_count{cause=%q,function_name="Insert",node_id="1",rg="",status="fail"} 1
 `, CauseNA, CauseSystem)
 	require.NoError(t, testutil.CollectAndCompare(
 		ProxyFunctionCall,

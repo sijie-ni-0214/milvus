@@ -492,8 +492,11 @@ LoadCellBatchAsync(milvus::OpContext* op_ctx,
                         // so their shared backing buffers are destroyed before the
                         // batch reservation is released.
                         auto release_guard = std::move(budget_guard);
-                        const auto started = milvus::monitor::QueryStageClock::now();
-                        milvus::monitor::ObserveQueryStage(milvus::monitor::QueryStage::LoadBatchQueue, started - submitted);
+                        const auto started =
+                            milvus::monitor::QueryStageClock::now();
+                        milvus::monitor::ObserveQueryStage(
+                            milvus::monitor::QueryStage::LoadBatchQueue,
+                            started - submitted);
                         CheckCancellation(op_ctx, -1, "LoadCellBatchAsync");
 
                         auto tables_result =

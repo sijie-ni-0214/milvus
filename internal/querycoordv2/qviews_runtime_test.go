@@ -409,7 +409,7 @@ func TestPrefetchedQueryViewsRecoverSameRegistry(t *testing.T) {
 		if prefetch {
 			catalog = newPrefetchedQueryViewCatalog(ctx, catalog)
 		}
-		reliableSyncer := syncer.NewReliableSyncer(&fakeRuntimeViewSyncClient{})
+		reliableSyncer := syncer.NewReliableSyncer(&fakeRuntimeViewSyncClient{}, nil, nil)
 		registry, err := coordview.RecoverShardViewRegistryWithDataViews(ctx, catalog, reliableSyncer, provider)
 		require.NoError(t, err)
 		t.Cleanup(func() {

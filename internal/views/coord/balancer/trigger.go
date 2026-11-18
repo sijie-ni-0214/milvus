@@ -7,8 +7,8 @@ import (
 	"github.com/milvus-io/milvus/internal/views/coord/balancer/api"
 	"github.com/milvus-io/milvus/internal/views/qviews"
 	"github.com/milvus-io/milvus/pkg/v3/util/metautil"
-	"github.com/milvus-io/milvus/pkg/v3/util/syncutil"
 	"github.com/milvus-io/milvus/pkg/v3/util/stage"
+	"github.com/milvus-io/milvus/pkg/v3/util/syncutil"
 )
 
 type TriggerScope = api.TriggerScope

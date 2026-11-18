@@ -89,6 +89,17 @@ func TestCollectionLoadInfoAutoLoadWireCompatibility(t *testing.T) {
 			require.Equal(t, string(wire), stored)
 		})
 	}
+	for _, autoLoad := range []bool{true, false} {
+		info := &viewpb.CollectionLoadConfig{CollectionID: 25, Version: 11, AutoLoad: autoLoad}
+		require.NoError(t, catalog.Save(ctx, info))
+		recovered, err := catalog.List(ctx)
+		require.NoError(t, err)
+		require.Len(t, recovered, 1)
+		require.True(t, proto.Equal(info, recovered[0]))
+		point, err := GetCollectionLoadInfo(ctx, storage, info.CollectionID, info.Version)
+		require.NoError(t, err)
+		require.True(t, proto.Equal(info, point))
+	}
 	key := collectionLoadInfoVersionKey(25, 11)
 	require.NoError(t, storage.Save(ctx, key, string(append(field9(1), 0x48, 0x80))))
 	_, err := catalog.List(ctx)

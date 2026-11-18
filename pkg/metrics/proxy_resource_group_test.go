@@ -33,12 +33,12 @@ func TestProxyMetricsResourceGroupLabelsAndCleanup(t *testing.T) {
 	RegisterProxy(r)
 	for _, coll := range []string{"coll", "other"} {
 		for _, rg := range []string{"", "rg-a", "rg-b"} {
-			ProxyFunctionCall.WithLabelValues("7", "Search", SuccessLabel, CauseNA, "db", coll, rg).Inc()
+			ProxyFunctionCall.WithLabelValues("7", "Search", SuccessLabel, CauseNA, rg).Inc()
 			ProxySearchVectors.WithLabelValues("7", "db", coll, rg).Add(3)
 			ProxySQLatency.WithLabelValues("7", SearchLabel, "db", coll, rg).Observe(17)
 		}
 	}
-	check := func(want int) {
+	check := func(collectionSeries int) {
 		t.Helper()
 		families, err := r.Gather()
 		require.NoError(t, err)
@@ -48,6 +48,10 @@ func TestProxyMetricsResourceGroupLabelsAndCleanup(t *testing.T) {
 			switch f.GetName() {
 			case "milvus_proxy_req_count", "milvus_proxy_search_vectors_count", "milvus_proxy_sq_latency":
 				found++
+				want := collectionSeries
+				if f.GetName() == "milvus_proxy_req_count" {
+					want = 3 // One counter per RG survives collection and database cleanup.
+				}
 				require.Len(t, f.Metric, want)
 				groups := map[string]int{}
 				for _, m := range f.Metric {
@@ -63,10 +67,10 @@ func TestProxyMetricsResourceGroupLabelsAndCleanup(t *testing.T) {
 				assert.Equal(t, map[string]int{"": want / 3, "rg-a": want / 3, "rg-b": want / 3}, groups)
 			}
 		}
-		if want > 0 {
+		if collectionSeries > 0 {
 			require.Equal(t, 3, found)
 		} else {
-			require.Zero(t, found)
+			require.Equal(t, 1, found)
 		}
 	}
 	check(6)

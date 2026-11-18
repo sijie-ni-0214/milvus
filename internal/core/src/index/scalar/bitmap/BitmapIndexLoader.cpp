@@ -1105,16 +1105,15 @@ BitmapIndexLoader::LoadStorage(OpenedIndexSource& source,
         // destroyed twice by GCC 11/12 (GCC PR 101367), which releases the
         // captured token one extra time and leaves the operation's
         // CancellationState reference count short by one.
-        PackedPlanFn make_plan =
-            [&prepared, token](const auto& directory,
-                               const auto& metadata,
-                               const auto& opts) {
-                auto plan = PlanPacked(directory, metadata, opts, &prepared);
-                std::any_cast<const std::shared_ptr<PackedBitmapState>&>(
-                    plan.load_context)
-                    ->cancellation_token = token;
-                return plan;
-            };
+        PackedPlanFn make_plan = [&prepared, token](const auto& directory,
+                                                    const auto& metadata,
+                                                    const auto& opts) {
+            auto plan = PlanPacked(directory, metadata, opts, &prepared);
+            std::any_cast<const std::shared_ptr<PackedBitmapState>&>(
+                plan.load_context)
+                ->cancellation_token = token;
+            return plan;
+        };
         co_return co_await RunPackedIndexLoad<
             std::unique_ptr<BitmapPostingStorage<T, Posting>>>(
             *packed,

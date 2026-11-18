@@ -53,6 +53,7 @@ import (
 	"github.com/milvus-io/milvus/internal/querycoordv2/balance"
 	"github.com/milvus-io/milvus/internal/querycoordv2/checkers"
 	"github.com/milvus-io/milvus/internal/querycoordv2/dist"
+	"github.com/milvus-io/milvus/internal/querycoordv2/job"
 	"github.com/milvus-io/milvus/internal/querycoordv2/meta"
 	"github.com/milvus-io/milvus/internal/querycoordv2/observers"
 	"github.com/milvus-io/milvus/internal/querycoordv2/params"
@@ -117,6 +118,7 @@ type ServiceSuite struct {
 	collectionObserver *observers.CollectionObserver
 	cluster            *session.MockCluster
 	nodeMgr            *session.NodeManager
+	jobScheduler       *job.Scheduler
 	taskScheduler      *task.MockScheduler
 	balancer           balance.Balance
 
@@ -271,6 +273,9 @@ func (suite *ServiceSuite) SetupTest() {
 		}))
 		suite.meta.HandleNodeUp(context.TODO(), node)
 	}
+	suite.jobScheduler = job.NewScheduler(suite.T().Context())
+	suite.jobScheduler.Start()
+	suite.T().Cleanup(suite.jobScheduler.Stop)
 	suite.taskScheduler = task.NewMockScheduler(suite.T())
 	suite.taskScheduler.EXPECT().GetSegmentTaskDeltaSnapshot(mock.Anything, mock.Anything).Return(task.NewSegmentTaskDeltaSnapshot(nil, nil)).Maybe()
 	suite.taskScheduler.EXPECT().GetChannelTaskDelta(mock.Anything, mock.Anything).Return(0).Maybe()
@@ -297,6 +302,7 @@ func (suite *ServiceSuite) SetupTest() {
 	suite.collectionObserver.Start()
 
 	suite.server = &Server{
+		jobScheduler:        suite.jobScheduler,
 		idAllocator:         params.RandomIncrementIDAllocator(),
 		kv:                  suite.kv,
 		etcdCli:             cli,
@@ -2169,7 +2175,7 @@ func (suite *ServiceSuite) TestPrewarmReturnsTaskBeforeSchedulerJobCompletes() {
 		suite.dist.SegmentDistManager.Update(nodeID, utils.CreateTestSegment(collectionID, partitionID, segmentID, nodeID, 1, "test-channel"))
 
 		blockingJob := newBlockingQueryCoordJob(ctx, collectionID)
-		suite.jobScheduler.Add(blockingJob)
+		suite.Require().NoError(suite.jobScheduler.Add(blockingJob))
 		select {
 		case <-blockingJob.started:
 		case <-ctx.Done():

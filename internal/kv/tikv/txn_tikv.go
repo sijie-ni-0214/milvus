@@ -1030,4 +1030,3 @@ func convertEmptyByteToString(value []byte) string {
 func convertEmptyStringToByte(value string) ([]byte, error) {
 	return tikvutil.EncodeValue([]byte(value))
 }
-

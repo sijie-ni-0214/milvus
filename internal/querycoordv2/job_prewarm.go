@@ -21,6 +21,7 @@ import (
 
 	"github.com/milvus-io/milvus/internal/querycoordv2/job"
 	"github.com/milvus-io/milvus/pkg/v3/proto/querypb"
+	"github.com/milvus-io/milvus/pkg/v3/util/contextutil"
 	"github.com/milvus-io/milvus/pkg/v3/util/merr"
 )
 
@@ -53,20 +54,22 @@ func (j *prewarmJob) PreExecute() error {
 }
 
 func (j *prewarmJob) Execute() (err error) {
+	ctx, cancel := contextutil.MergeContext(context.WithoutCancel(j.Context()), j.server.jobScheduler.Context())
+	defer cancel()
 	j.server.initPrewarmTaskStore().warming(j.taskID, 10)
 	partitionID := j.req.GetPartitionIDs()[0]
 	defer func() {
-		clearErr := j.server.clearPrewarmForceSyncWarmup(j.Context(), j.req.GetCollectionID(), partitionID)
+		clearErr := j.server.clearPrewarmForceSyncWarmup(ctx, j.req.GetCollectionID(), partitionID)
 		if clearErr != nil {
 			err = merr.Combine(err, clearErr)
 		}
 	}()
 
-	if err := j.server.ensurePrewarmPartitionLoaded(j.Context(), j.req); err != nil {
+	if err := j.server.ensurePrewarmPartitionLoaded(ctx, j.req); err != nil {
 		return err
 	}
 	j.server.initPrewarmTaskStore().warming(j.taskID, 60)
-	return j.server.prewarmLoadedSegments(j.Context(), j.req)
+	return j.server.prewarmLoadedSegments(ctx, j.req)
 }
 
 func (j *prewarmJob) PostExecute() {

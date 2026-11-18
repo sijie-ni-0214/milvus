@@ -76,7 +76,7 @@ func TestRequestCounterResourceGroup(t *testing.T) {
 			})
 			require.Equal(t, 2, testutil.CollectAndCount(metrics.ProxyFunctionCall))
 			for _, labels := range [][2]string{{metrics.TotalLabel, metrics.CauseNA}, {tc.outcome, tc.cause}} {
-				assert.Equal(t, float64(1), testutil.ToFloat64(metrics.ProxyFunctionCall.WithLabelValues(paramtable.GetStringNodeID(), "Search", labels[0], labels[1], "db", "coll", tc.expected)))
+				assert.Equal(t, float64(1), testutil.ToFloat64(metrics.ProxyFunctionCall.WithLabelValues(paramtable.GetStringNodeID(), "Search", labels[0], labels[1], tc.expected)))
 			}
 			require.Equal(t, 2, testutil.CollectAndCount(metrics.ProxyFunctionCall), "no unscoped duplicate")
 		})
@@ -86,7 +86,7 @@ func TestRequestCounterResourceGroup(t *testing.T) {
 		hookutil.SetTestHook(resourceGroupHook{group: group})
 		_, _ = chain(context.Background(), req, info, func(context.Context, any) (any, error) { return &milvuspb.SearchResults{Status: merr.Success()}, nil })
 	}
-	assert.Equal(t, float64(2), testutil.ToFloat64(metrics.ProxyFunctionCall.WithLabelValues(paramtable.GetStringNodeID(), "Search", metrics.TotalLabel, metrics.CauseNA, "db", "coll", "rg-a")))
-	assert.Equal(t, float64(1), testutil.ToFloat64(metrics.ProxyFunctionCall.WithLabelValues(paramtable.GetStringNodeID(), "Search", metrics.TotalLabel, metrics.CauseNA, "db", "coll", "rg-b")))
+	assert.Equal(t, float64(2), testutil.ToFloat64(metrics.ProxyFunctionCall.WithLabelValues(paramtable.GetStringNodeID(), "Search", metrics.TotalLabel, metrics.CauseNA, "rg-a")))
+	assert.Equal(t, float64(1), testutil.ToFloat64(metrics.ProxyFunctionCall.WithLabelValues(paramtable.GetStringNodeID(), "Search", metrics.TotalLabel, metrics.CauseNA, "rg-b")))
 	assert.Zero(t, metrics.ProxyFunctionCall.DeletePartialMatch(prometheus.Labels{"rg": ""}))
 }

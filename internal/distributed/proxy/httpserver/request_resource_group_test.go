@@ -82,7 +82,7 @@ func TestRESTRequestCounterResourceGroup(t *testing.T) {
 			postJSONBody(r, path, `{"dbName":"db","collectionName":"coll"}`)
 			require.Equal(t, 2, testutil.CollectAndCount(metrics.ProxyFunctionCall))
 			for _, labels := range [][2]string{{metrics.TotalLabel, metrics.CauseNA}, {tc.outcome, tc.cause}} {
-				assert.Equal(t, float64(1), testutil.ToFloat64(metrics.ProxyFunctionCall.WithLabelValues(paramtable.GetStringNodeID(), "Search", labels[0], labels[1], "db", "coll", tc.expected)))
+				assert.Equal(t, float64(1), testutil.ToFloat64(metrics.ProxyFunctionCall.WithLabelValues(paramtable.GetStringNodeID(), "Search", labels[0], labels[1], tc.expected)))
 			}
 			require.Equal(t, 2, testutil.CollectAndCount(metrics.ProxyFunctionCall))
 		})

@@ -15,8 +15,8 @@ import (
 	"github.com/milvus-io/milvus/pkg/v3/mlog"
 	"github.com/milvus-io/milvus/pkg/v3/util/merr"
 	"github.com/milvus-io/milvus/pkg/v3/util/paramtable"
-	"github.com/milvus-io/milvus/pkg/v3/util/syncutil"
 	"github.com/milvus-io/milvus/pkg/v3/util/stage"
+	"github.com/milvus-io/milvus/pkg/v3/util/syncutil"
 )
 
 // Balancer is the scheduling controller that reconciles dirty shards into

@@ -2881,7 +2881,8 @@ ChunkedSegmentSealedImpl::LoadColumnGroups(
         auto future =
             folly::via(
                 &pool,
-                [this, submitted,
+                [this,
+                 submitted,
                  column_groups,
                  properties,
                  cg_index = task.column_group_index,
@@ -2899,9 +2900,9 @@ ChunkedSegmentSealedImpl::LoadColumnGroups(
                  is_replace,
                  &committer]() mutable {
                     milvus::monitor::QueryStageTaskTimer task_timer(
-                    milvus::monitor::QueryStage::LoadColumnGroupQueue,
-                    milvus::monitor::QueryStage::LoadColumnGroupRun,
-                    submitted);
+                        milvus::monitor::QueryStage::LoadColumnGroupQueue,
+                        milvus::monitor::QueryStage::LoadColumnGroupRun,
+                        submitted);
                     CheckCancellation(
                         op_ctx,
                         id_,
@@ -9761,7 +9762,8 @@ ChunkedSegmentSealedImpl::LoadColumnGroups(
         auto future =
             folly::via(
                 &pool,
-                [this, submitted,
+                [this,
+                 submitted,
                  column_groups,
                  properties,
                  cg_index = task.column_group_index,
@@ -9779,9 +9781,9 @@ ChunkedSegmentSealedImpl::LoadColumnGroups(
                  is_replace,
                  &committer]() mutable {
                     milvus::monitor::QueryStageTaskTimer task_timer(
-                    milvus::monitor::QueryStage::LoadColumnGroupQueue,
-                    milvus::monitor::QueryStage::LoadColumnGroupRun,
-                    submitted);
+                        milvus::monitor::QueryStage::LoadColumnGroupQueue,
+                        milvus::monitor::QueryStage::LoadColumnGroupRun,
+                        submitted);
                     CheckCancellation(
                         op_ctx,
                         id_,
@@ -10296,7 +10298,8 @@ ChunkedSegmentSealedImpl::LoadBatchIndexes(
             auto future =
                 folly::via(
                     &pool,
-                    [this, submitted,
+                    [this,
+                     submitted,
                      trace_ctx,
                      field_id,
                      load_index_info_ptr,
@@ -10304,10 +10307,10 @@ ChunkedSegmentSealedImpl::LoadBatchIndexes(
                      op_ctx,
                      is_replace,
                      &committer]() mutable -> void {
-                    milvus::monitor::QueryStageTaskTimer task_timer(
-                    milvus::monitor::QueryStage::LoadIndexQueue,
-                    milvus::monitor::QueryStage::LoadIndexRun,
-                    submitted);
+                        milvus::monitor::QueryStageTaskTimer task_timer(
+                            milvus::monitor::QueryStage::LoadIndexQueue,
+                            milvus::monitor::QueryStage::LoadIndexRun,
+                            submitted);
                         // Early exit if cancelled while queued
                         CheckCancellation(
                             op_ctx, id_, field_id.get(), "LoadIndex");
@@ -10514,7 +10517,8 @@ ChunkedSegmentSealedImpl::LoadBatchFieldData(
         // Create local copies to capture in lambda (C++17 compatible)
         const auto field_data = load_field_data_info;
         const auto captured_field_id = field_id;
-        LOG_INFO("[xxx] segment {} submit pool size {}", id_, pool.numThreads());
+        LOG_INFO(
+            "[xxx] segment {} submit pool size {}", id_, pool.numThreads());
         auto future =
             folly::via(&pool,
                        [this,

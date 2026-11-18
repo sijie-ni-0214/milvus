@@ -43,6 +43,7 @@ import (
 	"github.com/milvus-io/milvus/internal/querycoordv2/balance"
 	"github.com/milvus-io/milvus/internal/querycoordv2/checkers"
 	"github.com/milvus-io/milvus/internal/querycoordv2/dist"
+	"github.com/milvus-io/milvus/internal/querycoordv2/job"
 	"github.com/milvus-io/milvus/internal/querycoordv2/meta"
 	"github.com/milvus-io/milvus/internal/querycoordv2/observers"
 	"github.com/milvus-io/milvus/internal/querycoordv2/params"
@@ -104,6 +105,7 @@ type Server struct {
 	queryNodeCreator session.QueryNodeCreator
 
 	// Schedulers
+	jobScheduler  *job.Scheduler // Serializes asynchronous partition prewarm per collection.
 	taskScheduler task.Scheduler
 	prewarmTaskMu sync.Mutex
 	prewarmTasks  *prewarmTaskStore
@@ -335,6 +337,7 @@ func (s *Server) initQueryCoord() error {
 
 	// Init schedulers
 	mlog.Info(s.ctx, "init schedulers")
+	s.jobScheduler = job.NewScheduler(s.ctx)
 	s.taskScheduler = task.NewScheduler(
 		s.ctx,
 		s.meta,
@@ -534,6 +537,10 @@ func (s *Server) startQueryCoord() error {
 }
 
 func (s *Server) startServerLoop() {
+	if s.jobScheduler != nil {
+		s.jobScheduler.Start()
+	}
+
 	mlog.Info(s.ctx, "start resource observer...")
 	if s.resourceObserver != nil {
 		s.resourceObserver.Start()
@@ -550,6 +557,10 @@ func (s *Server) startServerLoop() {
 }
 
 func (s *Server) Stop() error {
+	if s.jobScheduler != nil {
+		s.jobScheduler.Stop()
+	}
+
 	// FOLLOW the dependence graph:
 	// checker controller -> task scheduler -> dist controller -> cluster -> session
 	// observers -> dist controller
