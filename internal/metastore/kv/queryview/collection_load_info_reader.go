@@ -5,7 +5,6 @@ import (
 	"fmt"
 
 	"github.com/cockroachdb/errors"
-	"google.golang.org/protobuf/proto"
 
 	"github.com/milvus-io/milvus/pkg/v3/kv"
 	"github.com/milvus-io/milvus/pkg/v3/proto/viewpb"
@@ -23,8 +22,8 @@ func GetCollectionLoadInfo(ctx context.Context, storage kv.MetaKv, collectionID 
 	if err != nil {
 		return nil, err
 	}
-	info := new(viewpb.CollectionLoadConfig)
-	if err := proto.Unmarshal([]byte(value), info); err != nil {
+	info, err := decodeCollectionLoadConfig([]byte(value))
+	if err != nil {
 		return nil, merr.Wrap(err, "decode collection load requirements")
 	}
 	if info.GetCollectionID() != collectionID || info.GetVersion() != version || version == 0 {

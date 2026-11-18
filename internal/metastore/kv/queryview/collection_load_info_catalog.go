@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 
+	"google.golang.org/protobuf/encoding/protowire"
 	"google.golang.org/protobuf/proto"
 
 	"github.com/milvus-io/milvus/internal/metastore/kv/txn"
@@ -47,8 +48,8 @@ func collectionLoadInfoVersionKey(collectionID int64, version uint64) string {
 func (c *collectionLoadInfoCatalog) List(ctx context.Context) ([]*viewpb.CollectionLoadConfig, error) {
 	var records []*viewpb.CollectionLoadConfig
 	err := c.storage.WalkWithPrefix(ctx, VersionedLoadInfoPrefix+"/", c.pageSize, func(key, value []byte) error {
-		info := new(viewpb.CollectionLoadConfig)
-		if err := proto.Unmarshal(value, info); err != nil {
+		info, err := decodeCollectionLoadConfig(value)
+		if err != nil {
 			return merr.Wrap(err, "decode collection load requirements")
 		}
 		expected := collectionLoadInfoVersionKey(info.GetCollectionID(), info.GetVersion())
@@ -59,6 +60,40 @@ func (c *collectionLoadInfoCatalog) List(ctx context.Context) ([]*viewpb.Collect
 		return nil
 	})
 	return records, err
+}
+
+// Older QueryView builds wrote a warmup epoch (a TSO) at tag 9. Both that
+// integer and today's auto_load boolean use varint encoding. Only the boolean
+// writer emits 1 for true. Preserve protobuf's last-value-wins behavior when
+// reading duplicate tags, and skip nested messages and unknown fields intact.
+func decodeCollectionLoadConfig(data []byte) (*viewpb.CollectionLoadConfig, error) {
+	info := new(viewpb.CollectionLoadConfig)
+	if err := proto.Unmarshal(data, info); err != nil {
+		return nil, err
+	}
+	if !info.AutoLoad {
+		return info, nil
+	}
+	for len(data) > 0 {
+		num, typ, tagSize := protowire.ConsumeTag(data)
+		if tagSize < 0 {
+			return nil, protowire.ParseError(tagSize)
+		}
+		data = data[tagSize:]
+		var size int
+		if num == 9 && typ == protowire.VarintType {
+			var value uint64
+			value, size = protowire.ConsumeVarint(data)
+			info.AutoLoad = value == 1
+		} else {
+			size = protowire.ConsumeFieldValue(num, typ, data)
+		}
+		if size < 0 {
+			return nil, protowire.ParseError(size)
+		}
+		data = data[size:]
+	}
+	return info, nil
 }
 
 // Save publishes all requirements, including partition and replica membership,
