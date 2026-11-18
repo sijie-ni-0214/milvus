@@ -47,7 +47,7 @@ type Scheduler struct {
 }
 
 func NewScheduler(parent context.Context) *Scheduler {
-	ctx, cancel := context.WithCancel(parent)
+	ctx, cancel := context.WithCancel(parent) //nolint:gosec // Stop calls cancel before waiting for the workers.
 	return &Scheduler{
 		ctx: ctx, cancel: cancel,
 		processors: typeutil.NewConcurrentSet[int64](),
