@@ -1100,18 +1100,26 @@ BitmapIndexLoader::LoadStorage(OpenedIndexSource& source,
     const auto token = folly::cancellation_token_merge(
         operation_token, co_await folly::coro::co_current_cancellation_token);
     if (auto* packed = std::get_if<PackedIndexSource>(&source)) {
-        co_return co_await RunPackedIndexLoad<
-            std::unique_ptr<BitmapPostingStorage<T, Posting>>>(
-            *packed,
-            options,
-            [&prepared, token](
-                const auto& directory, const auto& metadata, const auto& opts) {
+        // The plan callback must be a named local: a lambda temporary that
+        // captures the token by value in a statement containing co_await is
+        // destroyed twice by GCC 11/12 (GCC PR 101367), which releases the
+        // captured token one extra time and leaves the operation's
+        // CancellationState reference count short by one.
+        PackedPlanFn make_plan =
+            [&prepared, token](const auto& directory,
+                               const auto& metadata,
+                               const auto& opts) {
                 auto plan = PlanPacked(directory, metadata, opts, &prepared);
                 std::any_cast<const std::shared_ptr<PackedBitmapState>&>(
                     plan.load_context)
                     ->cancellation_token = token;
                 return plan;
-            },
+            };
+        co_return co_await RunPackedIndexLoad<
+            std::unique_ptr<BitmapPostingStorage<T, Posting>>>(
+            *packed,
+            options,
+            std::move(make_plan),
             &FinishPackedStorage<T, Posting>,
             context);
     }
