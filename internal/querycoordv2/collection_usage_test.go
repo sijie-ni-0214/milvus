@@ -18,52 +18,84 @@ package querycoordv2
 
 import (
 	"context"
+	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
+	"github.com/bytedance/mockey"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 
 	"github.com/milvus-io/milvus-proto/go-api/v3/commonpb"
+	"github.com/milvus-io/milvus-proto/go-api/v3/milvuspb"
+	"github.com/milvus-io/milvus-proto/go-api/v3/schemapb"
+	"github.com/milvus-io/milvus/internal/metacache"
 	metastoremocks "github.com/milvus-io/milvus/internal/metastore/mocks"
+	"github.com/milvus-io/milvus/internal/mocks/streamingcoord/server/mock_balancer"
+	"github.com/milvus-io/milvus/internal/mocks/streamingcoord/server/mock_broadcaster"
 	"github.com/milvus-io/milvus/internal/querycoordv2/meta"
+	"github.com/milvus-io/milvus/internal/querycoordv2/session"
+	walbalance "github.com/milvus-io/milvus/internal/streamingcoord/server/balancer/balance"
+	"github.com/milvus-io/milvus/internal/util/sessionutil"
+	"github.com/milvus-io/milvus/internal/views/coord/loadmgr"
+	"github.com/milvus-io/milvus/internal/views/coord/loadmgr/loadmgrtest"
 	"github.com/milvus-io/milvus/internal/views/qviews"
 	"github.com/milvus-io/milvus/pkg/v3/common"
+	"github.com/milvus-io/milvus/pkg/v3/mlog"
 	"github.com/milvus-io/milvus/pkg/v3/proto/viewpb"
 	"github.com/milvus-io/milvus/pkg/v3/util/merr"
+	"github.com/milvus-io/milvus/pkg/v3/util/metricsinfo"
 	"github.com/milvus-io/milvus/pkg/v3/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/v3/util/replicateutil"
 )
 
 const usageTestVChannel = "by-dev-rootcoord-dml_100v0"
 
-func enableAutoReleaseForTest(t *testing.T) {
+func enableAutoReleaseForTest(t *testing.T, scanRoles ...replicateutil.Role) {
 	t.Helper()
+	b := mock_balancer.NewMockBalancer(t)
+	if len(scanRoles) == 0 {
+		b.EXPECT().ReplicateRole().Return(replicateutil.RolePrimary).Maybe()
+	}
+	for _, role := range scanRoles {
+		b.EXPECT().ReplicateRole().Return(role).Once()
+	}
+	getBalancer := mockey.Mock(walbalance.GetWithContext).Return(b, nil).Build()
+	t.Cleanup(func() { getBalancer.UnPatch() })
+
 	params := paramtable.Get()
-	require.NoError(t, params.Save(params.QueryCoordCfg.AutoReleaseIdleTTLSeconds.Key, "10"))
+	require.NoError(t, params.Save(params.QueryCoordCfg.AutoReleaseTTISeconds.Key, "10"))
 	require.NoError(t, params.Save(params.ProxyCfg.EnableAutoLoad.Key, "true"))
 	require.NoError(t, params.Save(params.QueryCoordCfg.AutoReleaseEnabled.Key, "true"))
 	t.Cleanup(func() {
-		require.NoError(t, params.Reset(params.QueryCoordCfg.AutoReleaseIdleTTLSeconds.Key))
+		require.NoError(t, params.Reset(params.QueryCoordCfg.AutoReleaseTTISeconds.Key))
 		require.NoError(t, params.Reset(params.QueryCoordCfg.AutoReleaseEnabled.Key))
 		require.NoError(t, params.Reset(params.ProxyCfg.EnableAutoLoad.Key))
 	})
 }
 
-func newUsageTestManager(t *testing.T) (*Server, *collectionUsageManager, *metastoremocks.QueryCoordCatalog, *int) {
+func newUsageTestManager(t *testing.T) (*Server, *collectionUsageManager, *mockey.Mocker) {
 	t.Helper()
-	s, catalog, _ := newReadinessTestServer(t, testPersistedQueryView(100, qviews.ShardID{
+	s, _, _ := newReadinessTestServer(t, testPersistedQueryView(100, qviews.ShardID{
 		ReplicaID: 1000,
 		VChannel:  usageTestVChannel,
 	}))
-	releaseCount := 0
 	manager := s.collectionUsage
-	manager.release = func(context.Context, int64) error {
-		releaseCount++
-		return nil
-	}
-	return s, manager, catalog, &releaseCount
+	return s, manager, mockAutoRelease(t, manager)
+}
+
+func mockAutoRelease(t *testing.T, manager *collectionUsageManager) *mockey.Mocker {
+	t.Helper()
+	releaseMock := mockey.Mock((*collectionUsageManager).autoReleaseCollection).Return(nil).Build()
+	t.Cleanup(func() {
+		manager.close()
+		releaseMock.UnPatch()
+	})
+	return releaseMock
 }
 
 func activityTime(manager *collectionUsageManager, collectionID int64) (time.Time, bool) {
@@ -79,10 +111,9 @@ func setActivityTime(manager *collectionUsageManager, collectionID int64, at tim
 	manager.mu.Unlock()
 }
 
-// scanAndWait scans and waits until the releases the scan queued have finished.
 func scanAndWait(t *testing.T, manager *collectionUsageManager) {
 	t.Helper()
-	manager.scan(context.Background())
+	manager.scan(t.Context())
 	waitReleasesDone(t, manager)
 }
 
@@ -92,35 +123,97 @@ func waitReleasesDone(t *testing.T, manager *collectionUsageManager) {
 		manager.mu.Lock()
 		defer manager.mu.Unlock()
 		return len(manager.releasing) == 0
-	}, 5*time.Second, time.Millisecond)
+	}, time.Second, time.Millisecond)
 }
 
-// useGlobalTTLForTest makes every collection use the global idle TTL.
-func useGlobalTTLForTest(t *testing.T, manager *collectionUsageManager) {
-	broker := meta.NewMockBroker(t)
-	broker.EXPECT().GetCollectionProperties(mock.Anything, mock.Anything).Return(nil, nil).Maybe()
-	manager.broker = broker
-}
-
-// queueIdleReleases queues collections whose activity predates the idle TTL
-// enableAutoReleaseForTest sets.
-func queueIdleReleases(manager *collectionUsageManager, collectionIDs ...int64) {
+func queueIdleReleases(ctx context.Context, manager *collectionUsageManager, collectionIDs ...int64) {
+	candidates := make([]releaseCandidate, 0, len(collectionIDs))
 	for _, collectionID := range collectionIDs {
-		setActivityTime(manager, collectionID, time.Now().Add(-20*time.Second))
+		lastActiveAt := time.Now().Add(-20 * time.Second)
+		setActivityTime(manager, collectionID, lastActiveAt)
+		candidates = append(candidates, releaseCandidate{collectionID: collectionID, lastActiveAt: lastActiveAt, reason: releaseReasonTTI})
 	}
-	manager.queueReleases(context.Background(), collectionIDs)
+	manager.queueReleases(ctx, candidates)
 }
 
-func setReleaseConcurrencyForTest(t *testing.T, concurrency string) {
+func setUsageParameter(t *testing.T, item *paramtable.ParamItem, value string) {
 	t.Helper()
 	params := paramtable.Get()
-	require.NoError(t, params.Save(params.QueryCoordCfg.AutoReleaseConcurrency.Key, concurrency))
-	t.Cleanup(func() { require.NoError(t, params.Reset(params.QueryCoordCfg.AutoReleaseConcurrency.Key)) })
+	require.NoError(t, params.Save(item.Key, value))
+	t.Cleanup(func() { require.NoError(t, params.Reset(item.Key)) })
+}
+
+func newLRUUsageManager(t *testing.T, count int, scanRoles ...replicateutil.Role) (*collectionUsageManager, chan int64, *mockey.Mocker, *mockey.Mocker) {
+	t.Helper()
+	enableAutoReleaseForTest(t, scanRoles...)
+	setUsageParameter(t, &paramtable.Get().QueryCoordCfg.AutoReleaseTTISeconds, "3600")
+	ctx := t.Context()
+	store, err := loadmgr.RecoverLoadConfigStore(ctx, loadmgrtest.Dependencies(t))
+	require.NoError(t, err)
+	views := make([]*viewpb.QueryViewOfShard, 0, count)
+	collections := make([]*metacache.CollectionInfo, 0, count)
+	for i := 0; i < count; i++ {
+		id := int64(100 + i)
+		channel := fmt.Sprintf("by-dev-rootcoord-dml_%dv0", id)
+		replicaID := id * 10
+		require.NoError(t, store.Put(ctx, &loadmgr.LoadConfig{
+			CollectionID: id,
+			Replicas:     []*loadmgr.ReplicaAssignment{{ReplicaID: replicaID, ResourceGroup: "pool"}},
+		}))
+		views = append(views, testPersistedQueryView(id, qviews.ShardID{ReplicaID: replicaID, VChannel: channel}))
+		collections = append(collections, &metacache.CollectionInfo{ID: id, VChannelNames: []string{channel}})
+	}
+	s, _ := newReadinessTestServerWithStore(t, store, views...)
+	s.meta = newViewMeta(collections...)
+	manager := s.collectionUsage
+	releaseMock := mockAutoRelease(t, manager)
+	for i := 0; i < count; i++ {
+		setActivityTime(manager, int64(100+i), time.Now().Add(-time.Duration(count-i)*time.Second))
+	}
+	memoryMock := mockey.Mock((*collectionUsageManager).collectMemoryUsageByRG).
+		Return(map[string]collectionMemoryUsage{"pool": {used: 90, total: 100}}).Build()
+	t.Cleanup(func() {
+		manager.close()
+		memoryMock.UnPatch()
+	})
+	released := make(chan int64, count*2)
+	releaseMock.To(func(_ *collectionUsageManager, _ context.Context, id int64, _ collectionReleaseReason) error {
+		manager.s.qviewsRuntime.loadConfigStore.StopPlanning(id)
+		released <- id
+		return nil
+	})
+	return manager, released, releaseMock, memoryMock
+}
+
+func TestCollectionUsageSkipsSecondaryScanAndResumesOnPromotion(t *testing.T) {
+	manager, released, _, memoryMock := newLRUUsageManager(t, 2, replicateutil.RoleSecondary, replicateutil.RolePrimary)
+	setActivityTime(manager, 100, time.Now().Add(-2*time.Hour))
+	broker := meta.NewMockBroker(t)
+	manager.s.broker = broker
+
+	scanAndWait(t, manager)
+	require.Zero(t, memoryMock.Times())
+	require.Empty(t, released)
+
+	// Collection 100 has expired. Collection 101 qualifies only under memory pressure.
+	broker.EXPECT().GetCollectionProperties(mock.Anything, mock.Anything).Return(nil, nil).Times(4)
+	scanAndWait(t, manager)
+	require.Equal(t, 1, memoryMock.Times())
+	require.Len(t, released, 2)
+	require.ElementsMatch(t, []int64{100, 101}, []int64{<-released, <-released})
+}
+
+func TestCollectionUsageSkipsScanWhenRoleUnavailable(t *testing.T) {
+	getBalancer := mockey.Mock(walbalance.GetWithContext).Return(nil, context.DeadlineExceeded).Build()
+	defer getBalancer.UnPatch()
+	manager := &collectionUsageManager{enabled: true}
+	scanAndWait(t, manager)
+	require.Equal(t, 1, getBalancer.Times())
 }
 
 func TestCollectionUsageRefreshesOnEveryDQLAttempt(t *testing.T) {
 	enableAutoReleaseForTest(t)
-	s, manager, _, releaseCount := newUsageTestManager(t)
+	s, manager, releaseMock := newUsageTestManager(t)
 	scanAndWait(t, manager)
 	_, exists := activityTime(manager, 100)
 	require.True(t, exists)
@@ -135,17 +228,17 @@ func TestCollectionUsageRefreshesOnEveryDQLAttempt(t *testing.T) {
 		lastActiveAt, _ := activityTime(manager, 100)
 		require.False(t, lastActiveAt.Before(before))
 		scanAndWait(t, manager)
-		require.Zero(t, *releaseCount)
+		require.Zero(t, releaseMock.Times())
 	}
 
-	// There is no end notification. A query which is still running after TTL
+	// There is no end notification. A query which is still running after TTI
 	// does not prevent release and must use the existing DQL retry path.
 	setActivityTime(manager, 100, time.Now().Add(-9*time.Second))
 	scanAndWait(t, manager)
-	require.Zero(t, *releaseCount)
+	require.Zero(t, releaseMock.Times())
 	setActivityTime(manager, 100, time.Now().Add(-10*time.Second))
 	scanAndWait(t, manager)
-	require.Equal(t, 1, *releaseCount)
+	require.Equal(t, 1, releaseMock.Times())
 }
 
 func TestCollectionUsageHotEnableAndScanInterval(t *testing.T) {
@@ -161,11 +254,11 @@ func TestCollectionUsageHotEnableAndScanInterval(t *testing.T) {
 	autoLoadKey := params.ProxyCfg.EnableAutoLoad.Key
 	autoLoadWatchers := len(dispatcher.Get(autoLoadKey))
 	intervalWatchers := len(dispatcher.Get(intervalKey))
-	_, manager, _, _ := newUsageTestManager(t)
+	_, manager, _ := newUsageTestManager(t)
+	manager.start(context.Background())
 	scanAndWait(t, manager)
 	_, exists := activityTime(manager, 100)
 	require.False(t, exists, "startup disabled must not initialize activity")
-	manager.start(context.Background())
 
 	// Save follows the same cache-invalidation and event-dispatch order as
 	// the file and etcd sources. Warm the cache before changing each value.
@@ -191,7 +284,7 @@ func TestCollectionUsageHotEnableAndScanInterval(t *testing.T) {
 	require.Len(t, dispatcher.Get(intervalKey), intervalWatchers)
 }
 
-func TestCollectionUsageFeatureGatesClearActivityAndRestartTTL(t *testing.T) {
+func TestCollectionUsageFeatureGatesClearActivityAndRestartTTI(t *testing.T) {
 	params := paramtable.Get()
 	for _, gate := range []struct {
 		name string
@@ -203,7 +296,7 @@ func TestCollectionUsageFeatureGatesClearActivityAndRestartTTL(t *testing.T) {
 		t.Run(gate.name, func(t *testing.T) {
 			enableAutoReleaseForTest(t)
 			require.NoError(t, params.Save(gate.key, "false"))
-			s, manager, _, releaseCount := newUsageTestManager(t)
+			s, manager, releaseMock := newUsageTestManager(t)
 			scanAndWait(t, manager)
 			_, exists := activityTime(manager, 100)
 			require.False(t, exists)
@@ -222,39 +315,39 @@ func TestCollectionUsageFeatureGatesClearActivityAndRestartTTL(t *testing.T) {
 			_, exists = activityTime(manager, 100)
 			require.False(t, exists, "disabled DQL must not recreate activity")
 			scanAndWait(t, manager)
-			require.Zero(t, *releaseCount)
+			require.Zero(t, releaseMock.Times())
 
 			require.NoError(t, params.Save(gate.key, "true"))
 			scanAndWait(t, manager)
 			lastActiveAt, exists := activityTime(manager, 100)
 			require.True(t, exists)
 			require.WithinDuration(t, time.Now(), lastActiveAt, time.Second)
-			require.Zero(t, *releaseCount)
+			require.Zero(t, releaseMock.Times())
 		})
 	}
 }
 
-func TestCollectionUsageHotTTLAppliesToScan(t *testing.T) {
+func TestCollectionUsageHotTTIAppliesToScan(t *testing.T) {
 	enableAutoReleaseForTest(t)
-	_, manager, _, releaseCount := newUsageTestManager(t)
+	_, manager, releaseMock := newUsageTestManager(t)
 	scanAndWait(t, manager)
 	initial := time.Now().Add(-11 * time.Second)
 	setActivityTime(manager, 100, initial)
 	params := paramtable.Get()
-	key := params.QueryCoordCfg.AutoReleaseIdleTTLSeconds.Key
+	key := params.QueryCoordCfg.AutoReleaseTTISeconds.Key
 	require.NoError(t, params.Save(key, "20"))
 	scanAndWait(t, manager)
-	require.Zero(t, *releaseCount, "extending TTL must postpone release")
+	require.Zero(t, releaseMock.Times(), "extending TTI must postpone release")
 	require.NoError(t, params.Save(key, "5"))
 	scanAndWait(t, manager)
-	require.Equal(t, 1, *releaseCount, "shortening TTL must use the existing timestamp")
+	require.Equal(t, 1, releaseMock.Times(), "shortening TTI must use the existing timestamp")
 	lastActiveAt, _ := activityTime(manager, 100)
-	require.Equal(t, initial, lastActiveAt, "changing TTL must not reset activity")
+	require.Equal(t, initial, lastActiveAt, "changing TTI must not reset activity")
 }
 
-func TestCollectionUsageUsesDifferentCollectionTTLs(t *testing.T) {
+func TestCollectionUsageUsesDifferentCollectionTTIs(t *testing.T) {
 	enableAutoReleaseForTest(t)
-	s, manager, _, _ := newUsageTestManager(t)
+	s, manager, releaseMock := newUsageTestManager(t)
 	for _, id := range []int64{200, 300, 400} {
 		cfg := s.qviewsRuntime.loadConfigStore.Get(100).Config.Clone()
 		cfg.CollectionID = id
@@ -265,34 +358,34 @@ func TestCollectionUsageUsesDifferentCollectionTTLs(t *testing.T) {
 	broker.EXPECT().GetCollectionProperties(mock.Anything, mock.Anything).RunAndReturn(func(_ context.Context, id int64) ([]*commonpb.KeyValuePair, error) {
 		values := map[int64]string{100: "20", 200: "5", 300: "-1"}
 		if value, ok := values[id]; ok {
-			return []*commonpb.KeyValuePair{{Key: common.CollectionAutoReleaseIdleTTLKey, Value: value}}, nil
+			return []*commonpb.KeyValuePair{{Key: common.CollectionAutoReleaseTTIKey, Value: value}}, nil
 		}
 		return nil, nil
 	})
-	manager.broker = broker
+	manager.s.broker = broker
 	scanAndWait(t, manager)
 	for _, id := range []int64{100, 200, 300, 400} {
 		setActivityTime(manager, id, time.Now().Add(-11*time.Second))
 	}
 	released := make(chan int64, 4)
-	manager.release = func(_ context.Context, id int64) error {
+	releaseMock.To(func(_ *collectionUsageManager, _ context.Context, id int64, _ collectionReleaseReason) error {
 		released <- id
 		return nil
-	}
+	})
 	scanAndWait(t, manager)
 	require.Len(t, released, 2)
 	require.ElementsMatch(t, []int64{200, 400}, []int64{<-released, <-released})
 }
 
-func TestCollectionUsageDynamicCollectionTTL(t *testing.T) {
+func TestCollectionUsageDynamicCollectionTTI(t *testing.T) {
 	enableAutoReleaseForTest(t)
-	s, manager, _, releaseCount := newUsageTestManager(t)
-	properties := []*commonpb.KeyValuePair{{Key: common.CollectionAutoReleaseIdleTTLKey, Value: "20"}}
+	s, manager, releaseMock := newUsageTestManager(t)
+	properties := []*commonpb.KeyValuePair{{Key: common.CollectionAutoReleaseTTIKey, Value: "20"}}
 	broker := meta.NewMockBroker(t)
 	broker.EXPECT().GetCollectionProperties(mock.Anything, int64(100)).RunAndReturn(func(context.Context, int64) ([]*commonpb.KeyValuePair, error) {
 		return properties, nil
 	})
-	manager.broker = broker
+	manager.s.broker = broker
 	scanAndWait(t, manager)
 	initial := time.Now().Add(-6 * time.Second)
 	setActivityTime(manager, 100, initial)
@@ -301,50 +394,50 @@ func TestCollectionUsageDynamicCollectionTTL(t *testing.T) {
 		if value == "" {
 			properties = nil
 		} else {
-			properties = []*commonpb.KeyValuePair{{Key: common.CollectionAutoReleaseIdleTTLKey, Value: value}}
+			properties = []*commonpb.KeyValuePair{{Key: common.CollectionAutoReleaseTTIKey, Value: value}}
 		}
-		before := *releaseCount
+		before := releaseMock.Times()
 		scanAndWait(t, manager)
 		if value == "5" {
-			require.Equal(t, before+1, *releaseCount)
+			require.Equal(t, before+1, releaseMock.Times())
 		} else {
-			require.Equal(t, before, *releaseCount)
+			require.Equal(t, before, releaseMock.Times())
 		}
 		lastActiveAt, _ := activityTime(manager, 100)
 		require.Equal(t, initial, lastActiveAt, "changing or deleting a property must not reset activity")
 		require.Equal(t, configVersion, s.qviewsRuntime.loadConfigStore.GetConfigVersion(100))
 	}
-	properties = []*commonpb.KeyValuePair{{Key: common.CollectionAutoReleaseIdleTTLKey, Value: "-1"}}
+	properties = []*commonpb.KeyValuePair{{Key: common.CollectionAutoReleaseTTIKey, Value: "-1"}}
 	manager.touch(100)
 	lastActiveAt, _ := activityTime(manager, 100)
 	require.True(t, lastActiveAt.After(initial), "DQL must still refresh activity while auto release is disabled for this collection")
-	properties = []*commonpb.KeyValuePair{{Key: common.CollectionAutoReleaseIdleTTLKey, Value: "5"}}
+	properties = []*commonpb.KeyValuePair{{Key: common.CollectionAutoReleaseTTIKey, Value: "5"}}
 	scanAndWait(t, manager)
-	require.Equal(t, 1, *releaseCount, "enabling auto release must respect the latest DQL activity")
+	require.Equal(t, 1, releaseMock.Times(), "enabling auto release must respect the latest DQL activity")
 }
 
-func TestCollectionUsageInvalidTTLFallsBackToGlobalTTL(t *testing.T) {
+func TestCollectionUsageInvalidTTIFallsBackToGlobalTTI(t *testing.T) {
 	for _, value := range []string{"invalid", "0"} {
 		t.Run(value, func(t *testing.T) {
 			enableAutoReleaseForTest(t)
-			_, manager, _, releaseCount := newUsageTestManager(t)
+			_, manager, releaseMock := newUsageTestManager(t)
 			scanAndWait(t, manager)
 			broker := meta.NewMockBroker(t)
 			broker.EXPECT().GetCollectionProperties(mock.Anything, int64(100)).Return(
-				[]*commonpb.KeyValuePair{{Key: common.CollectionAutoReleaseIdleTTLKey, Value: value}}, nil,
-			).Times(3) // two scans and the check before the release
-			manager.broker = broker
+				[]*commonpb.KeyValuePair{{Key: common.CollectionAutoReleaseTTIKey, Value: value}}, nil,
+			).Times(3) // two scans and a dispatch-time recheck
+			manager.s.broker = broker
 
 			setActivityTime(manager, 100, time.Now().Add(-5*time.Second))
 			scanAndWait(t, manager)
-			require.Zero(t, *releaseCount, "invalid TTL must respect the global idle TTL")
+			require.Zero(t, releaseMock.Times(), "invalid TTI must respect the global idle TTI")
 
 			initial := time.Now().Add(-11 * time.Second)
 			setActivityTime(manager, 100, initial)
 			scanAndWait(t, manager)
-			require.Equal(t, 1, *releaseCount, "invalid TTL must allow release after the global idle TTL")
+			require.Equal(t, 1, releaseMock.Times(), "invalid TTI must allow release after the global idle TTI")
 			lastActiveAt, _ := activityTime(manager, 100)
-			require.Equal(t, initial, lastActiveAt, "falling back to the global TTL must not reset activity")
+			require.Equal(t, initial, lastActiveAt, "falling back to the global TTI must not reset activity")
 		})
 	}
 }
@@ -360,15 +453,15 @@ func TestCollectionUsageSkipsUnavailableMetadata(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			enableAutoReleaseForTest(t)
-			_, manager, _, releaseCount := newUsageTestManager(t)
+			_, manager, releaseMock := newUsageTestManager(t)
 			scanAndWait(t, manager)
 			initial := time.Now().Add(-11 * time.Second)
 			setActivityTime(manager, 100, initial)
 			broker := meta.NewMockBroker(t)
 			broker.EXPECT().GetCollectionProperties(mock.Anything, int64(100)).Return(nil, tc.err).Once()
-			manager.broker = broker
+			manager.s.broker = broker
 			scanAndWait(t, manager)
-			require.Zero(t, *releaseCount, "a failed lookup must not fall back to the global TTL and release")
+			require.Zero(t, releaseMock.Times(), "a failed lookup must not fall back to the global TTI and release")
 			lastActiveAt, _ := activityTime(manager, 100)
 			require.Equal(t, initial, lastActiveAt)
 		})
@@ -377,17 +470,17 @@ func TestCollectionUsageSkipsUnavailableMetadata(t *testing.T) {
 
 func TestCollectionUsageReadsLoadedPropertiesOnEveryScan(t *testing.T) {
 	enableAutoReleaseForTest(t)
-	_, manager, _, releaseCount := newUsageTestManager(t)
+	_, manager, releaseMock := newUsageTestManager(t)
 	// Activity alone must not make an unloaded collection a scan target.
 	setActivityTime(manager, 200, time.Now().Add(-time.Hour))
 	broker := meta.NewMockBroker(t)
 	broker.EXPECT().GetCollectionProperties(mock.Anything, int64(100)).Return(
-		[]*commonpb.KeyValuePair{{Key: common.CollectionAutoReleaseIdleTTLKey, Value: "-1"}}, nil,
+		[]*commonpb.KeyValuePair{{Key: common.CollectionAutoReleaseTTIKey, Value: "-1"}}, nil,
 	).Twice()
-	manager.broker = broker
+	manager.s.broker = broker
 	scanAndWait(t, manager)
 	scanAndWait(t, manager)
-	require.Zero(t, *releaseCount)
+	require.Zero(t, releaseMock.Times())
 }
 
 func TestCollectionUsageEnsureRefreshesOnEntryAndReady(t *testing.T) {
@@ -467,9 +560,9 @@ func TestCollectionUsageInitializesFromRecoveredLoadConfig(t *testing.T) {
 	require.False(t, lastActiveAt.Before(before))
 }
 
-func TestCollectionUsageCleansReleasedCollectionAndRestartsTTL(t *testing.T) {
+func TestCollectionUsageCleansReleasedCollectionAndRestartsTTI(t *testing.T) {
 	enableAutoReleaseForTest(t)
-	s, manager, _, releaseCount := newUsageTestManager(t)
+	s, manager, releaseMock := newUsageTestManager(t)
 	scanAndWait(t, manager)
 	config := s.qviewsRuntime.loadConfigStore.Get(100).Config.Clone()
 	setActivityTime(manager, 100, time.Now().Add(-20*time.Second))
@@ -489,14 +582,351 @@ func TestCollectionUsageCleansReleasedCollectionAndRestartsTTL(t *testing.T) {
 	lastActiveAt, exists := activityTime(manager, 100)
 	require.True(t, exists)
 	require.False(t, lastActiveAt.Before(before))
-	require.Zero(t, *releaseCount)
+	require.Zero(t, releaseMock.Times())
+}
+
+func TestCollectionUsageLRUDefaultBatchSelectsOldest64(t *testing.T) {
+	manager, released, _, _ := newLRUUsageManager(t, 70)
+	scanAndWait(t, manager)
+	require.Len(t, released, 64)
+	for id := int64(100); id < 164; id++ {
+		require.False(t, manager.s.qviewsRuntime.loadConfigStore.Contains(id))
+	}
+	for id := int64(164); id < 170; id++ {
+		require.True(t, manager.s.qviewsRuntime.loadConfigStore.Contains(id))
+	}
+}
+
+func TestCollectionUsageLRUSkipsLoadingCollections(t *testing.T) {
+	manager, released, _, _ := newLRUUsageManager(t, 3)
+	store := manager.s.qviewsRuntime.loadConfigStore
+	cfg := store.Get(101).Config.Clone()
+	cfg.AutoLoad = true
+	require.NoError(t, store.Put(t.Context(), cfg))
+	// Two collections still need a shard to finish loading. One was loaded
+	// explicitly and the other was loaded by a query.
+	manager.s.meta = newViewMeta(
+		&metacache.CollectionInfo{ID: 100, VChannelNames: []string{usageTestVChannel, "by-dev-rootcoord-dml_100v1"}},
+		&metacache.CollectionInfo{ID: 101, VChannelNames: []string{"by-dev-rootcoord-dml_101v0", "by-dev-rootcoord-dml_101v1"}},
+		&metacache.CollectionInfo{ID: 102, VChannelNames: []string{"by-dev-rootcoord-dml_102v0"}},
+	)
+	setActivityTime(manager, 100, time.Now().Add(-time.Minute))
+	setActivityTime(manager, 101, time.Now().Add(-time.Minute))
+
+	scanAndWait(t, manager)
+
+	require.Len(t, released, 1)
+	require.EqualValues(t, 102, <-released)
+	require.True(t, store.Contains(100))
+	require.True(t, store.Contains(101))
+}
+
+func TestCollectionUsageLRUHysteresisAndDynamicParameters(t *testing.T) {
+	manager, released, _, memoryMock := newLRUUsageManager(t, 8)
+	params := &paramtable.Get().QueryCoordCfg
+	setUsageParameter(t, &params.AutoReleaseLRUMaxEvictions, "2")
+	usage := uint64(84)
+	memoryMock.To(func(*collectionUsageManager, context.Context) map[string]collectionMemoryUsage {
+		return map[string]collectionMemoryUsage{"pool": {used: usage, total: 100}}
+	})
+	scanAndWait(t, manager)
+	require.Empty(t, released)
+	usage = 85
+	scanAndWait(t, manager)
+	require.Len(t, released, 2)
+	usage = 84
+	scanAndWait(t, manager)
+	require.Len(t, released, 4, "pressure persists below high until low is reached")
+	usage = 80
+	scanAndWait(t, manager)
+	usage = 84
+	scanAndWait(t, manager)
+	require.Len(t, released, 4, "pressure does not restart below high")
+	setUsageParameter(t, &params.AutoReleaseLRUHighWatermark, "84")
+	scanAndWait(t, manager)
+	require.Len(t, released, 6, "lowering high applies to the next scan")
+	setUsageParameter(t, &params.AutoReleaseLRUHighWatermark, "95")
+	setUsageParameter(t, &params.AutoReleaseLRULowWatermark, "87")
+	scanAndWait(t, manager)
+	require.Len(t, released, 6, "raising low ends existing pressure")
+	setUsageParameter(t, &params.AutoReleaseLRUMaxEvictions, "1")
+	usage = 95
+	scanAndWait(t, manager)
+	require.Len(t, released, 7, "a new batch limit applies without restarting")
+}
+
+func TestCollectionUsageTTIDoesNotConsumeLRUQuota(t *testing.T) {
+	manager, released, _, _ := newLRUUsageManager(t, 3)
+	setUsageParameter(t, &paramtable.Get().QueryCoordCfg.AutoReleaseLRUMaxEvictions, "1")
+	setActivityTime(manager, 102, time.Now().Add(-2*time.Hour))
+
+	scanAndWait(t, manager)
+	require.Len(t, released, 2)
+	require.ElementsMatch(t, []int64{102, 100}, []int64{<-released, <-released}, "expired TTI plus the oldest LRU candidate")
+	require.True(t, manager.s.qviewsRuntime.loadConfigStore.Contains(101))
+}
+
+func TestCollectionUsageQueuedLRURevalidatesBeforeRelease(t *testing.T) {
+	for _, change := range []string{"queried", "exempted", "load withdrawn", "pressure ended", "missing sample", "still eligible"} {
+		t.Run(change, func(t *testing.T) {
+			manager, released, releaseMock, memoryMock := newLRUUsageManager(t, 2)
+			setUsageParameter(t, &paramtable.Get().QueryCoordCfg.AutoReleaseConcurrency, "1")
+			setActivityTime(manager, 100, time.Now().Add(-2*time.Hour))
+
+			var exempted atomic.Bool
+			broker := meta.NewMockBroker(t)
+			broker.EXPECT().GetCollectionProperties(mock.Anything, mock.Anything).RunAndReturn(func(_ context.Context, id int64) ([]*commonpb.KeyValuePair, error) {
+				if id == 101 && exempted.Load() {
+					return []*commonpb.KeyValuePair{{Key: common.CollectionAutoReleaseTTIKey, Value: "-1"}}, nil
+				}
+				return nil, nil
+			}).Maybe()
+			manager.s.broker = broker
+
+			first := make(chan struct{})
+			var once sync.Once
+			unblock := func() { once.Do(func() { close(first) }) }
+			t.Cleanup(unblock)
+			releaseMock.To(func(_ *collectionUsageManager, _ context.Context, id int64, _ collectionReleaseReason) error {
+				if id == 100 {
+					<-first
+				}
+				released <- id
+				return nil
+			})
+
+			manager.scan(t.Context())
+			require.Empty(t, released)
+			switch change {
+			case "queried":
+				manager.touch(101)
+			case "exempted":
+				exempted.Store(true)
+			case "load withdrawn":
+				manager.s.qviewsRuntime.loadConfigStore.StopPlanning(101)
+			case "pressure ended":
+				memoryMock.Return(map[string]collectionMemoryUsage{"pool": {used: 80, total: 100}})
+				manager.scan(t.Context())
+			case "missing sample":
+				memoryMock.Return(map[string]collectionMemoryUsage{})
+				manager.scan(t.Context())
+			}
+			unblock()
+			waitReleasesDone(t, manager)
+			require.NotEmpty(t, released)
+			require.EqualValues(t, 100, <-released)
+			if change == "still eligible" {
+				require.Len(t, released, 1)
+				require.EqualValues(t, 101, <-released)
+			}
+			require.Empty(t, released)
+		})
+	}
+}
+
+func TestCollectionUsageLRUExemptionsAndPoolIsolation(t *testing.T) {
+	manager, released, _, memoryMock := newLRUUsageManager(t, 4)
+	broker := meta.NewMockBroker(t)
+	broker.EXPECT().GetCollectionProperties(mock.Anything, mock.Anything).RunAndReturn(func(_ context.Context, id int64) ([]*commonpb.KeyValuePair, error) {
+		if id == 100 {
+			return []*commonpb.KeyValuePair{{Key: common.CollectionAutoReleaseTTIKey, Value: "-1"}}, nil
+		}
+		return nil, nil
+	}).Maybe()
+	manager.s.broker = broker
+	cfg := manager.s.qviewsRuntime.loadConfigStore.Get(101).Config.Clone()
+	cfg.Replicas[0].ResourceGroup = "other"
+	require.NoError(t, manager.s.qviewsRuntime.loadConfigStore.Put(context.Background(), cfg))
+	memoryMock.To(func(*collectionUsageManager, context.Context) map[string]collectionMemoryUsage {
+		return map[string]collectionMemoryUsage{"pool": {used: 90, total: 100}, "other": {used: 50, total: 100}}
+	})
+	scanAndWait(t, manager)
+	require.Len(t, released, 2)
+	require.ElementsMatch(t, []int64{102, 103}, []int64{<-released, <-released})
+	require.True(t, manager.s.qviewsRuntime.loadConfigStore.Contains(100))
+	require.True(t, manager.s.qviewsRuntime.loadConfigStore.Contains(101))
+}
+
+func TestCollectionUsageLRUMissingMetricsAndInvalidWatermarksPreserveTTI(t *testing.T) {
+	for _, missing := range []bool{true, false} {
+		t.Run(map[bool]string{true: "missing metrics", false: "invalid watermark pair"}[missing], func(t *testing.T) {
+			manager, released, _, memoryMock := newLRUUsageManager(t, 3)
+			if missing {
+				memoryMock.To(func(*collectionUsageManager, context.Context) map[string]collectionMemoryUsage { return nil })
+			} else {
+				setUsageParameter(t, &paramtable.Get().QueryCoordCfg.AutoReleaseLRULowWatermark, "95")
+			}
+			setActivityTime(manager, 102, time.Now().Add(-2*time.Hour))
+			scanAndWait(t, manager)
+			require.Len(t, released, 1)
+			require.EqualValues(t, 102, <-released)
+		})
+	}
+}
+
+func TestCollectionUsageReleaseLogs(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		used   uint64
+		idle   time.Duration
+		reason string
+	}{
+		{"TTI expired", 50, 2 * time.Hour, "tti"},
+		{"TTI expired under pressure", 90, 2 * time.Hour, "tti"},
+		{"LRU under pressure", 90, time.Minute, "memory_pressure"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			manager, _, releaseMock, memoryMock := newLRUUsageManager(t, 1)
+			releaseMock.UnPatch()
+			manager.s.meta = newViewMeta(&metacache.CollectionInfo{
+				ID: 100, DatabaseName: "tenant_db", Schema: &schemapb.CollectionSchema{DbName: "tenant_db", Name: "embeddings"},
+				VChannelNames: []string{usageTestVChannel},
+			})
+			broadcaster := mock_broadcaster.NewMockBroadcastAPI(t)
+			broadcaster.EXPECT().Broadcast(mock.Anything, mock.Anything).Return(nil, merr.ErrServiceUnavailable).Once()
+			broadcaster.EXPECT().Broadcast(mock.Anything, mock.Anything).Return(nil, nil).Once()
+			broadcaster.EXPECT().Close().Twice()
+			lock := mockey.Mock((*Server).startBroadcastWithCollectionIDLock).Return(broadcaster, nil).Build()
+			defer lock.UnPatch()
+			memoryMock.Return(map[string]collectionMemoryUsage{"pool": {used: tc.used, total: 100}})
+			setActivityTime(manager, 100, time.Now().Add(-tc.idle))
+			logs := mlog.CaptureGlobalLogs(t, &mlog.Config{Level: "info"})
+			scanAndWait(t, manager)
+			failed := logs.String()
+			require.Contains(t, failed, "releaseReason="+tc.reason)
+			require.NotContains(t, failed, "event=collection_auto_released")
+
+			scanAndWait(t, manager)
+			success := strings.TrimPrefix(logs.String(), failed)
+			require.Contains(t, success, "event=collection_auto_released")
+			require.Contains(t, success, "collectionID=100")
+			require.Contains(t, success, "dbName=tenant_db")
+			require.Contains(t, success, "collectionName=embeddings")
+			require.Contains(t, success, "releaseReason="+tc.reason)
+		})
+	}
+}
+
+func TestCollectionUsageLRUFailedReleaseCanBeSelectedAgain(t *testing.T) {
+	manager, _, releaseMock, _ := newLRUUsageManager(t, 1)
+	var calls atomic.Int32
+	releaseMock.To(func(_ *collectionUsageManager, _ context.Context, id int64, _ collectionReleaseReason) error {
+		if calls.Add(1) == 1 {
+			return merr.ErrServiceUnavailable
+		}
+		manager.s.qviewsRuntime.loadConfigStore.StopPlanning(id)
+		return nil
+	})
+	scanAndWait(t, manager)
+	require.True(t, manager.s.qviewsRuntime.loadConfigStore.Contains(100))
+	scanAndWait(t, manager)
+	require.False(t, manager.s.qviewsRuntime.loadConfigStore.Contains(100))
+	require.EqualValues(t, 2, calls.Load())
+}
+
+func TestAutoReleaseMemoryUsageUsesRawWeightedWorkerMemory(t *testing.T) {
+	req, err := metricsinfo.ConstructRequestByMetricType(metricsinfo.NodeMemoryMetrics)
+	require.NoError(t, err)
+	for _, failure := range []string{"", "rpc", "unsupported metric", "malformed", "missing capacity", "missing usage"} {
+		t.Run("reading/"+failure, func(t *testing.T) {
+			cluster := session.NewMockCluster(t)
+			nodes := session.NewNodeManager()
+			catalog := metastoremocks.NewQueryCoordCatalog(t)
+			catalog.EXPECT().SaveResourceGroup(mock.Anything, mock.Anything).Return(nil).Maybe()
+			manager := meta.NewMeta(nil, catalog, nodes, metacache.NewMetaStore(nil))
+			const healthyRG = "healthy"
+			for id := int64(1); id <= 7; id++ {
+				labels := map[string]string{}
+				switch id {
+				case 4:
+					labels[sessionutil.LabelStreamingNodeEmbeddedQueryNode] = "1"
+				case 6:
+					labels[sessionutil.LegacyLabelStreamingNodeEmbeddedQueryNode] = "1"
+				case 7:
+					labels[sessionutil.LabelResourceGroup] = healthyRG
+				}
+				nodes.Add(session.NewNodeInfo(session.ImmutableNodeInfo{NodeID: id, Labels: labels}))
+				if id != 5 { // Node 5 is suspended outside any resource group.
+					manager.HandleNodeUp(context.Background(), id)
+				}
+			}
+			nodes.Stopping(3)
+			for _, id := range []int64{1, 2, 7} {
+				used, total := uint64(90), uint64(100)
+				if id == 2 {
+					used, total = 450, 900
+				}
+				if id == 7 {
+					used, total = 30, 200
+				}
+				if id == 2 && failure == "rpc" {
+					cluster.EXPECT().GetMetrics(mock.Anything, id, req).Return(nil, merr.ErrServiceUnavailable).Once()
+					continue
+				}
+				if id == 2 && failure == "unsupported metric" {
+					cluster.EXPECT().GetMetrics(mock.Anything, id, req).Return(&milvuspb.GetMetricsResponse{Status: merr.Status(merr.ErrParameterInvalid)}, nil).Once()
+					continue
+				}
+				if id == 2 && failure == "missing capacity" {
+					total = 0
+				}
+				if id == 2 && failure == "missing usage" {
+					used = 0
+				}
+				payload, err := metricsinfo.MarshalComponentInfos(metricsinfo.NodeMemory{Memory: total, MemoryUsage: used})
+				require.NoError(t, err)
+				if id == 2 && failure == "malformed" {
+					payload = "not-json"
+				}
+				cluster.EXPECT().GetMetrics(mock.Anything, id, req).Return(&milvuspb.GetMetricsResponse{Status: merr.Success(), Response: payload}, nil).Once()
+			}
+			s := &Server{nodeMgr: nodes, meta: manager, cluster: cluster}
+			usage := (&collectionUsageManager{s: s}).collectMemoryUsageByRG(context.Background())
+			want := map[string]collectionMemoryUsage{healthyRG: {used: 30, total: 200}}
+			if failure == "" {
+				want[meta.DefaultResourceGroupName] = collectionMemoryUsage{used: 540, total: 1000}
+			}
+			require.Equal(t, want, usage)
+		})
+	}
+}
+
+func TestAutoReleaseMemoryUsageQueuedNodeGetsFullTimeout(t *testing.T) {
+	const nodeCount = maxConcurrentQueryNodeMetrics + 1
+	nodes := session.NewNodeManager()
+	catalog := metastoremocks.NewQueryCoordCatalog(t)
+	catalog.EXPECT().SaveResourceGroup(mock.Anything, mock.Anything).Return(nil).Maybe()
+	manager := meta.NewMeta(nil, catalog, nodes, metacache.NewMetaStore(nil))
+	for id := int64(1); id <= nodeCount; id++ {
+		nodes.Add(session.NewNodeInfo(session.ImmutableNodeInfo{NodeID: id}))
+		manager.HandleNodeUp(context.Background(), id)
+	}
+	cluster := session.NewMockCluster(t)
+	payload, err := metricsinfo.MarshalComponentInfos(metricsinfo.NodeMemory{Memory: 100, MemoryUsage: 90})
+	require.NoError(t, err)
+	resp := &milvuspb.GetMetricsResponse{Status: merr.Success(), Response: payload}
+	// Each RPC fits its own timeout, but the queued node finishes after the first batch's deadline.
+	cluster.EXPECT().GetMetrics(mock.Anything, mock.Anything, mock.Anything).RunAndReturn(
+		func(ctx context.Context, _ int64, _ *milvuspb.GetMetricsRequest) (*milvuspb.GetMetricsResponse, error) {
+			select {
+			case <-time.After(3 * queryNodeMetricsTimeout / 4):
+				return resp, nil
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		}).Times(nodeCount)
+
+	s := &Server{nodeMgr: nodes, meta: manager, cluster: cluster}
+	synctest.Test(t, func(t *testing.T) {
+		usage := (&collectionUsageManager{s: s}).collectMemoryUsageByRG(t.Context())
+		require.Equal(t, collectionMemoryUsage{used: 90 * nodeCount, total: 100 * nodeCount}, usage[meta.DefaultResourceGroupName])
+	})
 }
 
 func TestCollectionUsageReleaseConcurrency(t *testing.T) {
 	enableAutoReleaseForTest(t)
-	_, manager, _, _ := newUsageTestManager(t)
-	useGlobalTTLForTest(t, manager)
-	setReleaseConcurrencyForTest(t, "2")
+	_, manager, releaseMock := newUsageTestManager(t)
+	setUsageParameter(t, &paramtable.Get().QueryCoordCfg.AutoReleaseConcurrency, "2")
 
 	const collections = 5
 	// Room for duplicate releases, so a regression fails instead of blocking.
@@ -508,7 +938,7 @@ func TestCollectionUsageReleaseConcurrency(t *testing.T) {
 	var active atomic.Int32
 	var maxActive atomic.Int32
 	var calls atomic.Int32
-	manager.release = func(context.Context, int64) error {
+	releaseMock.To(func(*collectionUsageManager, context.Context, int64, collectionReleaseReason) error {
 		calls.Add(1)
 		running := active.Add(1)
 		for current := maxActive.Load(); running > current; current = maxActive.Load() {
@@ -520,9 +950,9 @@ func TestCollectionUsageReleaseConcurrency(t *testing.T) {
 		<-unblock
 		active.Add(-1)
 		return nil
-	}
+	})
 
-	queueIdleReleases(manager, 1, 2, 3, 4, 5)
+	queueIdleReleases(t.Context(), manager, 1, 2, 3, 4, 5)
 	for i := 0; i < 2; i++ {
 		select {
 		case <-started:
@@ -535,78 +965,145 @@ func TestCollectionUsageReleaseConcurrency(t *testing.T) {
 		t.Fatal("release exceeded configured concurrency")
 	case <-time.After(100 * time.Millisecond):
 	}
-	// A scan while every slot is busy queues nothing twice.
-	queueIdleReleases(manager, 1, 2, 3, 4, 5)
 
+	queueIdleReleases(t.Context(), manager, 1, 2, 3, 4, 5)
 	releaseAll()
 	waitReleasesDone(t, manager)
+
 	require.EqualValues(t, collections, calls.Load())
 	require.EqualValues(t, 2, maxActive.Load())
 }
 
 func TestCollectionUsageSlowReleaseHoldsOnlyItsSlot(t *testing.T) {
 	enableAutoReleaseForTest(t)
-	_, manager, _, _ := newUsageTestManager(t)
-	useGlobalTTLForTest(t, manager)
-	setReleaseConcurrencyForTest(t, "2")
-
+	_, manager, releaseMock := newUsageTestManager(t)
+	setUsageParameter(t, &paramtable.Get().QueryCoordCfg.AutoReleaseConcurrency, "2")
 	stuck := make(chan struct{})
-	t.Cleanup(func() { close(stuck) })
+	var once sync.Once
+	unblock := func() { once.Do(func() { close(stuck) }) }
+	t.Cleanup(unblock)
 	var released atomic.Int32
-	manager.release = func(_ context.Context, collectionID int64) error {
+	releaseMock.To(func(_ *collectionUsageManager, _ context.Context, collectionID int64, _ collectionReleaseReason) error {
 		if collectionID == 1 {
 			<-stuck
 		}
 		released.Add(1)
 		return nil
-	}
-	queueIdleReleases(manager, 1)
-	// Collections found by a later scan release through the remaining slot.
-	queueIdleReleases(manager, 2, 3)
+	})
+	queueIdleReleases(t.Context(), manager, 1)
+	queueIdleReleases(t.Context(), manager, 2, 3)
 	require.Eventually(t, func() bool { return released.Load() == 2 }, time.Second, time.Millisecond)
+	unblock()
+	waitReleasesDone(t, manager)
+	require.EqualValues(t, 3, released.Load())
 }
 
-func TestCollectionUsageQueuedReleaseChecksIdlenessAgain(t *testing.T) {
-	for name, change := range map[string]func(*collectionUsageManager, *atomic.Bool){
-		"queried while queued":      func(m *collectionUsageManager, _ *atomic.Bool) { m.touch(2) },
-		"TTL disabled while queued": func(_ *collectionUsageManager, disabled *atomic.Bool) { disabled.Store(true) },
-	} {
-		t.Run(name, func(t *testing.T) {
+func TestCollectionUsageQueuedTTIRevalidatesBeforeRelease(t *testing.T) {
+	for _, change := range []string{"queried", "exempted"} {
+		t.Run(change, func(t *testing.T) {
 			enableAutoReleaseForTest(t)
-			_, manager, _, _ := newUsageTestManager(t)
-			setReleaseConcurrencyForTest(t, "1")
-			var disabled atomic.Bool
+			_, manager, releaseMock := newUsageTestManager(t)
+			setUsageParameter(t, &paramtable.Get().QueryCoordCfg.AutoReleaseConcurrency, "1")
+			var exempted atomic.Bool
 			broker := meta.NewMockBroker(t)
-			broker.EXPECT().GetCollectionProperties(mock.Anything, mock.Anything).RunAndReturn(func(_ context.Context, collectionID int64) ([]*commonpb.KeyValuePair, error) {
-				if collectionID == 2 && disabled.Load() {
-					return []*commonpb.KeyValuePair{{Key: common.CollectionAutoReleaseIdleTTLKey, Value: "-1"}}, nil
+			broker.EXPECT().GetCollectionProperties(mock.Anything, mock.Anything).RunAndReturn(func(_ context.Context, id int64) ([]*commonpb.KeyValuePair, error) {
+				if id == 2 && exempted.Load() {
+					return []*commonpb.KeyValuePair{{Key: common.CollectionAutoReleaseTTIKey, Value: "-1"}}, nil
 				}
 				return nil, nil
 			}).Maybe()
-			manager.broker = broker
-
+			manager.s.broker = broker
 			first := make(chan struct{})
+			var once sync.Once
+			unblock := func() { once.Do(func() { close(first) }) }
+			t.Cleanup(unblock)
 			released := make(chan int64, 2)
-			manager.release = func(_ context.Context, collectionID int64) error {
-				if collectionID == 1 {
+			releaseMock.To(func(_ *collectionUsageManager, _ context.Context, id int64, _ collectionReleaseReason) error {
+				if id == 1 {
 					<-first
 				}
-				released <- collectionID
+				released <- id
 				return nil
+			})
+			queueIdleReleases(t.Context(), manager, 1, 2)
+			if change == "queried" {
+				manager.touch(2)
+			} else {
+				exempted.Store(true)
 			}
-			queueIdleReleases(manager, 1, 2)
-			change(manager, &disabled)
-			close(first)
+			unblock()
 			waitReleasesDone(t, manager)
-			require.Len(t, released, 1, "collection 2 stays loaded")
+			require.Len(t, released, 1)
 			require.EqualValues(t, 1, <-released)
 		})
 	}
 }
 
+func TestCollectionUsageReleaseConcurrencyUpdatesOnDispatch(t *testing.T) {
+	enableAutoReleaseForTest(t)
+	params := &paramtable.Get().QueryCoordCfg
+	setUsageParameter(t, &params.AutoReleaseConcurrency, "1")
+	_, manager, releaseMock := newUsageTestManager(t)
+	first := make(chan struct{})
+	rest := make(chan struct{})
+	var firstOnce, restOnce sync.Once
+	unblockFirst := func() { firstOnce.Do(func() { close(first) }) }
+	unblockRest := func() { restOnce.Do(func() { close(rest) }) }
+	t.Cleanup(unblockFirst)
+	t.Cleanup(unblockRest)
+	started := make(chan int64, 3)
+	releaseMock.To(func(_ *collectionUsageManager, _ context.Context, id int64, _ collectionReleaseReason) error {
+		started <- id
+		if id == 1 {
+			<-first
+		} else {
+			<-rest
+		}
+		return nil
+	})
+	queueIdleReleases(t.Context(), manager, 1, 2, 3)
+	require.Eventually(t, func() bool { return len(started) == 1 }, time.Second, time.Millisecond)
+	require.EqualValues(t, 1, <-started)
+	require.NoError(t, paramtable.Get().Save(params.AutoReleaseConcurrency.Key, "2"))
+	unblockFirst()
+	require.Eventually(t, func() bool { return len(started) == 2 }, time.Second, time.Millisecond)
+	require.ElementsMatch(t, []int64{2, 3}, []int64{<-started, <-started})
+	unblockRest()
+	waitReleasesDone(t, manager)
+}
+
+func TestCollectionUsageCloseCancelsReleasesAndUnblocksScan(t *testing.T) {
+	setUsageParameter(t, &paramtable.Get().QueryCoordCfg.AutoReleaseConcurrency, "1")
+	manager, _, releaseMock, _ := newLRUUsageManager(t, 5)
+	started := make(chan int64, 5)
+	releaseMock.To(func(_ *collectionUsageManager, ctx context.Context, id int64, _ collectionReleaseReason) error {
+		started <- id
+		<-ctx.Done()
+		return ctx.Err()
+	})
+	setUsageParameter(t, &paramtable.Get().QueryCoordCfg.AutoReleaseCheckInterval, "1")
+	manager.start(context.Background())
+	select {
+	case <-started:
+	case <-time.After(3 * time.Second):
+		t.Fatal("release task did not start")
+	}
+	closed := make(chan struct{})
+	go func() {
+		manager.close()
+		close(closed)
+	}()
+	select {
+	case <-closed:
+	case <-time.After(time.Second):
+		t.Fatal("shutdown did not drain the active release")
+	}
+	require.Empty(t, started, "pending collections must not start releasing during shutdown")
+}
+
 func TestCollectionUsageConcurrentTouchAndScan(t *testing.T) {
 	enableAutoReleaseForTest(t)
-	_, manager, _, _ := newUsageTestManager(t)
+	_, manager, _ := newUsageTestManager(t)
 	manager.scan(context.Background())
 	var wg sync.WaitGroup
 	for i := 0; i < 8; i++ {

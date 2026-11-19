@@ -417,11 +417,7 @@ func (s *Server) initQViewsRuntime(queryViewCatalog queryview.QueryViewCatalog) 
 	}
 	s.qviewsRuntime = runtime
 	qvresource.Init(runtime.resources)
-	s.collectionUsage = newCollectionUsageManager(
-		runtime.loadConfigStore,
-		s.broker,
-		s.autoReleaseCollection,
-	)
+	s.collectionUsage = newCollectionUsageManager(s)
 	return nil
 }
 

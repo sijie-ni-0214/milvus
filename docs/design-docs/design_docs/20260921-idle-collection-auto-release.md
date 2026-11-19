@@ -2,18 +2,18 @@
 
 ## Goal and assumptions
 
-In streaming mode, QueryCoord releases collections that have received no DQL attempts for an idle TTL. Subsequent queries use the existing Load on Search path to reload them.
+In streaming mode, QueryCoord releases collections after their time to idle (TTI) or when Worker QueryNode memory pressure calls for evicting the least recently accessed collections. Subsequent queries use the existing Load on Search path to reload them.
 
 - The feature is effective only when both `queryCoord.autoRelease.enabled` and `proxy.enableAutoLoad` are enabled. It depends on the existing complete DQL retry: a collection-not-loaded, view-not-found, or view-invalidated error during loading or execution sends the request back through automatic loading before another query attempt.
-- The TTL should be substantially longer than normal query latency. It measures time since the latest query attempt. Request completion does not refresh it; there are no in-flight request counts or completion notifications.
+- The TTI should be substantially longer than normal query latency. It measures time since the latest query attempt. Request completion does not refresh it; there are no in-flight request counts or completion notifications.
 - Loading, a long-running query, or an iterator waiting for its next page does not prevent expiration. Retries remain bounded by the original request deadline and retry limit, so repeated releases or slow loading can still cause the request to fail.
-- All collections with a load config are eligible, including collections loaded manually.
+- Collections loaded manually or automatically are eligible. The collection property `collection.autorelease.tti.seconds=-1` exempts a collection from both release triggers.
 
 ## Component responsibilities and flow
 
 **Proxy** sends one `EnsureCollectionReady` RPC per complete DQL attempt of Search, HybridSearch, and Query, and per read attempt of a Delete by expression, partial Upsert or AutoID Upsert, and retries the whole request or read on a recoverable release or view error. QueryCoord shares load submission and the readiness wait among all callers of a collection.
 
-**QueryCoord** keeps an in-memory `collectionID -> lastActiveAt` map. Existing readiness RPCs refresh activity, and a periodic scan of load configs selects expired collections. Requests from different Proxies update the same collection timestamp using QueryCoord's local clock.
+**QueryCoord** keeps an in-memory `collectionID -> lastActiveAt` map. Existing readiness RPCs refresh activity, and a periodic scan of load configs selects candidates for release. Requests from different Proxies update the same collection timestamp using QueryCoord's local clock.
 
 **SQN and Worker QN** handle release through their existing QueryView and resource-reference lifecycles. Automatic release submits the existing `DropLoadConfig` broadcast.
 
@@ -27,9 +27,9 @@ Proxy receives DQL
 
 QueryCoord periodically scans load configs
   -> No activity record: initialize it to the current time; skip release this round
-  -> Existing activity has expired: queue the collection unless it is already queued or releasing
+  -> Queue TTI expirations and the oldest ready collections in pressured groups
   -> Return without waiting; queued releases start whenever fewer than releaseConcurrency run
-  -> Check the collection is still idle, then run the existing release path
+  -> Recheck eligibility, then run the existing release path
 ```
 
 ### Activity timestamps
@@ -41,26 +41,28 @@ QueryCoord periodically scans load configs
 
 ### Scanning and release
 
-The TTL starts when a scan first sees a load config. Later scans do not refresh existing timestamps. The scanner reads only load configs and activity timestamps; it does not call `DescribeCollection` or check collection readiness. Loading time can therefore count toward the TTL, and a slow load can be released before it first becomes ready.
+The TTI starts when a scan first sees a load config. Later scans keep the existing timestamp. A scan reads the collection's TTI override. Loading time counts toward TTI expiration.
 
-The scanner queues expired collections and returns without waiting for their releases. A collection stays queued, and later scans skip it, until its release returns. Queued releases start in order whenever fewer than `releaseConcurrency` run, so a slow release holds only its own slot and never delays the next scan. Right before releasing, the collection's activity and TTL are read again. Each release uses the existing collection DDL lock and load-config existence check. A failed release is logged without affecting other releases. If its load config remains, a later scan can queue it again.
+The primary QueryCoord samples balanceable Worker QueryNodes by resource group. Each group's memory ratio is the sum of process resident memory excluding shared pages divided by the sum of memory limits. A group enters memory pressure at the high watermark and leaves it at the low watermark. A group with incomplete readings is skipped for the current scan. In pressured groups, the scanner selects the oldest ready collections, up to `lruMaxEvictionsPerScan` across all groups. TTI expirations do not count toward that limit.
+
+The scanner queues candidates and returns. A collection can appear in the queue or in a running release once at a time. When a release finishes, QueryCoord fills the available slots from the queue. Failed releases are eligible for a later scan if their load config still exists.
 
 A successful release log means the `DropLoadConfig` broadcast call returned successfully. Physical resource cleanup on every node may still be in progress.
 
 ## Concurrency semantics
 
-If a query refreshes activity before the scanner reads the timestamp, the scanner uses the new timestamp. A query, a manual release, disabling automatic release or a TTL change while the collection waits in the queue keeps it loaded, because activity and the TTL are read again right before its release; a later scan evaluates it again. Once the release has started, a later query does not cancel it. Readiness and load-config versions are not rechecked before release.
+When a candidate reaches the head of the queue, QueryCoord checks the latest collection TTI and activity. A memory-pressure candidate also needs unchanged activity, a ready collection, and pressure in its current resource group according to the latest scan. The release uses the existing collection DDL lock and load-config existence check. Once release starts, subsequent queries do not cancel it.
 
-Existing resource references protect segment resources already acquired by a query. If a later query stage encounters `CollectionNotLoaded`, `ViewNotFound`, or `ViewInvalidated`, the existing complete DQL retry handles recovery. The TTL does not provide a query or iterator view lease.
+Existing resource references protect segment resources already acquired by a query. If a later query stage encounters `CollectionNotLoaded`, `ViewNotFound`, or `ViewInvalidated`, the existing complete DQL retry handles recovery. The TTI does not provide a query or iterator view lease.
 
-The activity mutex protects only in-memory records. Reading load configs, submitting broadcasts, and waiting for releases happen outside that mutex. The load-config removal observer only removes activity records and does not call back into the store.
+The activity mutex protects timestamps, pressure state, and the release queue. Reading load configs, submitting broadcasts, and waiting for releases happen outside that mutex. The load-config removal observer only removes activity records and does not call back into the store.
 
 ## Recovery and cleanup
 
-- **QueryCoord restart or leader change:** activity is not persisted. After load configs are recovered, the first scan starts a fresh TTL for each collection. Proxies do not need to report previous activity.
+- **QueryCoord restart or leader change:** activity is not persisted. After load configs are recovered, the first scan starts a fresh TTI for each collection. Proxies do not need to report previous activity.
 - **Manual release, drop, or automatic release:** a synchronous load-config removal observer deletes the activity record. After a reload, a later scan initializes a new timestamp.
 - **Proxy exit:** there are no per-request registrations to clean up. Collections continue to expire according to their latest query attempt.
-- **Either feature disabled:** clear activity, stop refreshing timestamps, and stop the scan timer. Queued releases that have not started are skipped; started ones may still finish. When both features are enabled again, scanning initializes fresh TTLs.
+- **Either feature disabled:** clear activity, stop refreshing timestamps, and stop the scan timer. Queued releases that have not started are skipped; started ones may still finish. When both features are enabled again, scanning initializes fresh TTIs.
 
 ## Configuration
 
@@ -70,21 +72,27 @@ proxy:
 queryCoord:
   autoRelease:
     enabled: false
-    idleTTLSeconds: 600
-    checkIntervalSeconds: 30
+    ttiSeconds: 3600
+    checkIntervalSeconds: 10
     releaseConcurrency: 64
+    lruHighWatermarkPercentage: 85
+    lruLowWatermarkPercentage: 80
+    lruMaxEvictionsPerScan: 64
 ```
 
-All four autoRelease parameters are marked as version `3.0.0` and support runtime updates:
+All autoRelease parameters are marked as version `3.0.0` and support runtime updates:
 
 | Parameter | Effect of an update |
 |---|---|
-| `enabled` | Requires autoLoad as well; disabling clears activity, and re-enabling starts fresh TTLs through scanning |
-| `idleTTLSeconds` | Scans use the latest TTL without resetting existing timestamps |
+| `enabled` | Requires autoLoad as well; disabling clears activity, and re-enabling starts fresh TTIs through scanning |
+| `ttiSeconds` | Scans use the latest idle threshold without resetting timestamps |
 | `checkIntervalSeconds` | The event loop resets the timer to the new interval |
-| `releaseConcurrency` | Releases that start afterwards use the new limit; running releases are not interrupted |
+| `releaseConcurrency` | The next dispatch uses the new concurrency limit |
+| `lruHighWatermarkPercentage` | A group at or above this percentage enters memory pressure |
+| `lruLowWatermarkPercentage` | A group at or below this percentage leaves memory pressure |
+| `lruMaxEvictionsPerScan` | Maximum memory-pressure candidates selected per scan |
 
-The TTL, scan interval, and concurrency must be positive. The TTL and scan interval must also fit in `time.Duration`. If autoRelease is enabled while autoLoad is disabled, QueryCoord logs a warning and leaves automatic release disabled.
+The TTI, scan interval, and concurrency must be positive. The TTI and scan interval must also fit in `time.Duration`. If autoRelease is enabled while autoLoad is disabled, QueryCoord logs a warning and leaves automatic release disabled.
 
 ## Implementation entry points
 
