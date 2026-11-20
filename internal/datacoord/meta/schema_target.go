@@ -33,12 +33,14 @@ func (m *Meta) CollectionForPreparation(ctx context.Context, collection *Collect
 	if err != nil {
 		return nil, err
 	}
-	copy := *collection
-	copy.Schema = schema
-	if schema != collection.Schema {
-		copy.Properties = funcutil.KeyValuePair2Map(schema.GetProperties())
+	if schema == collection.Schema {
+		return collection, nil
 	}
-	return &copy, nil
+
+	prepared := *collection
+	prepared.Schema = schema
+	prepared.Properties = funcutil.KeyValuePair2Map(schema.GetProperties())
+	return &prepared, nil
 }
 
 // CollectionsForPreparation leaves collections whose callback is still being
