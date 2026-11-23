@@ -411,6 +411,7 @@ func (s *Server) initQViewsRuntime(queryViewCatalog queryview.QueryViewCatalog) 
 		s.mixCoord,
 	)
 	deps.replicaResources = qviewsReplicaResources{ResourceManager: s.meta.ResourceManager, allocateID: s.idAllocator}
+	deps.getCollectionInfo = s.meta.GetCollectionInfo
 	runtime, err := newQViewsRuntime(s.ctx, deps)
 	if err != nil {
 		return err
